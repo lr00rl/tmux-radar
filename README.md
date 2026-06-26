@@ -11,7 +11,10 @@ alerts that flag any window where **Claude Code** or **Codex** is waiting on you
 - **One key, three views** — session tree, recent (MRU), and "needs input",
   switchable live inside the popup. Pick which one opens by default.
 - **Title-only fuzzy search** — type to match the window name, not the path or
-  running command.
+  running command. Results rank by match score as you type, recency order at rest.
+- **Smart cursor in recent view** — opens with the cursor on the 2nd entry,
+  since row 1 is always the current window (you won't switch back to yourself).
+  The current window stays in the list, one `↑` away.
 - **Live preview** — the selected window's content, no wrap, anchored to the
   bottom (current prompt/state visible), with line/page scroll.
 - **Need-input alerts** — Claude/Codex flag their pane when they want you; a

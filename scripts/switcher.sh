@@ -91,6 +91,15 @@ do_menu() {
 
   default_view="$(opt @switcher-default-view tree)"
   case "$default_view" in tree|recent|needinput) ;; *) default_view=tree ;; esac
+  # In the recent view, row 1 is always the current window (you won't switch
+  # back to yourself), so move the cursor to row 2 on launch. The current
+  # window stays in the list (row 1) so its detail is still one ↑ away.
+  # Other views keep row 1 selected (tree row 1 is a header; need-input row 1
+  # is a real target you do want).
+  # --sync is required: without it, the 'start' event fires before the piped
+  # list is loaded and 'down' becomes a no-op.
+  local start_bind=""
+  [ "$default_view" = "recent" ] && start_bind="--sync --bind=start:down"
   preview_pos="$(opt @switcher-preview right:62%)"
   follow="$(opt @switcher-preview-follow on)"
   preview_win="${preview_pos},nowrap"
@@ -99,6 +108,7 @@ do_menu() {
   selected="$(
     "$SELF" list "$default_view" | "$fzf" \
       --ansi --delimiter=$'\t' --with-nth=2.. --nth=1 --cycle \
+      $start_bind \
       --layout=reverse --prompt="${default_view}> " \
       --header='ctrl-t tree · ctrl-r recent · ctrl-i need-input · alt-p preview · S-↑/↓ PgUp/PgDn scroll · Enter switch' \
       --preview="$SELF preview {1}" --preview-window="$preview_win" \

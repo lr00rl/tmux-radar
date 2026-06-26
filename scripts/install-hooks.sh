@@ -15,8 +15,13 @@ CODEX_WRAP="${TMUX_SWITCHER_CODEX_WRAP:-$SCRIPT_DIR/codex-notify-wrap.sh}"
 CLAUDE_SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 CODEX_CONFIG="${CODEX_CONFIG:-$HOME/.codex/config.toml}"
 
-CLAUDE_EVENTS=(Notification Stop UserPromptSubmit SessionEnd)
-CLAUDE_SUBCMDS=(claude-mark claude-stop claude-clear claude-clear)
+# NOTE: SessionEnd is intentionally NOT hooked. It fires the instant a session
+# ends — which immediately follows Stop for short-lived / print-mode / background
+# runs — so a SessionEnd clear would wipe the "Claude finished — your turn" mark
+# before you ever see it. Marks are cleared when you navigate to the window
+# (session-window-changed hook) and dead panes are filtered from the view.
+CLAUDE_EVENTS=(Notification Stop UserPromptSubmit)
+CLAUDE_SUBCMDS=(claude-mark claude-stop claude-clear)
 CODEX_NOTIFY_JSON="[\"$NOTIFY\", \"codex\"]"
 
 die()  { echo "error: $*" >&2; exit 1; }
@@ -29,6 +34,16 @@ claude_install() {
   [ -f "$CLAUDE_SETTINGS" ] || echo '{}' > "$CLAUDE_SETTINGS"
   cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak.$(date +%Y%m%d%H%M%S)"
   jq empty "$CLAUDE_SETTINGS" 2>/dev/null || die "$CLAUDE_SETTINGS is not valid JSON"
+  # Migration: older versions hooked SessionEnd -> claude-clear, which wiped the
+  # "finished" mark the moment a session ended. Strip it so upgrades self-heal.
+  local mtmp; mtmp="$(mktemp)"
+  jq --arg p "$NOTIFY " '
+    if (.hooks // {}).SessionEnd then
+      .hooks.SessionEnd |= ( map(.hooks |= map(select((.command // "") | startswith($p) | not)))
+                             | map(select((.hooks // []) | length > 0)) )
+      | if (.hooks.SessionEnd | length) == 0 then del(.hooks.SessionEnd) else . end
+    else . end
+  ' "$CLAUDE_SETTINGS" > "$mtmp" && mv "$mtmp" "$CLAUDE_SETTINGS"
   local i ev cmd tmp
   for i in "${!CLAUDE_EVENTS[@]}"; do
     ev="${CLAUDE_EVENTS[$i]}"; cmd="$NOTIFY ${CLAUDE_SUBCMDS[$i]}"; tmp="$(mktemp)"
@@ -60,7 +75,7 @@ claude_uninstall() {
 claude_status() {
   if command -v jq >/dev/null 2>&1 && [ -f "$CLAUDE_SETTINGS" ]; then
     local c; c="$(jq --arg p "$NOTIFY " '[.hooks // {} | .. | .command? // empty | select(startswith($p))] | length' "$CLAUDE_SETTINGS" 2>/dev/null || echo 0)"
-    echo "Claude hooks installed: ${c:-0}/4"
+    echo "Claude hooks installed: ${c:-0}/3"
   else echo "Claude settings: (none / jq missing)"; fi
 }
 

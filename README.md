@@ -95,10 +95,15 @@ once:
 ~/.tmux/plugins/tmux-switcher/scripts/install-hooks.sh uninstall   # remove
 ```
 
-It edits `~/.claude/settings.json` (4 hooks: `Notification`, `Stop`,
-`UserPromptSubmit`, `SessionEnd`) and `~/.codex/config.toml` (`notify`),
+It edits `~/.claude/settings.json` (3 hooks: `Notification` + `Stop` mark the
+pane, `UserPromptSubmit` clears it) and `~/.codex/config.toml` (`notify`),
 idempotently and with timestamped backups. An existing Codex `notify` chain is
 **wrapped** (preserved), not replaced. Restart Claude/Codex sessions afterward.
+
+> `SessionEnd` is intentionally **not** hooked: it fires the instant a session
+> ends — right after `Stop` for short-lived / print-mode / background runs — so
+> clearing on it would erase the "finished" mark before you ever see it. The
+> mark instead clears when you navigate to the window.
 
 A flagged pane is identified via the `$TMUX_PANE` that hook subprocesses inherit;
 the flag clears when you focus that window (and, for Claude, when you submit your

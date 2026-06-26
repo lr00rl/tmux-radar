@@ -50,15 +50,22 @@ run-shell ~/.tmux/plugins/tmux-switcher/tmux-switcher.tmux   # or add to tmux.co
 
 | Key | Action |
 |-----|--------|
-| type | fuzzy search the window **title** |
+| type | fuzzy search **window + pane title** |
 | `ctrl-t` | session **tree** view |
 | `ctrl-r` | **recent** (MRU) view |
 | `ctrl-i` | **need-input** view (waiting panes only) |
+| `ctrl-e` | **expand / collapse panes** (nest panes under each window) |
 | `alt-p` | toggle preview |
 | `shift-↑` / `shift-↓` | scroll preview by line |
 | `PgUp` / `PgDn` | scroll preview by page |
 | `ctrl-n` / `ctrl-p` | move selection (fzf default) |
-| `Enter` | switch to the window |
+| `Enter` | switch to the window (or pane, when a pane row is selected) |
+
+**Pane level.** Each view starts at window granularity. Press `ctrl-e` to expand
+panes nested under their window (works in tree / recent / need-input); press it
+again to collapse. The cursor stays on the same window group across the toggle.
+When expanded, search matches **both** window and pane titles and keeps the
+window→pane grouping (only matching rows are shown).
 
 ## Configuration
 
@@ -67,6 +74,7 @@ Set these **before** the plugin loads:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `@switcher-default-view` | `tree` | Initial view: `tree`, `recent`, or `needinput`. |
+| `@switcher-expand-panes` | `off` | Start with panes expanded (`on`) or collapsed (`off`). Toggle live with `ctrl-e`. |
 | `@switcher-key` | `C-w` | Prefix key that opens the picker. |
 | `@switcher-popup-width` | `100%` | Popup width. |
 | `@switcher-popup-height` | `100%` | Popup height. |

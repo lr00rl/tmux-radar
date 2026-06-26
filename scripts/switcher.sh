@@ -98,7 +98,7 @@ do_menu() {
 
   selected="$(
     "$SELF" list "$default_view" | "$fzf" \
-      --ansi --delimiter=$'\t' --with-nth=2.. --nth=1 --no-sort --cycle \
+      --ansi --delimiter=$'\t' --with-nth=2.. --nth=1 --cycle \
       --layout=reverse --prompt="${default_view}> " \
       --header='ctrl-s tree · ctrl-r recent · ctrl-i need-input · alt-p preview · S-↑/↓ PgUp/PgDn scroll · Enter switch' \
       --preview="$SELF preview {1}" --preview-window="$preview_win" \

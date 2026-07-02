@@ -71,12 +71,13 @@ win_row() {  # $1 = sess:win  -> one window row (active pane drives the meta)
 }
 
 tree_win_row() {  # $1 = sess:win, $2 = visual tree prefix
-  local target="$1" prefix="$2" info name idx panes cmd cur_path
+  local target="$1" prefix="$2" info name idx panes cmd cur_path idx_label
   info="$(tmux display-message -p -t "$target" \
     "#{window_name}${SEP}#{window_index}${SEP}#{window_panes}${SEP}#{pane_current_command}${SEP}#{pane_current_path}" 2>/dev/null)" || return 0
   IFS="$SEP" read -r name idx panes cmd cur_path <<< "$info"
-  printf '%s\t%s%s%s %s\t%s%s%s %s%s · %s · %s%s\n' \
-    "$target" "$D" "$prefix" "$R" "$name" "$Y" "$idx" "$R" "$D" "${panes}p" "$cmd" "$(short_path "$cur_path")" "$R"
+  printf -v idx_label '%2s' "$idx"
+  printf '%s\t%s%s%s %s%s%s %s\t%s%s · %s · %s%s\n' \
+    "$target" "$D" "$prefix" "$R" "$Y" "$idx_label" "$R" "$name" "$D" "${panes}p" "$cmd" "$(short_path "$cur_path")" "$R"
 }
 
 pane_rows() {  # $1 = sess:win, $2 = tree stem, $3 = include window name (0/1)

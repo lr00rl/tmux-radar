@@ -23,15 +23,21 @@ NEEDINPUT="$(opt @switcher-needinput on)"
 # changes take effect immediately without rebinding).
 tmux bind-key "$KEY" display-popup -E -w "$POPUP_W" -h "$POPUP_H" "$SCRIPTS/switcher.sh menu"
 
-# Hooks are appended (-ga) so we don't clobber other hooks; guard against
-# duplicate registration on config reload.
-if [ "$(tmux show-option -gqv @switcher-hooked 2>/dev/null || true)" != "1" ]; then
+# Hooks are appended (-ga) so we don't clobber other hooks; a version guard
+# avoids duplicate registration on config reload. On version bump we reset our
+# events with -gu first (removes any hook on those events) and re-register.
+HOOK_VERSION=2
+if [ "$(tmux show-option -gqv @switcher-hooked 2>/dev/null || true)" != "$HOOK_VERSION" ]; then
+  tmux set-hook -gu session-window-changed 2>/dev/null || true
+  tmux set-hook -gu client-session-changed 2>/dev/null || true
   tmux set-hook -ga session-window-changed "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_window}'\""
   tmux set-hook -ga client-session-changed "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_session_name}:'\""
   if [ "$NEEDINPUT" = "on" ]; then
     tmux set-hook -ga session-window-changed "run-shell -b \"$SCRIPTS/needinput-notify.sh clear-window '#{hook_window}'\""
+    # session switches change which panes are on screen -> resync the bar
+    tmux set-hook -ga client-session-changed "run-shell -b \"$SCRIPTS/needinput-notify.sh tick\""
   fi
-  tmux set-option -g @switcher-hooked 1
+  tmux set-option -g @switcher-hooked "$HOOK_VERSION"
 fi
 
 # Transient toast line (revealed only while toasts are live; the notifier

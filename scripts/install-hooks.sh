@@ -79,6 +79,13 @@ claude_status() {
   else echo "Claude settings: (none / jq missing)"; fi
 }
 
+# Detect our scripts in the notify chain even when another tool (e.g. the
+# Codex desktop app) re-wrapped notify and buried ours inside a JSON-escaped
+# `--previous-notify` argument, where full paths appear as `\/Users\/...`.
+codex_has_ours() {
+  [ -f "$CODEX_CONFIG" ] && grep -qE 'codex-notify-wrap\.sh|needinput-notify\.sh' "$CODEX_CONFIG"
+}
+
 codex_install() {
   mkdir -p "$(dirname "$CODEX_CONFIG")"
   if [ ! -f "$CODEX_CONFIG" ]; then
@@ -86,8 +93,8 @@ codex_install() {
     info "Codex notify -> created $CODEX_CONFIG (direct)"; return 0
   fi
   cp "$CODEX_CONFIG" "$CODEX_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
-  if grep -qF "$CODEX_WRAP" "$CODEX_CONFIG" || grep -qF "$NOTIFY" "$CODEX_CONFIG"; then
-    info "Codex notify already integrated"; return 0
+  if codex_has_ours; then
+    info "Codex notify already integrated (possibly wrapped by another notify chain)"; return 0
   fi
   if grep -qE '^[[:space:]]*notify[[:space:]]*=[[:space:]]*\[' "$CODEX_CONFIG"; then
     sed -i '' "s#^\([[:space:]]*notify[[:space:]]*=[[:space:]]*\[\)#\1\"$CODEX_WRAP\", #" "$CODEX_CONFIG"
@@ -106,12 +113,14 @@ codex_uninstall() {
     sed -i '' "s#\"$CODEX_WRAP\", ##" "$CODEX_CONFIG"; info "unwrapped Codex notify (restored chain)"
   elif grep -qF "$NOTIFY" "$CODEX_CONFIG"; then
     grep -vF "$NOTIFY" "$CODEX_CONFIG" > "$CODEX_CONFIG.tmp" && mv "$CODEX_CONFIG.tmp" "$CODEX_CONFIG"; info "removed direct Codex notify"
+  elif codex_has_ours; then
+    echo "  WARNING: our wrap is buried (JSON-escaped) inside another notify chain in $CODEX_CONFIG." >&2
+    echo "  Remove the codex-notify-wrap.sh entry from that chain manually." >&2
   else info "Codex notify not ours / absent"; fi
 }
 
 codex_status() {
-  if [ -f "$CODEX_CONFIG" ] && { grep -qF "$CODEX_WRAP" "$CODEX_CONFIG" || grep -qF "$NOTIFY" "$CODEX_CONFIG"; }; then
-    echo "Codex notify: installed"
+  if codex_has_ours; then echo "Codex notify: installed"
   else echo "Codex notify: not installed"; fi
 }
 

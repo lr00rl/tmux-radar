@@ -241,9 +241,15 @@ list_needinput() {  # pane-level AI process view; hook-marked panes float first
         next
       }
       mode == "flags" && $0 != "" {
+        if ($1 == "-") {                     # paneless background-session mark
+          bg_n++
+          bg_src[bg_n]=$3
+          bg_label[bg_n]=(NF >= 5 ? $5 : $4)
+          next
+        }
         flagged[$1]=1
         flag_source[$1]=$3
-        flag_label[$1]=$4
+        flag_label[$1]=(NF >= 5 ? $5 : $4)
         next
       }
       mode == "ps" && $0 != "" { read_ps($0); next }
@@ -265,12 +271,24 @@ list_needinput() {  # pane-level AI process view; hook-marked panes float first
           }
         }
 
-        for (pass=1; pass<=2; pass++) {
+        # background rows jump to a pane running the claude TUI, if any
+        claude_pane=""
+        for (i=1; i<=n; i++) { p=order[i]; if (ai_cmd[p SUBSEP "claude"]) { claude_pane=p; break } }
+
+        for (pass=1; pass<=3; pass++) {
+          if (pass == 2) {                   # paneless background marks, newest first
+            for (b=bg_n; b>=1; b--) {
+              tgt=(claude_pane != "" ? pane_target[claude_pane] : "__hdr__:bg")
+              printf "%s\t%s⚠%s %s\t%s%s · background session%s\n", \
+                tgt, M, R, bg_label[b], D, bg_src[b], R
+            }
+            continue
+          }
           for (i=1; i<=n; i++) {
             pane=order[i]
             if (!(pane in ai)) continue
             is_flagged=(pane in flagged)
-            if ((pass == 1 && !is_flagged) || (pass == 2 && is_flagged)) continue
+            if ((pass == 1 && !is_flagged) || (pass == 3 && is_flagged)) continue
 
             mark=(is_flagged ? M "⚠ " R : "")
             title=(ti[pane] != "" && ti[pane] != wn[pane] ? "/" ti[pane] : "")

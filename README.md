@@ -18,8 +18,13 @@ alerts that flag any window where **Claude Code** or **Codex** is waiting on you
 - **Live preview** — the selected window's content, no wrap, anchored to the
   bottom (current prompt/state visible), with line/page scroll.
 - **Need-input alerts** — Claude/Codex flag their pane when they want you; a
-  transient toast appears on the status line and the pane shows up in the
-  need-input view until you focus it.
+  **persistent bar** appears on a second status line until you deal with it,
+  the pane's **title flips to `⚠ <reason>`** (visible in pane borders, like
+  Codex's native "Action Required" titles), and the pane shows up in the
+  need-input view. Everything clears when you focus the window or reply.
+- **Background Claude sessions covered** — Claude Code sessions that run outside
+  any tmux pane (dashboard / background jobs / cloud) are tracked per
+  `session_id` and surface on the bar and in the need-input view too.
 
 ## Requirements
 
@@ -81,8 +86,10 @@ Set these **before** the plugin loads:
 | `@switcher-popup-height` | `100%` | Popup height. |
 | `@switcher-preview` | `right:62%` | fzf preview position/size. |
 | `@switcher-preview-follow` | `on` | Anchor preview to the bottom (tail-style). |
-| `@switcher-needinput` | `on` | Enable the need-input system (hooks/toast). |
+| `@switcher-needinput` | `on` | Enable the need-input system (hooks/bar). |
 | `@switcher-needinput-commands` | `codex claude` | Process names the need-input view treats as AI panes. Comma/space/colon separated. |
+| `@switcher-retitle` | `on` | Rename a marked pane's title to `⚠ <reason>` (restored on clear). |
+| `@switcher-claude-bg` | `on` | Also track Claude sessions running outside tmux panes (background/dashboard/cloud). |
 
 Example:
 
@@ -102,9 +109,9 @@ the pane process tree and processes attached to the pane TTY, not on tmux window
 or pane names. Hook-marked panes are shown first and annotated with the hook
 message; unmarked AI panes remain visible for quick review.
 
-The plugin sets up the tmux side automatically (toast status line + clear on
-window focus). To let Claude Code and Codex flag their pane, install the hooks
-once:
+The plugin sets up the tmux side automatically (need-input bar status line +
+clear on window focus). To let Claude Code and Codex flag their pane, install
+the hooks once:
 
 ```sh
 ~/.tmux/plugins/tmux-switcher/scripts/install-hooks.sh install     # wire hooks
@@ -122,15 +129,28 @@ idempotently and with timestamped backups. An existing Codex `notify` chain is
 > clearing on it would erase the "finished" mark before you ever see it. The
 > mark instead clears when you navigate to the window.
 
-A flagged pane is identified via the `$TMUX_PANE` that hook subprocesses inherit;
-the flag clears when you focus that window (and, for Claude, when you submit your
-next prompt).
+### How marks are targeted and cleared
 
-### Toast position note
+- **Interactive TUI in a pane** — the pane comes from the `$TMUX_PANE` that hook
+  subprocesses inherit. The mark clears when you focus that window, or (Claude)
+  when you submit your next prompt in that session.
+- **Background Claude sessions** — Claude Code sessions that don't live in a
+  tmux pane (`$TMUX_PANE` unset, or `$CLAUDE_JOB_DIR` set: the dashboard, `&`
+  background jobs, cloud sessions) get a **paneless mark keyed by
+  `session_id`**, labelled `Claude·<project>`. It clears when you reply to that
+  session (`UserPromptSubmit`), and expires after 24h
+  (`TMUX_SWITCHER_BG_TTL`) as a safety net. In the need-input view these rows
+  jump to a pane running the `claude` TUI when one exists.
+- **Stale marks** — marks whose pane has died are garbage-collected on every
+  state change; a marked pane you are currently looking at is kept out of the
+  bar (no need to nag) but stays in the need-input view until cleared.
 
-tmux has a single `status-position`, so the toast renders on a second status line
-adjacent to your main status bar (revealed only while a toast is live). A toast
-strictly at the top while the bar stays at the bottom is not possible natively.
+### Bar position note
+
+tmux has a single `status-position`, so the bar renders on a second status line
+adjacent to your main status bar (revealed only while something waits, via
+`status 2`). A bar strictly at the top while the main line stays at the bottom
+is not possible natively.
 
 ## How it works
 
@@ -138,8 +158,10 @@ strictly at the top while the bar stays at the bottom is not possible natively.
   name+meta while searching only the name.
 - Preview uses `--preview-window '<pos>,nowrap,follow'`; `follow` tails to the
   bottom so the current state is visible.
-- State lives in `~/.local/state/tmux/` (`window-mru`, `need-input`,
-  `need-input-toasts`).
+- State lives in `~/.local/state/tmux/` (`window-mru`, `need-input`). Each
+  need-input mark is one TAB-separated line:
+  `pane ⇥ epoch ⇥ source ⇥ key ⇥ label ⇥ saved_title` (`pane` is `-` for
+  background-session marks; `key` is `s:<claude session_id>` or the pane id).
 
 ## License
 

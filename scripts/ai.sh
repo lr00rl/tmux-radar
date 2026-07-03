@@ -277,10 +277,11 @@ cmd_ask() {
 # ---------------------------------------------------------------------------
 cmd_list() {
   have_tmux || { echo "no tmux server"; return 0; }
-  local marks=""; [ -r "$STATE_FILE" ] && marks="$(cat "$STATE_FILE")"
+  # join mark records with \001 — BSD awk rejects newlines in -v values
+  local marks=""; [ -r "$STATE_FILE" ] && marks="$(tr '\n' '\001' < "$STATE_FILE")"
   tmux list-panes -a -F '#{pane_id}'$'\t''#{session_name}:#{window_index}.#{pane_index}'$'\t''#{pane_current_command}'$'\t''#{pane_title}' 2>/dev/null |
   awk -F '\t' -v marks="$marks" '
-    BEGIN { n=split(marks, ml, "\n"); for(i=1;i<=n;i++){split(ml[i],f,"\t"); if(f[1]!="") flagged[f[1]]=(f[5]?f[5]:f[4])} }
+    BEGIN { n=split(marks, ml, "\001"); for(i=1;i<=n;i++){split(ml[i],f,"\t"); if(f[1]!="") flagged[f[1]]=(f[5]?f[5]:f[4])} }
     tolower($3) ~ /codex|claude/ {
       printf "%s  %-16s %-8s %s%s\n", $1, $2, $3, ($1 in flagged?"⚠ ":"  "), ($1 in flagged?flagged[$1]:$4)
     }'

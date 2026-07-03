@@ -21,10 +21,18 @@ alerts that flag any window where **Claude Code** or **Codex** is waiting on you
   **persistent bar** appears on a second status line until you deal with it,
   the pane's **title flips to `⚠ <reason>`** (visible in pane borders, like
   Codex's native "Action Required" titles), and the pane shows up in the
-  need-input view. Everything clears when you focus the window or reply.
+  need-input view. Everything clears when you focus the window or reply — and
+  **stale marks self-heal**: a mark whose agent TUI has exited is dropped
+  automatically.
 - **Background Claude sessions covered** — Claude Code sessions that run outside
   any tmux pane (dashboard / background jobs / cloud) are tracked per
-  `session_id` and surface on the bar and in the need-input view too.
+  `session_id` and surface on the bar and in the need-input view too. Sessions
+  that *do* live in a pane but lost `$TMUX_PANE` (env-scrubbing launchers,
+  agent runners) are resolved back to their real pane via the process tree.
+- **AI supervisor (opt-in)** — `prefix + A`: drive tmux from natural language,
+  have Codex answer a waiting Claude/Codex prompt for you, or run a resident
+  watcher that auto-approves *safe* prompts until a pane's task is done — with
+  a read-only brain, an audit log, and escalation for anything risky.
 
 ## Requirements
 
@@ -118,7 +126,22 @@ set -g @switcher-default-view 'recent'
 set -g @switcher-key 'C-j'
 set -g @switcher-preview 'right:55%'
 set -g @switcher-needinput-commands 'codex claude'
+
+# AI supervisor (optional)
+set -g @switcher-ai 'on'
+set -g @switcher-ai-effort 'minimal'      # fastest decisions
+set -g @switcher-ai-rules "$HOME/.config/tmux-switcher/rules.md"
+
 set -g @plugin 'lr00rl/tmux-switcher'
+```
+
+An example `~/.config/tmux-switcher/rules.md` (loaded automatically when it
+exists, even without setting `@switcher-ai-rules`):
+
+```markdown
+- Auto-approve: running tests, linters, read-only commands, file reads.
+- ALWAYS escalate: git push, anything touching prod/deploys, package publishes.
+- If Claude asks which approach to take, prefer the smallest change.
 ```
 
 ## Need-input AI pane view + alerts (Claude Code / Codex)
@@ -155,16 +178,29 @@ idempotently and with timestamped backups. An existing Codex `notify` chain is
 - **Interactive TUI in a pane** — the pane comes from the `$TMUX_PANE` that hook
   subprocesses inherit. The mark clears when you focus that window, or (Claude)
   when you submit your next prompt in that session.
-- **Background Claude sessions** — Claude Code sessions that don't live in a
-  tmux pane (`$TMUX_PANE` unset, or `$CLAUDE_JOB_DIR` set: the dashboard, `&`
-  background jobs, cloud sessions) get a **paneless mark keyed by
-  `session_id`**, labelled `Claude·<project>`. It clears when you reply to that
-  session (`UserPromptSubmit`), and expires after 24h
-  (`TMUX_SWITCHER_BG_TTL`) as a safety net. In the need-input view these rows
-  jump to a pane running the `claude` TUI when one exists.
-- **Stale marks** — marks whose pane has died are garbage-collected on every
-  state change; a marked pane you are currently looking at is kept out of the
-  bar (no need to nag) but stays in the need-input view until cleared.
+- **No `$TMUX_PANE`, but still in a pane** — some launchers scrub the
+  environment, and agent runners fork sessions whose hooks don't inherit it.
+  Before falling back to a paneless mark, the notifier resolves the hook
+  process's **controlling tty / parent chain** against live panes — so those
+  sessions still get a jumpable pane mark instead of a bare "session id" row.
+- **Background Claude sessions** — sessions genuinely outside tmux
+  (`$CLAUDE_JOB_DIR` set: the dashboard, background jobs, cloud) get a
+  **paneless mark keyed by `session_id`**, labelled `Claude·<project>`. It
+  clears when you reply to that session (`UserPromptSubmit`) and expires after
+  24h (`TMUX_SWITCHER_BG_TTL`) as a safety net. In the need-input view these
+  rows jump to a pane running the `claude` TUI when one exists.
+- **Stale marks (agent-liveness GC)** — a pane mark is stale in two ways, and
+  both self-heal: the **pane died** (dropped on every state change), or the
+  pane is alive but the **agent TUI exited** and the shell got reused. The
+  latter is detected by scanning the process tree — a claude/codex mark whose
+  pane no longer hosts that agent is dropped (and the pane title restored).
+  Detection matches ps **argv0 path components**, never
+  `pane_current_command`: Claude Code's foreground binary is a bare version
+  number (e.g. `2.1.199`), so the naive match would miss it. The GC runs on
+  plugin load, while the bar is visible (every ≤30s), and whenever the
+  need-input view opens; a failed scan skips GC rather than guessing. A marked
+  pane you are currently looking at is kept out of the bar (no need to nag)
+  but stays in the need-input view until cleared.
 
 ### Bar position note
 
@@ -178,13 +214,18 @@ is not possible natively.
 Opt in with `set -g @switcher-ai 'on'` (needs the [`codex`](https://github.com/openai/codex)
 CLI, logged in, plus `jq`). Then `prefix + A` opens a menu:
 
-| Entry | What it does |
-|-------|--------------|
-| **指挥 tmux（自然语言）** | Type a request ("split this window into build/test/lint"); Codex proposes a batch of tmux commands, you confirm, they run. |
-| **让当前 pane 继续 / 决定一次** | Reads the current pane (a Claude Code / Codex TUI waiting on you), figures out the right answer, and — after you confirm — sends the keystrokes. |
-| **常驻监控当前 pane 直到完成** (`w`) | Starts a resident watcher: whenever the pane blocks on a prompt, the AI auto-answers the **safe** ones and keeps it moving until the task is done. |
-| **自定义监控…** (`v`) | Interactive setup for a watch: a **goal** for the AI to push toward, a **poll interval**, and a per-watch **approval policy** (safe-auto / always-allow / suggest-only). |
-| **状态 / 最近决策**, **停止全部监控**, **列出 AI pane** | Manage watchers, read the recent decision log, and see which panes are running AI tools (detected via the process tree — reliable even though Claude Code's foreground binary is a bare version number). |
+| Key | Entry | What it does |
+|-----|-------|--------------|
+| `a` | **指挥 tmux（自然语言）** | Type a request ("split this window into build/test/lint"); Codex proposes a batch of tmux commands, you confirm, they run. |
+| `c` | **让当前 pane 继续 / 决定一次** | Reads the current pane (a Claude Code / Codex TUI waiting on you), figures out the right answer, and — after you confirm — sends the keystrokes. |
+| `w` | **常驻监控当前 pane 直到完成** | Starts a resident watcher: whenever the pane blocks on a prompt, the AI auto-answers the **safe** ones and keeps it moving until the task is done. |
+| `W` | **常驻监控 + always-allow** | Same, but for safe approvals the AI prefers the TUI's "don't ask again" option — fewer interruptions, lower safety. |
+| `v` | **自定义监控…** | Interactive setup for a watch: a **goal** for the AI to push toward, a **poll interval**, and a per-watch **approval policy** (safe-auto / always-allow / suggest-only). |
+| `s` / `S` / `l` | **状态 / 停止全部 / 列出 AI pane** | Manage watchers, read the recent decision log, and see which panes are running AI tools (detected via the process tree — reliable even though Claude Code's foreground binary is a bare version number). |
+
+Free-text prompts (the `a` request, the `v` goal) use **readline**, so CJK
+input edits by character — one backspace deletes one 中文 char — and the usual
+`←`/`→`/`Ctrl-W` editing keys work.
 
 While a watcher runs, a **small companion pane** opens next to the watched pane
 (top by default; `@switcher-ai-monitor-pos`) live-tailing the supervisor's
@@ -218,7 +259,37 @@ every decision with top priority. A watch's **goal** is also injected, so
 "监控到测试全绿" actually steers the decisions. Watchers only consult the model
 when a pane goes **quiet** (screen unchanged) or is already flagged needs-input,
 so an actively-working agent doesn't burn model calls.
-CLI: `scripts/ai.sh {ask|decide|watch|watch-setup|stop|status|list|cleanup}`.
+
+### CLI reference
+
+Everything the menu does is scriptable:
+
+```sh
+ai.sh ask [request…]           # arrange tmux from natural language
+ai.sh decide [pane] [autonomy] [policy] [goal]
+                               # read one pane, act once
+ai.sh watch <pane> [goal] [policy] [poll] [autonomy]
+                               # resident watcher (policy: '' | always-allow)
+ai.sh watch-setup [pane]       # interactive goal/interval/policy setup
+ai.sh stop <pane|all>          # stop watcher(s)
+ai.sh status                   # active watchers + recent decisions
+ai.sh list                     # AI panes with ⚠ waiting / ● watching state
+ai.sh cleanup                  # GC watcher files, monitor panes, stale marks
+```
+
+`decide` exit codes (what the watch loop keys off): `0` sent · `2` done ·
+`3` still working · `4` escalated to you · `5` error · `6` suggest-only/skipped.
+Every action is one TAB-separated line in `~/.local/state/tmux/ai.log`:
+`datetime ⇥ action ⇥ pane ⇥ detail…`.
+
+Need-input internals are inspectable too:
+
+```sh
+needinput-notify.sh tick         # prune + agent-liveness GC + bar resync
+needinput-notify.sh agent-panes  # which panes host a watched agent right now
+needinput-notify.sh resolve-pane # which pane THIS process tree belongs to
+needinput-notify.sh mark|clear|clear-all …   # manual mark management
+```
 
 ### tmux-resurrect / restarts
 
@@ -243,10 +314,47 @@ load, when the bar renders (≤30s), and whenever the need-input view opens.
   name+meta while searching only the name.
 - Preview uses `--preview-window '<pos>,nowrap,follow'`; `follow` tails to the
   bottom so the current state is visible.
-- State lives in `~/.local/state/tmux/` (`window-mru`, `need-input`). Each
-  need-input mark is one TAB-separated line:
-  `pane ⇥ epoch ⇥ source ⇥ key ⇥ label ⇥ saved_title` (`pane` is `-` for
-  background-session marks; `key` is `s:<claude session_id>` or the pane id).
+- Colors are applied **shell/awk-side after** every tmux round-trip, never
+  embedded in a `-F` format — some tmux builds (Linux distros) vis-escape
+  control characters in command output, which would render a raw ESC as a
+  literal `\033[1;32m`.
+- State lives in `~/.local/state/tmux/`:
+  - `window-mru` — window ids, most recent last (drives the recent view).
+  - `need-input` — one TAB-separated mark per line:
+    `pane ⇥ epoch ⇥ source ⇥ key ⇥ label ⇥ saved_title` (`pane` is `-` for
+    background-session marks; `key` is `s:<claude session_id>` or the pane id).
+  - `ai-watch/` — one `<pane>.watch` pidfile (+ `.out` decision feed) per
+    resident watcher.
+  - `ai.log` — the AI supervisor's audit log.
+- Environment overrides (mainly for scripting/tests): `TMUX_SWITCHER_STATE_DIR`,
+  `TMUX_SWITCHER_MRU_FILE`, `TMUX_SWITCHER_NEEDINPUT_FILE`,
+  `TMUX_SWITCHER_NEEDINPUT_COMMANDS`, `TMUX_SWITCHER_BG_TTL` (bg-mark expiry,
+  default 86400s), `TMUX_SWITCHER_BAR_MAX` (bar chips, default 3),
+  `TMUX_SWITCHER_AI_LOG`, and `TMUX_SWITCHER_AI_CMD` (test seam for the brain,
+  overrides `@switcher-ai-cmd`).
+
+## Troubleshooting
+
+- **Colors show as literal `\033[1;32m` (Linux)** — fixed in current versions
+  (colors no longer round-trip through tmux); update the plugin (`prefix + I`
+  or `git -C ~/.tmux/plugins/tmux-switcher pull`).
+- **A pane stays in the need-input list after I closed the AI TUI** — stale
+  marks are GC'd automatically (plugin load / bar render / opening the view).
+  Force a pass with `scripts/needinput-notify.sh tick`; see which panes are
+  currently detected as agents with `scripts/needinput-notify.sh agent-panes`.
+- **A claude pane isn't detected as an AI pane** — detection matches ps argv0
+  path components against `@switcher-needinput-commands` (`codex claude` by
+  default) via the pane's tty and process tree. `pane_current_command` showing
+  a version number (`2.1.199`) is normal and does not matter. If you renamed
+  the binary, add that name to `@switcher-needinput-commands`.
+- **Hooks don't fire** — run `scripts/install-hooks.sh status`, and restart the
+  Claude/Codex sessions (hooks are read at session start).
+- **Deleting CJK text in an AI popup misbehaves** — fixed (prompts use
+  readline); update the plugin.
+- **The AI menu key** — default is capital `A` (`prefix + A`). If an old
+  `@switcher-ai-key 'a'` is still set globally on a running server, unset it
+  (`tmux set -gu @switcher-ai-key`) and re-run the plugin file, or reload your
+  tmux config.
 
 ## License
 

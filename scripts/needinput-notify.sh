@@ -55,6 +55,85 @@ _pane_map() {
     tr '\n' '\001' || true
 }
 
+# Panes currently hosting a watched AI agent (claude/codex/…). Prints
+# "OK\001%id\001%id\001…" — "OK\001" alone means the scan RAN and found none;
+# EMPTY output means the scan failed and the caller must not GC on it.
+# Matching mirrors switcher.sh's need-input view: an agent claims a pane when
+# its ps argv0 — any path component, ".app" stripped — equals a watched command
+# name AND it either sits on the pane's tty or has the pane's shell in its
+# parent chain. pane_current_command is NOT reliable here: Claude Code's
+# foreground binary is a bare version number ("2.1.199"), its argv0 is "claude".
+_agent_panes() {
+  have_tmux || return 0
+  local cmds panes ps_rows
+  cmds="${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @switcher-needinput-commands 'codex claude')}"
+  panes="$(tmux list-panes -a -F '#{pane_id} #{pane_pid} #{pane_tty}' 2>/dev/null)" || return 0
+  [ -n "$panes" ] || return 0
+  ps_rows="$(ps -axo pid=,ppid=,tty=,command= 2>/dev/null)" || return 0
+  [ -n "$ps_rows" ] || return 0
+  { printf '__PANES__\n%s\n__PS__\n%s\n' "$panes" "$ps_rows"; } | awk -v cmds="$cmds" '
+    function cleantty(t) { sub(/^\/dev\//, "", t); return t }
+    function is_agent(a0,    n, parts, i, c, w) {
+      a0 = tolower(a0); gsub(/\\/, "/", a0)
+      n = split(a0, parts, "/")
+      for (w in want)
+        for (i = 1; i <= n; i++) { c = parts[i]; sub(/\.app$/, "", c); if (c == w) return 1 }
+      return 0
+    }
+    BEGIN {
+      m = split(tolower(cmds), raw, /[[:space:],:]+/)
+      for (i = 1; i <= m; i++) if (raw[i] != "") want[raw[i]] = 1
+    }
+    $0 == "__PANES__" { mode = 1; next }
+    $0 == "__PS__"    { mode = 2; next }
+    mode == 1 && $1 != "" { bypid[$2] = $1; bytty[cleantty($3)] = $1; next }
+    mode == 2 && $1 != "" {
+      par[$1] = $2
+      if (is_agent($4)) { agent[$1] = 1; atty[$1] = cleantty($3) }
+      next
+    }
+    END {
+      for (pid in agent) {
+        if (atty[pid] != "" && atty[pid] != "??" && (atty[pid] in bytty)) { hit[bytty[atty[pid]]] = 1; continue }
+        cur = pid
+        for (hops = 0; hops < 80 && cur != "" && cur != "0"; hops++) {
+          if (cur in bypid) { hit[bypid[cur]] = 1; break }
+          cur = par[cur]
+        }
+      }
+      out = "OK"
+      for (p in hit) out = out "\001" p
+      printf "%s\001", out
+    }'
+}
+
+# Find the tmux pane hosting THIS process (a Claude hook runs as a child of its
+# claude): match our controlling tty against pane ttys, else walk our parent
+# chain to a pane shell pid. Lets marks land on the real pane even when
+# $TMUX_PANE was scrubbed from the environment (agent launchers, job runners).
+_resolve_pane_by_proc() {
+  have_tmux || return 1
+  local map rel
+  map="$(tmux list-panes -a -F '#{pane_id} #{pane_pid} #{pane_tty}' 2>/dev/null)"
+  [ -n "$map" ] || return 1
+  rel="$(ps -axo pid=,ppid=,tty= 2>/dev/null)"
+  [ -n "$rel" ] || return 1
+  { printf '__PANES__\n%s\n__PS__\n%s\n' "$map" "$rel"; } | awk -v me="$$" '
+    function cleantty(t) { sub(/^\/dev\//, "", t); return t }
+    $0 == "__PANES__" { mode = 1; next }
+    $0 == "__PS__"    { mode = 2; next }
+    mode == 1 && $1 != "" { bypid[$2] = $1; bytty[cleantty($3)] = $1; next }
+    mode == 2 && $1 != "" { par[$1] = $2; tty[$1] = cleantty($3); next }
+    END {
+      if (tty[me] != "" && tty[me] != "??" && (tty[me] in bytty)) { print bytty[tty[me]]; exit }
+      cur = me
+      for (hops = 0; hops < 40 && cur != "" && cur != "0" && cur != "1"; hops++) {
+        if (cur in bypid) { print bypid[cur]; exit }
+        cur = par[cur]
+      }
+    }'
+}
+
 # Rewrite the state file through an awk filter (callers hold the lock).
 # Also normalizes legacy 4-field rows and drops dead-pane / expired-bg rows.
 _rewrite() {  # _rewrite <awk-filter-body> [extra awk -v args...]
@@ -181,7 +260,24 @@ cmd_clear_window() {  # clear marks for every pane inside a window target
 }
 
 cmd_clear_all() { lock; _drop_rows '1'; unlock; _sync_bar; }
-cmd_tick()      { lock; _rewrite ''; unlock; _sync_bar; }
+
+# tick = prune + agent-liveness GC + bar resync. A pane mark whose source is an
+# AI agent (claude/codex/ai) but whose pane no longer hosts that agent (TUI
+# closed, shell reused for something else) is stale — drop it and restore the
+# pane title. If the process scan failed we only do the plain prune.
+cmd_tick() {
+  local agents
+  agents="$(_agent_panes || true)"
+  lock
+  if [ -n "$agents" ]; then
+    _drop_rows '$1 != "-" && ($3 == "claude" || $3 == "codex" || $3 == "ai") && index(ag, "\001" $1 "\001") == 0' \
+      -v ag="${agents#OK}"
+  else
+    _rewrite ''
+  fi
+  unlock
+  _sync_bar
+}
 
 # Extract a JSON string field (jq if present, else sed best-effort).
 _json_field() {
@@ -204,6 +300,12 @@ _claude_target() {  # sets PANE / KEY / WHERE from hook json in $1
   KEY=""; [ -n "$sid" ] && KEY="s:${sid}"
   WHERE=""; [ -n "$cwd" ] && WHERE="$(basename "$cwd")"
   if [ -n "${CLAUDE_JOB_DIR:-}" ] || [ -z "${TMUX_PANE:-}" ]; then
+    # No $TMUX_PANE — but the session may still live in a pane (env-scrubbed
+    # launcher, agent runner forked from a pane's claude). Resolve through our
+    # own tty / process ancestry before falling back to a paneless mark, so the
+    # mark is jumpable instead of a bare "session id + name" row.
+    p="$(_resolve_pane_by_proc || true)"
+    if [ -n "$p" ]; then PANE="$p"; return 0; fi
     PANE="-"
     [ -n "$KEY" ] || KEY="bg:${WHERE:-unknown}"
     # plugin-internal background sessions (claude-mem observers, SDK helpers,
@@ -254,11 +356,14 @@ cmd_claude_clear() {  # UserPromptSubmit hook (you replied)
 }
 
 cmd_codex() {  # Codex notify passes its event JSON as the last argv argument
-  local json="${1:-}" type
+  local json="${1:-}" type pane
   [ "$(opt @switcher-needinput on)" = "on" ] || exit 0
   type="$(_json_field type "$json")"
   [ -n "$type" ] || exit 0
-  cmd_mark "" codex "Codex: ${type}"
+  pane="${TMUX_PANE:-}"
+  [ -n "$pane" ] || pane="$(_resolve_pane_by_proc || true)"
+  [ -n "$pane" ] || exit 0
+  cmd_mark "$pane" codex "Codex: ${type}"
 }
 
 case "${1:-}" in
@@ -272,5 +377,7 @@ case "${1:-}" in
   claude-stop)   cmd_claude_stop ;;
   claude-clear)  cmd_claude_clear ;;
   codex)         shift; cmd_codex "${1:-}" ;;
+  agent-panes)   _agent_panes | tr '\001' '\n' ;;   # debug: which panes host an agent
+  resolve-pane)  _resolve_pane_by_proc ;;           # debug: pane of this process tree
   *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|claude-mark|claude-stop|claude-clear|codex <json>}" >&2; exit 2 ;;
 esac

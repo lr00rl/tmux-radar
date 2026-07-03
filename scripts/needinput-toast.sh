@@ -63,6 +63,16 @@ case "${1:-render}" in
       }' "$STATE_FILE" 2>/dev/null || true)"
     if [ -n "$out" ]; then
       printf '%s' "$out"
+      # Self-heal: a chip whose agent TUI already closed only disappears via a
+      # GC pass, so while the bar is visible run one in the background at most
+      # every 30s (epoch stored IN the stamp file — stat flags aren't portable).
+      stamp="$STATE_DIR/.gc-stamp"; now="$(date +%s)"; last=0
+      read -r last < "$stamp" 2>/dev/null || true
+      case "$last" in ''|*[!0-9]*) last=0 ;; esac
+      if [ $((now - last)) -ge 30 ]; then
+        printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+        ("$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/needinput-notify.sh" tick >/dev/null 2>&1 &)
+      fi
     else
       # nothing left to show: drop the extra status line (idempotent)
       tmux set -g status on >/dev/null 2>&1 || true

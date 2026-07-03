@@ -24,22 +24,29 @@ NEEDINPUT="$(opt @switcher-needinput on)"
 tmux bind-key "$KEY" display-popup -E -w "$POPUP_W" -h "$POPUP_H" "$SCRIPTS/switcher.sh menu"
 
 # AI supervisor (Codex-driven), opt-in via `set -g @switcher-ai on`. prefix +
-# <@switcher-ai-key> (default `a`) opens a menu: arrange tmux from natural
-# language, decide/answer a waiting AI pane, or run a resident watcher that
-# auto-approves safe prompts until a pane's task is done. display-menu is bound
-# natively (client context) rather than through the script for reliability.
+# <@switcher-ai-key> (default `A` — capital, so a stray prefix+a can't launch
+# it by accident) opens a menu: arrange tmux from natural language,
+# decide/answer a waiting AI pane, or run a resident watcher that auto-approves
+# safe prompts until a pane's task is done. display-menu is bound natively
+# (client context) rather than through the script for reliability; keep the
+# items in sync with cmd_menu in scripts/ai.sh (the CLI fallback).
 if [ "$(opt @switcher-ai off)" = "on" ]; then
-  AI_KEY="$(opt @switcher-ai-key a)"
+  AI_KEY="$(opt @switcher-ai-key A)"
   POP="display-popup -E -w 80% -h 70%"
   tmux bind-key "$AI_KEY" display-menu -T "#[align=centre] tmux AI 主管 " -x C -y C \
-    "指挥 tmux（自然语言）"          a "$POP \"TMUX_SWITCHER_AI_PAUSE=1 $SCRIPTS/ai.sh ask\"" \
-    "让当前 pane 继续 / 决定一次"     c "$POP \"TMUX_SWITCHER_AI_PAUSE=1 $SCRIPTS/ai.sh decide '#{pane_id}'\"" \
-    "常驻监控当前 pane 直到完成"      w "run-shell \"$SCRIPTS/ai.sh watch '#{pane_id}'\"" \
-    "常驻监控 + always-allow（更省心）" W "run-shell \"$SCRIPTS/ai.sh watch '#{pane_id}' '' always-allow\"" \
+    "指挥 tmux（自然语言）"            a "$POP \"TMUX_SWITCHER_AI_PAUSE=1 $SCRIPTS/ai.sh ask\"" \
+    "让当前 pane 继续 / 决定一次"       c "$POP \"TMUX_SWITCHER_AI_PAUSE=1 $SCRIPTS/ai.sh decide '#{pane_id}'\"" \
     "" \
-    "查看 / 停止监控"               s "$POP \"TMUX_SWITCHER_AI_PAUSE=1 $SCRIPTS/ai.sh status\"" \
-    "停止全部监控"                  S "run-shell \"$SCRIPTS/ai.sh stop all\"" \
-    "列出所有 AI pane"              l "$POP \"TMUX_SWITCHER_AI_PAUSE=1 $SCRIPTS/ai.sh list\""
+    "常驻监控当前 pane 直到完成"        w "run-shell \"$SCRIPTS/ai.sh watch '#{pane_id}'\"" \
+    "常驻监控 + always-allow（更省心）"  W "run-shell \"$SCRIPTS/ai.sh watch '#{pane_id}' '' always-allow\"" \
+    "自定义监控（目标 / 间隔 / 策略）…"  v "$POP \"$SCRIPTS/ai.sh watch-setup '#{pane_id}'\"" \
+    "" \
+    "状态 / 最近决策"                  s "$POP \"TMUX_SWITCHER_AI_PAUSE=1 $SCRIPTS/ai.sh status\"" \
+    "停止全部监控"                     S "run-shell \"$SCRIPTS/ai.sh stop all\"" \
+    "列出 AI pane"                    l "$POP \"TMUX_SWITCHER_AI_PAUSE=1 $SCRIPTS/ai.sh list\""
+  # housekeeping on every (re)load: GC stale watcher files / monitor panes /
+  # need-input marks — also what a tmux-resurrect post-restore hook should run
+  tmux run-shell -b "$SCRIPTS/ai.sh cleanup" 2>/dev/null || true
 fi
 
 # Hooks are appended (-ga) so we don't clobber other hooks; a version guard
@@ -63,4 +70,6 @@ fi
 # toggles `status 2` <-> `on`). Re-set each load (idempotent).
 if [ "$NEEDINPUT" = "on" ]; then
   tmux set-option -g status-format[1] "#[align=right]#($SCRIPTS/needinput-toast.sh render) "
+  # prune marks left over from a previous server / restore on every (re)load
+  tmux run-shell -b "$SCRIPTS/needinput-notify.sh tick" 2>/dev/null || true
 fi

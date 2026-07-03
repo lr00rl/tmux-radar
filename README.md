@@ -92,10 +92,14 @@ Set these **before** the plugin loads:
 | `@switcher-claude-bg` | `on` | Also track Claude sessions running outside tmux panes (background/dashboard/cloud). |
 | `@switcher-bar-ttl` | `60` | Seconds a chip stays on the bar before fading (`0` = until handled). The mark itself persists in the need-input view / pane title until cleared. |
 | `@switcher-claude-bg-ignore` | `~/.claude:~/.claude-mem` | Colon-separated path prefixes; background sessions whose cwd starts with one (plugin observers, SDK helpers) are not tracked. |
-| `@switcher-ai` | `off` | Enable the **AI supervisor** (`prefix + a` menu). Needs the `codex` CLI + `jq`. |
-| `@switcher-ai-key` | `a` | Prefix key that opens the AI supervisor menu. |
-| `@switcher-ai-model` | `gpt-5.3-codex-spark` | Codex model slug the supervisor uses. |
-| `@switcher-ai-effort` | `low` | Reasoning effort per decision (`minimal`/`low`/`medium`/`high`). |
+| `@switcher-ai` | `off` | Enable the **AI supervisor** (`prefix + A` menu). Needs the `codex` CLI + `jq`. |
+| `@switcher-ai-key` | `A` | Prefix key that opens the AI supervisor menu (capital `A` so a stray `prefix + a` can't trigger it). |
+| `@switcher-ai-model` | `gpt-5.3-codex-spark` | Codex model slug the supervisor uses (`-spark` is the fast tier; pair with `effort minimal/low` for the fastest decisions). |
+| `@switcher-ai-effort` | `low` | Reasoning effort per decision (`minimal`/`low`/`medium`/`high`/`xhigh`). |
+| `@switcher-ai-profile` | *(none)* | Use a [codex config profile](https://github.com/openai/codex) (`codex exec -p <profile>`) instead of the model/effort options — bundle model, effort, etc. in `~/.codex/config.toml`. Safety flags (read-only, ephemeral) still apply. |
+| `@switcher-ai-cmd` | *(none)* | Replace Codex entirely: any shell command that reads the prompt on **stdin** and prints the decision **JSON** on stdout (another CLI, a local model, …). |
+| `@switcher-ai-rules` | *(none)* | **Your approval rules**: a file path (contents used) or a literal text block, appended to every decision prompt with top priority — e.g. "auto-approve npm test / file reads; ALWAYS escalate git push, deploys, anything touching prod". Falls back to `~/.config/tmux-switcher/rules.md` when that file exists. |
+| `@switcher-ai-prompt-dir` | *(none)* | Directory that **shadows** `scripts/prompts/` per file (`decide.md`, `control.md`, `*.schema.json`) — customize the default prompts without editing the plugin. |
 | `@switcher-ai-autonomy` | `confirm` | One-shot `ask`/`decide`: `suggest` (print only), `confirm` (ask first), `auto`. |
 | `@switcher-ai-watch-autonomy` | `auto-safe` | Resident `watch`: `auto-safe` (auto-send only safe replies, escalate the rest), `suggest`, `auto`. |
 | `@switcher-ai-poll` | `5` | Seconds between polls while watching a pane. |
@@ -172,14 +176,15 @@ is not possible natively.
 ## AI supervisor (Codex)
 
 Opt in with `set -g @switcher-ai 'on'` (needs the [`codex`](https://github.com/openai/codex)
-CLI, logged in, plus `jq`). Then `prefix + a` opens a menu:
+CLI, logged in, plus `jq`). Then `prefix + A` opens a menu:
 
 | Entry | What it does |
 |-------|--------------|
 | **指挥 tmux（自然语言）** | Type a request ("split this window into build/test/lint"); Codex proposes a batch of tmux commands, you confirm, they run. |
 | **让当前 pane 继续 / 决定一次** | Reads the current pane (a Claude Code / Codex TUI waiting on you), figures out the right answer, and — after you confirm — sends the keystrokes. |
-| **常驻监控当前 pane 直到完成** | Starts a resident watcher: whenever the pane blocks on a prompt, the AI auto-answers the **safe** ones and keeps it moving until the task is done. |
-| **查看 / 停止监控**, **停止全部监控**, **列出所有 AI pane** | Manage watchers and see which panes are running AI tools. |
+| **常驻监控当前 pane 直到完成** (`w`) | Starts a resident watcher: whenever the pane blocks on a prompt, the AI auto-answers the **safe** ones and keeps it moving until the task is done. |
+| **自定义监控…** (`v`) | Interactive setup for a watch: a **goal** for the AI to push toward, a **poll interval**, and a per-watch **approval policy** (safe-auto / always-allow / suggest-only). |
+| **状态 / 最近决策**, **停止全部监控**, **列出 AI pane** | Manage watchers, read the recent decision log, and see which panes are running AI tools (detected via the process tree — reliable even though Claude Code's foreground binary is a bare version number). |
 
 While a watcher runs, a **small companion pane** opens next to the watched pane
 (top by default; `@switcher-ai-monitor-pos`) live-tailing the supervisor's
@@ -204,11 +209,33 @@ then sends the keystrokes, gated by three safeguards:
 - **Audit + caps** — every action is appended to `~/.local/state/tmux/ai.log`,
   and a watcher pauses after `@switcher-ai-max-calls` model calls.
 
-The "skill" the model follows lives in `scripts/prompts/*.md` (editable): how to
-read each TUI's prompts, which menu option is the safe "Yes", and the safety
-rules. Watchers only consult the model when a pane goes **quiet** (screen
-unchanged) or is already flagged needs-input, so an actively-working agent
-doesn't burn model calls. CLI: `scripts/ai.sh {ask|decide|watch|stop|status|list}`.
+The "skill" the model follows lives in `scripts/prompts/*.md`: how to read each
+TUI's prompts, which menu option is the safe "Yes", and the safety rules.
+Customize without touching the plugin: `@switcher-ai-prompt-dir` shadows any
+prompt file with your own copy, and `@switcher-ai-rules` (or
+`~/.config/tmux-switcher/rules.md`) appends **your** approve/escalate rules to
+every decision with top priority. A watch's **goal** is also injected, so
+"监控到测试全绿" actually steers the decisions. Watchers only consult the model
+when a pane goes **quiet** (screen unchanged) or is already flagged needs-input,
+so an actively-working agent doesn't burn model calls.
+CLI: `scripts/ai.sh {ask|decide|watch|watch-setup|stop|status|list|cleanup}`.
+
+### tmux-resurrect / restarts
+
+Watchers and their monitor panes don't survive a tmux server restart (by
+design — an unattended auto-approver should not resurrect itself). The plugin
+runs `ai.sh cleanup` on every load, which garbage-collects stale watcher state,
+orphan monitor panes, and need-input marks whose pane or agent is gone. If you
+use [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect), also wire
+its post-restore hook so the cleanup runs right after a restore:
+
+```tmux
+set -g @resurrect-hook-post-restore-all 'run-shell -b "~/.tmux/plugins/tmux-switcher/scripts/ai.sh cleanup"'
+```
+
+Stale "needs input" marks self-heal in general: any mark whose agent TUI has
+exited (the pane is back to a plain shell) is dropped automatically — on plugin
+load, when the bar renders (≤30s), and whenever the need-input view opens.
 
 ## How it works
 

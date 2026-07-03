@@ -193,7 +193,7 @@ list_needinput() {  # pane-level AI process view; hook-marked panes float first
   commands="$(needinput_commands)"
 
   { printf '__PANES__\n%s\n__FLAGS__\n%s\n__PS__\n%s\n' "$live" "$flags" "$ps_rows"; } |
-    awk -F '\t' -v cmds="$commands" -v C="$C" -v M="$M" -v D="$D" -v R="$R" '
+    LC_ALL=C awk -F '\t' -v cmds="$commands" -v C="$C" -v M="$M" -v D="$D" -v R="$R" '
       function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
       function clean_tty(t) { sub(/^\/dev\//, "", t); return t }
       function first_word(s, x) { x=trim(s); sub(/[[:space:]].*/, "", x); return x }

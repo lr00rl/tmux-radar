@@ -277,8 +277,24 @@ cmd_watch_loop() {
   rm -f "$wf"; audit "watch-stop\t$pane"
 }
 
+monitor_size() {  # monitor_size <pane> <height|width> <requested> <min> <reserve>
+  local pane="$1" axis="$2" requested="$3" min="$4" reserve="$5" dim max
+  case "$requested" in ''|*[!0-9]*) requested="$min" ;; esac
+  case "$axis" in
+    width)  dim="$(tmux display-message -p -t "$pane" '#{pane_width}' 2>/dev/null || true)" ;;
+    *)      dim="$(tmux display-message -p -t "$pane" '#{pane_height}' 2>/dev/null || true)" ;;
+  esac
+  case "$dim" in ''|*[!0-9]*) printf '%s' "$requested"; return 0 ;; esac
+  max=$((dim - reserve))
+  [ "$max" -lt "$min" ] && return 1
+  [ "$requested" -gt "$max" ] && requested="$max"
+  [ "$requested" -lt "$min" ] && requested="$min"
+  printf '%s' "$requested"
+}
+
 cmd_watch() {  # detach the loop so the caller (popup/menu) can return
-  local pane goal policy poll auto wf feed size pos split
+  local pane goal policy poll auto wf feed pos mon_size err
+  local -a split_args
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane"; return 1; }
   goal="${2:-}"; policy="${3:-}"; poll="${4:-}"; auto="${5:-}"
   wf="$(_wf "$pane")"; feed="${wf%.watch}.out"
@@ -293,15 +309,36 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
   # watch ends. So you see the supervisor's decisions AND the pane's progress.
   if [ "$(opt @switcher-ai-monitor on)" = "on" ] && have_tmux; then
     pos="$(opt @switcher-ai-monitor-pos top)"
+    split_args=()
     case "$pos" in
-      bottom) split="-v -l $(opt @switcher-ai-monitor-size 8)" ;;
-      right)  split="-h -l $(opt @switcher-ai-monitor-size-h 60)" ;;
-      *)      split="-v -b -l $(opt @switcher-ai-monitor-size 8)" ;;   # top (default)
+      bottom)
+        if mon_size="$(monitor_size "$pane" height "$(opt @switcher-ai-monitor-size 8)" 3 4)"; then
+          split_args=(-v -l "$mon_size")
+        fi ;;
+      right)
+        if mon_size="$(monitor_size "$pane" width "$(opt @switcher-ai-monitor-size-h 60)" 20 30)"; then
+          split_args=(-h -l "$mon_size")
+        fi ;;
+      *)
+        pos="top"
+        if mon_size="$(monitor_size "$pane" height "$(opt @switcher-ai-monitor-size 8)" 3 4)"; then
+          split_args=(-v -b -l "$mon_size")
+        fi ;;
     esac
-    # pass STATE_DIR explicitly: the split pane inherits the tmux server env, not
-    # the watcher's, so this keeps the monitor's feed/pidfile paths in sync.
-    tmux split-window $split -d -t "$pane" \
-      "TMUX_SWITCHER_STATE_DIR='$STATE_DIR' exec bash '$SELF' monitor '$pane'" 2>/dev/null || true
+    if [ "${#split_args[@]}" -gt 0 ]; then
+      # pass STATE_DIR explicitly: the split pane inherits the tmux server env, not
+      # the watcher's, so this keeps the monitor's feed/pidfile paths in sync.
+      if err="$(tmux split-window "${split_args[@]}" -d -t "$pane" \
+        "TMUX_SWITCHER_STATE_DIR='$STATE_DIR' exec bash '$SELF' monitor '$pane'" 2>&1)"; then
+        audit "monitor-start\t$pane\t$pos\tsize=$mon_size"
+      else
+        printf '%s⚠ 监控 pane 打开失败%s（watch 仍在运行）%s\n' "$CY" "$CR" "${err:+: $err}"
+        audit "monitor-fail\t$pane\t$pos\tsize=${mon_size:-?}\t$err"
+      fi
+    else
+      printf '%s⚠ 目标 pane 太小，未打开监控 pane%s（watch 仍在运行）\n' "$CY" "$CR"
+      audit "monitor-skip\t$pane\t$pos\tpane-too-small"
+    fi
   fi
   printf '%s✓ 已开始监控%s %s%s%s\n' "$CG" "$CR" "$(_pane_label "$pane")" \
     "${goal:+  ${CD}· ${goal}${CR}}" "${policy:+  ${CY}[$policy]${CR}}"
@@ -474,7 +511,7 @@ cmd_list() {
 # tmux-resurrect post-restore hook.
 # ---------------------------------------------------------------------------
 cmd_cleanup() {
-  local wf pid f n=0 mon start watched
+  local wf pid f n=0 mon start watched live_pids orphan_pids opid
   for wf in "$WATCH_DIR"/*.watch; do
     [ -e "$wf" ] || continue
     pid="$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)"
@@ -485,6 +522,22 @@ cmd_cleanup() {
     [ -e "$f" ] || continue
     [ -f "${f%.out}.watch" ] || rm -f "$f"
   done
+  live_pids=""
+  for wf in "$WATCH_DIR"/*.watch; do
+    [ -e "$wf" ] || continue
+    pid="$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)"
+    [ -n "$pid" ] && live_pids="$live_pids$pid"$'\034'
+  done
+  orphan_pids="$(ps -axo pid=,command= 2>/dev/null | LC_ALL=C awk -v self="$SELF" -v live="$live_pids" '
+    index($0, self " _watch_loop") == 0 { next }
+    {
+      pid=$1
+      if (pid != "" && index("\034" live, "\034" pid "\034") == 0) print pid
+    }' || true)"
+  while IFS= read -r opid; do
+    [ -n "$opid" ] || continue
+    kill "$opid" 2>/dev/null && n=$((n+1)) || true
+  done <<< "$orphan_pids"
   if have_tmux; then
     tmux list-panes -a -F '#{pane_id}'$'\t''#{pane_start_command}' 2>/dev/null |
       grep -F "' monitor '" | grep -F "$SELF" |

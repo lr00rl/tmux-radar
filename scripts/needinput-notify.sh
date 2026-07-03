@@ -71,7 +71,7 @@ _agent_panes() {
   [ -n "$panes" ] || return 0
   ps_rows="$(ps -axo pid=,ppid=,tty=,command= 2>/dev/null)" || return 0
   [ -n "$ps_rows" ] || return 0
-  { printf '__PANES__\n%s\n__PS__\n%s\n' "$panes" "$ps_rows"; } | awk -v cmds="$cmds" '
+  { printf '__PANES__\n%s\n__PS__\n%s\n' "$panes" "$ps_rows"; } | LC_ALL=C awk -v cmds="$cmds" '
     function cleantty(t) { sub(/^\/dev\//, "", t); return t }
     function is_agent(a0,    n, parts, i, c, w) {
       a0 = tolower(a0); gsub(/\\/, "/", a0)

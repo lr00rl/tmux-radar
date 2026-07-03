@@ -101,6 +101,11 @@ Set these **before** the plugin loads:
 | `@switcher-ai-poll` | `5` | Seconds between polls while watching a pane. |
 | `@switcher-ai-max-calls` | `40` | Cost cap: a watcher pauses after this many model calls. |
 | `@switcher-ai-capture-lines` | `120` | Pane lines fed to the model per decision. |
+| `@switcher-ai-watch-always-allow` | `off` | While watching, prefer the TUI's "don't ask again / always allow" option for **safe** actions (fewer interruptions, lower safety). Menu entry `W` enables it per-watch. |
+| `@switcher-ai-monitor` | `on` | Open a small companion pane next to a watched pane, live-tailing the supervisor's decisions (self-closes when the watch ends). |
+| `@switcher-ai-monitor-pos` | `top` | Where the monitor pane opens: `top`, `bottom`, or `right`. |
+| `@switcher-ai-monitor-size` | `8` | Monitor pane height in lines (`top`/`bottom`). |
+| `@switcher-ai-monitor-size-h` | `60` | Monitor pane width in columns (`right`). |
 
 Example:
 
@@ -175,6 +180,14 @@ CLI, logged in, plus `jq`). Then `prefix + a` opens a menu:
 | **让当前 pane 继续 / 决定一次** | Reads the current pane (a Claude Code / Codex TUI waiting on you), figures out the right answer, and — after you confirm — sends the keystrokes. |
 | **常驻监控当前 pane 直到完成** | Starts a resident watcher: whenever the pane blocks on a prompt, the AI auto-answers the **safe** ones and keeps it moving until the task is done. |
 | **查看 / 停止监控**, **停止全部监控**, **列出所有 AI pane** | Manage watchers and see which panes are running AI tools. |
+
+While a watcher runs, a **small companion pane** opens next to the watched pane
+(top by default; `@switcher-ai-monitor-pos`) live-tailing the supervisor's
+decisions — so you see the supervisor **and** the agent's own output at once. It
+self-closes when the watch ends. The **`W`** menu entry starts a watch with
+**always-allow**: for safe approvals the AI prefers the TUI's "don't ask again"
+so the agent runs with fewer interruptions (convenience over per-action vetting;
+off by default).
 
 **Design — Codex is a read-only brain; the script is the only actor.** For every
 decision the plugin captures the pane, hands the text to `codex exec -s

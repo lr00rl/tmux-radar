@@ -35,6 +35,7 @@ if [ "$(opt @switcher-ai off)" = "on" ]; then
     "指挥 tmux（自然语言）"          a "$POP \"TMUX_SWITCHER_AI_PAUSE=1 $SCRIPTS/ai.sh ask\"" \
     "让当前 pane 继续 / 决定一次"     c "$POP \"TMUX_SWITCHER_AI_PAUSE=1 $SCRIPTS/ai.sh decide '#{pane_id}'\"" \
     "常驻监控当前 pane 直到完成"      w "run-shell \"$SCRIPTS/ai.sh watch '#{pane_id}'\"" \
+    "常驻监控 + always-allow（更省心）" W "run-shell \"$SCRIPTS/ai.sh watch '#{pane_id}' '' always-allow\"" \
     "" \
     "查看 / 停止监控"               s "$POP \"TMUX_SWITCHER_AI_PAUSE=1 $SCRIPTS/ai.sh status\"" \
     "停止全部监控"                  S "run-shell \"$SCRIPTS/ai.sh stop all\"" \

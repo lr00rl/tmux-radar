@@ -101,14 +101,18 @@ _send() {  # _send <pane> <text> <key> <key> ...
 cmd_decide() {
   need_jq
   have_brain || { echo "codex 未安装/不可用，无法决策。"; return 3; }
-  local pane autonomy cap where json action text safe reason
+  local pane autonomy policy cap where json action text safe reason extra=""
   pane="$(_resolve_pane "${1:-}")" || { echo "no target pane"; return 5; }
   autonomy="${2:-$(opt @switcher-ai-autonomy confirm)}"
+  policy="${3:-}"
+  if [ "$policy" = "always-allow" ]; then
+    extra=$'\n\nPOLICY: watch-until-done with ALWAYS-ALLOW enabled. When the pending action is SAFE and the prompt offers a "Yes, and don\'t ask again" / "always allow" / "don\'t ask again for … commands" option, PREFER that option so the agent stops interrupting for this command type. Still escalate anything destructive or ambiguous; NEVER pick an always-allow option for an unsafe action.'
+  fi
   where="$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}' 2>/dev/null || echo "$pane")"
   cap="$(tmux capture-pane -p -t "$pane" -S "-$(opt @switcher-ai-capture-lines 120)" 2>/dev/null || true)"
   [ -n "$cap" ] || { echo "pane $pane: nothing to read"; return 5; }
 
-  json="$(_brain "$PROMPT_DIR/decide.schema.json" "$(_skill decide.md)"$'\n\n'"PANE ($where):"$'\n'"$cap")"
+  json="$(_brain "$PROMPT_DIR/decide.schema.json" "$(_skill decide.md)$extra"$'\n\n'"PANE ($where):"$'\n'"$cap")"
   action="$(printf '%s' "$json" | jq -r '.action // "unknown"' 2>/dev/null || echo unknown)"
   text="$(printf '%s' "$json" | jq -r '.text // ""' 2>/dev/null || echo '')"
   safe="$(printf '%s' "$json" | jq -r 'if .safe == false then "0" else "1" end' 2>/dev/null || echo 0)"
@@ -149,14 +153,17 @@ cmd_decide() {
 # don't burn a Codex call every tick while the agent is actively working.
 # ---------------------------------------------------------------------------
 cmd_watch_loop() {
-  local pane goal wf poll maxcalls calls=0 last="" quiet=0 decided="" rc
+  local pane goal policy wf poll maxcalls calls=0 last="" quiet=0 decided="" rc
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane" >&2; return 1; }
   goal="${2:-}"
+  policy="${3:-}"
+  [ -z "$policy" ] && [ "$(opt @switcher-ai-watch-always-allow off)" = "on" ] && policy="always-allow"
   poll="$(opt @switcher-ai-poll 5)"
   maxcalls="$(opt @switcher-ai-max-calls 40)"
   wf="$(_wf "$pane")"
   printf 'pid=%s\npane=%s\nstarted=%s\ngoal=%s\n' "$$" "$pane" "$(now)" "$goal" > "$wf"
-  audit "watch-start\t$pane\t$goal"
+  audit "watch-start\t$pane\t$goal\t${policy:-safe}"
+  printf '▶ 开始监控 %s%s  (approval=%s, 轮询=%ss)\n' "$pane" "${goal:+ · $goal}" "${policy:-逐个确认安全项}" "$poll"
   # $wf is a function-local, so an EXIT trap would see it out-of-scope after the
   # loop returns (rm no-ops). Trap signals only (wf is in scope mid-loop); clean
   # up normal exits explicitly after the loop.
@@ -178,7 +185,7 @@ cmd_watch_loop() {
         echo "watch $pane: hit max-calls ($maxcalls), pausing"
         _escalate "$pane" "AI 监控达到调用上限($maxcalls),已暂停"; audit "watch-cap\t$pane"; break
       fi
-      set +e; cmd_decide "$pane" "$(opt @switcher-ai-watch-autonomy auto-safe)"; rc=$?; set -e
+      set +e; cmd_decide "$pane" "$(opt @switcher-ai-watch-autonomy auto-safe)" "$policy"; rc=$?; set -e
       case "$rc" in
         2) echo "watch $pane: done"; audit "watch-done\t$pane\t$goal"; _escalate "$pane" "AI: 任务完成 ✓${goal:+ ($goal)}"; break ;;
         4) echo "watch $pane: escalated to user, pausing"; break ;;
@@ -190,15 +197,32 @@ cmd_watch_loop() {
 }
 
 cmd_watch() {  # detach the loop so the caller (popup/menu) can return
-  local pane goal
+  local pane goal policy wf feed size pos split
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane"; return 1; }
-  goal="${2:-}"
-  if [ -f "$(_wf "$pane")" ] && kill -0 "$(awk -F= '/^pid=/{print $2}' "$(_wf "$pane")" 2>/dev/null)" 2>/dev/null; then
+  goal="${2:-}"; policy="${3:-}"
+  wf="$(_wf "$pane")"; feed="${wf%.watch}.out"
+  if [ -f "$wf" ] && kill -0 "$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)" 2>/dev/null; then
     echo "already watching $pane (stop it first)"; return 0
   fi
-  nohup bash "$SELF" _watch_loop "$pane" "$goal" >/dev/null 2>&1 &
+  : > "$feed"                                  # create the feed before the monitor tails it
+  nohup bash "$SELF" _watch_loop "$pane" "$goal" "$policy" >"$feed" 2>&1 &
   disown 2>/dev/null || true
-  echo "watching $pane${goal:+ — goal: $goal}"
+  # Companion monitor pane: a small split NEXT TO the watched pane (not a
+  # covering popup), live-tailing the decision feed; it self-closes when the
+  # watch ends. So you see the supervisor's decisions AND the pane's progress.
+  if [ "$(opt @switcher-ai-monitor on)" = "on" ] && have_tmux; then
+    pos="$(opt @switcher-ai-monitor-pos top)"
+    case "$pos" in
+      bottom) split="-v -l $(opt @switcher-ai-monitor-size 8)" ;;
+      right)  split="-h -l $(opt @switcher-ai-monitor-size-h 60)" ;;
+      *)      split="-v -b -l $(opt @switcher-ai-monitor-size 8)" ;;   # top (default)
+    esac
+    # pass STATE_DIR explicitly: the split pane inherits the tmux server env, not
+    # the watcher's, so this keeps the monitor's feed/pidfile paths in sync.
+    tmux split-window $split -d -t "$pane" \
+      "TMUX_SWITCHER_STATE_DIR='$STATE_DIR' exec bash '$SELF' monitor '$pane'" 2>/dev/null || true
+  fi
+  echo "watching $pane${goal:+ — goal: $goal}${policy:+ [$policy]}"
 }
 
 cmd_stop() {
@@ -232,6 +256,25 @@ cmd_status() {
   done
   [ "$any" = 1 ] || echo "no active watchers"
   if [ -r "$LOG" ]; then echo "--- recent decisions ---"; tail -n 8 "$LOG"; fi
+}
+
+# ---------------------------------------------------------------------------
+# monitor: the live viewer that runs in the companion split pane. Tails the
+# watcher's decision feed; when the watcher ends (its pidfile disappears), it
+# lingers briefly then returns, so the exec'd pane closes and the layout
+# restores. Read-only — you watch here, the watched pane runs below/beside.
+# ---------------------------------------------------------------------------
+cmd_monitor() {
+  local pane wf feed tailpid
+  pane="$(_resolve_pane "${1:-}" 2>/dev/null || echo "${1:-}")"
+  wf="$(_wf "$pane")"; feed="${wf%.watch}.out"
+  printf '\033[7m ▶ AI 监控 %s \033[0m  被监控的 pane 就在旁边；本窗随监控结束自动关闭\n\n' "$pane"
+  [ -f "$feed" ] || : > "$feed"
+  tail -n +1 -F "$feed" 2>/dev/null &
+  tailpid=$!
+  while [ -f "$wf" ]; do sleep 1; done
+  kill "$tailpid" 2>/dev/null || true
+  printf '\n\033[2m— 监控结束，本窗即将关闭 —\033[0m\n'; sleep 3
 }
 
 # ---------------------------------------------------------------------------
@@ -305,14 +348,15 @@ cmd_menu() {
 rc=0
 case "${1:-}" in
   ask)          shift; cmd_ask "$@" || rc=$? ;;
-  decide)       shift; cmd_decide "${1:-}" "${2:-}" || rc=$? ;;
-  watch)        shift; cmd_watch "${1:-}" "${2:-}" || rc=$? ;;
-  _watch_loop)  shift; cmd_watch_loop "${1:-}" "${2:-}" || rc=$? ;;
+  decide)       shift; cmd_decide "${1:-}" "${2:-}" "${3:-}" || rc=$? ;;
+  watch)        shift; cmd_watch "${1:-}" "${2:-}" "${3:-}" || rc=$? ;;
+  _watch_loop)  shift; cmd_watch_loop "${1:-}" "${2:-}" "${3:-}" || rc=$? ;;
+  monitor)      shift; cmd_monitor "${1:-}" || rc=$? ;;
   stop)         shift; cmd_stop "${1:-all}" || rc=$? ;;
   status)       cmd_status || rc=$? ;;
   list)         cmd_list || rc=$? ;;
   menu)         cmd_menu || rc=$? ;;
-  *) echo "usage: ai.sh {ask [req]|decide [pane]|watch <pane> [goal]|stop <pane|all>|status|list|menu}" >&2; exit 2 ;;
+  *) echo "usage: ai.sh {ask [req]|decide [pane]|watch <pane> [goal] [always-allow]|monitor <pane>|stop <pane|all>|status|list|menu}" >&2; exit 2 ;;
 esac
 # menu-launched popups set this so the result stays on screen until a keypress
 if [ -n "${TMUX_SWITCHER_AI_PAUSE:-}" ] && [ -t 0 ]; then

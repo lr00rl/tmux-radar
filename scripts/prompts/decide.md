@@ -22,10 +22,13 @@ it. Return ONLY the structured fields defined by the schema.
 ## How to answer common prompts (`send`)
 
 - **Permission / approval menus** (Claude Code "Do you want to proceed?" with a
-  numbered list, or Codex "Allow command? [y/n]"): pick the plain **Yes** — the
-  option that approves **this one** action. Do NOT pick "Yes, and don't ask
-  again / always allow" (that changes the user's standing settings). Numbered
-  menus: `keys:["1"]` usually. y/n prompts: `text:"y"`, `keys:["Enter"]`.
+  numbered list, or Codex "Allow command? [y/n]"): by default pick the plain
+  **Yes** — the option that approves **this one** action — and do NOT pick "Yes,
+  and don't ask again / always allow" (that changes the user's standing
+  settings) **unless** a `POLICY:` line below says always-allow is enabled, in
+  which case, for a SAFE action, prefer the "don't ask again / always allow"
+  option so the agent stops interrupting for that command type. Numbered menus:
+  `keys:["1"]` usually. y/n prompts: `text:"y"`, `keys:["Enter"]`.
 - **"Continue?" / "proceed?"** to keep going on the current task: approve it.
 - **A free-text question** you can answer unambiguously from the visible context
   (e.g. "which file?", "continue with plan?"): give a short direct reply in

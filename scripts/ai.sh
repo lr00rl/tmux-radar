@@ -51,6 +51,10 @@ now()  { date '+%s'; }
 audit() { printf '%s\t%s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true; }
 _skill() { cat "$PROMPT_DIR/$1" 2>/dev/null; }
 _wf()  { printf '%s/%s.watch' "$WATCH_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
+# Human-readable target for headers: "session:win.pane cmd" instead of "%160".
+_pane_label() {
+  tmux display-message -p -t "$1" '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}' 2>/dev/null || printf '%s' "$1"
+}
 
 # Resolve a pane target -> canonical %id. Empty arg falls back to $TMUX_PANE,
 # then to the most recently marked live pane in the need-input state.
@@ -163,7 +167,7 @@ cmd_watch_loop() {
   wf="$(_wf "$pane")"
   printf 'pid=%s\npane=%s\nstarted=%s\ngoal=%s\n' "$$" "$pane" "$(now)" "$goal" > "$wf"
   audit "watch-start\t$pane\t$goal\t${policy:-safe}"
-  printf '▶ 开始监控 %s%s  (approval=%s, 轮询=%ss)\n' "$pane" "${goal:+ · $goal}" "${policy:-逐个确认安全项}" "$poll"
+  printf '▶ 开始监控 %s%s  (approval=%s, 轮询=%ss)\n' "$(_pane_label "$pane")" "${goal:+ · $goal}" "${policy:-逐个确认安全项}" "$poll"
   # $wf is a function-local, so an EXIT trap would see it out-of-scope after the
   # loop returns (rm no-ops). Trap signals only (wf is in scope mid-loop); clean
   # up normal exits explicitly after the loop.
@@ -268,7 +272,7 @@ cmd_monitor() {
   local pane wf feed tailpid
   pane="$(_resolve_pane "${1:-}" 2>/dev/null || echo "${1:-}")"
   wf="$(_wf "$pane")"; feed="${wf%.watch}.out"
-  printf '\033[7m ▶ AI 监控 %s \033[0m  被监控的 pane 就在旁边；本窗随监控结束自动关闭\n\n' "$pane"
+  printf '\033[7m ▶ AI 监控 %s \033[0m  被监控的 pane 就在旁边；本窗随监控结束自动关闭\n\n' "$(_pane_label "$pane")"
   [ -f "$feed" ] || : > "$feed"
   tail -n +1 -F "$feed" 2>/dev/null &
   tailpid=$!

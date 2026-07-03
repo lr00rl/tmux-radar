@@ -21,14 +21,28 @@ it. Return ONLY the structured fields defined by the schema.
 
 ## How to answer common prompts (`send`)
 
-- **Permission / approval menus** (Claude Code "Do you want to proceed?" with a
-  numbered list, or Codex "Allow command? [y/n]"): by default pick the plain
-  **Yes** — the option that approves **this one** action — and do NOT pick "Yes,
-  and don't ask again / always allow" (that changes the user's standing
-  settings) **unless** a `POLICY:` line below says always-allow is enabled, in
-  which case, for a SAFE action, prefer the "don't ask again / always allow"
-  option so the agent stops interrupting for that command type. Numbered menus:
-  `keys:["1"]` usually. y/n prompts: `text:"y"`, `keys:["Enter"]`.
+- **Approval / permission prompts — the tool matters, look at which TUI it is:**
+  - **Claude Code** ("Do you want to proceed?" with a numbered list like
+    `❯ 1. Yes` / `2. …` / `3. No`): it is number-selectable, so `keys:["1"]`
+    picks the plain Yes.
+  - **Codex** (the option list has a `›` cursor on the highlighted line and says
+    "Press enter to continue", or it is an `Allow command? [y/n]` prompt): this
+    is an **arrow-selected** menu, NOT number-typed. The safe "Yes / approve"
+    option is usually already highlighted by `›` — then send just
+    `keys:["Enter"]`. If the safe option is NOT the highlighted one, move the
+    cursor with `keys:["Down"]` or `["Up"]` and then `Enter`. **Never type a
+    digit** ("1"/"2") into Codex — it does not select the option and can drop the
+    TUI into a scroll/selection view. For `[y/n]`: `text:"y"`, `keys:["Enter"]`.
+  - In both: pick the option that approves **this one** action. Do NOT pick "Yes,
+    and don't ask again / always allow" **unless** a `POLICY:` line below enables
+    always-allow, in which case (for a SAFE action) prefer that option — for
+    Codex reach it with arrow keys, for Claude with its number.
+- **Turn finished / waiting for a new instruction** (Codex "agent-turn-complete"
+  or an empty input box; Claude "finished — your turn" at an idle prompt): the
+  agent is **not** blocked on an approval — it is waiting for a NEW human
+  instruction. Do NOT type keys into an idle input box. Return **`done`** (or
+  `wait` if it may still be working), never `send`, unless you were given a clear
+  goal to push it toward.
 - **"Continue?" / "proceed?"** to keep going on the current task: approve it.
 - **A free-text question** you can answer unambiguously from the visible context
   (e.g. "which file?", "continue with plan?"): give a short direct reply in

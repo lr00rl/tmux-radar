@@ -136,19 +136,35 @@ list_tree() {  # $1 = expand
 list_recent() {  # $1 = expand
   local expand="$1" rows pairs ordered mfile tgt
   if [ "$expand" != 1 ]; then
+    # Ask tmux for PLAIN fields only and colorize afterwards: some tmux builds
+    # (Linux distros) vis-escape control characters in command output, so a raw
+    # ESC embedded in the -F format comes back as a literal "\033[1;32m".
     rows="$(tmux list-windows -a -F \
-      "#{window_id}"$'\t'"#{session_name}:#{window_index}"$'\t'"#{window_name}"$'\t'"${G}#{session_name}:#{window_index}${R} ${D}#{pane_current_command} · #{pane_current_path}${R}" 2>/dev/null)"
-    if [ -r "$MRU_FILE" ]; then
-      awk -F '\t' '
-        NR==FNR { tgt[$1]=$2; nm[$1]=$3; meta[$1]=$4; ord[++m]=$1; next }
-        { mru[++n]=$1 }
-        END {
-          for (i=n;i>=1;i--){id=mru[i]; if((id in tgt) && !seen[id]++) print tgt[id] "\t" nm[id] "\t" meta[id]}
-          for (j=1;j<=m;j++){id=ord[j];  if(!seen[id]++)             print tgt[id] "\t" nm[id] "\t" meta[id]}
-        }' <(printf '%s\n' "$rows") "$MRU_FILE"
-    else
-      printf '%s\n' "$rows" | cut -f2-
-    fi
+      '#{window_id}'$'\t''#{session_name}:#{window_index}'$'\t''#{window_name}'$'\t''#{pane_current_command}'$'\t''#{pane_current_path}' 2>/dev/null)"
+    mfile="$MRU_FILE"; [ -r "$mfile" ] || mfile=/dev/null
+    awk -F '\t' -v G="$G" -v D="$D" -v R="$R" -v home="$HOME" '
+      function spath(p) {
+        if (p == home) return "~"
+        if (index(p, home "/") == 1) return "~" substr(p, length(home) + 1)
+        return p
+      }
+      function emit(id,    name) {
+        name = nm[id]
+        while (length(name) < w) name = name " "   # align the meta column
+        printf "%s\t%s\t%s%s%s %s%s · %s%s\n", \
+          tgt[id], name, G, tgt[id], R, D, cmd[id], spath(path[id]), R
+      }
+      NR==FNR {
+        tgt[$1]=$2; nm[$1]=$3; cmd[$1]=$4; path[$1]=$5; ord[++m]=$1
+        if (length($3) > w) w = length($3)
+        next
+      }
+      { mru[++n]=$1 }
+      END {
+        if (w > 24) w = 24
+        for (i=n;i>=1;i--){id=mru[i]; if((id in tgt) && !seen[id]++) emit(id)}
+        for (j=1;j<=m;j++){id=ord[j];  if(!seen[id]++)               emit(id)}
+      }' <(printf '%s\n' "$rows") "$mfile"
     return 0
   fi
   # expanded: order windows by MRU, then nest panes under each
@@ -354,6 +370,8 @@ cmd_set_view() {  # fzf transform: switch view, reload, repoint prompt
   local pos
   read_state
   VIEW="${1:-tree}"; case "$VIEW" in tree|recent|needinput) ;; *) VIEW=tree ;; esac
+  # GC stale marks before the need-input list renders (~50ms, one keystroke)
+  [ "$VIEW" = needinput ] && "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 || true
   write_state
   pos=1
   [ "$VIEW" = recent ] && pos=2
@@ -400,6 +418,12 @@ do_menu() {
 
   SW_STATE="$(mktemp "${STATE_DIR}/.sw.XXXXXX")"; export SW_STATE
   write_state
+
+  # GC stale need-input marks so the view opens clean; synchronous only when
+  # need-input is the first view shown (elsewhere the C-i transform re-GCs).
+  if [ "$VIEW" = needinput ]; then "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 || true
+  else ("$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 &)
+  fi
 
   # Recent opens with the cursor on row 2 (row 1 is the current window), both
   # on initial popup open and when switching back into the recent view.

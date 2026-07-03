@@ -92,6 +92,15 @@ Set these **before** the plugin loads:
 | `@switcher-claude-bg` | `on` | Also track Claude sessions running outside tmux panes (background/dashboard/cloud). |
 | `@switcher-bar-ttl` | `60` | Seconds a chip stays on the bar before fading (`0` = until handled). The mark itself persists in the need-input view / pane title until cleared. |
 | `@switcher-claude-bg-ignore` | `~/.claude:~/.claude-mem` | Colon-separated path prefixes; background sessions whose cwd starts with one (plugin observers, SDK helpers) are not tracked. |
+| `@switcher-ai` | `off` | Enable the **AI supervisor** (`prefix + a` menu). Needs the `codex` CLI + `jq`. |
+| `@switcher-ai-key` | `a` | Prefix key that opens the AI supervisor menu. |
+| `@switcher-ai-model` | `gpt-5.3-codex-spark` | Codex model slug the supervisor uses. |
+| `@switcher-ai-effort` | `low` | Reasoning effort per decision (`minimal`/`low`/`medium`/`high`). |
+| `@switcher-ai-autonomy` | `confirm` | One-shot `ask`/`decide`: `suggest` (print only), `confirm` (ask first), `auto`. |
+| `@switcher-ai-watch-autonomy` | `auto-safe` | Resident `watch`: `auto-safe` (auto-send only safe replies, escalate the rest), `suggest`, `auto`. |
+| `@switcher-ai-poll` | `5` | Seconds between polls while watching a pane. |
+| `@switcher-ai-max-calls` | `40` | Cost cap: a watcher pauses after this many model calls. |
+| `@switcher-ai-capture-lines` | `120` | Pane lines fed to the model per decision. |
 
 Example:
 
@@ -154,6 +163,39 @@ tmux has a single `status-position`, so the bar renders on a second status line
 adjacent to your main status bar (revealed only while something waits, via
 `status 2`). A bar strictly at the top while the main line stays at the bottom
 is not possible natively.
+
+## AI supervisor (Codex)
+
+Opt in with `set -g @switcher-ai 'on'` (needs the [`codex`](https://github.com/openai/codex)
+CLI, logged in, plus `jq`). Then `prefix + a` opens a menu:
+
+| Entry | What it does |
+|-------|--------------|
+| **指挥 tmux（自然语言）** | Type a request ("split this window into build/test/lint"); Codex proposes a batch of tmux commands, you confirm, they run. |
+| **让当前 pane 继续 / 决定一次** | Reads the current pane (a Claude Code / Codex TUI waiting on you), figures out the right answer, and — after you confirm — sends the keystrokes. |
+| **常驻监控当前 pane 直到完成** | Starts a resident watcher: whenever the pane blocks on a prompt, the AI auto-answers the **safe** ones and keeps it moving until the task is done. |
+| **查看 / 停止监控**, **停止全部监控**, **列出所有 AI pane** | Manage watchers and see which panes are running AI tools. |
+
+**Design — Codex is a read-only brain; the script is the only actor.** For every
+decision the plugin captures the pane, hands the text to `codex exec -s
+read-only --ephemeral` with a JSON `--output-schema`, and gets back a structured
+decision (`send` / `wait` / `done` / `escalate` + the exact keys). The **script**
+then sends the keystrokes, gated by three safeguards:
+
+- **Autonomy** — `ask`/`decide` default to `confirm` (show the plan, ask first);
+  the resident `watch` uses `auto-safe` (auto-send only decisions the model
+  marked safe).
+- **Escalation** — anything destructive, irreversible, or ambiguous (rm, force
+  push, deleting data, credentials, deploys, or "I'm not sure") is **never**
+  auto-sent; it re-marks the pane needs-input and pauses so you decide.
+- **Audit + caps** — every action is appended to `~/.local/state/tmux/ai.log`,
+  and a watcher pauses after `@switcher-ai-max-calls` model calls.
+
+The "skill" the model follows lives in `scripts/prompts/*.md` (editable): how to
+read each TUI's prompts, which menu option is the safe "Yes", and the safety
+rules. Watchers only consult the model when a pane goes **quiet** (screen
+unchanged) or is already flagged needs-input, so an actively-working agent
+doesn't burn model calls. CLI: `scripts/ai.sh {ask|decide|watch|stop|status|list}`.
 
 ## How it works
 

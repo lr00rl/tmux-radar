@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["commands", "explain"],
+  "properties": {
+    "commands": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Ordered tmux commands WITHOUT the leading 'tmux' word; run via tmux source-file."
+    },
+    "explain": {
+      "type": "string",
+      "description": "One or two sentences (user's language) describing what the batch does; flag anything destructive."
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["action", "text", "keys", "safe", "reason"],
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["send", "wait", "done", "escalate"],
+      "description": "send=answer a blocked prompt; wait=busy/not blocked; done=task finished; escalate=hand back to human"
+    },
+    "text": {
+      "type": "string",
+      "description": "Literal characters to type (may be empty or contain spaces). Sent before keys."
+    },
+    "keys": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "tmux key names sent after text, in order (e.g. [\"Enter\"], [\"Down\",\"Enter\"], [\"1\"])."
+    },
+    "safe": {
+      "type": "boolean",
+      "description": "false for destructive/irreversible/ambiguous actions — forces escalation."
+    },
+    "reason": {
+      "type": "string",
+      "description": "One concise sentence explaining the pane state and the chosen action."
+    }
+  }
+}

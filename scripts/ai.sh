@@ -77,6 +77,15 @@ _hdr() {  # _hdr <title> [subtitle] — one consistent reverse-video header
   printf '\n\n'
 }
 
+readline_tty() {  # readline paints the editable line on stderr; keep it on tty.
+  local __var="$1"
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    IFS= read -e -r "$__var" </dev/tty 2>/dev/tty || printf -v "$__var" ''
+  else
+    IFS= read -r "$__var" || printf -v "$__var" ''
+  fi
+}
+
 # Prompt "skills" are plain files; @switcher-ai-prompt-dir lets the user shadow
 # any of them (decide.md / control.md / *.schema.json) with their own copies.
 _skill_file() {
@@ -206,7 +215,7 @@ cmd_decide() {
       audit "suggest\t$pane\t$plan\t$reason"; return 6 ;;
     confirm)
       printf '%s→ %s:%s %s\n   发送: %s\n' "$CC" "$pane" "$CR" "$reason" "$plan"
-      printf '   执行? [y/N] '; local ans=""; read -e -r ans </dev/tty 2>/dev/null || ans=""
+      printf '   执行? [y/N] '; local ans=""; readline_tty ans
       case "$ans" in y|Y|yes) ;; *) printf '   %s已跳过%s\n' "$CD" "$CR"; return 6 ;; esac ;;
     auto-safe|auto) : ;;   # safe already ensured above
     *) echo "unknown autonomy: $autonomy" >&2; return 5 ;;
@@ -306,14 +315,14 @@ cmd_watch_setup() {
   pane="$(_resolve_pane "${1:-}")" || { echo "watch-setup: no target pane"; return 1; }
   _hdr "AI 常驻监控 · 设置" "$(_pane_label "$pane")"
   printf '%s目标（回车 = 通用：推进直到任务完成）%s\n> ' "$CD" "$CR"
-  IFS= read -e -r goal </dev/tty 2>/dev/null || goal=""
+  readline_tty goal
   printf '\n%s轮询间隔秒（回车 = %s）%s\n> ' "$CD" "$(opt @switcher-ai-poll 5)" "$CR"
-  IFS= read -e -r poll </dev/tty 2>/dev/null || poll=""
+  readline_tty poll
   printf '\n%s批准策略%s\n' "$CD" "$CR"
   printf '  1) 安全项自动批准，其余上报给你（默认）\n'
   printf '  2) always-allow — 安全项可选“不再询问”，更省心\n'
   printf '  3) 仅建议 — 只播报，不代按任何键\n> '
-  IFS= read -e -r ans </dev/tty 2>/dev/null || ans=""
+  readline_tty ans
   case "$ans" in 2) policy="always-allow" ;; 3) auto="suggest" ;; esac
   echo
   cmd_watch "$pane" "$goal" "$policy" "$poll" "$auto"
@@ -393,7 +402,7 @@ cmd_ask() {
   have_brain || { echo "codex 未安装/不可用，无法使用 AI 指挥。"; return 3; }
   local req autonomy snap json explain n cmds_file
   req="${*:-}"
-  [ -n "$req" ] || { printf 'tmux 指令（自然语言）: '; read -e -r req </dev/tty 2>/dev/null || true; }
+  [ -n "$req" ] || { printf 'tmux 指令（自然语言）: '; readline_tty req; }
   [ -n "$req" ] || { echo "nothing to do"; return 0; }
   autonomy="$(opt @switcher-ai-autonomy confirm)"
   snap="$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{?pane_active,*,} #{pane_current_command} #{pane_current_path} "#{pane_title}"' 2>/dev/null || true)"
@@ -413,7 +422,7 @@ cmd_ask() {
   case "$autonomy" in
     suggest) echo "(suggest 模式：自行执行)"; rm -f "$cmds_file"; return 6 ;;
     confirm)
-      printf '执行? [y/N] '; local ans=""; read -e -r ans </dev/tty 2>/dev/null || ans=""
+      printf '执行? [y/N] '; local ans=""; readline_tty ans
       case "$ans" in y|Y|yes) ;; *) echo "已取消"; rm -f "$cmds_file"; return 6 ;; esac ;;
   esac
   tmux source-file "$cmds_file" 2>&1 && echo "✓ 已执行 $n 条" || echo "部分命令执行失败"

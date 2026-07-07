@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Mark / clear panes and sessions that are "waiting for user input", driven by
-# Claude Code hooks and Codex notify. Single state file under $STATE_DIR:
+# Claude Code hooks plus Codex hooks / legacy notify. Single state file under $STATE_DIR:
 #
 #   need-input   one mark per line, 6 TAB-separated fields:
 #                "<pane>\t<epoch>\t<source>\t<key>\t<label>\t<saved_title>"
@@ -355,15 +355,62 @@ cmd_claude_clear() {  # UserPromptSubmit hook (you replied)
   fi
 }
 
+_codex_pane() {
+  local pane
+  pane="${TMUX_PANE:-}"
+  [ -n "$pane" ] || pane="$(_resolve_pane_by_proc || true)"
+  printf '%s' "$pane"
+}
+
+_codex_label() {  # _codex_label <event-or-type> <json>
+  local event="$1" json="$2" tool desc
+  case "$event" in
+    PermissionRequest|exec_approval_request|apply_patch_approval_request|request_permissions)
+      tool="$(_json_field tool_name "$json")"
+      desc="$(_json_field description "$json")"
+      [ -n "$desc" ] || desc="$(_json_field reason "$json")"
+      if [ -n "$tool" ]; then printf 'Codex needs approval: %s' "$tool"
+      else printf 'Codex needs approval'; fi
+      ;;
+    Stop|task_complete|agent-turn-complete|turn_complete)
+      printf 'Codex finished - your turn'
+      ;;
+    request_user_input)
+      printf 'Codex needs your input'
+      ;;
+    *)
+      if [ -n "$event" ]; then printf 'Codex: %s' "$event"
+      else printf 'Codex needs input'; fi
+      ;;
+  esac
+}
+
+cmd_codex_hook() {  # Codex native hooks pass JSON on stdin
+  local json event pane
+  json="$(cat 2>/dev/null || true)"
+  [ "$(opt @switcher-needinput on)" = "on" ] || exit 0
+  event="$(_json_field hook_event_name "$json")"
+  [ -n "$event" ] || exit 0
+  pane="$(_codex_pane)"
+  case "$event" in
+    UserPromptSubmit)
+      [ -n "$pane" ] && cmd_clear_pane "$pane"
+      ;;
+    PermissionRequest|Stop)
+      [ -n "$pane" ] || exit 0
+      cmd_mark "$pane" codex "$(_codex_label "$event" "$json")"
+      ;;
+  esac
+}
+
 cmd_codex() {  # Codex notify passes its event JSON as the last argv argument
   local json="${1:-}" type pane
   [ "$(opt @switcher-needinput on)" = "on" ] || exit 0
   type="$(_json_field type "$json")"
   [ -n "$type" ] || exit 0
-  pane="${TMUX_PANE:-}"
-  [ -n "$pane" ] || pane="$(_resolve_pane_by_proc || true)"
+  pane="$(_codex_pane)"
   [ -n "$pane" ] || exit 0
-  cmd_mark "$pane" codex "Codex: ${type}"
+  cmd_mark "$pane" codex "$(_codex_label "$type" "$json")"
 }
 
 case "${1:-}" in
@@ -376,8 +423,9 @@ case "${1:-}" in
   claude-mark)   cmd_claude_mark ;;
   claude-stop)   cmd_claude_stop ;;
   claude-clear)  cmd_claude_clear ;;
+  codex-hook)    cmd_codex_hook ;;
   codex)         shift; cmd_codex "${1:-}" ;;
   agent-panes)   _agent_panes | tr '\001' '\n' ;;   # debug: which panes host an agent
   resolve-pane)  _resolve_pane_by_proc ;;           # debug: pane of this process tree
-  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|claude-mark|claude-stop|claude-clear|codex <json>}" >&2; exit 2 ;;
+  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|claude-mark|claude-stop|claude-clear|codex-hook|codex <json>}" >&2; exit 2 ;;
 esac

@@ -164,9 +164,12 @@ the hooks once:
 ```
 
 It edits `~/.claude/settings.json` (3 hooks: `Notification` + `Stop` mark the
-pane, `UserPromptSubmit` clears it) and `~/.codex/config.toml` (`notify`),
-idempotently and with timestamped backups. An existing Codex `notify` chain is
-**wrapped** (preserved), not replaced. Restart Claude/Codex sessions afterward.
+pane, `UserPromptSubmit` clears it) and `~/.codex/config.toml` (Codex native
+hooks: `PermissionRequest` marks approval prompts, `Stop` marks a finished turn,
+`UserPromptSubmit` clears old marks; legacy `notify` is still wrapped as a
+turn-ended fallback). Existing Codex notify chains are **wrapped** (preserved),
+not replaced. Restart Claude/Codex sessions afterward, then review/trust the new
+Codex hooks with `/hooks` if Codex prompts for hook trust.
 
 > `SessionEnd` is intentionally **not** hooked: it fires the instant a session
 > ends — right after `Stop` for short-lived / print-mode / background runs — so

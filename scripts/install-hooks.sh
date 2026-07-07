@@ -4,7 +4,7 @@
 #
 # Edits, idempotently and with a timestamped backup:
 #   ~/.claude/settings.json   (Claude hooks)
-#   ~/.codex/config.toml      (Codex notify — wraps an existing chain, non-destructively)
+#   ~/.codex/config.toml      (Codex hooks + legacy notify fallback)
 #
 # Usage: install-hooks.sh [install|uninstall|status]
 set -euo pipefail
@@ -23,6 +23,9 @@ CODEX_CONFIG="${CODEX_CONFIG:-$HOME/.codex/config.toml}"
 CLAUDE_EVENTS=(Notification Stop UserPromptSubmit)
 CLAUDE_SUBCMDS=(claude-mark claude-stop claude-clear)
 CODEX_NOTIFY_JSON="[\"$NOTIFY\", \"codex\"]"
+CODEX_HOOK_CMD="$NOTIFY codex-hook"
+CODEX_HOOK_BEGIN="# BEGIN tmux-switcher Codex hooks"
+CODEX_HOOK_END="# END tmux-switcher Codex hooks"
 
 die()  { echo "error: $*" >&2; exit 1; }
 info() { echo "  $*"; }
@@ -82,46 +85,99 @@ claude_status() {
 # Detect our scripts in the notify chain even when another tool (e.g. the
 # Codex desktop app) re-wrapped notify and buried ours inside a JSON-escaped
 # `--previous-notify` argument, where full paths appear as `\/Users\/...`.
-codex_has_ours() {
-  [ -f "$CODEX_CONFIG" ] && grep -qE 'codex-notify-wrap\.sh|needinput-notify\.sh' "$CODEX_CONFIG"
+codex_has_notify() {
+  [ -f "$CODEX_CONFIG" ] || return 1
+  grep -qF "codex-notify-wrap.sh" "$CODEX_CONFIG" && return 0
+  grep -qF 'needinput-notify.sh", "codex' "$CODEX_CONFIG" && return 0
+  grep -qF 'needinput-notify.sh","codex' "$CODEX_CONFIG" && return 0
+  grep -qF 'needinput-notify.sh\", \"codex' "$CODEX_CONFIG" && return 0
+  grep -qF 'needinput-notify.sh\",\"codex' "$CODEX_CONFIG" && return 0
+  grep -qF 'needinput-notify.sh\\\",\\\"codex' "$CODEX_CONFIG" && return 0
+  return 1
+}
+
+codex_hook_count() {
+  [ -f "$CODEX_CONFIG" ] || { echo 0; return 0; }
+  local count
+  count="$(grep -F "$CODEX_HOOK_CMD" "$CODEX_CONFIG" 2>/dev/null | wc -l | tr -d '[:space:]')"
+  [ "${count:-0}" -gt 3 ] && count=3
+  echo "${count:-0}"
+}
+
+codex_has_hooks() {
+  [ "$(codex_hook_count)" -ge 3 ]
+}
+
+codex_install_hooks() {
+  if codex_has_hooks; then
+    info "Codex hooks already integrated"; return 0
+  fi
+  cat >> "$CODEX_CONFIG" <<EOF
+
+$CODEX_HOOK_BEGIN
+[[hooks.PermissionRequest]]
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = '$CODEX_HOOK_CMD'
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = '$CODEX_HOOK_CMD'
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = '$CODEX_HOOK_CMD'
+$CODEX_HOOK_END
+EOF
+  info "Codex hooks -> PermissionRequest/Stop/UserPromptSubmit"
 }
 
 codex_install() {
   mkdir -p "$(dirname "$CODEX_CONFIG")"
   if [ ! -f "$CODEX_CONFIG" ]; then
     printf 'notify = %s\n' "$CODEX_NOTIFY_JSON" > "$CODEX_CONFIG"
-    info "Codex notify -> created $CODEX_CONFIG (direct)"; return 0
+    info "Codex notify -> created $CODEX_CONFIG (direct)"
   fi
   cp "$CODEX_CONFIG" "$CODEX_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
-  if codex_has_ours; then
-    info "Codex notify already integrated (possibly wrapped by another notify chain)"; return 0
-  fi
-  if grep -qE '^[[:space:]]*notify[[:space:]]*=[[:space:]]*\[' "$CODEX_CONFIG"; then
-    sed -i '' "s#^\([[:space:]]*notify[[:space:]]*=[[:space:]]*\[\)#\1\"$CODEX_WRAP\", #" "$CODEX_CONFIG"
-    if grep -qF "$CODEX_WRAP" "$CODEX_CONFIG"; then info "Codex notify -> wrapped existing chain (preserved)"
-    else echo "  WARNING: could not auto-wrap Codex notify (multi-line array?). Prepend \"$CODEX_WRAP\" manually." >&2; fi
+  if codex_has_notify; then
+    info "Codex notify already integrated (legacy fallback)"
   else
-    printf '\nnotify = %s\n' "$CODEX_NOTIFY_JSON" >> "$CODEX_CONFIG"
-    info "Codex notify -> appended (direct)"
+    if grep -qE '^[[:space:]]*notify[[:space:]]*=[[:space:]]*\[' "$CODEX_CONFIG"; then
+      sed -i '' "s#^\([[:space:]]*notify[[:space:]]*=[[:space:]]*\[\)#\1\"$CODEX_WRAP\", #" "$CODEX_CONFIG"
+      if grep -qF "$CODEX_WRAP" "$CODEX_CONFIG"; then info "Codex notify -> wrapped existing chain (preserved fallback)"
+      else echo "  WARNING: could not auto-wrap Codex notify (multi-line array?). Prepend \"$CODEX_WRAP\" manually." >&2; fi
+    else
+      printf '\nnotify = %s\n' "$CODEX_NOTIFY_JSON" >> "$CODEX_CONFIG"
+      info "Codex notify -> appended (direct fallback)"
+    fi
   fi
+  codex_install_hooks
 }
 
 codex_uninstall() {
   [ -f "$CODEX_CONFIG" ] || { info "no $CODEX_CONFIG"; return 0; }
   cp "$CODEX_CONFIG" "$CODEX_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+  if grep -qF "$CODEX_HOOK_BEGIN" "$CODEX_CONFIG"; then
+    sed -i '' "/$(printf '%s' "$CODEX_HOOK_BEGIN" | sed 's/[]\[^$.*/]/\\&/g')/,/$(printf '%s' "$CODEX_HOOK_END" | sed 's/[]\[^$.*/]/\\&/g')/d" "$CODEX_CONFIG"
+    info "removed Codex hooks"
+  fi
   if grep -qF "$CODEX_WRAP" "$CODEX_CONFIG"; then
     sed -i '' "s#\"$CODEX_WRAP\", ##" "$CODEX_CONFIG"; info "unwrapped Codex notify (restored chain)"
   elif grep -qF "$NOTIFY" "$CODEX_CONFIG"; then
     grep -vF "$NOTIFY" "$CODEX_CONFIG" > "$CODEX_CONFIG.tmp" && mv "$CODEX_CONFIG.tmp" "$CODEX_CONFIG"; info "removed direct Codex notify"
-  elif codex_has_ours; then
+  elif codex_has_notify; then
     echo "  WARNING: our wrap is buried (JSON-escaped) inside another notify chain in $CODEX_CONFIG." >&2
     echo "  Remove the codex-notify-wrap.sh entry from that chain manually." >&2
   else info "Codex notify not ours / absent"; fi
 }
 
 codex_status() {
-  if codex_has_ours; then echo "Codex notify: installed"
-  else echo "Codex notify: not installed"; fi
+  local c; c="$(codex_hook_count)"
+  echo "Codex hooks installed: ${c:-0}/3"
+  if codex_has_notify; then echo "Codex notify fallback: installed"
+  else echo "Codex notify fallback: not installed"; fi
 }
 
 [ -x "$NOTIFY" ] || die "$NOTIFY not found/executable"

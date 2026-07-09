@@ -362,7 +362,7 @@ list_needinput() {  # pane-level AI-status process view; hook-marked panes float
           if (nk[i] == "b") {
             b=nv[i]
             printf "%s\t%s%s\t%s%s · background session · not a tmux pane%s\n", \
-              "__hdr__:bg", badge(bg_level[b]), bg_label[b], D, bg_src[b], R
+              "__bg__:" b, badge(bg_level[b]), bg_label[b], D, bg_src[b], R
           } else {
             emit_pane(nv[i], flag_level[nv[i]])
           }
@@ -391,6 +391,8 @@ do_list() {  # do_list [view] [expand]
 do_preview() {
   local t="${1:-}"
   case "$t" in
+    __bg__:*)  printf 'Background AI session\n\nThis status came from an agent hook, but tmux-radar could not resolve it to a live tmux pane.\nThere is no pane to switch to for this row.\n' ;;
+    __noop__:*) printf 'This row is informational and has no tmux target.\n' ;;
     __hdr__:*) tmux list-windows -t "${t#__hdr__:}" \
                  -F '  #{window_index}: #{window_name}  (#{window_panes} panes · #{pane_current_command})' 2>/dev/null ;;
     '')        : ;;
@@ -422,6 +424,7 @@ cmd_toggle_expand() {  # fzf transform: flip expand, keep cursor on the window
   EXPAND=$((1 - EXPAND)); write_state
   ctgt="${curline%%$'\t'*}"
   case "$ctgt" in
+    __bg__:*|__noop__:*) cwin="" ;;
     __hdr__:*) cwin="$ctgt" ;;
     *.*)       cwin="${ctgt%.*}" ;;   # strip ".pane"
     *)         cwin="$ctgt" ;;
@@ -493,7 +496,21 @@ do_menu() {
 
   [ -n "$selected" ] || exit 0
   target="${selected%%$'\t'*}"
-  case "$target" in __hdr__:* | '') exit 0 ;; esac
+  case "$target" in
+    __bg__:* | __noop__:* | __hdr__:* | '')
+      tmux display-message "tmux-radar: status-only row; no tmux pane to switch to" 2>/dev/null || true
+      exit 0
+      ;;
+    __*)
+      tmux display-message "tmux-radar: unknown internal row; no switch performed" 2>/dev/null || true
+      exit 0
+      ;;
+    *:*) ;;
+    *)
+      tmux display-message "tmux-radar: invalid target '$target'; no switch performed" 2>/dev/null || true
+      exit 0
+      ;;
+  esac
 
   session="${target%%:*}"
   win="${target%.*}"            # sess:win (drops ".pane" if present)

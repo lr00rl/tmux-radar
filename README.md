@@ -337,7 +337,7 @@ use [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect), also wire
 its post-restore hook so the cleanup runs right after a restore:
 
 ```tmux
-set -g @resurrect-hook-post-restore-all 'run-shell -b "~/.tmux/plugins/tmux-radar/scripts/ai.sh cleanup"'
+set -g @resurrect-hook-post-restore-all 'run-shell -b "~/.tmux/plugins/tmux-radar/scripts/ai.sh cleanup >/dev/null 2>&1"'
 ```
 
 Stale AI-status marks self-heal in general: any mark whose agent TUI has exited

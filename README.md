@@ -114,10 +114,11 @@ Set these **before** the plugin loads:
 | `@switcher-ai-max-calls` | `40` | Cost cap: a watcher pauses after this many model calls. |
 | `@switcher-ai-capture-lines` | `120` | Pane lines fed to the model per decision. |
 | `@switcher-ai-watch-always-allow` | `off` | While watching, prefer the TUI's "don't ask again / always allow" option for **safe** actions (fewer interruptions, lower safety). Menu entry `W` enables it per-watch. |
-| `@switcher-ai-monitor` | `on` | Open a small companion pane next to a watched pane, live-tailing the supervisor's decisions (self-closes when the watch ends). |
+| `@switcher-ai-monitor` | `on` | Open companion monitor pane(s) next to a watched pane, showing live countdown/status plus the supervisor's timeline/details (self-closes when the watch ends). |
 | `@switcher-ai-monitor-pos` | `top` | Where the monitor pane opens: `top`, `bottom`, or `right`. |
-| `@switcher-ai-monitor-size` | `8` | Monitor pane height in lines (`top`/`bottom`). |
+| `@switcher-ai-monitor-size` | `12` | Monitor pane height in lines (`top`/`bottom`). |
 | `@switcher-ai-monitor-size-h` | `60` | Monitor pane width in columns (`right`). |
+| `@switcher-ai-monitor-layout` | `split` | `split` opens timeline + detail as two monitor panes; `single` keeps one combined pane. |
 
 Example:
 
@@ -230,10 +231,14 @@ Free-text prompts (the `a` request, the `v` goal) use **readline**, so CJK
 input edits by character — one backspace deletes one 中文 char — and the usual
 `←`/`→`/`Ctrl-W` editing keys work.
 
-While a watcher runs, a **small companion pane** opens next to the watched pane
-(top by default; `@switcher-ai-monitor-pos`) live-tailing the supervisor's
-decisions — so you see the supervisor **and** the agent's own output at once. It
-self-closes when the watch ends. The **`W`** menu entry starts a watch with
+While a watcher runs, companion monitor pane(s) open next to the watched pane
+(top by default; `@switcher-ai-monitor-pos`). The default `split` layout makes
+the monitor region two panes: **timeline** on the left (polls, quiet/marked
+state, decisions, pauses, completion) and **detail** on the right (countdown,
+backend/model command, last pane excerpt sent to the model, parsed action, raw
+decision JSON, and the recent execution feed). It self-closes when the watch
+ends. Set `@switcher-ai-monitor-layout 'single'` to keep one combined pane. The
+**`W`** menu entry starts a watch with
 **always-allow**: for safe approvals the AI prefers the TUI's "don't ask again"
 so the agent runs with fewer interruptions (convenience over per-action vetting;
 off by default).
@@ -326,8 +331,9 @@ load, when the bar renders (≤30s), and whenever the need-input view opens.
   - `need-input` — one TAB-separated mark per line:
     `pane ⇥ epoch ⇥ source ⇥ key ⇥ label ⇥ saved_title` (`pane` is `-` for
     background-session marks; `key` is `s:<claude session_id>` or the pane id).
-  - `ai-watch/` — one `<pane>.watch` pidfile (+ `.out` decision feed) per
-    resident watcher.
+  - `ai-watch/` — one `<pane>.watch` pid/state file per resident watcher, plus
+    `<pane>.out` execution feed, `<pane>.timeline` monitor events, and
+    `<pane>.detail` last model-call detail.
   - `ai.log` — the AI supervisor's audit log.
 - Environment overrides (mainly for scripting/tests): `TMUX_SWITCHER_STATE_DIR`,
   `TMUX_SWITCHER_MRU_FILE`, `TMUX_SWITCHER_NEEDINPUT_FILE`,

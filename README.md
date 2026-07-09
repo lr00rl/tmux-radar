@@ -1,14 +1,15 @@
 # tmux-switcher
 
-A full-screen tmux window switcher with **tree / recent / need-input** views, a
+A full-screen tmux window switcher with **tree / recent / AI-status** views, a
 live bottom-anchored preview, title-only fuzzy search — plus optional hook-driven
-alerts that flag any window where **Claude Code** or **Codex** is waiting on you.
+alerts that flag **Claude Code** / **Codex** action requests and finished-turn
+notices.
 
-![view: tree | recent | need-input](https://img.shields.io/badge/views-tree%20%7C%20recent%20%7C%20need--input-blue)
+![view: tree | recent | AI status](https://img.shields.io/badge/views-tree%20%7C%20recent%20%7C%20AI--status-blue)
 
 ## Features
 
-- **One key, three views** — session tree, recent (MRU), and "needs input",
+- **One key, three views** — session tree, recent (MRU), and AI status,
   switchable live inside the popup. Pick which one opens by default.
 - **Title-only fuzzy search** — type to match the window name, not the path or
   running command. Results rank by match score as you type, recency order at rest.
@@ -17,16 +18,17 @@ alerts that flag any window where **Claude Code** or **Codex** is waiting on you
   The current window stays in the list, one `↑` away.
 - **Live preview** — the selected window's content, no wrap, anchored to the
   bottom (current prompt/state visible), with line/page scroll.
-- **Need-input alerts** — Claude/Codex flag their pane when they want you; a
-  **persistent bar** appears on a second status line until you deal with it,
-  the pane's **title flips to `⚠ <reason>`** (visible in pane borders, like
-  Codex's native "Action Required" titles), and the pane shows up in the
-  need-input view. Everything clears when you focus the window or reply — and
+- **AI status alerts** — Claude/Codex flag their pane for action-required
+  prompts and finished-turn notices; a **persistent bar** appears on a second
+  status line while an off-screen mark is fresh,
+  the pane's **title flips to a status label** (`⚠` action required, `✓`
+  finished, `!` notice), and the pane shows up in the AI status view.
+  Everything clears when you focus the window or reply — and
   **stale marks self-heal**: a mark whose agent TUI has exited is dropped
   automatically.
 - **Background Claude sessions covered** — Claude Code sessions that run outside
   any tmux pane (dashboard / background jobs / cloud) are tracked per
-  `session_id` and surface on the bar and in the need-input view too. Sessions
+  `session_id` and surface on the bar and in the AI status view too. Sessions
   that *do* live in a pane but lost `$TMUX_PANE` (env-scrubbing launchers,
   agent runners) are resolved back to their real pane via the process tree.
 - **AI supervisor (opt-in)** — `prefix + A`: drive tmux from natural language,
@@ -66,7 +68,7 @@ run-shell ~/.tmux/plugins/tmux-switcher/tmux-switcher.tmux   # or add to tmux.co
 | type | fuzzy search **window + pane title** |
 | `ctrl-t` | session **tree** view |
 | `ctrl-r` | **recent** (MRU) view |
-| `ctrl-i` | **need-input** view (all detected AI panes; hook-marked panes float first) |
+| `ctrl-i` | **AI status** view: action-required marks first, finished-turn notices next, then other detected AI panes as context |
 | `ctrl-e` | **expand / collapse panes** (nest panes under each window) |
 | `alt-p` | toggle preview |
 | `shift-↑` / `shift-↓` | scroll preview by line |
@@ -78,8 +80,8 @@ run-shell ~/.tmux/plugins/tmux-switcher/tmux-switcher.tmux   # or add to tmux.co
 expand panes nested under their window; press it again to collapse. The cursor
 stays on the same window group across the toggle. When expanded, search matches
 **both** window and pane titles and keeps the window→pane grouping (only matching
-rows are shown). The need-input view is always pane-level so you can jump to the
-exact AI TUI pane.
+rows are shown). The AI status view is always pane-level so you can jump to the
+exact AI TUI pane for real pane rows.
 
 ## Configuration
 
@@ -95,10 +97,10 @@ Set these **before** the plugin loads:
 | `@switcher-preview` | `right:62%` | fzf preview position/size. |
 | `@switcher-preview-follow` | `on` | Anchor preview to the bottom (tail-style). |
 | `@switcher-needinput` | `on` | Enable the need-input system (hooks/bar). |
-| `@switcher-needinput-commands` | `codex claude` | Process names the need-input view treats as AI panes. Comma/space/colon separated. |
-| `@switcher-retitle` | `on` | Rename a marked pane's title to `⚠ <reason>` (restored on clear). |
+| `@switcher-needinput-commands` | `codex claude` | Process names the AI status view treats as AI panes. Comma/space/colon separated. |
+| `@switcher-retitle` | `on` | Rename a marked pane's title to a status label (`⚠` action required, `✓` finished, `!` notice), restored on clear. |
 | `@switcher-claude-bg` | `on` | Also track Claude sessions running outside tmux panes (background/dashboard/cloud). |
-| `@switcher-bar-ttl` | `60` | Seconds a chip stays on the bar before fading (`0` = until handled). The mark itself persists in the need-input view / pane title until cleared. |
+| `@switcher-bar-ttl` | `60` | Seconds a chip stays on the bar before fading (`0` = until handled). The mark itself persists in the AI status view / pane title until cleared. |
 | `@switcher-claude-bg-ignore` | `~/.claude:~/.claude-mem` | Colon-separated path prefixes; background sessions whose cwd starts with one (plugin observers, SDK helpers) are not tracked. |
 | `@switcher-ai` | `off` | Enable the **AI supervisor** (`prefix + A` menu). Needs the `codex` CLI + `jq`. |
 | `@switcher-ai-key` | `A` | Prefix key that opens the AI supervisor menu (capital `A` so a stray `prefix + a` can't trigger it). |
@@ -146,16 +148,18 @@ exists, even without setting `@switcher-ai-rules`):
 - If Claude asks which approach to take, prefer the smallest change.
 ```
 
-## Need-input AI pane view + alerts (Claude Code / Codex)
+## AI status view + alerts (Claude Code / Codex)
 
 The `ctrl-i` view scans live tmux panes for configured AI processes, defaulting
 to `codex` and `claude`, and lists matching panes directly. Matching is based on
 the pane process tree and processes attached to the pane TTY, not on tmux window
-or pane names. Rows needing input come first — hook-marked panes and background
-session marks merged, newest mark first — followed by every other detected AI
-pane for quick review.
+or pane names. Rows are labeled by meaning: **ACTION** for permissions/input that
+really need a decision, **DONE** for finished-turn notifications that are useful
+to review but are not approvals, and **ACTIVE** for other detected AI panes shown
+only as context. Background Claude sessions are shown as non-jumpable status rows
+instead of pretending to be a tmux pane.
 
-The plugin sets up the tmux side automatically (need-input bar status line +
+The plugin sets up the tmux side automatically (AI-status bar status line +
 clear on window focus). To let Claude Code and Codex flag their pane, install
 the hooks once:
 
@@ -192,8 +196,8 @@ Codex hooks with `/hooks` if Codex prompts for hook trust.
   (`$CLAUDE_JOB_DIR` set: the dashboard, background jobs, cloud) get a
   **paneless mark keyed by `session_id`**, labelled `Claude·<project>`. It
   clears when you reply to that session (`UserPromptSubmit`) and expires after
-  24h (`TMUX_SWITCHER_BG_TTL`) as a safety net. In the need-input view these
-  rows jump to a pane running the `claude` TUI when one exists.
+  24h (`TMUX_SWITCHER_BG_TTL`) as a safety net. In the AI status view these rows
+  are non-jumpable status rows, because there is no real tmux pane to select.
 - **Stale marks (agent-liveness GC)** — a pane mark is stale in two ways, and
   both self-heal: the **pane died** (dropped on every state change), or the
   pane is alive but the **agent TUI exited** and the shell got reused. The
@@ -203,9 +207,9 @@ Codex hooks with `/hooks` if Codex prompts for hook trust.
   `pane_current_command`: Claude Code's foreground binary is a bare version
   number (e.g. `2.1.199`), so the naive match would miss it. The GC runs on
   plugin load, while the bar is visible (every ≤30s), and whenever the
-  need-input view opens; a failed scan skips GC rather than guessing. A marked
+  AI status view opens; a failed scan skips GC rather than guessing. A marked
   pane you are currently looking at is kept out of the bar (no need to nag)
-  but stays in the need-input view until cleared.
+  but stays in the AI status view until cleared.
 
 ### Bar position note
 
@@ -287,7 +291,7 @@ ai.sh watch <pane> [goal] [policy] [poll] [autonomy]
 ai.sh watch-setup [pane]       # interactive goal/interval/policy setup
 ai.sh stop <pane|all>          # stop watcher(s)
 ai.sh status                   # active watchers + recent decisions
-ai.sh list                     # AI panes with ⚠ waiting / ● watching state
+ai.sh list                     # AI panes with ⚠ action / ✓ done / ● watching state
 ai.sh cleanup                  # GC watcher files, monitor panes, stale marks
 ```
 
@@ -318,9 +322,9 @@ its post-restore hook so the cleanup runs right after a restore:
 set -g @resurrect-hook-post-restore-all 'run-shell -b "~/.tmux/plugins/tmux-switcher/scripts/ai.sh cleanup"'
 ```
 
-Stale "needs input" marks self-heal in general: any mark whose agent TUI has
-exited (the pane is back to a plain shell) is dropped automatically — on plugin
-load, when the bar renders (≤30s), and whenever the need-input view opens.
+Stale AI-status marks self-heal in general: any mark whose agent TUI has exited
+(the pane is back to a plain shell) is dropped automatically — on plugin load,
+when the bar renders (≤30s), and whenever the AI status view opens.
 
 ## How it works
 
@@ -353,7 +357,7 @@ load, when the bar renders (≤30s), and whenever the need-input view opens.
 - **Colors show as literal `\033[1;32m` (Linux)** — fixed in current versions
   (colors no longer round-trip through tmux); update the plugin (`prefix + I`
   or `git -C ~/.tmux/plugins/tmux-switcher pull`).
-- **A pane stays in the need-input list after I closed the AI TUI** — stale
+- **A pane stays in the AI status list after I closed the AI TUI** — stale
   marks are GC'd automatically (plugin load / bar render / opening the view).
   Force a pass with `scripts/needinput-notify.sh tick`; see which panes are
   currently detected as agents with `scripts/needinput-notify.sh agent-panes`.

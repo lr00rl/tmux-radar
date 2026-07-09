@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install / uninstall the "needs input" hooks for Claude Code and Codex so they
-# flag the tmux pane they run in (via $TMUX_PANE) when they wait on you.
+# Install / uninstall the AI-status hooks for Claude Code and Codex so they flag
+# action-required prompts and finished-turn notices in tmux.
 #
 # Edits, idempotently and with a timestamped backup:
 #   ~/.claude/settings.json   (Claude hooks)
@@ -72,7 +72,7 @@ claude_uninstall() {
       ) | .hooks |= with_entries(select((.value | length) > 0))
     else . end
   ' "$CLAUDE_SETTINGS" > "$tmp" && mv "$tmp" "$CLAUDE_SETTINGS"
-  info "removed Claude need-input hooks"
+  info "removed Claude AI-status hooks"
 }
 
 claude_status() {
@@ -183,9 +183,9 @@ codex_status() {
 [ -x "$NOTIFY" ] || die "$NOTIFY not found/executable"
 
 case "${1:-install}" in
-  install)   echo "Installing tmux-switcher need-input hooks:"; claude_install; codex_install
+  install)   echo "Installing tmux-switcher AI-status hooks:"; claude_install; codex_install
              echo "Done. Restart Claude/Codex sessions (or open new ones) to pick up the hooks." ;;
-  uninstall) echo "Uninstalling tmux-switcher need-input hooks:"; claude_uninstall; codex_uninstall ;;
+  uninstall) echo "Uninstalling tmux-switcher AI-status hooks:"; claude_uninstall; codex_uninstall ;;
   status)    claude_status; codex_status ;;
   *) die "usage: install-hooks.sh [install|uninstall|status]" ;;
 esac

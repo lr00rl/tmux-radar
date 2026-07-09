@@ -4,8 +4,8 @@
 #
 #   codex-notify-wrap.sh <original-notify-argv...> <event-json>
 #
-# We mark the Codex pane as "needs input" (JSON is the last arg; $TMUX_PANE is
-# inherited), then exec the original chain unchanged so existing notify
+# We mark the Codex pane with an AI-status notice (JSON is the last arg;
+# $TMUX_PANE is inherited), then exec the original chain unchanged so existing notify
 # behaviour keeps working. With no prior chain it is invoked as
 # `codex-notify-wrap.sh <event-json>` and simply marks.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

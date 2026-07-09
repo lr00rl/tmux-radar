@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Mark / clear panes and sessions that are "waiting for user input", driven by
-# Claude Code hooks plus Codex hooks / legacy notify. Single state file under $STATE_DIR:
+# Mark / clear panes and sessions with AI-status notices, driven by Claude Code
+# hooks plus Codex hooks / legacy notify. Single state file under $STATE_DIR:
 #
 #   need-input   one mark per line, 6 TAB-separated fields:
 #                "<pane>\t<epoch>\t<source>\t<key>\t<label>\t<saved_title>"
@@ -12,14 +12,14 @@
 #   - persistent bar: status line 2 (status-format[1] -> needinput-toast.sh)
 #     shows marks whose pane is not currently on screen; `status 2` while any
 #     such mark is live, `status on` when none.
-#   - pane retitle: marked panes get "⚠ <label>" as pane_title (mirrors Codex's
-#     native "[ ! ] Action Required" titles), restored on clear.
+#   - pane retitle: marked panes get a status-prefixed pane_title (`⚠` action,
+#     `✓` finished, `!` notice), restored on clear.
 #     Disable with `set -g @switcher-retitle off`.
 #
 # Claude background sessions (dashboard / cloud / `claude` jobs) run outside
 # any tmux pane ($TMUX_PANE unset, $CLAUDE_JOB_DIR set): they are recorded as
 # paneless marks keyed by session_id so the bar still notifies you, and the
-# need-input view lists them. Disable with `set -g @switcher-claude-bg off`.
+# AI status view lists them. Disable with `set -g @switcher-claude-bg off`.
 #
 # Safe to call outside tmux (no-op unless a server is reachable).
 set -euo pipefail
@@ -58,7 +58,7 @@ _pane_map() {
 # Panes currently hosting a watched AI agent (claude/codex/…). Prints
 # "OK\001%id\001%id\001…" — "OK\001" alone means the scan RAN and found none;
 # EMPTY output means the scan failed and the caller must not GC on it.
-# Matching mirrors switcher.sh's need-input view: an agent claims a pane when
+# Matching mirrors switcher.sh's AI status view: an agent claims a pane when
 # its ps argv0 — any path component, ".app" stripped — equals a watched command
 # name AND it either sits on the pane's tty or has the pane's shell in its
 # parent chain. pane_current_command is NOT reliable here: Claude Code's
@@ -165,7 +165,30 @@ _restore_title() {  # _restore_title <pane> <saved_title>
   [ "$pane" = "-" ] || [ -z "$pane" ] && return 0
   [ "$(opt @switcher-retitle on)" = "off" ] && return 0
   cur="$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)"
-  case "$cur" in "⚠ "*) tmux select-pane -t "$pane" -T "$saved" 2>/dev/null || true ;; esac
+  case "$cur" in "⚠ "*|"✓ "*|"! "*|"· "*) tmux select-pane -t "$pane" -T "$saved" 2>/dev/null || true ;; esac
+}
+
+_mark_icon() {  # _mark_icon <source> <label>
+  local text
+  text="$(printf '%s %s' "${1:-}" "${2:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$text" in
+    *finished*|*"your turn"*|*"turn complete"*|*"task complete"*|*"任务完成"*|*"完成"*) printf '✓' ;;
+    *"needs approval"*|*"needs your permission"*|*"needs input"*|*waiting*input*|*"waiting on you"*|*permission*|*approval*|*"action required"*|*approve*|*"拿不准"*|*"需要你"*|*"等待"*"输入"*) printf '⚠' ;;
+    *) printf '!' ;;
+  esac
+}
+
+_refresh_titles() {
+  have_tmux || return 0
+  [ "$(opt @switcher-retitle on)" = "off" ] && return 0
+  [ -r "$STATE_FILE" ] || return 0
+  local pane _epoch source _key label _title
+  while IFS=$'\t' read -r pane _epoch source _key label _title; do
+    [ -n "$pane" ] || continue
+    [ "$pane" = "-" ] && continue
+    tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1 || continue
+    tmux select-pane -t "$pane" -T "$(_mark_icon "$source" "$label") ${label}" 2>/dev/null || true
+  done < "$STATE_FILE"
 }
 
 # Restore titles for rows an awk filter is about to drop, then rewrite.
@@ -184,7 +207,7 @@ _drop_rows() {  # _drop_rows <awk-condition-marking-rows-to-DROP> [extra -v args
 # Recompute bar visibility: status 2 while any mark is bar-visible, else status
 # on. A chip is bar-visible while its mark is off-screen AND younger than
 # @switcher-bar-ttl seconds (0 = show until handled); the mark itself persists
-# in the need-input view / pane title until actually cleared.
+# in the AI status view / pane title until actually cleared.
 _sync_bar() {
   have_tmux || return 0
   local n=0 barttl
@@ -221,8 +244,8 @@ cmd_mark() {  # cmd_mark <pane|-> <source> <label> [key]
     [ -n "$key" ] || key="$pane"
     if [ "$(opt @switcher-retitle on)" != "off" ]; then
       saved_title="$(_san "$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)")"
-      case "$saved_title" in "⚠ "*) saved_title="" ;; esac   # keep original across re-marks
-      tmux select-pane -t "$pane" -T "⚠ ${label}" 2>/dev/null || true
+      case "$saved_title" in "⚠ "*|"✓ "*|"! "*|"· "*) saved_title="" ;; esac   # keep original across re-marks
+      tmux select-pane -t "$pane" -T "$(_mark_icon "$source" "$label") ${label}" 2>/dev/null || true
     fi
   else
     [ -n "$key" ] || exit 0
@@ -276,6 +299,7 @@ cmd_tick() {
     _rewrite ''
   fi
   unlock
+  _refresh_titles
   _sync_bar
 }
 

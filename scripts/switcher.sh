@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tmux-switcher — full-screen window/pane picker with tree / recent / need-input
+# tmux-switcher — full-screen window/pane picker with tree / recent / AI-status
 # views, an expand/collapse pane level, and a live bottom-anchored preview.
 #
 # Subcommands (the script calls itself for fzf reload/preview/binds):
@@ -42,7 +42,7 @@ short_path() {  # short_path <path> -> compact display path
   esac
 }
 
-needinput_commands() {  # newline-separated process names watched by need-input
+needinput_commands() {  # newline-separated process names watched by AI status
   local configured
   configured="${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @switcher-needinput-commands 'codex claude')}"
   printf '%s\n' "$configured" | tr ',:' '  '
@@ -183,7 +183,7 @@ list_recent() {  # $1 = expand
   done <<< "$ordered"
 }
 
-list_needinput() {  # pane-level AI process view; hook-marked panes float first
+list_needinput() {  # pane-level AI-status process view; hook-marked panes float first
   local live flags ps_rows commands
   live="$(tmux list-panes -a -F \
     '#{pane_id}'$'\t''#{session_name}:#{window_index}'$'\t''#{pane_index}'$'\t''#{window_name}'$'\t''#{pane_title}'$'\t''#{pane_current_command}'$'\t''#{pane_current_path}'$'\t''#{pane_pid}'$'\t''#{pane_tty}' 2>/dev/null)"
@@ -193,10 +193,21 @@ list_needinput() {  # pane-level AI process view; hook-marked panes float first
   commands="$(needinput_commands)"
 
   { printf '__PANES__\n%s\n__FLAGS__\n%s\n__PS__\n%s\n' "$live" "$flags" "$ps_rows"; } |
-    LC_ALL=C awk -F '\t' -v cmds="$commands" -v C="$C" -v M="$M" -v D="$D" -v R="$R" '
+    LC_ALL=C awk -F '\t' -v cmds="$commands" -v C="$C" -v Y="$Y" -v G="$G" -v M="$M" -v D="$D" -v R="$R" '
       function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
       function clean_tty(t) { sub(/^\/dev\//, "", t); return t }
       function first_word(s, x) { x=trim(s); sub(/[[:space:]].*/, "", x); return x }
+      function level_for(src, label,    l) {
+        l=tolower(src " " label)
+        if (l ~ /(finished|your turn|turn complete|task complete|done|任务完成|完成)/) return "done"
+        if (l ~ /(needs approval|needs your permission|needs input|waiting.*input|waiting on you|wait.*input|permission|approval|action required|approve|拿不准|需要你|需要.*许可|需要.*批准|等待.*输入)/) return "action"
+        return "notice"
+      }
+      function level_rank(level) { return (level == "action" ? 1 : (level == "done" ? 2 : (level == "notice" ? 3 : 4))) }
+      function level_color(level) { return (level == "action" ? M : (level == "done" ? G : (level == "notice" ? Y : D))) }
+      function level_word(level) { return (level == "action" ? "ACTION" : (level == "done" ? "DONE" : (level == "notice" ? "NOTICE" : "ACTIVE"))) }
+      function level_icon(level) { return (level == "action" ? "⚠" : (level == "done" ? "✓" : (level == "notice" ? "!" : "·"))) }
+      function badge(level) { return level_color(level) level_icon(level) " " level_word(level) " " R }
       function proc_match(argv0, raw, n, a, i, c, wanted) {
         raw=tolower(argv0); gsub(/\\/, "/", raw)
         n=split(raw, a, "/")
@@ -214,18 +225,31 @@ list_needinput() {  # pane-level AI process view; hook-marked panes float first
         if (!(pane in ai)) ai[pane]=1
         ai_cmd[pane SUBSEP cmd]=1
       }
-      function emit_pane(pane, is_flagged,    mark, title, matched, hint) {
-        mark=(is_flagged ? M "⚠ " R : "")
-        title=(ti[pane] != "" && ti[pane] != wn[pane] ? "/" ti[pane] : "")
+      function emit_pane(pane, level,    is_flagged, display_title, title, matched, hint) {
+        is_flagged=(pane in flagged)
+        if (level == "") level=(is_flagged ? flag_level[pane] : "active")
+        display_title=ti[pane]
+        if (is_flagged) {
+          if (flag_saved[pane] != "") display_title=flag_saved[pane]
+          else {
+            sub(/^⚠ /, "", display_title)
+            sub(/^✓ /, "", display_title)
+            sub(/^! /, "", display_title)
+            sub(/^· /, "", display_title)
+          }
+        } else {
+          if (display_title ~ /^(⚠|✓|!|·) /) display_title=""
+        }
+        title=(display_title != "" && display_title != wn[pane] ? "/" display_title : "")
         matched=cmds_for(pane)
         hint=""
         if (is_flagged) {
           hint=flag_label[pane]
           if (flag_source[pane] != "") hint=flag_source[pane] ": " hint
-          if (hint != "") hint=" · " M hint R
+          if (hint != "") hint=" · " level_color(level) level_word(level) ": " hint R
         }
         printf "%s\t%s%s%s%s %s%s%s\t%s%s · %s · %s%s%s\n", \
-          pane_target[pane], mark, C, wt[pane] "." pidx[pane], R, wn[pane], title, R, \
+          pane_target[pane], badge(level), C, wt[pane] "." pidx[pane], R, wn[pane], title, R, \
           D, matched, cm[pane], pa[pane], R, hint
       }
       function cmds_for(pane,    i, out, cmd) {
@@ -276,12 +300,15 @@ list_needinput() {  # pane-level AI process view; hook-marked panes float first
           bg_epoch[bg_n]=$2 + 0
           bg_src[bg_n]=$3
           bg_label[bg_n]=(NF >= 5 ? $5 : $4)
+          bg_level[bg_n]=level_for(bg_src[bg_n], bg_label[bg_n])
           next
         }
         flagged[$1]=1
         flag_epoch[$1]=$2 + 0
         flag_source[$1]=$3
         flag_label[$1]=(NF >= 5 ? $5 : $4)
+        flag_saved[$1]=(NF >= 6 ? $6 : "")
+        flag_level[$1]=level_for(flag_source[$1], flag_label[$1])
         next
       }
       mode == "ps" && $0 != "" { read_ps($0); next }
@@ -303,39 +330,42 @@ list_needinput() {  # pane-level AI process view; hook-marked panes float first
           }
         }
 
-        # background rows jump to a pane running the claude TUI, if any
-        claude_pane=""
-        for (i=1; i<=n; i++) { p=order[i]; if (ai_cmd[p SUBSEP "claude"]) { claude_pane=p; break } }
-
-        # needing input first: hook-marked panes (whether or not the ps scan
-        # recognised them) + background marks, merged, newest mark first
+        # Marked rows first, but split by meaning: real action requests before
+        # finished/notice marks. Background rows are not pane-jumpable; they are
+        # status rows for external Claude sessions.
         need_n=0
         for (i=1; i<=n; i++) {
           pane=order[i]
-          if (pane in flagged) { need_n++; ne[need_n]=flag_epoch[pane]; nk[need_n]="p"; nv[need_n]=pane }
+          if (pane in flagged) {
+            need_n++; nr[need_n]=level_rank(flag_level[pane]); ne[need_n]=flag_epoch[pane]; nk[need_n]="p"; nv[need_n]=pane
+          }
         }
-        for (b=1; b<=bg_n; b++) { need_n++; ne[need_n]=bg_epoch[b]; nk[need_n]="b"; nv[need_n]=b }
-        for (i=2; i<=need_n; i++) {          # insertion sort, epoch descending
-          e=ne[i]; k=nk[i]; v=nv[i]
-          for (j=i-1; j>=1 && ne[j] < e; j--) { ne[j+1]=ne[j]; nk[j+1]=nk[j]; nv[j+1]=nv[j] }
-          ne[j+1]=e; nk[j+1]=k; nv[j+1]=v
+        for (b=1; b<=bg_n; b++) {
+          need_n++; nr[need_n]=level_rank(bg_level[b]); ne[need_n]=bg_epoch[b]; nk[need_n]="b"; nv[need_n]=b
+        }
+        for (i=2; i<=need_n; i++) {          # insertion sort: severity, then epoch descending
+          r=nr[i]; e=ne[i]; k=nk[i]; v=nv[i]
+          for (j=i-1; j>=1 && (nr[j] > r || (nr[j] == r && ne[j] < e)); j--) {
+            nr[j+1]=nr[j]; ne[j+1]=ne[j]; nk[j+1]=nk[j]; nv[j+1]=nv[j]
+          }
+          nr[j+1]=r; ne[j+1]=e; nk[j+1]=k; nv[j+1]=v
         }
         for (i=1; i<=need_n; i++) {
           if (nk[i] == "b") {
             b=nv[i]
-            tgt=(claude_pane != "" ? pane_target[claude_pane] : "__hdr__:bg")
-            printf "%s\t%s⚠%s %s\t%s%s · background session%s\n", \
-              tgt, M, R, bg_label[b], D, bg_src[b], R
+            printf "%s\t%s%s\t%s%s · background session · not a tmux pane%s\n", \
+              "__hdr__:bg", badge(bg_level[b]), bg_label[b], D, bg_src[b], R
           } else {
-            emit_pane(nv[i], 1)
+            emit_pane(nv[i], flag_level[nv[i]])
           }
         }
 
-        # then every other detected AI pane, in pane order
+        # Then every other detected AI pane, in pane order. These are context,
+        # not "needs input" rows.
         for (i=1; i<=n; i++) {
           pane=order[i]
           if (!(pane in ai) || (pane in flagged)) continue
-          emit_pane(pane, 0)
+          emit_pane(pane, "active")
         }
       }
     '
@@ -361,7 +391,7 @@ do_preview() {
 }
 
 _prompt() {  # echo "label[+]> " for current VIEW/EXPAND
-  local label="$VIEW"; [ "$VIEW" = needinput ] && label="need-input"
+  local label="$VIEW"; [ "$VIEW" = needinput ] && label="AI status"
   local ind=""; [ "$EXPAND" = 1 ] && ind="+"
   printf '%s%s> ' "$label" "$ind"
 }
@@ -370,7 +400,7 @@ cmd_set_view() {  # fzf transform: switch view, reload, repoint prompt
   local pos
   read_state
   VIEW="${1:-tree}"; case "$VIEW" in tree|recent|needinput) ;; *) VIEW=tree ;; esac
-  # GC stale marks before the need-input list renders (~50ms, one keystroke)
+  # GC stale marks before the AI status list renders (~50ms, one keystroke)
   [ "$VIEW" = needinput ] && "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 || true
   write_state
   pos=1
@@ -419,27 +449,27 @@ do_menu() {
   SW_STATE="$(mktemp "${STATE_DIR}/.sw.XXXXXX")"; export SW_STATE
   write_state
 
-  # GC stale need-input marks so the view opens clean; synchronous only when
-  # need-input is the first view shown (elsewhere the C-i transform re-GCs).
+  # GC stale AI-status marks so the view opens clean; synchronous only when
+  # AI status is the first view shown (elsewhere the C-i transform re-GCs).
   if [ "$VIEW" = needinput ]; then "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 || true
   else ("$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 &)
   fi
 
   # Recent opens with the cursor on row 2 (row 1 is the current window), both
   # on initial popup open and when switching back into the recent view.
-  # Tree/need-input view switches and query changes reset to row 1.
+  # Tree/AI-status view switches and query changes reset to row 1.
   # --sync is required so the list is loaded before 'start' fires.
   start_bind=""
   [ "$VIEW" = recent ] && start_bind="--sync --bind=start:pos(2)"
   # sort: relevance when collapsed; preserve window/pane grouping when expanded.
-  # need-input is already pane-level and floats hook-marked panes first.
+  # AI status is already pane-level and floats hook-marked panes first.
   sort_flag=""; { [ "$EXPAND" = 1 ] || [ "$VIEW" = needinput ]; } && sort_flag="--no-sort"
 
   selected="$(
     "$SELF" list | "$fzf" \
       --ansi --delimiter=$'\t' --with-nth=2.. --nth=1 --cycle $sort_flag $start_bind \
       --layout=reverse --prompt="$(_prompt)" \
-      --header='C-t tree · C-r recent · C-i need-input · C-e expand/collapse panes · A-p preview · S-↑/↓ PgUp/Dn scroll · Enter switch' \
+      --header='C-t tree · C-r recent · C-i AI status · C-e expand/collapse panes · A-p preview · S-↑/↓ PgUp/Dn scroll · Enter switch' \
       --preview="$SELF preview {1}" --preview-window="$preview_win" \
       --bind='change:pos(1)' \
       --bind="ctrl-t:transform($SELF set-view tree)" \

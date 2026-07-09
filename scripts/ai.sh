@@ -814,14 +814,14 @@ cmd_ask() {
 }
 
 # ---------------------------------------------------------------------------
-# list: AI panes + their need-input / watch state (quick picker source).
+# list: AI panes + their AI-status / watch state (quick picker source).
 # Detection goes through the notifier's process scan (ps argv0 components), not
 # pane_current_command — Claude Code's foreground binary is a bare version
 # number ("2.1.199"), so the naive match misses it.
 # ---------------------------------------------------------------------------
 cmd_list() {
   have_tmux || { echo "no tmux server"; return 0; }
-  _hdr "AI panes" "⚠ 等待输入 · ● 监控中"
+  _hdr "AI panes" "⚠ 操作 · ✓ 完成 · ! 通知 · ● 监控中"
   # join mark records with \001 — BSD awk rejects newlines in -v values
   local marks="" agents="" watching="" wf
   [ -r "$STATE_FILE" ] && marks="$(tr '\n' '\001' < "$STATE_FILE")"
@@ -833,9 +833,17 @@ cmd_list() {
   done
   tmux list-panes -a -F '#{pane_id}'$'\t''#{session_name}:#{window_index}.#{pane_index}'$'\t''#{pane_current_command}'$'\t''#{pane_title}' 2>/dev/null |
   awk -F '\t' -v marks="$marks" -v agents="$agents" -v watching="$watching" \
-      -v CG="$CG" -v CM="$CM" -v CD="$CD" -v CR="$CR" '
+      -v CG="$CG" -v CY="$CY" -v CM="$CM" -v CD="$CD" -v CR="$CR" '
+    function level_for(src, label,    l) {
+      l = tolower(src " " label)
+      if (l ~ /(finished|your turn|turn complete|task complete|done|任务完成|完成)/) return "done"
+      if (l ~ /(needs approval|needs your permission|needs input|waiting.*input|waiting on you|wait.*input|permission|approval|action required|approve|拿不准|需要你|需要.*许可|需要.*批准|等待.*输入)/) return "action"
+      return "notice"
+    }
+    function icon_for(level) { return (level == "action" ? "⚠" : (level == "done" ? "✓" : "!")) }
+    function color_for(level) { return (level == "action" ? CM : (level == "done" ? CG : CY)) }
     BEGIN {
-      n=split(marks, ml, "\001"); for(i=1;i<=n;i++){split(ml[i],f,"\t"); if(f[1]!="") flagged[f[1]]=(f[5]?f[5]:f[4])}
+      n=split(marks, ml, "\001"); for(i=1;i<=n;i++){split(ml[i],f,"\t"); if(f[1]!=""){flagged[f[1]]=(f[5]?f[5]:f[4]); flag_src[f[1]]=f[3]}}
       have_scan = (index(agents, "OK\001") == 1)
     }
     {
@@ -843,7 +851,7 @@ cmd_list() {
       if (have_scan) { if (index(agents, "\001" $1 "\001") == 0 && !($1 in flagged)) next }
       else if (tolower($3) !~ /codex|claude/ && !($1 in flagged)) next
       w = (index(watching, $1 "\001") > 0) ? CG "●" CR : " "
-      if ($1 in flagged) tail = CM "⚠ " flagged[$1] CR
+      if ($1 in flagged) { lvl=level_for(flag_src[$1], flagged[$1]); tail = color_for(lvl) icon_for(lvl) " " flagged[$1] CR }
       else               tail = CD $4 CR
       printf "%s %-5s %-20s %s%-10s%s %s\n", w, $1, $2, CD, $3, CR, tail
     }'

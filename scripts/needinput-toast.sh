@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Render the persistent "needs input" bar for the tmux status line.
+# Render the persistent AI-status bar for the tmux status line.
 # (Filename kept for status-format compatibility; this used to render 3s toasts.)
 #
 # Reads the need-input state file (see needinput-notify.sh for the format) and
 # prints one styled chip per live mark whose pane is NOT currently on screen
 # (paneless background marks always show), newest first, capped at $MAX with a
 # "+N" overflow counter. Embedded in status-format[1] via #(...); the notifier
-# toggles `status 2` <-> `on` so this line only exists while something waits.
+# toggles `status 2` <-> `on` so this line only exists while a mark is visible.
 #
 # If everything visible got resolved without an event (e.g. the marked pane
 # died), rendering finds nothing and flips the status line back itself.
@@ -32,9 +32,21 @@ case "${1:-render}" in
   render)
     [ -r "$STATE_FILE" ] || exit 0
     # chips fade from the bar after @switcher-bar-ttl seconds (0 = persistent);
-    # the underlying mark stays in the need-input view until handled
+    # the underlying mark stays in the AI status view until handled
     out="$(awk -F '\t' -v max="$MAX" -v panes="$(pane_map)" \
           -v now="$(date +%s)" -v barttl="$(opt @switcher-bar-ttl 60)" '
+      function level_for(src, label,    l) {
+        l = tolower(src " " label)
+        if (l ~ /(finished|your turn|turn complete|task complete|done|任务完成|完成)/) return "done"
+        if (l ~ /(needs approval|needs your permission|needs input|waiting.*input|waiting on you|wait.*input|permission|approval|action required|approve|拿不准|需要你|需要.*许可|需要.*批准|等待.*输入)/) return "action"
+        return "notice"
+      }
+      function icon_for(level) {
+        return (level == "action" ? "⚠" : (level == "done" ? "✓" : "!"))
+      }
+      function style_for(level) {
+        return (level == "action" ? "#[fg=colour234,bg=colour208,bold]" : (level == "done" ? "#[fg=colour234,bg=colour35,bold]" : "#[fg=colour234,bg=colour220,bold]"))
+      }
       BEGIN {
         n = split(panes, pl, "\001")
         for (i = 1; i <= n; i++) {
@@ -48,18 +60,20 @@ case "${1:-render}" in
       NF >= 4 {
         pane = $1
         label = (NF >= 5 ? $5 : $4)
+        level = level_for($3, label)
         if (barttl + 0 > 0 && now - $2 > barttl + 0) next
-        if (pane == "-") { txt[++c] = label; next }
+        if (pane == "-") { txt[++c] = label; lv[c] = level; next }
         if (!(pane in alive) || (pane in viewed)) next
         txt[++c] = label " · " where[pane]
+        lv[c] = level
       }
       END {
         shown = 0
         for (i = c; i >= 1 && shown < max; i--) {
-          printf "%s#[fg=colour234,bg=colour208,bold] ⚠ %s #[default]", (shown ? " " : ""), txt[i]
+          printf "%s%s %s %s #[default]", (shown ? " " : ""), style_for(lv[i]), icon_for(lv[i]), txt[i]
           shown++
         }
-        if (c > max) printf " #[fg=colour208]+%d#[default]", c - max
+        if (c > max) printf " #[fg=colour244]+%d#[default]", c - max
       }' "$STATE_FILE" 2>/dev/null || true)"
     if [ -n "$out" ]; then
       printf '%s' "$out"

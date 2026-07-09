@@ -115,6 +115,22 @@ _agent_panes() {
     }'
 }
 
+_claude_live_keys() {
+  local f json sid state out="OK"
+  for f in "$HOME"/.claude/jobs/*/state.json; do
+    [ -r "$f" ] || continue
+    json="$(cat "$f" 2>/dev/null || true)"
+    [ -n "$json" ] || continue
+    sid="$(_json_field sessionId "$json")"
+    state="$(_json_field state "$json")"
+    [ -n "$sid" ] || continue
+    case "$state" in
+      blocked|working|idle|"") out="$out"$'\001'"s:$sid" ;;
+    esac
+  done
+  printf '%s\001' "$out"
+}
+
 # Find the tmux pane hosting THIS process (a Claude hook runs as a child of its
 # claude): match our controlling tty against pane ttys, else walk our parent
 # chain to a pane shell pid. Lets marks land on the real pane even when
@@ -139,6 +155,27 @@ _resolve_pane_by_proc() {
         if (cur in bypid) { print bypid[cur]; exit }
         cur = par[cur]
       }
+    }'
+}
+
+_resolve_pane_by_cwd() {  # _resolve_pane_by_cwd <cwd>
+  have_tmux || return 1
+  local cwd="${1:-}" map
+  [ -n "$cwd" ] || return 1
+  map="$(tmux list-panes -a -F '#{pane_id}'$'\t''#{pane_current_path}'$'\t''#{window_name}'$'\t''#{pane_title}'$'\t''#{pane_current_command}' 2>/dev/null)"
+  [ -n "$map" ] || return 1
+  printf '%s\n' "$map" | awk -F '\t' -v cwd="$cwd" '
+    function score(name, title, cmd, text) {
+      text = tolower(name " " title " " cmd)
+      return (text ~ /claude/ ? 3 : (text ~ /(ai|agent)/ ? 2 : 1))
+    }
+    $2 == cwd {
+      s = score($3, $4, $5)
+      if (s > best) { best = s; pane = $1 }
+      hits++
+    }
+    END {
+      if (hits == 1 || best >= 3) print pane
     }'
 }
 
@@ -297,12 +334,13 @@ cmd_clear_all() { lock; _drop_rows '1'; unlock; _sync_bar; }
 # closed, shell reused for something else) is stale — drop it and restore the
 # pane title. If the process scan failed we only do the plain prune.
 cmd_tick() {
-  local agents
+  local agents claude_keys
   agents="$(_agent_panes || true)"
+  claude_keys="$(_claude_live_keys || true)"
   lock
   if [ -n "$agents" ]; then
-    _drop_rows '$1 != "-" && ($3 == "claude" || $3 == "codex" || $3 == "ai") && index(ag, "\001" $1 "\001") == 0' \
-      -v ag="${agents#OK}"
+    _drop_rows '$1 != "-" && ($3 == "claude" || $3 == "codex" || $3 == "ai") && index(ag, "\001" $1 "\001") == 0 && !($3 == "claude" && index(ck, "\001" $4 "\001") > 0)' \
+      -v ag="${agents#OK}" -v ck="${claude_keys#OK}"
   else
     _rewrite ''
   fi
@@ -337,6 +375,7 @@ _claude_target() {  # sets PANE / KEY / WHERE from hook json in $1
     # own tty / process ancestry before falling back to a paneless mark, so the
     # mark is jumpable instead of a bare "session id + name" row.
     p="$(_resolve_pane_by_proc || true)"
+    if [ -z "$p" ] && [ -n "$cwd" ]; then p="$(_resolve_pane_by_cwd "$cwd" || true)"; fi
     if [ -n "$p" ]; then PANE="$p"; return 0; fi
     PANE="-"
     [ -n "$KEY" ] || KEY="bg:${WHERE:-unknown}"
@@ -459,5 +498,6 @@ case "${1:-}" in
   codex)         shift; cmd_codex "${1:-}" ;;
   agent-panes)   _agent_panes | tr '\001' '\n' ;;   # debug: which panes host an agent
   resolve-pane)  _resolve_pane_by_proc ;;           # debug: pane of this process tree
-  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|claude-mark|claude-stop|claude-clear|codex-hook|codex <json>}" >&2; exit 2 ;;
+  resolve-cwd)   shift; _resolve_pane_by_cwd "${1:-$PWD}" ;;  # debug: pane owning a cwd
+  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|claude-mark|claude-stop|claude-clear|codex-hook|codex <json>|agent-panes|resolve-pane|resolve-cwd [cwd]}" >&2; exit 2 ;;
 esac

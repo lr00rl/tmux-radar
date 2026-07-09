@@ -45,7 +45,8 @@ long-running agents.
   any tmux pane (dashboard / background jobs / cloud) are tracked per
   `session_id` and surface on the bar and in the AI status view too. Sessions
   that *do* live in a pane but lost `$TMUX_PANE` (env-scrubbing launchers,
-  agent runners) are resolved back to their real pane via the process tree.
+  agent runners) are resolved back to their real pane via the process tree or
+  Claude's hook/job cwd.
 - **Optional AI supervisor** — `prefix + A`: drive tmux from natural language,
   have Codex answer a waiting Claude/Codex prompt for you, or run a resident
   watcher that auto-approves *safe* prompts until a pane's task is done — with
@@ -208,8 +209,11 @@ Codex hooks with `/hooks` if Codex prompts for hook trust.
 - **No `$TMUX_PANE`, but still in a pane** — some launchers scrub the
   environment, and agent runners fork sessions whose hooks don't inherit it.
   Before falling back to a paneless mark, the notifier resolves the hook
-  process's **controlling tty / parent chain** against live panes — so those
-  sessions still get a jumpable pane mark instead of a bare "session id" row.
+  process's **controlling tty / parent chain** against live panes. If that
+  fails, Claude hook/job `cwd` is matched against live pane cwd, preferring
+  panes whose window/title/command looks Claude-related — so daemon jobs with
+  a visible parent workspace still get a jumpable pane mark instead of a bare
+  "session id" row.
 - **Background Claude sessions** — sessions genuinely outside tmux
   (`$CLAUDE_JOB_DIR` set: the dashboard, background jobs, cloud) get a
   **paneless mark keyed by `session_id`**, labelled `Claude·<project>`. It
@@ -221,6 +225,10 @@ Codex hooks with `/hooks` if Codex prompts for hook trust.
   pane is alive but the **agent TUI exited** and the shell got reused. The
   latter is detected by scanning the process tree — a claude/codex mark whose
   pane no longer hosts that agent is dropped (and the pane title restored).
+  Claude daemon jobs keyed by `s:<session_id>` are kept while the corresponding
+  `~/.claude/jobs/<short>/state.json` is still live (`blocked`, `working`, or
+  `idle`), because their visible parent pane may not itself host a `claude`
+  process.
   Detection matches ps **argv0 path components**, never
   `pane_current_command`: Claude Code's foreground binary is a bare version
   number (e.g. `2.1.199`), so the naive match would miss it. The GC runs on
@@ -324,6 +332,7 @@ Need-input internals are inspectable too:
 needinput-notify.sh tick         # prune + agent-liveness GC + bar resync
 needinput-notify.sh agent-panes  # which panes host a watched agent right now
 needinput-notify.sh resolve-pane # which pane THIS process tree belongs to
+needinput-notify.sh resolve-cwd [cwd] # which pane owns a Claude hook/job cwd
 needinput-notify.sh mark|clear|clear-all …   # manual mark management
 ```
 

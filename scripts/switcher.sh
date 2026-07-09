@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tmux-switcher — full-screen window/pane picker with tree / recent / AI-status
+# tmux-radar — full-screen window/pane picker with tree / recent / AI-status
 # views, an expand/collapse pane level, and a live bottom-anchored preview.
 #
 # Subcommands (the script calls itself for fzf reload/preview/binds):
@@ -16,16 +16,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$SCRIPT_DIR/switcher.sh"
 
-STATE_DIR="${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}"
-MRU_FILE="${TMUX_SWITCHER_MRU_FILE:-$STATE_DIR/window-mru}"
-NEEDINPUT_FILE="${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}"
+STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
+MRU_FILE="${TMUX_RADAR_MRU_FILE:-${TMUX_SWITCHER_MRU_FILE:-$STATE_DIR/window-mru}}"
+NEEDINPUT_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
 MRU_RECORD="$SCRIPT_DIR/mru-record.sh"
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
 opt() {  # opt <option> <default>
-  local v; v="$(tmux show-option -gqv "$1" 2>/dev/null || true)"
-  if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "$2"; fi
+  local key="$1" def="$2" v legacy
+  v="$(tmux show-option -gqv "$key" 2>/dev/null || true)"
+  if [ -n "$v" ]; then printf '%s' "$v"; return; fi
+  case "$key" in
+    @radar-*)
+      legacy="@switcher-${key#@radar-}"
+      v="$(tmux show-option -gqv "$legacy" 2>/dev/null || true)"
+      ;;
+  esac
+  if [ -n "${v:-}" ]; then printf '%s' "$v"; else printf '%s' "$def"; fi
 }
 
 # ANSI (tmux -F / printf emit literally; fzf --ansi renders)
@@ -44,7 +52,7 @@ short_path() {  # short_path <path> -> compact display path
 
 needinput_commands() {  # newline-separated process names watched by AI status
   local configured
-  configured="${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @switcher-needinput-commands 'codex claude')}"
+  configured="${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude')}}"
   printf '%s\n' "$configured" | tr ',:' '  '
 }
 
@@ -361,7 +369,7 @@ list_needinput() {  # pane-level AI-status process view; hook-marked panes float
         }
 
         # Then every other detected AI pane, in pane order. These are context,
-        # not "needs input" rows.
+        # not action-required rows.
         for (i=1; i<=n; i++) {
           pane=order[i]
           if (!(pane in ai) || (pane in flagged)) continue
@@ -437,12 +445,12 @@ do_menu() {
   local fzf preview_pos follow preview_win selected target session win
   local start_bind sort_flag
   fzf="$(command -v fzf || true)"
-  [ -n "$fzf" ] || { tmux display-message "tmux-switcher: fzf not found"; exit 1; }
+  [ -n "$fzf" ] || { tmux display-message "tmux-radar: fzf not found"; exit 1; }
 
-  VIEW="$(opt @switcher-default-view tree)"; case "$VIEW" in tree|recent|needinput) ;; *) VIEW=tree ;; esac
-  case "$(opt @switcher-expand-panes off)" in on|1|true) EXPAND=1 ;; *) EXPAND=0 ;; esac
-  preview_pos="$(opt @switcher-preview right:62%)"
-  follow="$(opt @switcher-preview-follow on)"
+  VIEW="$(opt @radar-default-view tree)"; case "$VIEW" in tree|recent|needinput) ;; *) VIEW=tree ;; esac
+  case "$(opt @radar-expand-panes off)" in on|1|true) EXPAND=1 ;; *) EXPAND=0 ;; esac
+  preview_pos="$(opt @radar-preview right:62%)"
+  follow="$(opt @radar-preview-follow on)"
   preview_win="${preview_pos},nowrap"
   [ "$follow" = "on" ] && preview_win="${preview_win},follow"
 

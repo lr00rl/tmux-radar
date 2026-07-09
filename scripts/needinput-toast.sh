@@ -12,13 +12,21 @@
 # died), rendering finds nothing and flips the status line back itself.
 set -euo pipefail
 
-STATE_DIR="${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}"
-STATE_FILE="${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}"
-MAX="${TMUX_SWITCHER_BAR_MAX:-3}"
+STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
+STATE_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
+MAX="${TMUX_RADAR_BAR_MAX:-${TMUX_SWITCHER_BAR_MAX:-3}}"
 
 opt() {  # opt <option> <default>
-  local v; v="$(tmux show-option -gqv "$1" 2>/dev/null || true)"
-  if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "$2"; fi
+  local key="$1" def="$2" v legacy
+  v="$(tmux show-option -gqv "$key" 2>/dev/null || true)"
+  if [ -n "$v" ]; then printf '%s' "$v"; return; fi
+  case "$key" in
+    @radar-*)
+      legacy="@switcher-${key#@radar-}"
+      v="$(tmux show-option -gqv "$legacy" 2>/dev/null || true)"
+      ;;
+  esac
+  if [ -n "${v:-}" ]; then printf '%s' "$v"; else printf '%s' "$def"; fi
 }
 
 # Records joined with \001 (BSD awk rejects newlines in -v values).
@@ -31,10 +39,10 @@ pane_map() {
 case "${1:-render}" in
   render)
     [ -r "$STATE_FILE" ] || exit 0
-    # chips fade from the bar after @switcher-bar-ttl seconds (0 = persistent);
+    # chips fade from the bar after @radar-bar-ttl seconds (0 = persistent);
     # the underlying mark stays in the AI status view until handled
     out="$(awk -F '\t' -v max="$MAX" -v panes="$(pane_map)" \
-          -v now="$(date +%s)" -v barttl="$(opt @switcher-bar-ttl 60)" '
+          -v now="$(date +%s)" -v barttl="$(opt @radar-bar-ttl 60)" '
       function level_for(src, label,    l) {
         l = tolower(src " " label)
         if (l ~ /(finished|your turn|turn complete|task complete|done|任务完成|完成)/) return "done"

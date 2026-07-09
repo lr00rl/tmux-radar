@@ -10,8 +10,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NOTIFY="${TMUX_SWITCHER_NOTIFY:-$SCRIPT_DIR/needinput-notify.sh}"
-CODEX_WRAP="${TMUX_SWITCHER_CODEX_WRAP:-$SCRIPT_DIR/codex-notify-wrap.sh}"
+NOTIFY="${TMUX_RADAR_NOTIFY:-${TMUX_SWITCHER_NOTIFY:-$SCRIPT_DIR/needinput-notify.sh}}"
+CODEX_WRAP="${TMUX_RADAR_CODEX_WRAP:-${TMUX_SWITCHER_CODEX_WRAP:-$SCRIPT_DIR/codex-notify-wrap.sh}}"
 CLAUDE_SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 CODEX_CONFIG="${CODEX_CONFIG:-$HOME/.codex/config.toml}"
 
@@ -24,8 +24,8 @@ CLAUDE_EVENTS=(Notification Stop UserPromptSubmit)
 CLAUDE_SUBCMDS=(claude-mark claude-stop claude-clear)
 CODEX_NOTIFY_JSON="[\"$NOTIFY\", \"codex\"]"
 CODEX_HOOK_CMD="$NOTIFY codex-hook"
-CODEX_HOOK_BEGIN="# BEGIN tmux-switcher Codex hooks"
-CODEX_HOOK_END="# END tmux-switcher Codex hooks"
+CODEX_HOOK_BEGIN="# BEGIN tmux-radar Codex hooks"
+CODEX_HOOK_END="# END tmux-radar Codex hooks"
 
 die()  { echo "error: $*" >&2; exit 1; }
 info() { echo "  $*"; }
@@ -183,9 +183,9 @@ codex_status() {
 [ -x "$NOTIFY" ] || die "$NOTIFY not found/executable"
 
 case "${1:-install}" in
-  install)   echo "Installing tmux-switcher AI-status hooks:"; claude_install; codex_install
+  install)   echo "Installing tmux-radar AI-status hooks:"; claude_install; codex_install
              echo "Done. Restart Claude/Codex sessions (or open new ones) to pick up the hooks." ;;
-  uninstall) echo "Uninstalling tmux-switcher AI-status hooks:"; claude_uninstall; codex_uninstall ;;
+  uninstall) echo "Uninstalling tmux-radar AI-status hooks:"; claude_uninstall; codex_uninstall ;;
   status)    claude_status; codex_status ;;
   *) die "usage: install-hooks.sh [install|uninstall|status]" ;;
 esac

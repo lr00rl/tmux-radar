@@ -14,12 +14,12 @@
 #     such mark is live, `status on` when none.
 #   - pane retitle: marked panes get a status-prefixed pane_title (`⚠` action,
 #     `✓` finished, `!` notice), restored on clear.
-#     Disable with `set -g @switcher-retitle off`.
+#     Disable with `set -g @radar-retitle off`.
 #
 # Claude background sessions (dashboard / cloud / `claude` jobs) run outside
 # any tmux pane ($TMUX_PANE unset, $CLAUDE_JOB_DIR set): they are recorded as
 # paneless marks keyed by session_id so the bar still notifies you, and the
-# AI status view lists them. Disable with `set -g @switcher-claude-bg off`.
+# AI status view lists them. Disable with `set -g @radar-claude-bg off`.
 #
 # Safe to call outside tmux (no-op unless a server is reachable).
 set -euo pipefail
@@ -28,9 +28,9 @@ set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-STATE_DIR="${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}"
-STATE_FILE="${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}"
-BG_TTL="${TMUX_SWITCHER_BG_TTL:-86400}"   # paneless marks expire after 24h
+STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
+STATE_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
+BG_TTL="${TMUX_RADAR_BG_TTL:-${TMUX_SWITCHER_BG_TTL:-86400}}"   # paneless marks expire after 24h
 LOCK="$STATE_DIR/.need-input.lock"
 
 mkdir -p "$STATE_DIR"
@@ -40,8 +40,16 @@ lock()   { local n=0; until mkdir "$LOCK" 2>/dev/null; do n=$((n+1)); [ "$n" -gt
 unlock() { rmdir "$LOCK" 2>/dev/null || true; }
 
 opt() {  # opt <option> <default> (empty/no server -> default)
-  local v; v="$(tmux show-option -gqv "$1" 2>/dev/null || true)"
-  if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "$2"; fi
+  local key="$1" def="$2" v legacy
+  v="$(tmux show-option -gqv "$key" 2>/dev/null || true)"
+  if [ -n "$v" ]; then printf '%s' "$v"; return; fi
+  case "$key" in
+    @radar-*)
+      legacy="@switcher-${key#@radar-}"
+      v="$(tmux show-option -gqv "$legacy" 2>/dev/null || true)"
+      ;;
+  esac
+  if [ -n "${v:-}" ]; then printf '%s' "$v"; else printf '%s' "$def"; fi
 }
 
 _san() { printf '%s' "${1:-}" | tr '\t\n' '  '; }
@@ -66,7 +74,7 @@ _pane_map() {
 _agent_panes() {
   have_tmux || return 0
   local cmds panes ps_rows
-  cmds="${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @switcher-needinput-commands 'codex claude')}"
+  cmds="${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude')}}"
   panes="$(tmux list-panes -a -F '#{pane_id} #{pane_pid} #{pane_tty}' 2>/dev/null)" || return 0
   [ -n "$panes" ] || return 0
   ps_rows="$(ps -axo pid=,ppid=,tty=,command= 2>/dev/null)" || return 0
@@ -163,7 +171,7 @@ _rewrite() {  # _rewrite <awk-filter-body> [extra awk -v args...]
 _restore_title() {  # _restore_title <pane> <saved_title>
   local pane="$1" saved="$2" cur
   [ "$pane" = "-" ] || [ -z "$pane" ] && return 0
-  [ "$(opt @switcher-retitle on)" = "off" ] && return 0
+  [ "$(opt @radar-retitle on)" = "off" ] && return 0
   cur="$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)"
   case "$cur" in "⚠ "*|"✓ "*|"! "*|"· "*) tmux select-pane -t "$pane" -T "$saved" 2>/dev/null || true ;; esac
 }
@@ -180,7 +188,7 @@ _mark_icon() {  # _mark_icon <source> <label>
 
 _refresh_titles() {
   have_tmux || return 0
-  [ "$(opt @switcher-retitle on)" = "off" ] && return 0
+  [ "$(opt @radar-retitle on)" = "off" ] && return 0
   [ -r "$STATE_FILE" ] || return 0
   local pane _epoch source _key label _title
   while IFS=$'\t' read -r pane _epoch source _key label _title; do
@@ -194,7 +202,7 @@ _refresh_titles() {
 # Restore titles for rows an awk filter is about to drop, then rewrite.
 _drop_rows() {  # _drop_rows <awk-condition-marking-rows-to-DROP> [extra -v args...]
   local cond="$1"; shift || true
-  if [ -r "$STATE_FILE" ] && [ "$(opt @switcher-retitle on)" != "off" ]; then
+  if [ -r "$STATE_FILE" ] && [ "$(opt @radar-retitle on)" != "off" ]; then
     local victims line pane title
     victims="$(awk -F '\t' "$@" "NF >= 6 && ($cond) { print \$1 \"\t\" \$6 }" "$STATE_FILE" 2>/dev/null || true)"
     while IFS=$'\t' read -r pane title; do
@@ -206,12 +214,12 @@ _drop_rows() {  # _drop_rows <awk-condition-marking-rows-to-DROP> [extra -v args
 
 # Recompute bar visibility: status 2 while any mark is bar-visible, else status
 # on. A chip is bar-visible while its mark is off-screen AND younger than
-# @switcher-bar-ttl seconds (0 = show until handled); the mark itself persists
+# @radar-bar-ttl seconds (0 = show until handled); the mark itself persists
 # in the AI status view / pane title until actually cleared.
 _sync_bar() {
   have_tmux || return 0
   local n=0 barttl
-  barttl="$(opt @switcher-bar-ttl 60)"
+  barttl="$(opt @radar-bar-ttl 60)"
   if [ -r "$STATE_FILE" ]; then
     n="$(awk -F '\t' -v panes="$(_pane_map)" -v now="$(date +%s)" -v barttl="$barttl" '
       BEGIN {
@@ -242,7 +250,7 @@ cmd_mark() {  # cmd_mark <pane|-> <source> <label> [key]
     [ -n "$pane" ] || exit 0
     tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1 || exit 0
     [ -n "$key" ] || key="$pane"
-    if [ "$(opt @switcher-retitle on)" != "off" ]; then
+    if [ "$(opt @radar-retitle on)" != "off" ]; then
       saved_title="$(_san "$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)")"
       case "$saved_title" in "⚠ "*|"✓ "*|"! "*|"· "*) saved_title="" ;; esac   # keep original across re-marks
       tmux select-pane -t "$pane" -T "$(_mark_icon "$source" "$label") ${label}" 2>/dev/null || true
@@ -334,7 +342,7 @@ _claude_target() {  # sets PANE / KEY / WHERE from hook json in $1
     [ -n "$KEY" ] || KEY="bg:${WHERE:-unknown}"
     # plugin-internal background sessions (claude-mem observers, SDK helpers,
     # ...) live under these path prefixes — pure noise, don't track them
-    ignore="$(opt @switcher-claude-bg-ignore "$HOME/.claude:$HOME/.claude-mem")"
+    ignore="$(opt @radar-claude-bg-ignore "$HOME/.claude:$HOME/.claude-mem")"
     if [ -n "$cwd" ] && [ -n "$ignore" ]; then
       IFS=':' read -ra _pfx <<< "$ignore"
       for p in "${_pfx[@]}"; do
@@ -349,11 +357,11 @@ _claude_target() {  # sets PANE / KEY / WHERE from hook json in $1
 
 cmd_claude_mark() {  # Notification hook (permission request / waiting on you)
   local json msg; json="$(cat 2>/dev/null || true)"
-  [ "$(opt @switcher-needinput on)" = "on" ] || exit 0
+  [ "$(opt @radar-needinput on)" = "on" ] || exit 0
   msg="$(_json_field message "$json")"; [ -n "$msg" ] || msg="Claude needs input"
   _claude_target "$json"
   if [ "$PANE" = "-" ]; then
-    [ "$(opt @switcher-claude-bg on)" = "on" ] || exit 0
+    [ "$(opt @radar-claude-bg on)" = "on" ] || exit 0
     msg="Claude·${WHERE:-bg}: ${msg}"
   fi
   cmd_mark "$PANE" claude "$msg" "$KEY"
@@ -361,11 +369,11 @@ cmd_claude_mark() {  # Notification hook (permission request / waiting on you)
 
 cmd_claude_stop() {  # Stop hook (turn finished — your move)
   local json; json="$(cat 2>/dev/null || true)"
-  [ "$(opt @switcher-needinput on)" = "on" ] || exit 0
+  [ "$(opt @radar-needinput on)" = "on" ] || exit 0
   _claude_target "$json"
   local msg="Claude finished — your turn"
   if [ "$PANE" = "-" ]; then
-    [ "$(opt @switcher-claude-bg on)" = "on" ] || exit 0
+    [ "$(opt @radar-claude-bg on)" = "on" ] || exit 0
     msg="Claude·${WHERE:-bg}: finished — your turn"
   fi
   cmd_mark "$PANE" claude "$msg" "$KEY"
@@ -412,7 +420,7 @@ _codex_label() {  # _codex_label <event-or-type> <json>
 cmd_codex_hook() {  # Codex native hooks pass JSON on stdin
   local json event pane
   json="$(cat 2>/dev/null || true)"
-  [ "$(opt @switcher-needinput on)" = "on" ] || exit 0
+  [ "$(opt @radar-needinput on)" = "on" ] || exit 0
   event="$(_json_field hook_event_name "$json")"
   [ -n "$event" ] || exit 0
   pane="$(_codex_pane)"
@@ -429,7 +437,7 @@ cmd_codex_hook() {  # Codex native hooks pass JSON on stdin
 
 cmd_codex() {  # Codex notify passes its event JSON as the last argv argument
   local json="${1:-}" type pane
-  [ "$(opt @switcher-needinput on)" = "on" ] || exit 0
+  [ "$(opt @radar-needinput on)" = "on" ] || exit 0
   type="$(_json_field type "$json")"
   [ -n "$type" ] || exit 0
   pane="$(_codex_pane)"

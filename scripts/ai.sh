@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tmux-switcher AI supervisor — an AI (Codex) that watches the AI coding TUIs
+# tmux-radar AI supervisor — an AI (Codex) that watches the AI coding TUIs
 # running inside your tmux panes (Claude Code / Codex), answers their prompts on
 # your behalf, and arranges your tmux layout from natural language.
 #
@@ -17,38 +17,38 @@
 #   watch-setup [<pane>] interactive setup (goal / interval / approval policy)
 #   stop  <pane|all>    stop a resident watcher
 #   status              list active watchers + recent decisions
-#   list                list AI panes and their need-input state
-#   cleanup             GC stale watcher files / monitor panes / need-input marks
-#   menu                tmux display-menu entry point (prefix + <@switcher-ai-key>)
+#   list                list AI panes and their AI-status state
+#   cleanup             GC stale watcher files / monitor panes / AI-status marks
+#   menu                tmux display-menu entry point (prefix + <@radar-ai-key>)
 #
 # Config (tmux options, all optional):
-#   @switcher-ai-key            A                     menu key (prefix + A)
-#   @switcher-ai-model          gpt-5.3-codex-spark   Codex model slug (spark = fast tier)
-#   @switcher-ai-effort         low                   minimal|low|medium|high|xhigh
-#   @switcher-ai-profile        (none)                codex config profile (-p); overrides model/effort
-#   @switcher-ai-cmd            (none)                replace Codex entirely: shell cmd,
+#   @radar-ai-key            A                     menu key (prefix + A)
+#   @radar-ai-model          gpt-5.3-codex-spark   Codex model slug (spark = fast tier)
+#   @radar-ai-effort         low                   minimal|low|medium|high|xhigh
+#   @radar-ai-profile        (none)                codex config profile (-p); overrides model/effort
+#   @radar-ai-cmd            (none)                replace Codex entirely: shell cmd,
 #                                                     prompt on stdin -> decision JSON on stdout
-#   @switcher-ai-autonomy       confirm               ask: suggest|confirm|auto
-#   @switcher-ai-watch-autonomy auto-safe             watch: auto-safe|suggest|auto
-#   @switcher-ai-poll           5                     watch: seconds between polls
-#   @switcher-ai-max-calls      40                    watch: cost cap on brain calls
-#   @switcher-ai-capture-lines  120                   pane lines fed to the brain
-#   @switcher-ai-monitor        on                    open companion monitor pane
-#   @switcher-ai-monitor-pos    top                   top|bottom|right
-#   @switcher-ai-monitor-size   12                    monitor height (top/bottom)
-#   @switcher-ai-monitor-size-h 60                    monitor width (right)
-#   @switcher-ai-monitor-layout split                 split|single
-#   @switcher-ai-monitor-excerpt-lines 16             pane-capture lines shown in monitor detail
-#   @switcher-ai-rules          (none)                file path OR literal text: user rules
+#   @radar-ai-autonomy       confirm               ask: suggest|confirm|auto
+#   @radar-ai-watch-autonomy auto-safe             watch: auto-safe|suggest|auto
+#   @radar-ai-poll           5                     watch: seconds between polls
+#   @radar-ai-max-calls      40                    watch: cost cap on brain calls
+#   @radar-ai-capture-lines  120                   pane lines fed to the brain
+#   @radar-ai-monitor        on                    open companion monitor pane
+#   @radar-ai-monitor-pos    top                   top|bottom|right
+#   @radar-ai-monitor-size   12                    monitor height (top/bottom)
+#   @radar-ai-monitor-size-h 60                    monitor width (right)
+#   @radar-ai-monitor-layout split                 split|single
+#   @radar-ai-monitor-excerpt-lines 16             pane-capture lines shown in monitor detail
+#   @radar-ai-rules          (none)                file path OR literal text: user rules
 #                                                     (what to auto-approve / always escalate),
 #                                                     appended to every decide prompt; default
-#                                                     file ~/.config/tmux-switcher/rules.md
-#   @switcher-ai-prompt-dir     (none)                dir shadowing prompts/ (decide.md,
+#                                                     file ~/.config/tmux-radar/rules.md
+#   @radar-ai-prompt-dir     (none)                dir shadowing prompts/ (decide.md,
 #                                                     control.md, *.schema.json) per file
 #
-# Testing seam: set TMUX_SWITCHER_AI_CMD to a shell snippet that reads the prompt
+# Testing seam: set TMUX_RADAR_AI_CMD to a shell snippet that reads the prompt
 # on stdin and writes the decision JSON to stdout; Codex is then never called.
-# (@switcher-ai-cmd is the user-facing version of the same seam.)
+# (@radar-ai-cmd is the user-facing version of the same seam.)
 set -euo pipefail
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
@@ -61,16 +61,27 @@ SCRIPT_DIR="$(dirname "$SELF")"
 PROMPT_DIR="$SCRIPT_DIR/prompts"
 NOTIFY="$SCRIPT_DIR/needinput-notify.sh"
 
-STATE_DIR="${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}"
-STATE_FILE="${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}"
+STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
+STATE_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
 WATCH_DIR="$STATE_DIR/ai-watch"
-LOG="${TMUX_SWITCHER_AI_LOG:-$STATE_DIR/ai.log}"
+LOG="${TMUX_RADAR_AI_LOG:-${TMUX_SWITCHER_AI_LOG:-$STATE_DIR/ai.log}}"
 mkdir -p "$STATE_DIR" "$WATCH_DIR"
 
-opt() { local v; v="$(tmux show-option -gqv "$1" 2>/dev/null || true)"; [ -n "$v" ] && printf '%s' "$v" || printf '%s' "$2"; }
+opt() {
+  local key="$1" def="$2" v legacy
+  v="$(tmux show-option -gqv "$key" 2>/dev/null || true)"
+  if [ -n "$v" ]; then printf '%s' "$v"; return; fi
+  case "$key" in
+    @radar-*)
+      legacy="@switcher-${key#@radar-}"
+      v="$(tmux show-option -gqv "$legacy" 2>/dev/null || true)"
+      ;;
+  esac
+  if [ -n "${v:-}" ]; then printf '%s' "$v"; else printf '%s' "$def"; fi
+}
 have_tmux() { command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2>&1; }
-need_jq()  { command -v jq >/dev/null 2>&1 || { echo "tmux-switcher AI needs 'jq'." >&2; exit 3; }; }
-have_brain() { [ -n "${TMUX_SWITCHER_AI_CMD:-}" ] || [ -n "$(opt @switcher-ai-cmd '')" ] || command -v codex >/dev/null 2>&1; }
+need_jq()  { command -v jq >/dev/null 2>&1 || { echo "tmux-radar AI needs 'jq'." >&2; exit 3; }; }
+have_brain() { [ -n "${TMUX_RADAR_AI_CMD:-${TMUX_SWITCHER_AI_CMD:-}}" ] || [ -n "$(opt @radar-ai-cmd '')" ] || command -v codex >/dev/null 2>&1; }
 now()  { date '+%s'; }
 audit() { printf '%s\t%s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true; }
 
@@ -92,22 +103,22 @@ readline_tty() {  # readline paints the editable line on stderr; keep it on tty.
   fi
 }
 
-# Prompt "skills" are plain files; @switcher-ai-prompt-dir lets the user shadow
+# Prompt "skills" are plain files; @radar-ai-prompt-dir lets the user shadow
 # any of them (decide.md / control.md / *.schema.json) with their own copies.
 _skill_file() {
-  local d; d="$(opt @switcher-ai-prompt-dir '')"
+  local d; d="$(opt @radar-ai-prompt-dir '')"
   if [ -n "$d" ] && [ -r "$d/$1" ]; then printf '%s/%s' "$d" "$1"
   else printf '%s/%s' "$PROMPT_DIR" "$1"; fi
 }
 _skill() { cat "$(_skill_file "$1")" 2>/dev/null; }
 
-# User approval rules — @switcher-ai-rules is a file path (contents used) or a
-# literal text block; falls back to ~/.config/tmux-switcher/rules.md when unset.
+# User approval rules — @radar-ai-rules is a file path (contents used) or a
+# literal text block; falls back to ~/.config/tmux-radar/rules.md when unset.
 # Appended to every decide prompt as the highest-priority section, so the user
 # controls what gets auto-approved vs escalated without editing the plugin.
 _user_rules() {
-  local r; r="$(opt @switcher-ai-rules '')"
-  [ -z "$r" ] && [ -r "$HOME/.config/tmux-switcher/rules.md" ] && r="$HOME/.config/tmux-switcher/rules.md"
+  local r; r="$(opt @radar-ai-rules '')"
+  [ -z "$r" ] && [ -r "$HOME/.config/tmux-radar/rules.md" ] && r="$HOME/.config/tmux-radar/rules.md"
   [ -n "$r" ] || return 0
   [ -r "$r" ] && r="$(cat "$r" 2>/dev/null)"
   [ -n "$r" ] || return 0
@@ -117,7 +128,7 @@ _wf()  { printf '%s/%s.watch' "$WATCH_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-
 _wbase() { local wf; wf="$(_wf "$1")"; printf '%s' "${wf%.watch}"; }
 _flat() { printf '%s' "$1" | tr '\n\t' '  '; }
 _monitor_excerpt_lines() {
-  local n; n="$(opt @switcher-ai-monitor-excerpt-lines 16)"
+  local n; n="$(opt @radar-ai-monitor-excerpt-lines 16)"
   case "$n" in ''|*[!0-9]*) n=16 ;; esac
   [ "$n" -lt 3 ] && n=3
   printf '%s' "$n"
@@ -298,7 +309,7 @@ _pane_label() {
 }
 
 # Resolve a pane target -> canonical %id. Empty arg falls back to $TMUX_PANE,
-# then to the most recently marked live pane in the need-input state.
+# then to the most recently marked live pane in the AI-status state.
 _resolve_pane() {
   local p="${1:-}"
   [ -z "$p" ] && p="${TMUX_PANE:-}"
@@ -316,24 +327,24 @@ _resolve_pane() {
 _brain() {
   local schema="$1" prompt="$2" out custom profile err
   out="$(mktemp "${TMPDIR:-/tmp}/tmuxai.XXXXXX")"
-  err="${TMUX_SWITCHER_AI_ERR:-/dev/null}"
+  err="${TMUX_RADAR_AI_ERR:-${TMUX_SWITCHER_AI_ERR:-/dev/null}}"
   [ "$err" = "/dev/null" ] || : > "$err" 2>/dev/null || true
   # env seam (tests) wins over the user-facing option; both replace codex with
   # any command that reads the prompt on stdin and prints decision JSON.
-  custom="${TMUX_SWITCHER_AI_CMD:-$(opt @switcher-ai-cmd '')}"
+  custom="${TMUX_RADAR_AI_CMD:-${TMUX_SWITCHER_AI_CMD:-$(opt @radar-ai-cmd '')}}"
   if [ -n "$custom" ]; then
     printf '%s' "$prompt" | eval "$custom" > "$out" 2>"$err" || true
-  elif [ -n "$(opt @switcher-ai-profile '')" ]; then
+  elif [ -n "$(opt @radar-ai-profile '')" ]; then
     # a codex profile bundles model/effort/etc in ~/.codex/config.toml; the
     # safety flags (read-only, ephemeral) stay ours and are not overridable
-    profile="$(opt @switcher-ai-profile '')"
+    profile="$(opt @radar-ai-profile '')"
     codex exec -p "$profile" \
       -s read-only --ephemeral --skip-git-repo-check \
       --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" || true
   else
     codex exec \
-      -m "$(opt @switcher-ai-model gpt-5.3-codex-spark)" \
-      -c model_reasoning_effort="$(opt @switcher-ai-effort low)" \
+      -m "$(opt @radar-ai-model gpt-5.3-codex-spark)" \
+      -c model_reasoning_effort="$(opt @radar-ai-effort low)" \
       -s read-only --ephemeral --skip-git-repo-check \
       --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" || true
   fi
@@ -342,15 +353,15 @@ _brain() {
 
 _brain_label() {
   local custom profile
-  custom="${TMUX_SWITCHER_AI_CMD:-$(opt @switcher-ai-cmd '')}"
+  custom="${TMUX_RADAR_AI_CMD:-${TMUX_SWITCHER_AI_CMD:-$(opt @radar-ai-cmd '')}}"
   if [ -n "$custom" ]; then
     printf 'custom command: %s' "$(_flat "$custom")"
-  elif [ -n "$(opt @switcher-ai-profile '')" ]; then
-    profile="$(opt @switcher-ai-profile '')"
+  elif [ -n "$(opt @radar-ai-profile '')" ]; then
+    profile="$(opt @radar-ai-profile '')"
     printf 'codex profile: %s (read-only, ephemeral)' "$profile"
   else
     printf 'codex exec: model=%s effort=%s (read-only, ephemeral)' \
-      "$(opt @switcher-ai-model gpt-5.3-codex-spark)" "$(opt @switcher-ai-effort low)"
+      "$(opt @radar-ai-model gpt-5.3-codex-spark)" "$(opt @radar-ai-effort low)"
   fi
 }
 
@@ -368,7 +379,7 @@ _send() {  # _send <pane> <text> <key> <key> ...
 # decide: evaluate one pane, return an action, and act on it once.
 # Prints a human line; exit code encodes the action for the watch loop:
 #   0 sent   2 done   3 wait/working   4 escalated   5 error   6 suggest-only
-# $2 = autonomy (suggest|confirm|auto|auto-safe); default from @switcher-ai-autonomy
+# $2 = autonomy (suggest|confirm|auto|auto-safe); default from @radar-ai-autonomy
 # ---------------------------------------------------------------------------
 cmd_decide() {
   need_jq
@@ -376,7 +387,7 @@ cmd_decide() {
   local pane autonomy policy goal cap cap_tail where json pretty_json action text safe reason extra="" prompt backend
   local excerpt_lines errfile err_tail
   pane="$(_resolve_pane "${1:-}")" || { echo "no target pane"; return 5; }
-  autonomy="${2:-$(opt @switcher-ai-autonomy confirm)}"
+  autonomy="${2:-$(opt @radar-ai-autonomy confirm)}"
   policy="${3:-}"
   goal="${4:-}"
   if [ -n "$goal" ]; then
@@ -387,21 +398,21 @@ cmd_decide() {
   fi
   extra="$extra$(_user_rules)"
   where="$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}' 2>/dev/null || echo "$pane")"
-  cap="$(tmux capture-pane -p -t "$pane" -S "-$(opt @switcher-ai-capture-lines 120)" 2>/dev/null || true)"
+  cap="$(tmux capture-pane -p -t "$pane" -S "-$(opt @radar-ai-capture-lines 120)" 2>/dev/null || true)"
   [ -n "$cap" ] || { echo "pane $pane: nothing to read"; return 5; }
   excerpt_lines="$(_monitor_excerpt_lines)"
   cap_tail="$(printf '%s\n' "$cap" | tail -n "$excerpt_lines")"
 
   prompt="$(_skill decide.md)$extra"$'\n\n'"PANE ($where):"$'\n'"$cap"
   backend="$(_brain_label)"
-  if [ -n "${TMUX_SWITCHER_AI_DETAIL:-}" ]; then
+  if [ -n "${TMUX_RADAR_AI_DETAIL:-${TMUX_SWITCHER_AI_DETAIL:-}}" ]; then
     errfile="$(_wbase "$pane").brain.err"
     _watch_detail "$pane" "模型请求中" "$(printf 'Backend: %s\nTarget: %s\nAutonomy: %s\nPolicy: %s\nGoal: %s\n\nPane excerpt shown here (last %s lines; model receives last %s lines):\n%s\n' \
       "$backend" "$where" "$autonomy" "${policy:-safe-auto}" "${goal:-<none>}" \
-      "$excerpt_lines" "$(opt @switcher-ai-capture-lines 120)" "$cap_tail")"
+      "$excerpt_lines" "$(opt @radar-ai-capture-lines 120)" "$cap_tail")"
   fi
-  if [ -n "${TMUX_SWITCHER_AI_DETAIL:-}" ]; then
-    json="$(TMUX_SWITCHER_AI_ERR="$errfile" _brain "$(_skill_file decide.schema.json)" "$prompt")"
+  if [ -n "${TMUX_RADAR_AI_DETAIL:-${TMUX_SWITCHER_AI_DETAIL:-}}" ]; then
+    json="$(TMUX_RADAR_AI_ERR="$errfile" TMUX_SWITCHER_AI_ERR="$errfile" _brain "$(_skill_file decide.schema.json)" "$prompt")"
   else
     json="$(_brain "$(_skill_file decide.schema.json)" "$prompt")"
   fi
@@ -415,7 +426,7 @@ cmd_decide() {
     < <(printf '%s' "$json" | jq -r '.keys[]? // empty' 2>/dev/null || true)
   local plan; plan="$(printf 'text=%q keys=[%s]' "$text" "${keys[*]:-}")"
 
-  if [ -n "${TMUX_SWITCHER_AI_DETAIL:-}" ]; then
+  if [ -n "${TMUX_RADAR_AI_DETAIL:-${TMUX_SWITCHER_AI_DETAIL:-}}" ]; then
     err_tail=""
     [ -n "${errfile:-}" ] && [ -s "$errfile" ] && err_tail="$(tail -n 20 "$errfile" 2>/dev/null || true)"
     _watch_detail "$pane" "最近一次模型决策" "$(
@@ -428,7 +439,7 @@ cmd_decide() {
         printf 'Backend stderr (last 20 lines):\n%s\n\n' "$err_tail"
       fi
       printf 'Pane excerpt shown here (last %s lines; model receives last %s lines):\n%s\n' \
-        "$excerpt_lines" "$(opt @switcher-ai-capture-lines 120)" "$cap_tail"
+        "$excerpt_lines" "$(opt @radar-ai-capture-lines 120)" "$cap_tail"
     )"
     _watch_timeline "$pane" "${action:-unknown}" "${reason:-no reason} · $plan"
   fi
@@ -470,10 +481,10 @@ cmd_watch_loop() {
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane" >&2; return 1; }
   goal="${2:-}"
   policy="${3:-}"
-  [ -z "$policy" ] && [ "$(opt @switcher-ai-watch-always-allow off)" = "on" ] && policy="always-allow"
-  poll="${4:-}"; case "$poll" in ''|*[!0-9.]*) poll="$(opt @switcher-ai-poll 5)" ;; esac
-  auto="${5:-}"; [ -n "$auto" ] || auto="$(opt @switcher-ai-watch-autonomy auto-safe)"
-  maxcalls="$(opt @switcher-ai-max-calls 40)"
+  [ -z "$policy" ] && [ "$(opt @radar-ai-watch-always-allow off)" = "on" ] && policy="always-allow"
+  poll="${4:-}"; case "$poll" in ''|*[!0-9.]*) poll="$(opt @radar-ai-poll 5)" ;; esac
+  auto="${5:-}"; [ -n "$auto" ] || auto="$(opt @radar-ai-watch-autonomy auto-safe)"
+  maxcalls="$(opt @radar-ai-max-calls 40)"
   wf="$(_wf "$pane")"
   started="$(now)"
   _watch_state_write "$pane" "$started" "$poll" "$goal" "$policy" "$auto" "$maxcalls" "$calls" "$quiet" 0 "starting" "$(now)" ""
@@ -502,7 +513,7 @@ cmd_watch_loop() {
     fi
 
     marked=0
-    cap="$(tmux capture-pane -p -t "$pane" -S "-$(opt @switcher-ai-capture-lines 120)" 2>/dev/null || true)"
+    cap="$(tmux capture-pane -p -t "$pane" -S "-$(opt @radar-ai-capture-lines 120)" 2>/dev/null || true)"
     h="$(printf '%s' "$cap" | cksum | awk '{print $1}')"
     [ -r "$STATE_FILE" ] && grep -q "^$pane"$'\t' "$STATE_FILE" 2>/dev/null && marked=1
     if [ "$h" = "$last" ]; then quiet=$((quiet+1)); else quiet=0; last="$h"; fi
@@ -511,7 +522,7 @@ cmd_watch_loop() {
     if { [ "$marked" = 1 ] || [ "$quiet" -ge 2 ]; } && [ "$h" != "$decided" ]; then
       decided="$h"
       calls=$((calls+1))
-      status="calling model: $([ "$marked" = 1 ] && printf 'need-input mark' || printf 'quiet=%s' "$quiet")"
+      status="calling model: $([ "$marked" = 1 ] && printf 'AI-status mark' || printf 'quiet=%s' "$quiet")"
       _watch_state_write "$pane" "$started" "$poll" "$goal" "$policy" "$auto" "$maxcalls" "$calls" "$quiet" "$marked" "$status" 0 "$last_decision"
       _watch_timeline "$pane" "decide" "call $calls/$maxcalls · $status"
       if [ "$calls" -gt "$maxcalls" ]; then
@@ -520,7 +531,7 @@ cmd_watch_loop() {
         _watch_state_write "$pane" "$started" "$poll" "$goal" "$policy" "$auto" "$maxcalls" "$calls" "$quiet" "$marked" "paused: max-calls hit" "$(now)" "$last_decision"
         _escalate "$pane" "AI 监控达到调用上限($maxcalls),已暂停"; audit "watch-cap\t$pane"; break
       fi
-      set +e; TMUX_SWITCHER_AI_DETAIL=1 cmd_decide "$pane" "$auto" "$policy" "$goal"; rc=$?; set -e
+      set +e; TMUX_RADAR_AI_DETAIL=1 cmd_decide "$pane" "$auto" "$policy" "$goal"; rc=$?; set -e
       last_decision="$(now)"
       cooldown_until="$(awk -v n="$last_decision" -v p="$poll" 'BEGIN { if ((p+0) < 1) p = 1; printf "%d", n + p }')"
       case "$rc" in
@@ -591,25 +602,25 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
   # Companion monitor: a split next to the watched pane, not a covering popup.
   # In the default split layout, the monitor region is split again into
   # timeline + detail panes. If the second split fails, the watcher still runs.
-  if [ "$(opt @switcher-ai-monitor on)" = "on" ] && have_tmux; then
-    pos="$(opt @switcher-ai-monitor-pos top)"
-    layout="$(opt @switcher-ai-monitor-layout split)"
-    timeline_cmd="TMUX_SWITCHER_STATE_DIR='$STATE_DIR' exec bash '$SELF' monitor-timeline '$pane'"
-    detail_cmd="TMUX_SWITCHER_STATE_DIR='$STATE_DIR' exec bash '$SELF' monitor-detail '$pane'"
-    single_cmd="TMUX_SWITCHER_STATE_DIR='$STATE_DIR' exec bash '$SELF' monitor '$pane'"
+  if [ "$(opt @radar-ai-monitor on)" = "on" ] && have_tmux; then
+    pos="$(opt @radar-ai-monitor-pos top)"
+    layout="$(opt @radar-ai-monitor-layout split)"
+    timeline_cmd="TMUX_RADAR_STATE_DIR='$STATE_DIR' exec bash '$SELF' monitor-timeline '$pane'"
+    detail_cmd="TMUX_RADAR_STATE_DIR='$STATE_DIR' exec bash '$SELF' monitor-detail '$pane'"
+    single_cmd="TMUX_RADAR_STATE_DIR='$STATE_DIR' exec bash '$SELF' monitor '$pane'"
     split_args=()
     case "$pos" in
       bottom)
-        if mon_size="$(monitor_size "$pane" height "$(opt @switcher-ai-monitor-size 12)" 8 4)"; then
+        if mon_size="$(monitor_size "$pane" height "$(opt @radar-ai-monitor-size 12)" 8 4)"; then
           split_args=(-v -l "$mon_size")
         fi ;;
       right)
-        if mon_size="$(monitor_size "$pane" width "$(opt @switcher-ai-monitor-size-h 60)" 20 30)"; then
+        if mon_size="$(monitor_size "$pane" width "$(opt @radar-ai-monitor-size-h 60)" 20 30)"; then
           split_args=(-h -l "$mon_size")
         fi ;;
       *)
         pos="top"
-        if mon_size="$(monitor_size "$pane" height "$(opt @switcher-ai-monitor-size 12)" 8 4)"; then
+        if mon_size="$(monitor_size "$pane" height "$(opt @radar-ai-monitor-size 12)" 8 4)"; then
           split_args=(-v -b -l "$mon_size")
         fi ;;
     esac
@@ -654,7 +665,7 @@ cmd_watch_setup() {
   _hdr "AI 常驻监控 · 设置" "$(_pane_label "$pane")"
   printf '%s目标（回车 = 通用：推进直到任务完成）%s\n> ' "$CD" "$CR"
   readline_tty goal
-  printf '\n%s轮询间隔秒（回车 = %s）%s\n> ' "$CD" "$(opt @switcher-ai-poll 5)" "$CR"
+  printf '\n%s轮询间隔秒（回车 = %s）%s\n> ' "$CD" "$(opt @radar-ai-poll 5)" "$CR"
   readline_tty poll
   printf '\n%s批准策略%s\n' "$CD" "$CR"
   printf '  1) 安全项自动批准，其余上报给你（默认）\n'
@@ -787,7 +798,7 @@ cmd_ask() {
   req="${*:-}"
   [ -n "$req" ] || { printf 'tmux 指令（自然语言）: '; readline_tty req; }
   [ -n "$req" ] || { echo "nothing to do"; return 0; }
-  autonomy="$(opt @switcher-ai-autonomy confirm)"
+  autonomy="$(opt @radar-ai-autonomy confirm)"
   snap="$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{?pane_active,*,} #{pane_current_command} #{pane_current_path} "#{pane_title}"' 2>/dev/null || true)"
   echo "· thinking…"
   json="$(_brain "$PROMPT_DIR/control.schema.json" "$(_skill control.md)"$'\n\n'"CURRENT TMUX PANES:"$'\n'"$snap"$'\n\n'"CURRENT PANE: ${TMUX_PANE:-?}"$'\n'"USER REQUEST: $req")"
@@ -860,7 +871,7 @@ cmd_list() {
 # ---------------------------------------------------------------------------
 # cleanup: GC everything a dead server / resurrect restore can leave behind —
 # watcher pidfiles whose process is gone, orphan feed files, leftover monitor
-# panes whose watcher ended, and stale need-input marks (via the notifier).
+# panes whose watcher ended, and stale AI-status marks (via the notifier).
 # Safe to run any time; wired to plugin load and (optionally) the
 # tmux-resurrect post-restore hook.
 # ---------------------------------------------------------------------------
@@ -914,23 +925,23 @@ cmd_cleanup() {
 }
 
 # ---------------------------------------------------------------------------
-# menu: the display-menu chooser. Single source of truth — tmux-switcher.tmux
-# binds prefix + <@switcher-ai-key> to `ai.sh menu` so this never drifts from
+# menu: the display-menu chooser. Single source of truth — tmux-radar.tmux
+# binds prefix + <@radar-ai-key> to `ai.sh menu` so this never drifts from
 # the plugin binding.
 # ---------------------------------------------------------------------------
 cmd_menu() {
   local pop; pop="display-popup -E -w 80% -h 70%"
   tmux display-menu -T "#[align=centre] tmux AI 主管 " -x C -y C \
-    "指挥 tmux（自然语言）"             a "$pop \"TMUX_SWITCHER_AI_PAUSE=1 $SELF ask\"" \
-    "让当前 pane 继续 / 决定一次"        c "$pop \"TMUX_SWITCHER_AI_PAUSE=1 $SELF decide '#{pane_id}'\"" \
+    "指挥 tmux（自然语言）"             a "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF ask\"" \
+    "让当前 pane 继续 / 决定一次"        c "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF decide '#{pane_id}'\"" \
     "" \
     "常驻监控当前 pane 直到完成"         w "run-shell \"$SELF watch '#{pane_id}'\"" \
     "常驻监控 + always-allow（更省心）"  W "run-shell \"$SELF watch '#{pane_id}' '' always-allow\"" \
     "自定义监控（目标 / 间隔 / 策略）…"   v "$pop \"$SELF watch-setup '#{pane_id}'\"" \
     "" \
-    "状态 / 最近决策"                   s "$pop \"TMUX_SWITCHER_AI_PAUSE=1 $SELF status\"" \
+    "状态 / 最近决策"                   s "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF status\"" \
     "停止全部监控"                      S "run-shell \"$SELF stop all\"" \
-    "列出 AI pane"                     l "$pop \"TMUX_SWITCHER_AI_PAUSE=1 $SELF list\""
+    "列出 AI pane"                     l "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF list\""
 }
 
 rc=0
@@ -951,7 +962,7 @@ case "${1:-}" in
   *) echo "usage: ai.sh {ask [req]|decide [pane] [autonomy] [policy]|watch <pane> [goal] [policy] [poll] [autonomy]|watch-setup [pane]|monitor <pane>|monitor-timeline <pane>|monitor-detail <pane>|stop <pane|all>|status|list|cleanup|menu}" >&2; exit 2 ;;
 esac
 # menu-launched popups set this so the result stays on screen until a keypress
-if [ -n "${TMUX_SWITCHER_AI_PAUSE:-}" ] && [ -t 0 ]; then
+if [ -n "${TMUX_RADAR_AI_PAUSE:-${TMUX_SWITCHER_AI_PAUSE:-}}" ] && [ -t 0 ]; then
   printf '\n%s按任意键关闭…%s' "$CD" "$CR"; read -n1 -r _ </dev/tty 2>/dev/null || true
 fi
 exit "$rc"

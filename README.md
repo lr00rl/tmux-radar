@@ -110,7 +110,7 @@ Set these **before** the plugin loads:
 | `@switcher-ai-prompt-dir` | *(none)* | Directory that **shadows** `scripts/prompts/` per file (`decide.md`, `control.md`, `*.schema.json`) — customize the default prompts without editing the plugin. |
 | `@switcher-ai-autonomy` | `confirm` | One-shot `ask`/`decide`: `suggest` (print only), `confirm` (ask first), `auto`. |
 | `@switcher-ai-watch-autonomy` | `auto-safe` | Resident `watch`: `auto-safe` (auto-send only safe replies, escalate the rest), `suggest`, `auto`. |
-| `@switcher-ai-poll` | `5` | Seconds between polls while watching a pane. |
+| `@switcher-ai-poll` | `5` | Idle-listen interval while watching a pane. The next interval starts after a model decision/action returns, so slow decisions do not overlap. |
 | `@switcher-ai-max-calls` | `40` | Cost cap: a watcher pauses after this many model calls. |
 | `@switcher-ai-capture-lines` | `120` | Pane lines fed to the model per decision. |
 | `@switcher-ai-watch-always-allow` | `off` | While watching, prefer the TUI's "don't ask again / always allow" option for **safe** actions (fewer interruptions, lower safety). Menu entry `W` enables it per-watch. |

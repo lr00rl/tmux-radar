@@ -374,6 +374,7 @@ cmd_decide() {
 # ---------------------------------------------------------------------------
 cmd_watch_loop() {
   local pane goal policy wf poll auto maxcalls calls=0 last="" quiet=0 decided="" rc started last_decision="" status next_at
+  local cooldown_until=0 now_s sleep_for marked=0 cap h
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane" >&2; return 1; }
   goal="${2:-}"
   policy="${3:-}"
@@ -398,7 +399,17 @@ cmd_watch_loop() {
 
   while :; do
     tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1 || { echo "pane $pane gone"; break; }
-    local cap h marked=0
+    now_s="$(now)"
+    if [ "$cooldown_until" -gt "$now_s" ]; then
+      status="cooldown after decision"
+      _watch_state_write "$pane" "$started" "$poll" "$goal" "$policy" "$auto" "$maxcalls" "$calls" "$quiet" "$marked" "$status" "$cooldown_until" "$last_decision"
+      sleep_for=$((cooldown_until - now_s))
+      [ "$sleep_for" -lt 1 ] && sleep_for=1
+      sleep "$sleep_for"
+      continue
+    fi
+
+    marked=0
     cap="$(tmux capture-pane -p -t "$pane" -S "-$(opt @switcher-ai-capture-lines 120)" 2>/dev/null || true)"
     h="$(printf '%s' "$cap" | cksum | awk '{print $1}')"
     [ -r "$STATE_FILE" ] && grep -q "^$pane"$'\t' "$STATE_FILE" 2>/dev/null && marked=1
@@ -409,7 +420,7 @@ cmd_watch_loop() {
       decided="$h"
       calls=$((calls+1))
       status="calling model: $([ "$marked" = 1 ] && printf 'need-input mark' || printf 'quiet=%s' "$quiet")"
-      _watch_state_write "$pane" "$started" "$poll" "$goal" "$policy" "$auto" "$maxcalls" "$calls" "$quiet" "$marked" "$status" "$(now)" "$last_decision"
+      _watch_state_write "$pane" "$started" "$poll" "$goal" "$policy" "$auto" "$maxcalls" "$calls" "$quiet" "$marked" "$status" 0 "$last_decision"
       _watch_timeline "$pane" "decide" "call $calls/$maxcalls · $status"
       if [ "$calls" -gt "$maxcalls" ]; then
         echo "watch $pane: hit max-calls ($maxcalls), pausing"
@@ -419,6 +430,7 @@ cmd_watch_loop() {
       fi
       set +e; TMUX_SWITCHER_AI_DETAIL=1 cmd_decide "$pane" "$auto" "$policy" "$goal"; rc=$?; set -e
       last_decision="$(now)"
+      cooldown_until="$(awk -v n="$last_decision" -v p="$poll" 'BEGIN { if ((p+0) < 1) p = 1; printf "%d", n + p }')"
       case "$rc" in
         0) status="sent safe action" ;;
         2) status="done" ;;
@@ -428,19 +440,27 @@ cmd_watch_loop() {
         6) status="suggested; not sent" ;;
         *) status="decision rc=$rc" ;;
       esac
-      _watch_state_write "$pane" "$started" "$poll" "$goal" "$policy" "$auto" "$maxcalls" "$calls" "$quiet" "$marked" "$status" "$(now)" "$last_decision"
+      _watch_state_write "$pane" "$started" "$poll" "$goal" "$policy" "$auto" "$maxcalls" "$calls" "$quiet" "$marked" "$status" "$cooldown_until" "$last_decision"
       case "$rc" in
         2) echo "watch $pane: done"; _watch_timeline "$pane" "done" "${goal:-task complete}"; audit "watch-done\t$pane\t$goal"; _escalate "$pane" "AI: 任务完成 ✓${goal:+ ($goal)}"; break ;;
         4) echo "watch $pane: escalated to user, pausing"; _watch_timeline "$pane" "pause" "escalated to user"; break ;;
       esac
+      _watch_timeline "$pane" "cooldown" "next check starts ${poll}s after decision completion"
     else
       if [ "$marked" = 1 ]; then status="marked; already decided for this screen"
       elif [ "$quiet" -lt 2 ]; then status="watching active screen; quiet=$quiet/2"
       else status="quiet screen already evaluated; waiting for change"; fi
     fi
-    next_at="$(awk -v n="$(now)" -v p="$poll" 'BEGIN { if ((p+0) < 1) p = 1; printf "%d", n + p }')"
+    now_s="$(now)"
+    if [ "$cooldown_until" -gt "$now_s" ]; then
+      next_at="$cooldown_until"
+    else
+      next_at="$(awk -v n="$now_s" -v p="$poll" 'BEGIN { if ((p+0) < 1) p = 1; printf "%d", n + p }')"
+    fi
     _watch_state_write "$pane" "$started" "$poll" "$goal" "$policy" "$auto" "$maxcalls" "$calls" "$quiet" "$marked" "$status" "$next_at" "$last_decision"
-    sleep "$poll"
+    sleep_for=$((next_at - now_s))
+    [ "$sleep_for" -lt 1 ] && sleep_for=1
+    sleep "$sleep_for"
   done
   _watch_timeline "$pane" "stop" "watch loop ended"
   rm -f "$wf"; audit "watch-stop\t$pane"
@@ -606,7 +626,7 @@ cmd_status() {
 # ---------------------------------------------------------------------------
 _monitor_loop() {  # _monitor_loop <timeline|detail|combined> <pane>
   local mode="$1" pane="$2" wf base feed timeline detail label cols rows body now_s next_at remain
-  local started poll goal policy auto maxcalls calls quiet marked status updated last_decision leftw rightw lefttmp righttmp
+  local started poll goal policy auto maxcalls calls quiet marked status updated last_decision next_label leftw rightw lefttmp righttmp
   pane="$(_resolve_pane "$pane" 2>/dev/null || echo "$pane")"
   wf="$(_wf "$pane")"; base="${wf%.watch}"
   feed="$base.out"; timeline="$base.timeline"; detail="$base.detail"
@@ -629,11 +649,15 @@ _monitor_loop() {  # _monitor_loop <timeline|detail|combined> <pane>
     next_at="$(_state_get "$wf" next_at)"; updated="$(_state_get "$wf" updated)"
     last_decision="$(_state_get "$wf" last_decision)"
     case "$next_at" in ''|*[!0-9]*) remain=0 ;; *) remain=$((next_at - now_s)); [ "$remain" -lt 0 ] && remain=0 ;; esac
+    case "$status" in
+      "calling model:"*) next_label="after model + ${poll:-?}s" ;;
+      *) next_label="${remain}s" ;;
+    esac
 
     printf '\033[H\033[J'
     printf '\033[7;1m AI monitor · %s \033[0m  %s%s%s\n' "$mode" "$CD" "$label" "$CR"
-    printf 'status=%s%s%s · next=%ss · calls=%s/%s · quiet=%s · mark=%s · poll=%ss · updated=%s\n' \
-      "$CC" "${status:-starting}" "$CR" "$remain" "${calls:-0}" "${maxcalls:-?}" "${quiet:-0}" "${marked:-0}" "${poll:-?}" "${updated:-?}"
+    printf 'status=%s%s%s · next=%s · calls=%s/%s · quiet=%s · mark=%s · poll=%ss · updated=%s\n' \
+      "$CC" "${status:-starting}" "$CR" "$next_label" "${calls:-0}" "${maxcalls:-?}" "${quiet:-0}" "${marked:-0}" "${poll:-?}" "${updated:-?}"
     [ -n "$goal" ] && printf '%sgoal: %s%s\n' "$CD" "$goal" "$CR" || printf '%spolicy=%s autonomy=%s last-decision=%s%s\n' "$CD" "${policy:-?}" "${auto:-?}" "${last_decision:-none}" "$CR"
     printf '%s%s\n' "$CD" "$(printf '%*s' "$cols" '' | tr ' ' '-')"
 

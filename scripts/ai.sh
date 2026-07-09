@@ -38,6 +38,7 @@
 #   @switcher-ai-monitor-size   12                    monitor height (top/bottom)
 #   @switcher-ai-monitor-size-h 60                    monitor width (right)
 #   @switcher-ai-monitor-layout split                 split|single
+#   @switcher-ai-monitor-excerpt-lines 16             pane-capture lines shown in monitor detail
 #   @switcher-ai-rules          (none)                file path OR literal text: user rules
 #                                                     (what to auto-approve / always escalate),
 #                                                     appended to every decide prompt; default
@@ -115,6 +116,22 @@ _user_rules() {
 _wf()  { printf '%s/%s.watch' "$WATCH_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
 _wbase() { local wf; wf="$(_wf "$1")"; printf '%s' "${wf%.watch}"; }
 _flat() { printf '%s' "$1" | tr '\n\t' '  '; }
+_monitor_excerpt_lines() {
+  local n; n="$(opt @switcher-ai-monitor-excerpt-lines 16)"
+  case "$n" in ''|*[!0-9]*) n=16 ;; esac
+  [ "$n" -lt 3 ] && n=3
+  printf '%s' "$n"
+}
+
+_pretty_json() {
+  local json="$1"
+  [ -n "$json" ] || { printf '<empty>'; return 0; }
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$json" | jq . 2>/dev/null || printf '%s' "$json"
+  else
+    printf '%s' "$json"
+  fi
+}
 
 _watch_file_tail() {  # _watch_file_tail <file> <keep-lines>
   local file="$1" keep="${2:-240}" n tmp
@@ -205,26 +222,28 @@ _resolve_pane() {
 # Codex is read-only + ephemeral; only its --output-schema'd last message is used.
 # ---------------------------------------------------------------------------
 _brain() {
-  local schema="$1" prompt="$2" out custom profile
+  local schema="$1" prompt="$2" out custom profile err
   out="$(mktemp "${TMPDIR:-/tmp}/tmuxai.XXXXXX")"
+  err="${TMUX_SWITCHER_AI_ERR:-/dev/null}"
+  [ "$err" = "/dev/null" ] || : > "$err" 2>/dev/null || true
   # env seam (tests) wins over the user-facing option; both replace codex with
   # any command that reads the prompt on stdin and prints decision JSON.
   custom="${TMUX_SWITCHER_AI_CMD:-$(opt @switcher-ai-cmd '')}"
   if [ -n "$custom" ]; then
-    printf '%s' "$prompt" | eval "$custom" > "$out" 2>/dev/null || true
+    printf '%s' "$prompt" | eval "$custom" > "$out" 2>"$err" || true
   elif [ -n "$(opt @switcher-ai-profile '')" ]; then
     # a codex profile bundles model/effort/etc in ~/.codex/config.toml; the
     # safety flags (read-only, ephemeral) stay ours and are not overridable
     profile="$(opt @switcher-ai-profile '')"
     codex exec -p "$profile" \
       -s read-only --ephemeral --skip-git-repo-check \
-      --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>&1 || true
+      --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" || true
   else
     codex exec \
       -m "$(opt @switcher-ai-model gpt-5.3-codex-spark)" \
       -c model_reasoning_effort="$(opt @switcher-ai-effort low)" \
       -s read-only --ephemeral --skip-git-repo-check \
-      --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>&1 || true
+      --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" || true
   fi
   cat "$out" 2>/dev/null; rm -f "$out"
 }
@@ -262,7 +281,8 @@ _send() {  # _send <pane> <text> <key> <key> ...
 cmd_decide() {
   need_jq
   have_brain || { echo "codex 未安装/不可用，无法决策。"; return 3; }
-  local pane autonomy policy goal cap where json action text safe reason extra="" prompt backend
+  local pane autonomy policy goal cap cap_tail where json pretty_json action text safe reason extra="" prompt backend
+  local excerpt_lines errfile err_tail
   pane="$(_resolve_pane "${1:-}")" || { echo "no target pane"; return 5; }
   autonomy="${2:-$(opt @switcher-ai-autonomy confirm)}"
   policy="${3:-}"
@@ -277,14 +297,23 @@ cmd_decide() {
   where="$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}' 2>/dev/null || echo "$pane")"
   cap="$(tmux capture-pane -p -t "$pane" -S "-$(opt @switcher-ai-capture-lines 120)" 2>/dev/null || true)"
   [ -n "$cap" ] || { echo "pane $pane: nothing to read"; return 5; }
+  excerpt_lines="$(_monitor_excerpt_lines)"
+  cap_tail="$(printf '%s\n' "$cap" | tail -n "$excerpt_lines")"
 
   prompt="$(_skill decide.md)$extra"$'\n\n'"PANE ($where):"$'\n'"$cap"
   backend="$(_brain_label)"
   if [ -n "${TMUX_SWITCHER_AI_DETAIL:-}" ]; then
-    _watch_detail "$pane" "模型请求中" "$(printf 'Backend: %s\nTarget: %s\nAutonomy: %s\nPolicy: %s\nGoal: %s\n\nPane excerpt sent to model (last %s lines):\n%s\n' \
-      "$backend" "$where" "$autonomy" "${policy:-safe-auto}" "${goal:-<none>}" "$(opt @switcher-ai-capture-lines 120)" "$cap")"
+    errfile="$(_wbase "$pane").brain.err"
+    _watch_detail "$pane" "模型请求中" "$(printf 'Backend: %s\nTarget: %s\nAutonomy: %s\nPolicy: %s\nGoal: %s\n\nPane excerpt shown here (last %s lines; model receives last %s lines):\n%s\n' \
+      "$backend" "$where" "$autonomy" "${policy:-safe-auto}" "${goal:-<none>}" \
+      "$excerpt_lines" "$(opt @switcher-ai-capture-lines 120)" "$cap_tail")"
   fi
-  json="$(_brain "$(_skill_file decide.schema.json)" "$prompt")"
+  if [ -n "${TMUX_SWITCHER_AI_DETAIL:-}" ]; then
+    json="$(TMUX_SWITCHER_AI_ERR="$errfile" _brain "$(_skill_file decide.schema.json)" "$prompt")"
+  else
+    json="$(_brain "$(_skill_file decide.schema.json)" "$prompt")"
+  fi
+  pretty_json="$(_pretty_json "$json")"
   action="$(printf '%s' "$json" | jq -r '.action // "unknown"' 2>/dev/null || echo unknown)"
   text="$(printf '%s' "$json" | jq -r '.text // ""' 2>/dev/null || echo '')"
   safe="$(printf '%s' "$json" | jq -r 'if .safe == false then "0" else "1" end' 2>/dev/null || echo 0)"
@@ -295,9 +324,20 @@ cmd_decide() {
   local plan; plan="$(printf 'text=%q keys=[%s]' "$text" "${keys[*]:-}")"
 
   if [ -n "${TMUX_SWITCHER_AI_DETAIL:-}" ]; then
-    _watch_detail "$pane" "最近一次模型决策" "$(printf 'Backend: %s\nTarget: %s\nAutonomy: %s\nPolicy: %s\nGoal: %s\n\nParsed decision:\n  action: %s\n  safe: %s\n  reason: %s\n  plan: %s\n\nModel JSON:\n%s\n\nPane excerpt sent to model (last %s lines):\n%s\n' \
-      "$backend" "$where" "$autonomy" "${policy:-safe-auto}" "${goal:-<none>}" \
-      "$action" "$safe" "${reason:-<none>}" "$plan" "${json:-<empty>}" "$(opt @switcher-ai-capture-lines 120)" "$cap")"
+    err_tail=""
+    [ -n "${errfile:-}" ] && [ -s "$errfile" ] && err_tail="$(tail -n 20 "$errfile" 2>/dev/null || true)"
+    _watch_detail "$pane" "最近一次模型决策" "$(
+      printf 'Backend: %s\nTarget: %s\nAutonomy: %s\nPolicy: %s\nGoal: %s\n\n' \
+        "$backend" "$where" "$autonomy" "${policy:-safe-auto}" "${goal:-<none>}"
+      printf 'Parsed decision:\n  action: %s\n  safe: %s\n  reason: %s\n  plan: %s\n\n' \
+        "$action" "$safe" "${reason:-<none>}" "$plan"
+      printf 'Model JSON:\n%s\n\n' "$pretty_json"
+      if [ -n "$err_tail" ]; then
+        printf 'Backend stderr (last 20 lines):\n%s\n\n' "$err_tail"
+      fi
+      printf 'Pane excerpt shown here (last %s lines; model receives last %s lines):\n%s\n' \
+        "$excerpt_lines" "$(opt @switcher-ai-capture-lines 120)" "$cap_tail"
+    )"
     _watch_timeline "$pane" "${action:-unknown}" "${reason:-no reason} · $plan"
   fi
 
@@ -379,7 +419,16 @@ cmd_watch_loop() {
       fi
       set +e; TMUX_SWITCHER_AI_DETAIL=1 cmd_decide "$pane" "$auto" "$policy" "$goal"; rc=$?; set -e
       last_decision="$(now)"
-      _watch_state_write "$pane" "$started" "$poll" "$goal" "$policy" "$auto" "$maxcalls" "$calls" "$quiet" "$marked" "decision rc=$rc" "$(now)" "$last_decision"
+      case "$rc" in
+        0) status="sent safe action" ;;
+        2) status="done" ;;
+        3) status="model says wait" ;;
+        4) status="paused: escalated to user" ;;
+        5) status="decision error/unknown" ;;
+        6) status="suggested; not sent" ;;
+        *) status="decision rc=$rc" ;;
+      esac
+      _watch_state_write "$pane" "$started" "$poll" "$goal" "$policy" "$auto" "$maxcalls" "$calls" "$quiet" "$marked" "$status" "$(now)" "$last_decision"
       case "$rc" in
         2) echo "watch $pane: done"; _watch_timeline "$pane" "done" "${goal:-task complete}"; audit "watch-done\t$pane\t$goal"; _escalate "$pane" "AI: 任务完成 ✓${goal:+ ($goal)}"; break ;;
         4) echo "watch $pane: escalated to user, pausing"; _watch_timeline "$pane" "pause" "escalated to user"; break ;;
@@ -598,7 +647,7 @@ _monitor_loop() {  # _monitor_loop <timeline|detail|combined> <pane>
           cat "$detail" 2>/dev/null
           printf '\nRecent feed\n'
           tail -n 8 "$feed" 2>/dev/null
-        } | _clip_lines "$cols" "$body"
+        } | sed -n "1,${body}p"
         ;;
       *)
         leftw=$((cols * 42 / 100)); [ "$leftw" -lt 34 ] && leftw=34

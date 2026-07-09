@@ -119,6 +119,7 @@ Set these **before** the plugin loads:
 | `@switcher-ai-monitor-size` | `12` | Monitor pane height in lines (`top`/`bottom`). |
 | `@switcher-ai-monitor-size-h` | `60` | Monitor pane width in columns (`right`). |
 | `@switcher-ai-monitor-layout` | `split` | `split` opens timeline + detail as two monitor panes; `single` keeps one combined pane. |
+| `@switcher-ai-monitor-excerpt-lines` | `16` | Pane-capture lines shown in the monitor detail view. The model still receives `@switcher-ai-capture-lines`; this only keeps the UI readable. |
 
 Example:
 
@@ -235,9 +236,11 @@ While a watcher runs, companion monitor pane(s) open next to the watched pane
 (top by default; `@switcher-ai-monitor-pos`). The default `split` layout makes
 the monitor region two panes: **timeline** on the left (polls, quiet/marked
 state, decisions, pauses, completion) and **detail** on the right (countdown,
-backend/model command, last pane excerpt sent to the model, parsed action, raw
-decision JSON, and the recent execution feed). It self-closes when the watch
-ends. Set `@switcher-ai-monitor-layout 'single'` to keep one combined pane. The
+backend/model command, parsed action, raw decision JSON, backend stderr, a
+short tail of the pane excerpt sent to the model, and the recent execution
+feed). Only that pane excerpt is shortened in the detail view; model context
+still uses `@switcher-ai-capture-lines`. It self-closes when the watch ends.
+Set `@switcher-ai-monitor-layout 'single'` to keep one combined pane. The
 **`W`** menu entry starts a watch with
 **always-allow**: for safe approvals the AI prefers the TUI's "don't ask again"
 so the agent runs with fewer interruptions (convenience over per-action vetting;

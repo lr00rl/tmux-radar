@@ -238,9 +238,12 @@ the monitor region two panes: **timeline** on the left (polls, quiet/marked
 state, decisions, pauses, completion) and **detail** on the right (countdown,
 backend/model command, parsed action, raw decision JSON, backend stderr, a
 short tail of the pane excerpt sent to the model, and the recent execution
-feed). Only that pane excerpt is shortened in the detail view; model context
-still uses `@switcher-ai-capture-lines`. It self-closes when the watch ends.
-Set `@switcher-ai-monitor-layout 'single'` to keep one combined pane. The
+feed). The monitor keeps a fixed status bar at the top and appends new history
+below it instead of repainting the full pane, so tmux copy-mode / scrollback can
+review older events without fighting a one-second refresh. Only the pane excerpt
+is shortened in the detail view; model context still uses
+`@switcher-ai-capture-lines`. It self-closes when the watch ends. Set
+`@switcher-ai-monitor-layout 'single'` to keep one combined detail pane. The
 **`W`** menu entry starts a watch with
 **always-allow**: for safe approvals the AI prefers the TUI's "don't ask again"
 so the agent runs with fewer interruptions (convenience over per-action vetting;

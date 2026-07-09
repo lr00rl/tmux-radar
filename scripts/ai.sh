@@ -154,13 +154,19 @@ _watch_timeline() {  # _watch_timeline <pane> <kind> <message>
 }
 
 _watch_detail() {  # _watch_detail <pane> <title> <body>
-  local pane="$1" title="$2" body="$3" file
+  local pane="$1" title="$2" body="$3" file log
   file="$(_wbase "$pane").detail"
+  log="$(_wbase "$pane").detail.log"
   {
     printf '%s\n' "$title"
     printf '%s\n\n' "$(date '+%F %T')"
     printf '%s\n' "$body"
   } > "$file" 2>/dev/null || true
+  {
+    printf '\n===== %s · %s =====\n' "$(date '+%F %T')" "$title"
+    printf '%s\n' "$body"
+  } >> "$log" 2>/dev/null || true
+  _watch_file_tail "$log" 1200
 }
 
 _watch_state_write() {  # pane started poll goal policy auto maxcalls calls quiet marked status next_at last_decision
@@ -198,6 +204,92 @@ _clip_lines() {  # _clip_lines <width> <max-lines> [file]
       n++
       if (n >= max) exit
     }'
+}
+
+_monitor_state_read() {  # sets monitor globals for a watch file
+  local wf="$1"
+  mon_now="$(now)"
+  mon_poll="$(_state_get "$wf" poll)"
+  mon_goal="$(_state_get "$wf" goal)"
+  mon_policy="$(_state_get "$wf" policy)"
+  mon_auto="$(_state_get "$wf" autonomy)"
+  mon_maxcalls="$(_state_get "$wf" maxcalls)"
+  mon_calls="$(_state_get "$wf" calls)"
+  mon_quiet="$(_state_get "$wf" quiet)"
+  mon_marked="$(_state_get "$wf" marked)"
+  mon_status="$(_state_get "$wf" status)"
+  mon_next_at="$(_state_get "$wf" next_at)"
+  mon_updated="$(_state_get "$wf" updated)"
+  mon_last_decision="$(_state_get "$wf" last_decision)"
+  case "$mon_next_at" in ''|*[!0-9]*) mon_remain=0 ;; *) mon_remain=$((mon_next_at - mon_now)); [ "$mon_remain" -lt 0 ] && mon_remain=0 ;; esac
+  case "$mon_status" in
+    "calling model:"*) mon_next_label="after model + ${mon_poll:-?}s" ;;
+    *) mon_next_label="${mon_remain}s" ;;
+  esac
+}
+
+_monitor_draw_header() {  # _monitor_draw_header <mode> <label> <cols> <wf>
+  local mode="$1" label="$2" cols="$3" wf="$4" sep
+  _monitor_state_read "$wf"
+  sep="$(printf '%*s' "$cols" '' | tr ' ' '-')"
+  printf '\0337'
+  printf '\033[1;1H\033[2K\033[7;1m AI monitor · %s \033[0m  %s%s%s' "$mode" "$CD" "$label" "$CR"
+  printf '\033[2;1H\033[2Kstatus=%s%s%s · next=%s · calls=%s/%s · quiet=%s · mark=%s · poll=%ss · updated=%s' \
+    "$CC" "${mon_status:-starting}" "$CR" "$mon_next_label" "${mon_calls:-0}" "${mon_maxcalls:-?}" "${mon_quiet:-0}" "${mon_marked:-0}" "${mon_poll:-?}" "${mon_updated:-?}"
+  printf '\033[3;1H\033[2K'
+  if [ -n "$mon_goal" ]; then
+    printf '%sgoal: %s%s' "$CD" "$mon_goal" "$CR"
+  else
+    printf '%spolicy=%s autonomy=%s last-decision=%s%s' "$CD" "${mon_policy:-?}" "${mon_auto:-?}" "${mon_last_decision:-none}" "$CR"
+  fi
+  printf '\033[4;1H\033[2K%s%s%s' "$CD" "$sep" "$CR"
+  printf '\0338'
+}
+
+_monitor_color_timeline() {
+  awk -v CG="$CG" -v CY="$CY" -v CC="$CC" -v CM="$CM" -v CD="$CD" -v CR="$CR" '
+    {
+      kind=$2
+      color=CD
+      if (kind == "send" || kind == "done") color=CG
+      else if (kind == "decide" || kind == "cooldown") color=CC
+      else if (kind == "pause" || kind == "unknown" || kind == "escalate") color=CM
+      else if (kind == "wait") color=CY
+      printf "%s%s%s\n", color, $0, CR
+    }'
+}
+
+_monitor_color_detail() {
+  awk -v CC="$CC" -v CD="$CD" -v CR="$CR" '
+    /^===== / { printf "%s%s%s\n", CC, $0, CR; next }
+    /^(Backend|Target|Autonomy|Policy|Goal|Model JSON|Backend stderr|Pane excerpt|Parsed decision|Recent feed)/ {
+      printf "%s%s%s\n", CD, $0, CR; next
+    }
+    { print }'
+}
+
+_monitor_emit_new() {  # _monitor_emit_new <mode> <file> <old-line-count> <width>
+  local mode="$1" file="$2" old="$3" width="$4" total start
+  monitor_emit_total="$old"
+  [ -f "$file" ] || return 0
+  total="$(wc -l < "$file" 2>/dev/null | tr -d '[:space:]' || echo 0)"
+  case "$total" in ''|*[!0-9]*) total=0 ;; esac
+  if [ "$total" -lt "$old" ]; then old=0; fi
+  if [ "$total" -gt "$old" ]; then
+    start=$((old + 1))
+    case "$mode" in
+      timeline)
+        sed -n "${start},${total}p" "$file" 2>/dev/null | _clip_lines "$width" "$((total - old))" | _monitor_color_timeline
+        ;;
+      detail)
+        sed -n "${start},${total}p" "$file" 2>/dev/null | _monitor_color_detail
+        ;;
+      *)
+        sed -n "${start},${total}p" "$file" 2>/dev/null
+        ;;
+    esac
+  fi
+  monitor_emit_total="$total"
 }
 
 # Human-readable target for headers: "session:win.pane cmd" instead of "%160".
@@ -493,6 +585,7 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
   : > "$feed"                                  # create the feed before the monitor tails it
   : > "$base.timeline"
   : > "$base.detail"
+  : > "$base.detail.log"
   nohup bash "$SELF" _watch_loop "$pane" "$goal" "$policy" "$poll" "$auto" >"$feed" 2>&1 &
   disown 2>/dev/null || true
   # Companion monitor: a split next to the watched pane, not a covering popup.
@@ -625,75 +718,50 @@ cmd_status() {
 # stays live even when the watcher is sleeping between polls.
 # ---------------------------------------------------------------------------
 _monitor_loop() {  # _monitor_loop <timeline|detail|combined> <pane>
-  local mode="$1" pane="$2" wf base feed timeline detail label cols rows body now_s next_at remain
-  local started poll goal policy auto maxcalls calls quiet marked status updated last_decision next_label leftw rightw lefttmp righttmp
+  local mode="$1" pane="$2" wf base feed timeline detail detail_log label cols rows stream_top file pos=0
+  local last_cols=0 last_rows=0
   pane="$(_resolve_pane "$pane" 2>/dev/null || echo "$pane")"
   wf="$(_wf "$pane")"; base="${wf%.watch}"
-  feed="$base.out"; timeline="$base.timeline"; detail="$base.detail"
+  feed="$base.out"; timeline="$base.timeline"; detail="$base.detail"; detail_log="$base.detail.log"
   label="$(_pane_label "$pane")"
   [ -f "$feed" ] || : > "$feed"
   [ -f "$timeline" ] || : > "$timeline"
+  [ -f "$detail_log" ] || : > "$detail_log"
   [ -f "$detail" ] || : > "$detail"
+  case "$mode" in
+    timeline) file="$timeline" ;;
+    detail) file="$detail_log" ;;
+    *) file="$detail_log" ;;
+  esac
+  # Clear once, then keep the top four rows fixed. The content region below is
+  # append-only, so tmux scrollback stays useful and countdown updates do not
+  # repaint the whole pane.
+  printf '\033[?25l\033[H\033[J'
+  trap 'printf "\033[r\033[?25h"; exit 0' TERM INT
   while [ -f "$wf" ]; do
     cols="$(tput cols 2>/dev/null || echo 100)"
     rows="$(tput lines 2>/dev/null || echo 24)"
     case "$cols" in ''|*[!0-9]*) cols=100 ;; esac
     case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
-    body=$((rows - 5)); [ "$body" -lt 6 ] && body=6
-    now_s="$(now)"
-    started="$(_state_get "$wf" started)"; poll="$(_state_get "$wf" poll)"
-    goal="$(_state_get "$wf" goal)"; policy="$(_state_get "$wf" policy)"
-    auto="$(_state_get "$wf" autonomy)"; maxcalls="$(_state_get "$wf" maxcalls)"
-    calls="$(_state_get "$wf" calls)"; quiet="$(_state_get "$wf" quiet)"
-    marked="$(_state_get "$wf" marked)"; status="$(_state_get "$wf" status)"
-    next_at="$(_state_get "$wf" next_at)"; updated="$(_state_get "$wf" updated)"
-    last_decision="$(_state_get "$wf" last_decision)"
-    case "$next_at" in ''|*[!0-9]*) remain=0 ;; *) remain=$((next_at - now_s)); [ "$remain" -lt 0 ] && remain=0 ;; esac
-    case "$status" in
-      "calling model:"*) next_label="after model + ${poll:-?}s" ;;
-      *) next_label="${remain}s" ;;
-    esac
-
-    printf '\033[H\033[J'
-    printf '\033[7;1m AI monitor · %s \033[0m  %s%s%s\n' "$mode" "$CD" "$label" "$CR"
-    printf 'status=%s%s%s · next=%s · calls=%s/%s · quiet=%s · mark=%s · poll=%ss · updated=%s\n' \
-      "$CC" "${status:-starting}" "$CR" "$next_label" "${calls:-0}" "${maxcalls:-?}" "${quiet:-0}" "${marked:-0}" "${poll:-?}" "${updated:-?}"
-    [ -n "$goal" ] && printf '%sgoal: %s%s\n' "$CD" "$goal" "$CR" || printf '%spolicy=%s autonomy=%s last-decision=%s%s\n' "$CD" "${policy:-?}" "${auto:-?}" "${last_decision:-none}" "$CR"
-    printf '%s%s\n' "$CD" "$(printf '%*s' "$cols" '' | tr ' ' '-')"
-
-    case "$mode" in
-      timeline)
-        { printf 'Timeline\n'; tail -n "$((body - 1))" "$timeline" 2>/dev/null; } | _clip_lines "$cols" "$body"
-        ;;
-      detail)
-        {
-          printf 'Detail\n'
-          cat "$detail" 2>/dev/null
-          printf '\nRecent feed\n'
-          tail -n 8 "$feed" 2>/dev/null
-        } | sed -n "1,${body}p"
-        ;;
-      *)
-        leftw=$((cols * 42 / 100)); [ "$leftw" -lt 34 ] && leftw=34
-        rightw=$((cols - leftw - 3)); [ "$rightw" -lt 30 ] && rightw=30
-        lefttmp="$(mktemp "${TMPDIR:-/tmp}/tmuxai-left.XXXXXX")"
-        righttmp="$(mktemp "${TMPDIR:-/tmp}/tmuxai-right.XXXXXX")"
-        { printf 'Timeline\n'; tail -n "$((body - 1))" "$timeline" 2>/dev/null; } | _clip_lines "$leftw" "$body" > "$lefttmp"
-        {
-          printf 'Detail\n'
-          cat "$detail" 2>/dev/null
-          printf '\nRecent feed\n'
-          tail -n 6 "$feed" 2>/dev/null
-        } | _clip_lines "$rightw" "$body" > "$righttmp"
-        paste "$lefttmp" "$righttmp" 2>/dev/null | while IFS=$'\t' read -r l r; do
-          printf "%-${leftw}s │ %s\n" "$l" "$r"
-        done
-        rm -f "$lefttmp" "$righttmp"
-        ;;
-    esac
+    if [ "$cols" -ne "$last_cols" ] || [ "$rows" -ne "$last_rows" ]; then
+      stream_top=5
+      printf '\033[r\033[H\033[J'
+      printf '\033[%s;%sr' "$stream_top" "$rows"
+      printf '\033[%s;1H' "$stream_top"
+      case "$mode" in
+        timeline) printf '%sTimeline%s\n' "$CC" "$CR" ;;
+        detail) printf '%sDetail log%s\n' "$CC" "$CR" ;;
+        *) printf '%sDetail log%s\n' "$CC" "$CR" ;;
+      esac
+      pos=0
+      last_cols="$cols"; last_rows="$rows"
+    fi
+    _monitor_draw_header "$mode" "$label" "$cols" "$wf"
+    _monitor_emit_new "$mode" "$file" "$pos" "$cols"
+    case "${monitor_emit_total:-}" in ''|*[!0-9]*) : ;; *) pos="$monitor_emit_total" ;; esac
     sleep 1
   done
-  printf '\033[H\033[J'
+  printf '\033[r\033[?25h'
   printf '\033[2m— 监控结束，本窗即将关闭 —\033[0m\n'
   sleep 3
 }
@@ -794,14 +862,16 @@ cmd_cleanup() {
     [ -e "$wf" ] || continue
     pid="$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)"
     kill -0 "$pid" 2>/dev/null && continue
-    rm -f "$wf" "${wf%.watch}.out" "${wf%.watch}.timeline" "${wf%.watch}.detail"; n=$((n+1))
+    rm -f "$wf" "${wf%.watch}.out" "${wf%.watch}.timeline" "${wf%.watch}.detail" "${wf%.watch}.detail.log" "${wf%.watch}.brain.err"; n=$((n+1))
   done
-  for f in "$WATCH_DIR"/*.out "$WATCH_DIR"/*.timeline "$WATCH_DIR"/*.detail; do
+  for f in "$WATCH_DIR"/*.out "$WATCH_DIR"/*.timeline "$WATCH_DIR"/*.detail "$WATCH_DIR"/*.detail.log "$WATCH_DIR"/*.brain.err; do
     [ -e "$f" ] || continue
     case "$f" in
       *.out) base="${f%.out}" ;;
       *.timeline) base="${f%.timeline}" ;;
+      *.detail.log) base="${f%.detail.log}" ;;
       *.detail) base="${f%.detail}" ;;
+      *.brain.err) base="${f%.brain.err}" ;;
       *) base="${f%.*}" ;;
     esac
     [ -f "$base.watch" ] || rm -f "$f"

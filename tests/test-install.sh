@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# install-hooks.sh portability + safety tests. Runs entirely against throwaway
+# HOME-like dirs; never touches the real ~/.claude, ~/.codex, ~/.config/opencode.
+#
+# The interesting trick: a `sed` shim on PATH that FAILS on any -i invocation.
+# GNU sed reads `-i ''` as "-i" plus an empty script, so BSD-only in-place edits
+# would break a Linux install. Running the whole installer under the shim proves
+# no such call survives, without needing a Linux box.
+set -u
+WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+T="$(mktemp -d /tmp/radar-install.XXXXXX)"
+
+PASS=0; FAIL=0
+ok()  { PASS=$((PASS+1)); echo "PASS: $1"; }
+bad() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
+chk() { if eval "$2"; then ok "$1"; else bad "$1 -- [$2]"; fi; }
+
+command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not installed"; exit 0; }
+REAL_SED="$(command -v sed)"
+
+# --- the GNU-sed shim ------------------------------------------------------
+mkdir -p "$T/bin"
+cat > "$T/bin/sed" <<EOF
+#!/bin/sh
+for a in "\$@"; do
+  case "\$a" in
+    -i|-i*) echo "sed-shim: refusing '-i' (GNU sed would eat the next arg as its script)" >&2; exit 42 ;;
+  esac
+done
+exec "$REAL_SED" "\$@"
+EOF
+chmod +x "$T/bin/sed"
+export PATH="$T/bin:$PATH"
+chk "shim is active (sed -i now fails)" "! sed -i '' 's/a/b/' /dev/null 2>/dev/null"
+
+echo
+echo "### lint: no BSD-only in-place edits anywhere in scripts/"
+# real code only — a comment explaining why `sed -i` is banned isn't a violation
+sed_i_hits() {
+  grep -rn --include='*.sh' -E '(^|[^_[:alnum:]])sed[[:space:]]+-i' "$WT/scripts/" 2>/dev/null |
+    grep -vE ':[0-9]+:[[:space:]]*#'
+}
+chk "no 'sed -i' in scripts/ (comments excluded)" "! sed_i_hits | grep -q ."
+
+echo
+echo "### install/uninstall round-trip under the shim, from a path with & and #"
+# a scripts dir whose path contains sed-hostile characters
+SRC="$T/pa#th & dir/scripts"
+mkdir -p "$SRC"; cp "$WT/scripts/"*.sh "$SRC/"; cp "$WT/scripts/opencode-tmux-notify.js" "$SRC/"
+chmod +x "$SRC/"*.sh
+IH="$SRC/install-hooks.sh"
+NOTIFY_PATH="$SRC/needinput-notify.sh"
+
+export CLAUDE_SETTINGS="$T/home/.claude/settings.json"
+export CODEX_CONFIG="$T/home/.codex/config.toml"
+export OPENCODE_CONFIG_DIR="$T/home/.config/opencode"
+mkdir -p "$T/home/.claude" "$T/home/.codex" "$OPENCODE_CONFIG_DIR"
+
+# pre-existing user content that must be preserved
+cat > "$CLAUDE_SETTINGS" <<'JSON'
+{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo mine"}]}]}}
+JSON
+cat > "$CODEX_CONFIG" <<'TOML'
+model = "gpt-5.3-codex"
+notify = ["node", "/opt/other-tool/notify.js"]
+TOML
+
+OUT="$(bash "$IH" install 2>&1)"; RC=$?
+chk "install exits 0 under the GNU-sed shim" "[ $RC -eq 0 ]"
+chk "install never invoked 'sed -i'" "! printf '%s' \"\$OUT\" | grep -q 'sed-shim'"
+
+chk "claude: 5 hooks installed" "[ \$(jq '[.hooks[]?[]?.hooks[]?.command | select(startswith(\"$NOTIFY_PATH \"))] | length' '$CLAUDE_SETTINGS') -eq 5 ]"
+chk "claude: SessionStart -> claude-register" "jq -e '[.hooks.SessionStart[]?.hooks[]?.command] | any(endswith(\"claude-register\"))' '$CLAUDE_SETTINGS' >/dev/null"
+chk "claude: SessionEnd -> claude-end" "jq -e '[.hooks.SessionEnd[]?.hooks[]?.command] | any(endswith(\"claude-end\"))' '$CLAUDE_SETTINGS' >/dev/null"
+chk "claude: user's own Stop hook preserved" "jq -e '[.hooks.Stop[]?.hooks[]?.command] | any(. == \"echo mine\")' '$CLAUDE_SETTINGS' >/dev/null"
+chk "claude: unrelated keys preserved" "[ \$(jq -r .model '$CLAUDE_SETTINGS') = opus ]"
+
+chk "codex: notify chain WRAPPED, not replaced (& and # in path survived)" \
+  "grep -q 'other-tool/notify.js' '$CODEX_CONFIG' && grep -qF 'codex-notify-wrap.sh' '$CODEX_CONFIG'"
+chk "codex: 3 hook blocks appended" "[ \$(grep -cF 'needinput-notify.sh codex-hook' '$CODEX_CONFIG') -eq 3 ]"
+chk "opencode: plugin installed" "[ -f '$OPENCODE_CONFIG_DIR/plugins/tmux-radar.js' ]"
+chk "opencode: placeholder substituted with the real (&/# laden) path" \
+  "grep -qF 'const NOTIFY = \"$NOTIFY_PATH\"' '$OPENCODE_CONFIG_DIR/plugins/tmux-radar.js'"
+chk "opencode: plugin is valid JS after substitution" \
+  "! command -v node >/dev/null || node --check '$OPENCODE_CONFIG_DIR/plugins/tmux-radar.js' 2>/dev/null"
+
+echo
+echo "### idempotency: a second install must not duplicate anything"
+bash "$IH" install >/dev/null 2>&1
+chk "claude: still exactly 5 hooks after reinstall" "[ \$(jq '[.hooks[]?[]?.hooks[]?.command | select(startswith(\"$NOTIFY_PATH \"))] | length' '$CLAUDE_SETTINGS') -eq 5 ]"
+chk "claude: SessionEnd survived the legacy-migration pass" "jq -e '[.hooks.SessionEnd[]?.hooks[]?.command] | any(endswith(\"claude-end\"))' '$CLAUDE_SETTINGS' >/dev/null"
+chk "codex: still exactly 3 hook blocks" "[ \$(grep -cF 'needinput-notify.sh codex-hook' '$CODEX_CONFIG') -eq 3 ]"
+chk "codex: notify wrapped only once" "[ \$(grep -cF 'codex-notify-wrap.sh' '$CODEX_CONFIG') -eq 1 ]"
+
+STATUS="$(bash "$IH" status 2>&1)"
+chk "status reports 5/5 claude hooks" "printf '%s' \"\$STATUS\" | grep -q 'Claude hooks installed: 5/5'"
+chk "status reports 3/3 codex hooks" "printf '%s' \"\$STATUS\" | grep -q 'Codex hooks installed: 3/3'"
+chk "status reports the opencode plugin" "printf '%s' \"\$STATUS\" | grep -q 'opencode plugin: installed'"
+
+echo
+echo "### uninstall under the shim leaves the user's config intact"
+OUT2="$(bash "$IH" uninstall 2>&1)"; RC2=$?
+chk "uninstall exits 0 under the GNU-sed shim" "[ $RC2 -eq 0 ]"
+chk "uninstall never invoked 'sed -i'" "! printf '%s' \"\$OUT2\" | grep -q 'sed-shim'"
+chk "claude: all 5 of our hooks removed" "[ \$(jq '[.hooks[]?[]?.hooks[]?.command | select(startswith(\"$NOTIFY_PATH \"))] | length' '$CLAUDE_SETTINGS') -eq 0 ]"
+chk "claude: user's own Stop hook still there" "jq -e '[.hooks.Stop[]?.hooks[]?.command] | any(. == \"echo mine\")' '$CLAUDE_SETTINGS' >/dev/null"
+chk "codex: hook blocks gone" "! grep -qF 'needinput-notify.sh codex-hook' '$CODEX_CONFIG'"
+chk "codex: our wrap unwrapped" "! grep -qF 'codex-notify-wrap.sh' '$CODEX_CONFIG'"
+chk "codex: the user's original notify chain restored" "grep -q 'other-tool/notify.js' '$CODEX_CONFIG'"
+chk "codex: unrelated config preserved" "grep -q 'gpt-5.3-codex' '$CODEX_CONFIG'"
+chk "opencode: plugin removed" "[ ! -f '$OPENCODE_CONFIG_DIR/plugins/tmux-radar.js' ]"
+
+echo
+echo "### symlinked configs (dotfile repos) must stay symlinks"
+rm -rf "$T/home"; mkdir -p "$T/home/.claude" "$T/home/.codex" "$T/dots"
+printf '{}' > "$T/dots/settings.json"
+printf 'model = "x"\n' > "$T/dots/config.toml"
+ln -sf "$T/dots/settings.json" "$CLAUDE_SETTINGS"
+ln -sf "$T/dots/config.toml" "$CODEX_CONFIG"
+bash "$IH" install >/dev/null 2>&1
+chk "claude settings is STILL a symlink after install" "[ -L '$CLAUDE_SETTINGS' ]"
+chk "codex config is STILL a symlink after install" "[ -L '$CODEX_CONFIG' ]"
+chk "the dotfile-repo file actually received the hooks" "grep -q claude-register '$T/dots/settings.json'"
+chk "the dotfile-repo toml actually received the hooks" "grep -qF 'codex-hook' '$T/dots/config.toml'"
+bash "$IH" uninstall >/dev/null 2>&1
+chk "claude settings is still a symlink after uninstall" "[ -L '$CLAUDE_SETTINGS' ]"
+chk "codex config is still a symlink after uninstall" "[ -L '$CODEX_CONFIG' ]"
+
+echo
+echo "### opencode absent => skip, never create the directory"
+rm -rf "$T/home2"; export OPENCODE_CONFIG_DIR="$T/home2/.config/opencode"
+if command -v opencode >/dev/null 2>&1; then
+  echo "SKIP: opencode is on PATH here, cannot test the absent branch"
+else
+  OUT3="$(bash "$IH" install 2>&1)"
+  chk "opencode absent: reported as skipped" "printf '%s' \"\$OUT3\" | grep -q 'opencode not found'"
+  chk "opencode absent: no directory created" "[ ! -d '$T/home2' ]"
+fi
+
+rm -rf "$T"
+echo
+echo "=============================="
+echo "PASS=$PASS FAIL=$FAIL"
+[ "$FAIL" = 0 ]

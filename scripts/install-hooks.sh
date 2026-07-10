@@ -34,6 +34,30 @@ die()  { echo "error: $*" >&2; exit 1; }
 info() { echo "  $*"; }
 need_jq() { command -v jq >/dev/null 2>&1 || die "jq is required (brew install jq)"; }
 
+# --- portable, symlink-safe config editing ---------------------------------
+# `sed -i ''` is BSD-only (GNU sed reads the '' as its script and the real
+# script as a filename), and `mv tmp file` would replace a symlink — these
+# configs are routinely symlinked out of a dotfile repo — and drop its mode.
+# So: filter into a temp file, then write THROUGH the original path.
+
+_replace_file() {  # _replace_file <tmp> <target>
+  local tmp="$1" target="$2"
+  cat "$tmp" > "$target" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+}
+
+_sed_inplace() {  # _sed_inplace <sed-script> <file>
+  local script="$1" file="$2" tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/radar-sed.XXXXXX")" || return 1
+  sed "$script" "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  _replace_file "$tmp" "$file"
+}
+
+# Escape a path for use inside a sed replacement (& = whole match, \ escapes,
+# # is our delimiter) or a sed BRE pattern.
+_esc_rhs() { printf '%s' "${1:-}" | sed 's/[&#\]/\\&/g'; }
+_esc_lhs() { printf '%s' "${1:-}" | sed 's/[][^$.*\#]/\\&/g'; }
+
 claude_install() {
   need_jq
   mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
@@ -51,7 +75,7 @@ claude_install() {
                              | map(select((.hooks // []) | length > 0)) )
       | if (.hooks.SessionEnd | length) == 0 then del(.hooks.SessionEnd) else . end
     else . end
-  ' "$CLAUDE_SETTINGS" > "$mtmp" && mv "$mtmp" "$CLAUDE_SETTINGS"
+  ' "$CLAUDE_SETTINGS" > "$mtmp" && _replace_file "$mtmp" "$CLAUDE_SETTINGS"
   local i ev cmd tmp
   for i in "${!CLAUDE_EVENTS[@]}"; do
     ev="${CLAUDE_EVENTS[$i]}"; cmd="$NOTIFY ${CLAUDE_SUBCMDS[$i]}"; tmp="$(mktemp)"
@@ -59,7 +83,7 @@ claude_install() {
       .hooks //= {} | .hooks[$ev] //= []
       | if any(.hooks[$ev][]?; ((.hooks // [])[]?.command) == $cmd) then .
         else .hooks[$ev] += [ { "hooks": [ { "type": "command", "command": $cmd } ] } ] end
-    ' "$CLAUDE_SETTINGS" > "$tmp" && mv "$tmp" "$CLAUDE_SETTINGS"
+    ' "$CLAUDE_SETTINGS" > "$tmp" && _replace_file "$tmp" "$CLAUDE_SETTINGS"
     info "Claude $ev -> $cmd"
   done
 }
@@ -76,7 +100,7 @@ claude_uninstall() {
                     | map(select((.hooks // []) | length > 0)) )
       ) | .hooks |= with_entries(select((.value | length) > 0))
     else . end
-  ' "$CLAUDE_SETTINGS" > "$tmp" && mv "$tmp" "$CLAUDE_SETTINGS"
+  ' "$CLAUDE_SETTINGS" > "$tmp" && _replace_file "$tmp" "$CLAUDE_SETTINGS"
   info "removed Claude AI-status hooks"
 }
 
@@ -150,7 +174,7 @@ codex_install() {
     info "Codex notify already integrated (legacy fallback)"
   else
     if grep -qE '^[[:space:]]*notify[[:space:]]*=[[:space:]]*\[' "$CODEX_CONFIG"; then
-      sed -i '' "s#^\([[:space:]]*notify[[:space:]]*=[[:space:]]*\[\)#\1\"$CODEX_WRAP\", #" "$CODEX_CONFIG"
+      _sed_inplace "s#^\([[:space:]]*notify[[:space:]]*=[[:space:]]*\[\)#\1\"$(_esc_rhs "$CODEX_WRAP")\", #" "$CODEX_CONFIG"
       if grep -qF "$CODEX_WRAP" "$CODEX_CONFIG"; then info "Codex notify -> wrapped existing chain (preserved fallback)"
       else echo "  WARNING: could not auto-wrap Codex notify (multi-line array?). Prepend \"$CODEX_WRAP\" manually." >&2; fi
     else
@@ -165,13 +189,15 @@ codex_uninstall() {
   [ -f "$CODEX_CONFIG" ] || { info "no $CODEX_CONFIG"; return 0; }
   cp "$CODEX_CONFIG" "$CODEX_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
   if grep -qF "$CODEX_HOOK_BEGIN" "$CODEX_CONFIG"; then
-    sed -i '' "/$(printf '%s' "$CODEX_HOOK_BEGIN" | sed 's/[]\[^$.*/]/\\&/g')/,/$(printf '%s' "$CODEX_HOOK_END" | sed 's/[]\[^$.*/]/\\&/g')/d" "$CODEX_CONFIG"
+    _sed_inplace "/$(printf '%s' "$CODEX_HOOK_BEGIN" | sed 's/[]\[^$.*/]/\\&/g')/,/$(printf '%s' "$CODEX_HOOK_END" | sed 's/[]\[^$.*/]/\\&/g')/d" "$CODEX_CONFIG"
     info "removed Codex hooks"
   fi
   if grep -qF "$CODEX_WRAP" "$CODEX_CONFIG"; then
-    sed -i '' "s#\"$CODEX_WRAP\", ##" "$CODEX_CONFIG"; info "unwrapped Codex notify (restored chain)"
+    _sed_inplace "s#\"$(_esc_lhs "$CODEX_WRAP")\", ##" "$CODEX_CONFIG"; info "unwrapped Codex notify (restored chain)"
   elif grep -qF "$NOTIFY" "$CODEX_CONFIG"; then
-    grep -vF "$NOTIFY" "$CODEX_CONFIG" > "$CODEX_CONFIG.tmp" && mv "$CODEX_CONFIG.tmp" "$CODEX_CONFIG"; info "removed direct Codex notify"
+    local ctmp; ctmp="$(mktemp "${TMPDIR:-/tmp}/radar-codex.XXXXXX")"
+    grep -vF "$NOTIFY" "$CODEX_CONFIG" > "$ctmp" || true
+    _replace_file "$ctmp" "$CODEX_CONFIG"; info "removed direct Codex notify"
   elif codex_has_notify; then
     echo "  WARNING: our wrap is buried (JSON-escaped) inside another notify chain in $CODEX_CONFIG." >&2
     echo "  Remove the codex-notify-wrap.sh entry from that chain manually." >&2
@@ -204,9 +230,9 @@ opencode_install() {
   # replacement (& = whole match, # = our delimiter, \ = escape) and reject
   # a path that can't survive a JS string literal.
   case "$NOTIFY" in
-    *'"'*|*$'\n'*) die "notify path contains a quote/newline; cannot template: $NOTIFY" ;;
+    *'"'*|*'\'*|*$'\n'*) die "notify path contains a quote/backslash/newline; cannot template: $NOTIFY" ;;
   esac
-  esc="$(printf '%s' "$NOTIFY" | sed 's/[&#\\]/\\&/g')"
+  esc="$(_esc_rhs "$NOTIFY")"
   sed "s#__TMUX_RADAR_NOTIFY__#$esc#g" "$src" > "$tmp"
   if [ -f "$OPENCODE_PLUGIN" ] && ! cmp -s "$tmp" "$OPENCODE_PLUGIN"; then
     cp "$OPENCODE_PLUGIN" "$OPENCODE_PLUGIN.bak.$(date +%Y%m%d%H%M%S)"

@@ -68,7 +68,8 @@ long-running agents.
 ## Install
 
 Requirements: tmux ≥ 3.2 (uses `display-popup`), [`fzf`](https://github.com/junegunn/fzf),
-`jq` (only for the optional agent hook installer).
+`jq` (only for the optional agent hook installer). macOS and Linux; the scripts
+target bash 3.2 and POSIX awk/sed, so no GNU-only or BSD-only invocations.
 
 TPM — add to `~/.tmux.conf`, then `prefix + I`:
 
@@ -509,7 +510,16 @@ bash tests/test-registry.sh   # registry lifecycle, crash GC, pid-reuse defence,
                               # SessionEnd semantics, opencode events, bar restore
 bash tests/test-safety.sh     # supervisor guardrails: ask allowlist + ';' chains,
                               # cleanup pane-id safety, mark-GC evidence rules, locking
+bash tests/test-install.sh    # hook install/uninstall round-trip, idempotency,
+                              # symlinked configs, GNU/BSD sed portability
 ```
+
+`test-install.sh` runs the whole installer against throwaway config dirs with a
+`sed` shim on `PATH` that **fails on any `-i`**. GNU sed reads `sed -i '' …` as
+`-i` plus an empty script, so a BSD-only in-place edit breaks a Linux install —
+the shim catches that on macOS, without needing a Linux box. It also asserts
+that a symlinked `settings.json` / `config.toml` (dotfile repos) stays a symlink
+and that an existing Codex `notify` chain is wrapped, not replaced.
 
 ## Troubleshooting
 

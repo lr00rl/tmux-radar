@@ -45,7 +45,7 @@ if [ "$(opt @radar-ai off)" = "on" ]; then
     "让当前 pane 继续 / 决定一次"       c "$POP \"TMUX_RADAR_AI_PAUSE=1 $SCRIPTS/ai.sh decide '#{pane_id}'\"" \
     "" \
     "常驻监控当前 pane 直到完成"        w "run-shell \"$SCRIPTS/ai.sh watch '#{pane_id}'\"" \
-    "常驻监控 + always-allow（更省心）"  W "run-shell \"$SCRIPTS/ai.sh watch '#{pane_id}' '' always-allow\"" \
+    "⚡ 常驻监控 + always-allow（更省心）" W "run-shell \"$SCRIPTS/ai.sh watch '#{pane_id}' '' always-allow\"" \
     "自定义监控（目标 / 间隔 / 策略）…"  v "$POP \"$SCRIPTS/ai.sh watch-setup '#{pane_id}'\"" \
     "" \
     "状态 / 最近决策"                  s "$POP \"TMUX_RADAR_AI_PAUSE=1 $SCRIPTS/ai.sh status\"" \
@@ -73,10 +73,22 @@ if [ "$(tmux show-option -gqv @radar-hooked 2>/dev/null || true)" != "$HOOK_VERS
   tmux set-option -g @radar-hooked "$HOOK_VERSION"
 fi
 
-# Transient toast line (revealed only while toasts are live; the notifier
-# toggles `status 2` <-> `on`). Re-set each load (idempotent).
+# Toast line. @radar-bar: auto (default; notifier toggles status count between
+# 2 and the saved prior value while toasts are live) | pinned (user keeps
+# `status 2` themselves; we ensure it once at load and only fill content) |
+# off (never raise the bar; marks still tracked). Re-set each load (idempotent).
 if [ "$NEEDINPUT" = "on" ]; then
-  tmux set-option -g status-format[1] "#[align=right]#($SCRIPTS/needinput-toast.sh render) "
+  BAR_MODE="$(opt @radar-bar auto)"
+  case "$BAR_MODE" in
+    off) ;;
+    pinned)
+      tmux set-option -g status 2
+      tmux set-option -g status-format[1] "#[align=right]#($SCRIPTS/needinput-toast.sh render) "
+      ;;
+    *)
+      tmux set-option -g status-format[1] "#[align=right]#($SCRIPTS/needinput-toast.sh render) "
+      ;;
+  esac
   # prune marks left over from a previous server / restore on every (re)load
   tmux run-shell -b "$SCRIPTS/needinput-notify.sh tick" 2>/dev/null || true
 fi

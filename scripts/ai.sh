@@ -183,8 +183,10 @@ _watch_detail() {  # _watch_detail <pane> <title> <body>
 _watch_state_write() {  # pane started poll goal policy auto maxcalls calls quiet marked status next_at last_decision
   local pane="$1" started="$2" poll="$3" goal="$4" policy="$5" auto="$6" maxcalls="$7" calls="$8" quiet="$9"
   shift 9
-  local marked="$1" status="$2" next_at="$3" last_decision="$4" wf tmp
+  local marked="$1" status="$2" next_at="$3" last_decision="$4" wf tmp monitors=""
   wf="$(_wf "$pane")"
+  # monitors= is appended by cmd_watch after the splits; carry it across rewrites
+  [ -f "$wf" ] && monitors="$(_state_get "$wf" monitors)"
   tmp="$(mktemp "${wf}.XXXXXX")" || return 0
   {
     printf 'pid=%s\npane=%s\nstarted=%s\npoll=%s\ngoal=%s\n' "$$" "$pane" "$started" "$poll" "$(_flat "$goal")"
@@ -192,6 +194,7 @@ _watch_state_write() {  # pane started poll goal policy auto maxcalls calls quie
       "${policy:-safe-auto}" "$auto" "$maxcalls" "$calls" "$quiet" "$marked"
     printf 'status=%s\nnext_at=%s\nlast_decision=%s\nupdated=%s\n' \
       "$(_flat "$status")" "$next_at" "$last_decision" "$(now)"
+    if [ -n "$monitors" ]; then printf 'monitors=%s\n' "$monitors"; fi
   } > "$tmp" 2>/dev/null
   if [ -s "$tmp" ]; then
     mv "$tmp" "$wf" || rm -f "$tmp"
@@ -217,6 +220,25 @@ _clip_lines() {  # _clip_lines <width> <max-lines> [file]
     }'
 }
 
+_clip_str() {  # _clip_str <width> <text> — single-line variant of _clip_lines
+  printf '%s\n' "$2" | _clip_lines "$1" 1
+}
+
+_rel_age() {  # _rel_age <age-seconds> -> '3s前' / '2m前' / '1h前'
+  local s="$1"
+  case "$s" in ''|*[!0-9]*) printf '?'; return 0 ;; esac
+  if [ "$s" -lt 60 ]; then printf '%ss前' "$s"
+  elif [ "$s" -lt 3600 ]; then printf '%sm前' "$((s / 60))"
+  else printf '%sh前' "$((s / 3600))"
+  fi
+}
+
+_fmt_hms() {  # _fmt_hms <seconds> -> h:mm:ss
+  local t="$1"
+  case "$t" in ''|*[!0-9]*) t=0 ;; esac
+  printf '%d:%02d:%02d' "$((t / 3600))" "$((t % 3600 / 60))" "$((t % 60))"
+}
+
 _monitor_state_read() {  # sets monitor globals for a watch file
   local wf="$1"
   mon_now="$(now)"
@@ -240,19 +262,28 @@ _monitor_state_read() {  # sets monitor globals for a watch file
 }
 
 _monitor_draw_header() {  # _monitor_draw_header <mode> <label> <cols> <wf>
-  local mode="$1" label="$2" cols="$3" wf="$4" sep
+  local mode="$1" label="$2" cols="$3" wf="$4" sep upd_rel line2 line3 lw
   _monitor_state_read "$wf"
+  case "$mon_updated" in ''|*[!0-9]*) upd_rel='?' ;; *) upd_rel="$(_rel_age $((mon_now - mon_updated)))" ;; esac
   sep="$(printf '%*s' "$cols" '' | tr ' ' '-')"
-  printf '\0337'
-  printf '\033[1;1H\033[2K\033[7;1m AI monitor · %s \033[0m  %s%s%s' "$mode" "$CD" "$label" "$CR"
-  printf '\033[2;1H\033[2Kstatus=%s%s%s · next=%s · calls=%s/%s · quiet=%s · mark=%s · poll=%ss · updated=%s' \
-    "$CC" "${mon_status:-starting}" "$CR" "$mon_next_label" "${mon_calls:-0}" "${mon_maxcalls:-?}" "${mon_quiet:-0}" "${mon_marked:-0}" "${mon_poll:-?}" "${mon_updated:-?}"
-  printf '\033[3;1H\033[2K'
+  # clip every header line to the pane width: an over-long line would wrap
+  # into the next header row and shred the fixed scroll region
+  lw=$((cols - ${#mode} - 18)); [ "$lw" -lt 12 ] && lw=12
+  line2="status=${mon_status:-starting} · next=$mon_next_label · calls=${mon_calls:-0}/${mon_maxcalls:-?} · quiet=${mon_quiet:-0} · mark=${mon_marked:-0} · poll=${mon_poll:-?}s · updated=$upd_rel"
   if [ -n "$mon_goal" ]; then
-    printf '%sgoal: %s%s' "$CD" "$mon_goal" "$CR"
+    line3="goal: $mon_goal"
   else
-    printf '%spolicy=%s autonomy=%s last-decision=%s%s' "$CD" "${mon_policy:-?}" "${mon_auto:-?}" "${mon_last_decision:-none}" "$CR"
+    line3="policy=${mon_policy:-?} autonomy=${mon_auto:-?} last-decision=${mon_last_decision:-none}"
   fi
+  printf '\0337'
+  printf '\033[1;1H\033[2K\033[7;1m AI monitor · %s \033[0m  %s%s%s' "$mode" "$CD" "$(_clip_str "$lw" "$label")" "$CR"
+  if [ "${#line2}" -le "$cols" ]; then
+    printf '\033[2;1H\033[2Kstatus=%s%s%s · next=%s · calls=%s/%s · quiet=%s · mark=%s · poll=%ss · updated=%s' \
+      "$CC" "${mon_status:-starting}" "$CR" "$mon_next_label" "${mon_calls:-0}" "${mon_maxcalls:-?}" "${mon_quiet:-0}" "${mon_marked:-0}" "${mon_poll:-?}" "$upd_rel"
+  else
+    printf '\033[2;1H\033[2K%s' "$(_clip_str "$cols" "$line2")"
+  fi
+  printf '\033[3;1H\033[2K%s%s%s' "$CD" "$(_clip_str "$cols" "$line3")" "$CR"
   printf '\033[4;1H\033[2K%s%s%s' "$CD" "$sep" "$CR"
   printf '\0338'
 }
@@ -317,6 +348,14 @@ _resolve_pane() {
     p="$(awk -F '\t' '$1 != "-" && NF >= 2 { if ($2+0 >= best) { best=$2+0; win=$1 } } END { print win }' "$STATE_FILE" 2>/dev/null || true)"
   fi
   [ -n "$p" ] || return 1
+  tmux display-message -p -t "$p" '#{pane_id}' 2>/dev/null
+}
+
+# Strict variant for anything that SENDS to a pane (decide/watch): guessing
+# "most recently marked pane" is fine for display, not for keystrokes.
+_resolve_pane_strict() {
+  local p="${1:-${TMUX_PANE:-}}"
+  [ -n "$p" ] || { echo "请指定 pane（当前不在 tmux pane 内）" >&2; return 1; }
   tmux display-message -p -t "$p" '#{pane_id}' 2>/dev/null
 }
 
@@ -385,8 +424,8 @@ cmd_decide() {
   need_jq
   have_brain || { echo "codex 未安装/不可用，无法决策。"; return 3; }
   local pane autonomy policy goal cap cap_tail where json pretty_json action text safe reason extra="" prompt backend
-  local excerpt_lines errfile err_tail
-  pane="$(_resolve_pane "${1:-}")" || { echo "no target pane"; return 5; }
+  local excerpt_lines errfile err_tail cap_hash recap rehash
+  pane="$(_resolve_pane_strict "${1:-}")" || return 5
   autonomy="${2:-$(opt @radar-ai-autonomy confirm)}"
   policy="${3:-}"
   goal="${4:-}"
@@ -400,6 +439,8 @@ cmd_decide() {
   where="$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}' 2>/dev/null || echo "$pane")"
   cap="$(tmux capture-pane -p -t "$pane" -S "-$(opt @radar-ai-capture-lines 120)" 2>/dev/null || true)"
   [ -n "$cap" ] || { echo "pane $pane: nothing to read"; return 5; }
+  # hash what the model will see; re-checked right before sending (TOCTOU)
+  cap_hash="$(printf '%s' "$cap" | cksum | awk '{print $1}')"
   excerpt_lines="$(_monitor_excerpt_lines)"
   cap_tail="$(printf '%s\n' "$cap" | tail -n "$excerpt_lines")"
 
@@ -419,12 +460,19 @@ cmd_decide() {
   pretty_json="$(_pretty_json "$json")"
   action="$(printf '%s' "$json" | jq -r '.action // "unknown"' 2>/dev/null || echo unknown)"
   text="$(printf '%s' "$json" | jq -r '.text // ""' 2>/dev/null || echo '')"
-  safe="$(printf '%s' "$json" | jq -r 'if .safe == false then "0" else "1" end' 2>/dev/null || echo 0)"
+  # fail closed: only an explicit safe==true counts (missing/null/garbage -> 0)
+  safe="$(printf '%s' "$json" | jq -r 'if .safe == true then "1" else "0" end' 2>/dev/null || echo 0)"
   reason="$(printf '%s' "$json" | jq -r '.reason // ""' 2>/dev/null || echo '')"
   local keys=() _k                     # bash 3.2 (macOS) has no mapfile
   while IFS= read -r _k; do [ -n "$_k" ] && keys+=("$_k"); done \
     < <(printf '%s' "$json" | jq -r '.keys[]? // empty' 2>/dev/null || true)
   local plan; plan="$(printf 'text=%q keys=[%s]' "$text" "${keys[*]:-}")"
+  # empty/unparseable brain output usually means the backend itself failed
+  # (auth expired, network) — surface its stderr tail where the user looks
+  if { [ -z "$json" ] || [ -z "$action" ] || [ "$action" = "unknown" ]; } && [ -z "$reason" ] \
+     && [ -n "${errfile:-}" ] && [ -s "$errfile" ]; then
+    reason="$(tail -n 3 "$errfile" 2>/dev/null | tr '\n\t' '  ' | sed -e 's/  */ /g' -e 's/^ //')"
+  fi
 
   if [ -n "${TMUX_RADAR_AI_DETAIL:-${TMUX_SWITCHER_AI_DETAIL:-}}" ]; then
     err_tail=""
@@ -445,13 +493,13 @@ cmd_decide() {
   fi
 
   case "$action" in
-    wait)  printf '%s· %s 仍在工作%s — %s\n' "$CD" "$pane" "$CR" "$reason"; return 3 ;;
-    done)  printf '%s✓ %s 任务完成%s — %s\n' "$CG" "$pane" "$CR" "$reason"; _clearmark "$pane"; return 2 ;;
-    unknown|"") printf '%s? %s 无法判读%s — %s\n' "$CY" "$pane" "$CR" "$reason"; return 5 ;;
+    wait)  printf '%s· %s 仍在工作%s%s\n' "$CD" "$pane" "$CR" "${reason:+ — $reason}"; return 3 ;;
+    done)  printf '%s✓ %s 任务完成%s%s\n' "$CG" "$pane" "$CR" "${reason:+ — $reason}"; _clearmark "$pane"; return 2 ;;
+    unknown|"") printf '%s? %s 无法判读%s%s\n' "$CY" "$pane" "$CR" "${reason:+ — $reason}"; return 5 ;;
   esac
   # action == send (or escalate)
   if [ "$action" = "escalate" ] || [ "$safe" = "0" ]; then
-    printf '%s⚠ %s 需要你来定%s — %s\n' "$CM" "$pane" "$CR" "$reason"; _escalate "$pane" "AI 拿不准: $reason"
+    printf '%s⚠ %s 需要你来定%s%s\n' "$CM" "$pane" "$CR" "${reason:+ — $reason}"; _escalate "$pane" "AI 拿不准: $reason"
     audit "escalate\t$pane\t$reason"; return 4
   fi
   case "$autonomy" in
@@ -465,6 +513,26 @@ cmd_decide() {
     auto-safe|auto) : ;;   # safe already ensured above
     *) echo "unknown autonomy: $autonomy" >&2; return 5 ;;
   esac
+  # copy-mode gate: keys sent now would hit the copy-mode KEY TABLE, not the
+  # app (Enter/y copy-and-cancel, destroying the user's scrollback position).
+  # Never cancel the user's mode; just refuse. Probe failure counts as unsafe.
+  if [ "$(tmux display-message -p -t "$pane" '#{pane_in_mode}' 2>/dev/null || echo 1)" != "0" ]; then
+    printf '%s· %s 用户在 copy-mode，暂停介入%s\n' "$CD" "$pane" "$CR"
+    [ -n "${TMUX_RADAR_AI_DETAIL:-${TMUX_SWITCHER_AI_DETAIL:-}}" ] && \
+      _watch_timeline "$pane" "wait" "用户在 copy-mode，暂停介入"
+    audit "defer-copy-mode\t$pane"; return 3
+  fi
+  # TOCTOU gate: the reply was composed for the captured screen; if the pane
+  # moved on while the model was thinking, don't land it on the new screen.
+  # The watch loop's decided-hash dedupe then re-decides the new screen.
+  recap="$(tmux capture-pane -p -t "$pane" -S "-$(opt @radar-ai-capture-lines 120)" 2>/dev/null || true)"
+  rehash="$(printf '%s' "$recap" | cksum | awk '{print $1}')"
+  if [ "$rehash" != "$cap_hash" ]; then
+    printf '%s· %s 屏幕在决策期间变化，放弃本次发送%s\n' "$CD" "$pane" "$CR"
+    [ -n "${TMUX_RADAR_AI_DETAIL:-${TMUX_SWITCHER_AI_DETAIL:-}}" ] && \
+      _watch_timeline "$pane" "wait" "屏幕在决策期间变化，放弃本次发送"
+    audit "abort-screen-changed\t$pane"; return 3
+  fi
   _send "$pane" "$text" "${keys[@]}"
   printf '%s✓ %s 已发送:%s %s   %s(%s)%s\n' "$CG" "$pane" "$CR" "$plan" "$CD" "$reason" "$CR"; _clearmark "$pane"
   audit "send\t$pane\t$plan\t$reason"; return 0
@@ -477,8 +545,8 @@ cmd_decide() {
 # ---------------------------------------------------------------------------
 cmd_watch_loop() {
   local pane goal policy wf poll auto maxcalls calls=0 last="" quiet=0 decided="" rc started last_decision="" status next_at
-  local cooldown_until=0 now_s sleep_for marked=0 cap h
-  pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane" >&2; return 1; }
+  local cooldown_until=0 now_s sleep_for marked=0 cap h mode_noted=0 self_verified=0
+  pane="$(_resolve_pane_strict "${1:-}")" || return 1
   goal="${2:-}"
   policy="${3:-}"
   [ -z "$policy" ] && [ "$(opt @radar-ai-watch-always-allow off)" = "on" ] && policy="always-allow"
@@ -502,6 +570,12 @@ cmd_watch_loop() {
 
   while :; do
     tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1 || { echo "pane $pane gone"; break; }
+    if [ "$self_verified" = 0 ]; then
+      # lost the start race: another loop owns the watch file — leave quietly
+      # without touching its state (skip the trailing rm/timeline)
+      [ "$(_state_get "$wf" pid)" = "$$" ] || { audit "watch-dup\t$pane\tlost pidfile race"; return 0; }
+      self_verified=1
+    fi
     now_s="$(now)"
     if [ "$cooldown_until" -gt "$now_s" ]; then
       status="cooldown after decision"
@@ -511,6 +585,23 @@ cmd_watch_loop() {
       sleep "$sleep_for"
       continue
     fi
+
+    # copy-mode gate: the user is reading scrollback; deciding now could end
+    # in keystrokes that yank them out of it. Skip the brain, keep polling.
+    if [ "$(tmux display-message -p -t "$pane" '#{pane_in_mode}' 2>/dev/null || echo 0)" != "0" ]; then
+      status="pane in copy-mode; deferring"
+      if [ "$mode_noted" = 0 ]; then   # one timeline entry per mode-entry, not per poll
+        _watch_timeline "$pane" "wait" "用户在 copy-mode，暂停介入"
+        mode_noted=1
+      fi
+      next_at="$(awk -v n="$now_s" -v p="$poll" 'BEGIN { if ((p+0) < 1) p = 1; printf "%d", n + p }')"
+      _watch_state_write "$pane" "$started" "$poll" "$goal" "$policy" "$auto" "$maxcalls" "$calls" "$quiet" "$marked" "$status" "$next_at" "$last_decision"
+      sleep_for=$((next_at - now_s))
+      [ "$sleep_for" -lt 1 ] && sleep_for=1
+      sleep "$sleep_for"
+      continue
+    fi
+    mode_noted=0
 
     marked=0
     cap="$(tmux capture-pane -p -t "$pane" -S "-$(opt @radar-ai-capture-lines 120)" 2>/dev/null || true)"
@@ -585,12 +676,27 @@ monitor_size() {  # monitor_size <pane> <height|width> <requested> <min> <reserv
 }
 
 cmd_watch() {  # detach the loop so the caller (popup/menu) can return
-  local pane goal policy poll auto wf base feed pos mon_size err layout mon_pane detail_cmd timeline_cmd single_cmd
+  local pane goal policy poll auto wf base feed pos mon_size layout mon_pane detail_pane detail_cmd timeline_cmd single_cmd
+  local lockdir lockpid tries=0 i=0 monitors=""
   local -a split_args
-  pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane"; return 1; }
+  pane="$(_resolve_pane_strict "${1:-}")" || return 1
   goal="${2:-}"; policy="${3:-}"; poll="${4:-}"; auto="${5:-}"
   wf="$(_wf "$pane")"; base="${wf%.watch}"; feed="$base.out"
+  # exclusive start lock: two concurrent starts can both pass the pid check
+  # below and fork two loops fighting over one watch file
+  lockdir="$wf.lock"
+  until mkdir "$lockdir" 2>/dev/null; do
+    lockpid="$(cat "$lockdir/pid" 2>/dev/null || true)"
+    if [ -n "$lockpid" ] && ! kill -0 "$lockpid" 2>/dev/null; then
+      rm -rf "$lockdir"; continue              # stale: holder died mid-start
+    fi
+    tries=$((tries+1))
+    [ "$tries" -ge 20 ] && { echo "watch: another start in progress for $pane"; return 1; }
+    sleep 0.2
+  done
+  printf '%s' "$$" > "$lockdir/pid" 2>/dev/null || true
   if [ -f "$wf" ] && kill -0 "$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)" 2>/dev/null; then
+    rm -rf "$lockdir"
     echo "already watching $pane (stop it first)"; return 0
   fi
   : > "$feed"                                  # create the feed before the monitor tails it
@@ -599,6 +705,10 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
   : > "$base.detail.log"
   nohup bash "$SELF" _watch_loop "$pane" "$goal" "$policy" "$poll" "$auto" >"$feed" 2>&1 &
   disown 2>/dev/null || true
+  # hold the lock until the loop has written its watch file, so a racing start
+  # sees a live pid instead of an absent file
+  while [ ! -f "$wf" ] && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i+1)); done
+  rm -rf "$lockdir"
   # Companion monitor: a split next to the watched pane, not a covering popup.
   # In the default split layout, the monitor region is split again into
   # timeline + detail panes. If the second split fails, the watcher still runs.
@@ -628,20 +738,23 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
       # pass STATE_DIR explicitly: the split pane inherits the tmux server env, not
       # the watcher's, so this keeps the monitor's feed/pidfile paths in sync.
       if [ "$layout" = "single" ]; then
-        if err="$(tmux split-window "${split_args[@]}" -d -t "$pane" "$single_cmd" 2>&1)"; then
+        if mon_pane="$(tmux split-window "${split_args[@]}" -P -F '#{pane_id}' -d -t "$pane" "$single_cmd" 2>&1)"; then
+          monitors="$mon_pane"
           audit "monitor-start\t$pane\t$pos\tsingle\tsize=$mon_size"
         else
-          printf '%s⚠ 监控 pane 打开失败%s（watch 仍在运行）%s\n' "$CY" "$CR" "${err:+: $err}"
-          audit "monitor-fail\t$pane\t$pos\tsingle\tsize=${mon_size:-?}\t$err"
+          printf '%s⚠ 监控 pane 打开失败%s（watch 仍在运行）%s\n' "$CY" "$CR" "${mon_pane:+: $mon_pane}"
+          audit "monitor-fail\t$pane\t$pos\tsingle\tsize=${mon_size:-?}\t$mon_pane"
         fi
       elif mon_pane="$(tmux split-window "${split_args[@]}" -P -F '#{pane_id}' -d -t "$pane" "$timeline_cmd" 2>&1)"; then
+        monitors="$mon_pane"; detail_pane=""
         if [ "$pos" = "right" ]; then
-          tmux split-window -v -d -t "$mon_pane" -p 55 "$detail_cmd" >/dev/null 2>&1 || \
+          detail_pane="$(tmux split-window -v -d -t "$mon_pane" -p 55 -P -F '#{pane_id}' "$detail_cmd" 2>/dev/null)" || \
             audit "monitor-detail-fail\t$pane\t$pos\t$mon_pane"
         else
-          tmux split-window -h -d -t "$mon_pane" -p 58 "$detail_cmd" >/dev/null 2>&1 || \
+          detail_pane="$(tmux split-window -h -d -t "$mon_pane" -p 58 -P -F '#{pane_id}' "$detail_cmd" 2>/dev/null)" || \
             audit "monitor-detail-fail\t$pane\t$pos\t$mon_pane"
         fi
+        [ -n "$detail_pane" ] && monitors="$monitors,$detail_pane"
         audit "monitor-start\t$pane\t$pos\tsplit\tsize=$mon_size"
       else
         printf '%s⚠ 监控 pane 打开失败%s（watch 仍在运行）%s\n' "$CY" "$CR" "${mon_pane:+: $mon_pane}"
@@ -650,6 +763,16 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
     else
       printf '%s⚠ 目标 pane 太小，未打开监控 pane%s（watch 仍在运行）\n' "$CY" "$CR"
       audit "monitor-skip\t$pane\t$pos\tpane-too-small"
+    fi
+    # record the spawned monitor pane ids so cleanup / the timeline monitor can
+    # close exactly these panes; _watch_state_write carries the key across
+    # rewrites. Verify + retry: a rewrite racing the append can drop it.
+    if [ -n "$monitors" ] && [ -f "$wf" ]; then
+      for i in 1 2 3; do
+        printf 'monitors=%s\n' "$monitors" >> "$wf" 2>/dev/null || true
+        sleep 0.3
+        grep -q '^monitors=' "$wf" 2>/dev/null && break
+      done
     fi
   fi
   printf '%s✓ 已开始监控%s %s%s%s\n' "$CG" "$CR" "$(_pane_label "$pane")" \
@@ -661,7 +784,7 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
 # escaping to fight, and every choice is per-watch (no global option flips).
 cmd_watch_setup() {
   local pane goal poll ans policy="" auto=""
-  pane="$(_resolve_pane "${1:-}")" || { echo "watch-setup: no target pane"; return 1; }
+  pane="$(_resolve_pane_strict "${1:-}")" || return 1
   _hdr "AI 常驻监控 · 设置" "$(_pane_label "$pane")"
   printf '%s目标（回车 = 通用：推进直到任务完成）%s\n> ' "$CD" "$CR"
   readline_tty goal
@@ -707,9 +830,9 @@ cmd_status() {
     poll="$(awk -F= '/^poll=/{print $2}' "$wf")"
     if kill -0 "$pid" 2>/dev/null; then
       any=1
-      printf '%s●%s %-24s %s%s · pid %s · 已运行 %ss · 轮询 %ss%s\n' \
+      printf '%s●%s %-24s %s%s · pid %s · 已运行 %s · 轮询 %ss%s\n' \
         "$CG" "$CR" "$(_pane_label "$pane")" "$CD" "$pane" "$pid" \
-        "$(( $(now) - ${started:-$(now)} ))" "${poll:-5}" "$CR"
+        "$(_fmt_hms "$(( $(now) - ${started:-$(now)} ))")" "${poll:-5}" "$CR"
       [ -n "$goal" ] && printf '   %s目标: %s%s\n' "$CD" "$goal" "$CR"
     else rm -f "$wf" "${wf%.watch}.out"; fi
   done
@@ -730,7 +853,7 @@ cmd_status() {
 # ---------------------------------------------------------------------------
 _monitor_loop() {  # _monitor_loop <timeline|detail|combined> <pane>
   local mode="$1" pane="$2" wf base feed timeline detail detail_log label cols rows stream_top file pos=0
-  local last_cols=0 last_rows=0
+  local last_cols=0 last_rows=0 monitors="" m
   pane="$(_resolve_pane "$pane" 2>/dev/null || echo "$pane")"
   wf="$(_wf "$pane")"; base="${wf%.watch}"
   feed="$base.out"; timeline="$base.timeline"; detail="$base.detail"; detail_log="$base.detail.log"
@@ -770,11 +893,25 @@ _monitor_loop() {  # _monitor_loop <timeline|detail|combined> <pane>
     _monitor_draw_header "$mode" "$label" "$cols" "$wf"
     _monitor_emit_new "$mode" "$file" "$pos" "$cols"
     case "${monitor_emit_total:-}" in ''|*[!0-9]*) : ;; *) pos="$monitor_emit_total" ;; esac
+    # remember the recorded monitor panes while the watch file still exists —
+    # the timeline pane closes its siblings after the file is gone
+    [ "$mode" = timeline ] && monitors="$(_state_get "$wf" monitors 2>/dev/null || printf '%s' "$monitors")"
     sleep 1
   done
   printf '\033[r\033[?25h'
-  printf '\033[2m— 监控结束，本窗即将关闭 —\033[0m\n'
-  sleep 3
+  printf '\033[2m— 监控结束，按任意键关闭（3 秒后自动）—\033[0m\n'
+  if [ -t 0 ]; then read -t 3 -n 1 -r m 2>/dev/null || true; else sleep 3; fi
+  # atomic close: the timeline pane takes its sibling(s) down in the same
+  # breath so the layout reflows once, not once per pane
+  if [ "$mode" = timeline ] && [ -n "$monitors" ]; then
+    for m in $(printf '%s' "$monitors" | tr ',' ' '); do
+      [ -n "$m" ] || continue
+      [ "$m" = "${TMUX_PANE:-}" ] && continue
+      case "$(tmux display-message -p -t "$m" '#{pane_start_command}' 2>/dev/null)" in
+        *"$SELF"*monitor*) tmux kill-pane -t "$m" 2>/dev/null || true ;;
+      esac
+    done
+  fi
 }
 
 cmd_monitor_timeline() { _monitor_loop timeline "${1:-}"; }
@@ -805,13 +942,36 @@ cmd_ask() {
   explain="$(printf '%s' "$json" | jq -r '.explain // ""' 2>/dev/null || echo '')"
   cmds_file="$(mktemp "${TMPDIR:-/tmp}/tmuxask.XXXXXX")"
   printf '%s' "$json" | jq -r '.commands[]? // empty' 2>/dev/null > "$cmds_file" || true
-  n="$(grep -cve '^$' "$cmds_file" 2>/dev/null || echo 0)"
+  # `grep -c` prints 0 AND exits 1 on no match, so `|| echo 0` would append a
+  # second line and make the -gt test blow up with "integer expression expected"
+  n="$(grep -cve '^$' "$cmds_file" 2>/dev/null | head -1)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
   [ "$n" -gt 0 ] || { echo "${explain:-无可执行命令}"; rm -f "$cmds_file"; return 0; }
 
   echo "计划：${explain}"; echo "--- tmux 命令 ---"; cat "$cmds_file"; echo "-----------------"
-  # catastrophic denylist — these break out of "just arrange my tmux"
-  if grep -qiE '(^|[[:space:]])(run-shell|if-shell|source-file|kill-server|respawn-pane|respawn-window)([[:space:]]|$)' "$cmds_file"; then
-    echo "⚠ 含有危险命令(run-shell/kill-server 等)，已拒绝执行。"; rm -f "$cmds_file"; return 4
+  # allowlist — "arrange my tmux" verbs only. Anything outside it (send-keys,
+  # switch-client, select-window, kill-*, set, bind, run-shell...) would steal
+  # focus, type into programs, or rewire the server: reject the whole batch,
+  # regardless of autonomy, and leave the plan on screen as a suggestion.
+  # `;` must be rejected first: tmux source-file treats it as a command
+  # separator, so `split-window -d ; run-shell evil` would sneak past a check
+  # that only inspects the first word. Note the allowed verbs still take a
+  # shell-command argument (new-window "cmd"), so this bounds blast radius to
+  # "what you could type yourself" — it is not a sandbox.
+  local bad
+  bad="$(awk '
+    NF == 0 { next }
+    $1 ~ /^#/ { next }                                   # source-file comment
+    /(^|[[:space:]]);/ { print "  " NR ": " $0 "   ← 链式 ; 命令不允许"; next }
+    {
+      v = $1
+      if (v == "tmux") v = $2
+      if (v !~ /^(split-window|splitw|join-pane|joinp|move-window|movew|swap-pane|swapp|swap-window|link-window|select-layout|selectl|resize-pane|resizep|break-pane|breakp|new-window|neww|rename-window|renamew)$/)
+        print "  " NR ": " $0
+    }' "$cmds_file")"
+  if [ -n "$bad" ]; then
+    printf '⚠ 只允许布局类命令（split/join/swap/move/resize/layout/break/new/rename），以下被拒绝：\n%s\n上面的计划仅供参考，请自行执行。\n' "$bad"
+    rm -f "$cmds_file"; return 4
   fi
   case "$autonomy" in
     suggest) echo "(suggest 模式：自行执行)"; rm -f "$cmds_file"; return 6 ;;
@@ -876,11 +1036,25 @@ cmd_list() {
 # tmux-resurrect post-restore hook.
 # ---------------------------------------------------------------------------
 cmd_cleanup() {
-  local wf pid f base n=0 mon start watched live_pids orphan_pids opid
+  local wf pid f base n=0 mon start watched live_pids orphan_pids opid mons
   for wf in "$WATCH_DIR"/*.watch; do
     [ -e "$wf" ] || continue
     pid="$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)"
     kill -0 "$pid" 2>/dev/null && continue
+    # close this watch's recorded monitor panes before the state is dropped
+    # (the pane_start_command scan below only catches legacy watch files).
+    # Verify each id still names one of OUR monitor panes: $WATCH_DIR outlives
+    # reboots, and a fresh tmux server hands out %0.. again — killing a raw id
+    # from a stale watch file would destroy a resurrect-restored user pane.
+    mons="$(_state_get "$wf" monitors)"
+    if [ -n "$mons" ] && have_tmux; then
+      for mon in $(printf '%s' "$mons" | tr ',' ' '); do
+        [ -n "$mon" ] || continue
+        case "$(tmux display-message -p -t "$mon" '#{pane_start_command}' 2>/dev/null)" in
+          *"$SELF"*monitor*) tmux kill-pane -t "$mon" 2>/dev/null || true ;;
+        esac
+      done
+    fi
     rm -f "$wf" "${wf%.watch}.out" "${wf%.watch}.timeline" "${wf%.watch}.detail" "${wf%.watch}.detail.log" "${wf%.watch}.brain.err"; n=$((n+1))
   done
   for f in "$WATCH_DIR"/*.out "$WATCH_DIR"/*.timeline "$WATCH_DIR"/*.detail "$WATCH_DIR"/*.detail.log "$WATCH_DIR"/*.brain.err; do
@@ -936,7 +1110,7 @@ cmd_menu() {
     "让当前 pane 继续 / 决定一次"        c "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF decide '#{pane_id}'\"" \
     "" \
     "常驻监控当前 pane 直到完成"         w "run-shell \"$SELF watch '#{pane_id}'\"" \
-    "常驻监控 + always-allow（更省心）"  W "run-shell \"$SELF watch '#{pane_id}' '' always-allow\"" \
+    "⚡ 常驻监控 + always-allow（更省心）" W "run-shell \"$SELF watch '#{pane_id}' '' always-allow\"" \
     "自定义监控（目标 / 间隔 / 策略）…"   v "$pop \"$SELF watch-setup '#{pane_id}'\"" \
     "" \
     "状态 / 最近决策"                   s "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF status\"" \

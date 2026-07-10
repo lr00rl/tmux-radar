@@ -21,6 +21,18 @@
 # paneless marks keyed by session_id so the bar still notifies you, and the
 # AI status view lists them. Disable with `set -g @radar-claude-bg off`.
 #
+# Agent-session registry (agent-registry, TSV, 9 fields):
+#   "<kind>\t<key>\t<pid>\t<pane>\t<started>\t<last_event>\t<state>\t<cwd>\t<proc>"
+# One row per live agent session, maintained by native lifecycle hooks:
+# Claude SessionStart/SessionEnd (claude-register / claude-end), every other
+# Claude/Codex event (sessions predating hook install are adopted on their
+# first event), and the opencode plugin (opencode-hook). pid is the agent
+# process resolved from the hook's own ancestry; `proc` records the argv
+# basename that matched, so GC requires pid alive AND argv still matching —
+# a reused pid can't fake liveness. The registry replaces the old
+# ~/.claude/jobs/*/state.json guessing (those files freeze at "blocked"
+# after a session dies and kept zombie marks alive for hours).
+#
 # Safe to call outside tmux (no-op unless a server is reachable).
 set -euo pipefail
 
@@ -30,14 +42,39 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
 STATE_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
+REG_FILE="${TMUX_RADAR_REGISTRY_FILE:-$STATE_DIR/agent-registry}"
 BG_TTL="${TMUX_RADAR_BG_TTL:-${TMUX_SWITCHER_BG_TTL:-86400}}"   # paneless marks expire after 24h
-LOCK="$STATE_DIR/.need-input.lock"
+LOCK="$STATE_DIR/.need-input.lock"    # one lock guards need-input AND agent-registry
+
+# labels that mean "turn finished": these marks survive session end / GC so
+# short-lived and background runs still surface. Keep in sync with level_for
+# in switcher.sh / needinput-toast.sh.
+DONE_RE='(finished|your turn|turn complete|task complete|done|任务完成|完成)'
 
 mkdir -p "$STATE_DIR"
 
 have_tmux() { command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2>&1; }
-lock()   { local n=0; until mkdir "$LOCK" 2>/dev/null; do n=$((n+1)); [ "$n" -gt 100 ] && break; sleep 0.02; done; }
-unlock() { rmdir "$LOCK" 2>/dev/null || true; }
+
+# mkdir lock with an owner pid: a crashed hook's lock is reaped instead of
+# stalling every later hook for 2s, and a caller that gave up waiting never
+# rmdir's the live holder's lock (LOCK_OWNED gates unlock).
+LOCK_OWNED=0
+lock() {
+  local n=0 holder
+  while ! mkdir "$LOCK" 2>/dev/null; do
+    holder="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      rm -rf "$LOCK" 2>/dev/null || true; continue      # stale: owner is gone
+    fi
+    n=$((n+1))
+    [ "$n" -gt 100 ] && return 0                        # give up, but don't claim
+    sleep 0.02
+  done
+  printf '%s' "$$" > "$LOCK/pid" 2>/dev/null || true
+  LOCK_OWNED=1
+}
+unlock() { [ "${LOCK_OWNED:-0}" = 1 ] && rm -rf "$LOCK" 2>/dev/null; LOCK_OWNED=0; return 0; }
+trap 'unlock' EXIT INT TERM                             # never leak on set -e abort
 
 opt() {  # opt <option> <default> (empty/no server -> default)
   local key="$1" def="$2" v legacy
@@ -74,7 +111,7 @@ _pane_map() {
 _agent_panes() {
   have_tmux || return 0
   local cmds panes ps_rows
-  cmds="${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude')}}"
+  cmds="${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude opencode')}}"
   panes="$(tmux list-panes -a -F '#{pane_id} #{pane_pid} #{pane_tty}' 2>/dev/null)" || return 0
   [ -n "$panes" ] || return 0
   ps_rows="$(ps -axo pid=,ppid=,tty=,command= 2>/dev/null)" || return 0
@@ -115,20 +152,88 @@ _agent_panes() {
     }'
 }
 
-_claude_live_keys() {
-  local f json sid state out="OK"
-  for f in "$HOME"/.claude/jobs/*/state.json; do
-    [ -r "$f" ] || continue
-    json="$(cat "$f" 2>/dev/null || true)"
-    [ -n "$json" ] || continue
-    sid="$(_json_field sessionId "$json")"
-    state="$(_json_field state "$json")"
-    [ -n "$sid" ] || continue
-    case "$state" in
-      blocked|working|idle|"") out="$out"$'\001'"s:$sid" ;;
-    esac
-  done
-  printf '%s\001' "$out"
+# The agent process this hook descends from: hooks run as children of their
+# agent (claude/codex spawn hook commands directly), so walking our own
+# ancestry finds the agent pid even under env-scrubbed launchers. Prints
+# "pid<TAB>argv-basename"; empty when nothing in the chain matches <kind>.
+_resolve_agent_pid() {  # _resolve_agent_pid <kind>
+  local kind="${1:-}" rel
+  [ -n "$kind" ] || return 0
+  rel="$(ps -axo pid=,ppid=,command= 2>/dev/null)" || return 0
+  [ -n "$rel" ] || return 0
+  printf '%s\n' "$rel" | LC_ALL=C awk -v me="$$" -v kind="$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')" '
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    function kindmatch(argv0,    low, n, parts, i, c) {
+      low = tolower(argv0); gsub(/\\/, "/", low)
+      n = split(low, parts, "/")
+      for (i = 1; i <= n; i++) { c = parts[i]; sub(/\.app$/, "", c); if (c == kind) return 1 }
+      return 0
+    }
+    {
+      rest = trim($0)
+      pid = rest; sub(/[[:space:]].*/, "", pid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
+      ppid = rest; sub(/[[:space:]].*/, "", ppid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
+      a0 = rest; sub(/[[:space:]].*/, "", a0)
+      par[pid] = ppid; argv[pid] = a0
+    }
+    END {
+      cur = me
+      for (hops = 0; hops < 40 && cur != "" && cur != "0" && cur != "1"; hops++) {
+        if (kindmatch(argv[cur])) {
+          n = split(argv[cur], parts, "/"); b = parts[n]; sub(/\.app$/, "", b)
+          print cur "\t" b
+          exit
+        }
+        cur = par[cur]
+      }
+    }'
+}
+
+# --- agent-session registry (see header). Writes are atomic; callers must
+# NOT hold the lock (these helpers take it themselves). ---------------------
+_reg_upsert() {  # _reg_upsert <kind> <key> <pid> <pane> <state> <cwd> <proc>
+  local kind="${1:-}" key="${2:-}" pid="${3:-0}" pane="${4:--}" state="${5:-working}" cwd="${6:-}" proc="${7:-}"
+  [ -n "$kind" ] && [ -n "$key" ] || return 0
+  case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
+  local now old started tmp
+  now="$(date +%s)"
+  lock
+  old="$(awk -F '\t' -v k="$key" 'NF >= 9 && $2 == k { print; exit }' "$REG_FILE" 2>/dev/null || true)"
+  started="$now"
+  if [ -n "$old" ]; then
+    # carry fields forward when this event could not re-resolve them
+    started="$(printf '%s' "$old" | cut -f5)"
+    [ "$pid" = 0 ] && pid="$(printf '%s' "$old" | cut -f3)"
+    [ "$pane" = "-" ] && pane="$(printf '%s' "$old" | cut -f4)"
+    [ -z "$cwd" ] && cwd="$(printf '%s' "$old" | cut -f8)"
+    [ -z "$proc" ] && proc="$(printf '%s' "$old" | cut -f9)"
+  fi
+  [ -n "$proc" ] || proc="$kind"
+  tmp="$(mktemp "${REG_FILE}.XXXXXX")" || { unlock; return 0; }
+  { [ -r "$REG_FILE" ] && awk -F '\t' -v k="$key" 'NF >= 9 && $2 != k' "$REG_FILE"; :; } > "$tmp" 2>/dev/null
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$kind" "$(_san "$key")" "$pid" "$pane" "$started" "$now" "$state" "$(_san "$cwd")" "$(_san "$proc")" >> "$tmp"
+  mv "$tmp" "$REG_FILE"
+  unlock
+}
+
+_reg_remove() {  # _reg_remove <key>
+  local key="${1:-}" tmp
+  [ -n "$key" ] && [ -r "$REG_FILE" ] || return 0
+  lock
+  tmp="$(mktemp "${REG_FILE}.XXXXXX")" || { unlock; return 0; }
+  awk -F '\t' -v k="$key" 'NF >= 9 && $2 != k' "$REG_FILE" > "$tmp" 2>/dev/null || true
+  mv "$tmp" "$REG_FILE"
+  unlock
+}
+
+# Drop a dead session's marks but keep unseen "finished — your turn" notices:
+# an action/notice mark for a session that can no longer take input is a lie.
+_drop_session_marks() {  # _drop_session_marks <key>
+  [ -n "${1:-}" ] || return 0
+  lock
+  _drop_rows '$4 == k && tolower($5) !~ donere' -v k="$1" -v donere="$DONE_RE"
+  unlock
 }
 
 # Find the tmux pane hosting THIS process (a Claude hook runs as a child of its
@@ -217,7 +322,7 @@ _mark_icon() {  # _mark_icon <source> <label>
   local text
   text="$(printf '%s %s' "${1:-}" "${2:-}" | tr '[:upper:]' '[:lower:]')"
   case "$text" in
-    *finished*|*"your turn"*|*"turn complete"*|*"task complete"*|*"任务完成"*|*"完成"*) printf '✓' ;;
+    *finished*|*"your turn"*|*"turn complete"*|*"task complete"*|*done*|*"任务完成"*|*"完成"*) printf '✓' ;;
     *"needs approval"*|*"needs your permission"*|*"needs input"*|*waiting*input*|*"waiting on you"*|*permission*|*approval*|*"action required"*|*approve*|*"拿不准"*|*"需要你"*|*"等待"*"输入"*) printf '⚠' ;;
     *) printf '!' ;;
   esac
@@ -249,15 +354,46 @@ _drop_rows() {  # _drop_rows <awk-condition-marking-rows-to-DROP> [extra -v args
   _rewrite "if ($cond) next" "$@"
 }
 
-# Recompute bar visibility: status 2 while any mark is bar-visible, else status
-# on. A chip is bar-visible while its mark is off-screen AND younger than
-# @radar-bar-ttl seconds (0 = show until handled); the mark itself persists
-# in the AI status view / pane title until actually cleared.
+_bar_raise() {  # remember the user's status value, then show line 2
+  local cur
+  cur="$(tmux show-option -gv status 2>/dev/null || echo on)"
+  if [ "$cur" = "2" ]; then
+    # already raised — but a raise/lower interleave can leave status=2 with no
+    # saved value, which would strand the extra line forever. Re-arm it.
+    [ -z "$(tmux show-option -gqv @radar-prev-status 2>/dev/null || true)" ] &&
+      tmux set -g @radar-prev-status on >/dev/null 2>&1 || true
+    return 0
+  fi
+  tmux set -g @radar-prev-status "$cur" >/dev/null 2>&1 || true
+  tmux set -g status 2 >/dev/null 2>&1 || true
+}
+
+_bar_lower() {  # restore EXACTLY what the user had; never touch what we didn't set
+  local cur prev
+  prev="$(tmux show-option -gqv @radar-prev-status 2>/dev/null || true)"
+  [ -n "$prev" ] || return 0                     # we never raised — not ours
+  cur="$(tmux show-option -gv status 2>/dev/null || echo on)"
+  if [ "$cur" = "2" ]; then
+    [ "$prev" = "2" ] && prev=on
+    tmux set -g status "$prev" >/dev/null 2>&1 || true
+  fi                                             # user changed it since: leave it
+  tmux set -gu @radar-prev-status >/dev/null 2>&1 || true
+}
+
+# Recompute bar visibility. A chip is bar-visible while its mark is off-screen
+# AND younger than @radar-bar-ttl seconds (0 = show until handled); the mark
+# itself persists in the AI status view / pane title until actually cleared.
+# @radar-bar: auto (default) toggles status 1<->2 saving/restoring the user's
+# exact prior value; pinned never touches the status line COUNT (toggling it
+# resizes every window and SIGWINCHes every app — users who keep `status 2`
+# themselves want this; the content line self-hides); off never raises.
 _sync_bar() {
   have_tmux || return 0
-  local n=0 barttl
+  local mode n=0 barttl
+  mode="$(opt @radar-bar auto)"
+  case "$mode" in auto|pinned|off) ;; *) mode=auto ;; esac
   barttl="$(opt @radar-bar-ttl 60)"
-  if [ -r "$STATE_FILE" ]; then
+  if [ "$mode" = auto ] && [ -r "$STATE_FILE" ]; then
     n="$(awk -F '\t' -v panes="$(_pane_map)" -v now="$(date +%s)" -v barttl="$barttl" '
       BEGIN {
         m = split(panes, pl, "\001")
@@ -271,8 +407,11 @@ _sync_bar() {
       }
       END { print c + 0 }' "$STATE_FILE" 2>/dev/null || echo 0)"
   fi
-  if [ "${n:-0}" -gt 0 ]; then tmux set -g status 2 >/dev/null 2>&1 || true
-  else tmux set -g status on >/dev/null 2>&1 || true; fi
+  case "$mode" in
+    pinned) : ;;
+    off)    _bar_lower ;;
+    *)      if [ "${n:-0}" -gt 0 ]; then _bar_raise; else _bar_lower; fi ;;
+  esac
   tmux refresh-client -S >/dev/null 2>&1 || true
 }
 
@@ -329,18 +468,70 @@ cmd_clear_window() {  # clear marks for every pane inside a window target
 
 cmd_clear_all() { lock; _drop_rows '1'; unlock; _sync_bar; }
 
-# tick = prune + agent-liveness GC + bar resync. A pane mark whose source is an
-# AI agent (claude/codex/ai) but whose pane no longer hosts that agent (TUI
-# closed, shell reused for something else) is stale — drop it and restore the
-# pane title. If the process scan failed we only do the plain prune.
+# tick = prune + liveness GC + bar resync. Liveness, in order of authority:
+#   1. registry rows: pid alive AND argv still matching the recorded proc
+#      (one ps snapshot for all rows; reused pids don't count as alive)
+#   2. pane agent scan (_agent_panes): fallback for marks with no registry row
+# Dead registry rows are removed and their action/notice marks dropped; done
+# marks stay until handled (or BG_TTL for paneless ones). If both the ps
+# snapshot and the pane scan failed we only do the plain prune.
 cmd_tick() {
-  local agents claude_keys
+  local snapshot verdicts dead_keys="" live_keys="" agents tmp reg_ok=""
+  snapshot="$(ps -axo pid=,command= 2>/dev/null || true)"
+  # reg_ok = "the registry answered". Without it (ps failed, or the registry
+  # was never created — pre-upgrade, hooks not installed) we must NOT infer
+  # death from a missing row: absence of evidence isn't evidence of absence.
+  if [ -n "$snapshot" ] && [ -r "$REG_FILE" ]; then
+    reg_ok=1
+    verdicts="$({ printf '__PS__\n%s\n__REG__\n' "$snapshot"; cat "$REG_FILE"; } | LC_ALL=C awk -F '\t' '
+      function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+      function argmatch(argv0, name,    low, n, parts, i, c) {
+        low = tolower(argv0); gsub(/\\/, "/", low)
+        n = split(low, parts, "/")
+        for (i = 1; i <= n; i++) { c = parts[i]; sub(/\.app$/, "", c); if (c == name) return 1 }
+        return 0
+      }
+      $0 == "__PS__"  { mode = 1; next }
+      $0 == "__REG__" { mode = 2; next }
+      mode == 1 && $0 != "" {
+        rest = trim($0)
+        pid = rest; sub(/[[:space:]].*/, "", pid); sub(/^[^[:space:]]+[[:space:]]*/, "", rest)
+        a0 = rest; sub(/[[:space:]].*/, "", a0)
+        argv[pid] = a0; next
+      }
+      mode == 2 && NF >= 9 {
+        pid = $3 + 0
+        alive = 0
+        if (pid <= 0) alive = 1            # unresolved pid: GC via pane scan only
+        else if ((pid in argv) && argmatch(argv[pid], tolower($9))) alive = 1
+        print (alive ? "L" : "D") "\t" $2
+      }')"
+    dead_keys="$(printf '%s\n' "$verdicts" | awk -F '\t' '$1 == "D" { printf "%s\001", $2 }')"
+    live_keys="$(printf '%s\n' "$verdicts" | awk -F '\t' '$1 == "L" { printf "%s\001", $2 }')"
+    if [ -n "$dead_keys" ]; then
+      lock
+      tmp="$(mktemp "${REG_FILE}.XXXXXX")" || { unlock; return 0; }
+      awk -F '\t' -v dk="$(printf '\001%s' "$dead_keys")" \
+        'NF >= 9 && index(dk, "\001" $2 "\001") == 0' "$REG_FILE" > "$tmp" 2>/dev/null || true
+      mv "$tmp" "$REG_FILE"
+      unlock
+    fi
+  fi
   agents="$(_agent_panes || true)"
-  claude_keys="$(_claude_live_keys || true)"
   lock
-  if [ -n "$agents" ]; then
-    _drop_rows '$1 != "-" && ($3 == "claude" || $3 == "codex" || $3 == "ai") && index(ag, "\001" $1 "\001") == 0 && !($3 == "claude" && index(ck, "\001" $4 "\001") > 0)' \
-      -v ag="${agents#OK}" -v ck="${claude_keys#OK}"
+  if [ -n "$agents" ] || [ -n "$dead_keys" ] || [ -n "$live_keys" ]; then
+    # 1) marks of registry-dead sessions: keep only unseen "finished" notices;
+    # 2) agent-source pane marks with no live registry row whose pane no longer
+    #    hosts that agent (TUI closed, shell reused) — pre-registry fallback;
+    # 3) paneless agent action/notice marks with no live registry row are stale
+    #    (a background session that cannot take input any more). Requires
+    #    regok, and only touches agent sources — a `mark - tool ...` from a
+    #    user script has no registry row by design and must survive.
+    _drop_rows '( index(dk, "\001" $4 "\001") > 0 && tolower($5) !~ donere ) ||
+      ( $1 != "-" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "ai") && index(lk, "\001" $4 "\001") == 0 && ag != "" && index(ag, "\001" $1 "\001") == 0 ) ||
+      ( $1 == "-" && regok != "" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "ai") && index(lk, "\001" $4 "\001") == 0 && tolower($5) !~ donere )' \
+      -v dk="$(printf '\001%s' "$dead_keys")" -v lk="$(printf '\001%s' "$live_keys")" \
+      -v ag="${agents#OK}" -v donere="$DONE_RE" -v regok="$reg_ok"
   else
     _rewrite ''
   fi
@@ -356,6 +547,16 @@ _json_field() {
     printf '%s' "$json" | jq -r --arg f "$field" '.[$f] // empty' 2>/dev/null || true
   else
     printf '%s' "$json" | sed -n "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+  fi
+}
+
+# Like _json_field but tolerant of unquoted values (numbers: pid fields).
+_json_field_any() {
+  local field="$1" json="$2"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$json" | jq -r --arg f "$field" '.[$f] // empty | tostring' 2>/dev/null || true
+  else
+    printf '%s' "$json" | sed -n "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" | head -1
   fi
 }
 
@@ -394,11 +595,20 @@ _claude_target() {  # sets PANE / KEY / WHERE from hook json in $1
   fi
 }
 
+_claude_adopt() {  # _claude_adopt <state> <json> — registry upsert for this event
+  local state="$1" json="$2" agent pid="" proc=""
+  [ -n "${KEY:-}" ] || return 0
+  agent="$(_resolve_agent_pid claude || true)"
+  if [ -n "$agent" ]; then pid="${agent%%$'\t'*}"; proc="${agent#*$'\t'}"; fi
+  _reg_upsert claude "$KEY" "${pid:-0}" "${PANE:--}" "$state" "$(_json_field cwd "$json")" "$proc"
+}
+
 cmd_claude_mark() {  # Notification hook (permission request / waiting on you)
   local json msg; json="$(cat 2>/dev/null || true)"
   [ "$(opt @radar-needinput on)" = "on" ] || exit 0
   msg="$(_json_field message "$json")"; [ -n "$msg" ] || msg="Claude needs input"
   _claude_target "$json"
+  _claude_adopt waiting "$json"
   if [ "$PANE" = "-" ]; then
     [ "$(opt @radar-claude-bg on)" = "on" ] || exit 0
     msg="Claude·${WHERE:-bg}: ${msg}"
@@ -410,6 +620,7 @@ cmd_claude_stop() {  # Stop hook (turn finished — your move)
   local json; json="$(cat 2>/dev/null || true)"
   [ "$(opt @radar-needinput on)" = "on" ] || exit 0
   _claude_target "$json"
+  _claude_adopt "done" "$json"
   local msg="Claude finished — your turn"
   if [ "$PANE" = "-" ]; then
     [ "$(opt @radar-claude-bg on)" = "on" ] || exit 0
@@ -421,9 +632,32 @@ cmd_claude_stop() {  # Stop hook (turn finished — your move)
 cmd_claude_clear() {  # UserPromptSubmit hook (you replied)
   local json; json="$(cat 2>/dev/null || true)"
   _claude_target "$json"
+  _claude_adopt working "$json"
   if [ -n "$KEY" ] && [ "${KEY#s:}" != "$KEY" ]; then cmd_clear_key "$KEY"
   elif [ "$PANE" != "-" ] && [ -n "$PANE" ]; then cmd_clear_pane "$PANE"
   fi
+}
+
+cmd_claude_register() {  # SessionStart hook: adopt the session, drop stale asks
+  local json; json="$(cat 2>/dev/null || true)"
+  _claude_target "$json"
+  [ -n "${KEY:-}" ] || exit 0
+  _claude_adopt working "$json"
+  # a session that just (re)started cannot be waiting on you yet; an unseen
+  # "finished — your turn" from its previous life is still worth showing
+  _drop_session_marks "$KEY"
+  _sync_bar
+}
+
+cmd_claude_end() {  # SessionEnd hook: the native, instant "session is gone"
+  local json sid key
+  json="$(cat 2>/dev/null || true)"
+  sid="$(_json_field session_id "$json")"
+  [ -n "$sid" ] || exit 0
+  key="s:${sid}"
+  _reg_remove "$key"
+  _drop_session_marks "$key"
+  _sync_bar
 }
 
 _codex_pane() {
@@ -431,6 +665,21 @@ _codex_pane() {
   pane="${TMUX_PANE:-}"
   [ -n "$pane" ] || pane="$(_resolve_pane_by_proc || true)"
   printf '%s' "$pane"
+}
+
+_codex_adopt() {  # _codex_adopt <state> <json> <pane> — registry upsert
+  local state="$1" json="$2" pane="${3:--}" sid key agent pid="" proc=""
+  agent="$(_resolve_agent_pid codex || true)"
+  if [ -n "$agent" ]; then pid="${agent%%$'\t'*}"; proc="${agent#*$'\t'}"; fi
+  # notify payloads carry thread-id / thread_id; hook payloads may not — fall
+  # back to a pid key so liveness GC still applies
+  sid="$(_json_field thread-id "$json")"
+  [ -n "$sid" ] || sid="$(_json_field thread_id "$json")"
+  [ -n "$sid" ] || sid="$(_json_field session_id "$json")"
+  if [ -n "$sid" ]; then key="s:${sid}"
+  elif [ -n "$pid" ]; then key="p:${pid}"
+  else return 0; fi
+  _reg_upsert codex "$key" "${pid:-0}" "$pane" "$state" "$(_json_field cwd "$json")" "$proc"
 }
 
 _codex_label() {  # _codex_label <event-or-type> <json>
@@ -465,10 +714,13 @@ cmd_codex_hook() {  # Codex native hooks pass JSON on stdin
   pane="$(_codex_pane)"
   case "$event" in
     UserPromptSubmit)
+      _codex_adopt working "$json" "$pane"
       [ -n "$pane" ] && cmd_clear_pane "$pane"
       ;;
     PermissionRequest|Stop)
       [ -n "$pane" ] || exit 0
+      if [ "$event" = "Stop" ]; then _codex_adopt "done" "$json" "$pane"
+      else _codex_adopt waiting "$json" "$pane"; fi
       cmd_mark "$pane" codex "$(_codex_label "$event" "$json")"
       ;;
   esac
@@ -481,7 +733,163 @@ cmd_codex() {  # Codex notify passes its event JSON as the last argv argument
   [ -n "$type" ] || exit 0
   pane="$(_codex_pane)"
   [ -n "$pane" ] || exit 0
+  case "$type" in
+    Stop|task_complete|agent-turn-complete|turn_complete|turn-complete)
+      _codex_adopt "done" "$json" "$pane" ;;
+    *) _codex_adopt waiting "$json" "$pane" ;;
+  esac
   cmd_mark "$pane" codex "$(_codex_label "$type" "$json")"
+}
+
+# opencode plugin events (see scripts/opencode-tmux-notify.js): the plugin
+# runs inside the TUI process, so pane/pid/cwd come straight from the JSON.
+cmd_opencode_hook() {
+  local json event sid key pane pid cwd msg where label
+  json="$(cat 2>/dev/null || true)"
+  event="$(_json_field event "$json")"
+  [ -n "$event" ] || exit 0
+  sid="$(_json_field session_id "$json")"
+  pane="$(_json_field pane "$json")"
+  pid="$(_json_field_any pid "$json")"; case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
+  cwd="$(_json_field cwd "$json")"
+  msg="$(_json_field message "$json")"
+  [ -n "$pane" ] || pane="$(_resolve_pane_by_proc || true)"
+  # key on the PANE first: the plugin lives inside the TUI process and only
+  # runs when TMUX_PANE is set, so the pane is stable for the whole session
+  # while session_id only appears on some events — keying on sid would split
+  # one session across two registry rows (start/user/end vs permission/idle).
+  if [ -n "$pane" ]; then key="oc:${pane}"
+  elif [ -n "$sid" ]; then key="s:${sid}"
+  elif [ "$pid" -gt 0 ]; then key="p:${pid}"
+  else exit 0; fi
+  where=""; [ -n "$cwd" ] && where="$(basename "$cwd")"
+  case "$event" in
+    start)
+      _reg_upsert opencode "$key" "$pid" "${pane:--}" working "$cwd" opencode
+      ;;
+    user)
+      _reg_upsert opencode "$key" "$pid" "${pane:--}" working "$cwd" opencode
+      if [ "${key#s:}" != "$key" ]; then cmd_clear_key "$key"
+      elif [ -n "$pane" ]; then cmd_clear_pane "$pane"; fi
+      ;;
+    permission)
+      _reg_upsert opencode "$key" "$pid" "${pane:--}" waiting "$cwd" opencode
+      [ "$(opt @radar-needinput on)" = "on" ] || exit 0
+      label="opencode needs approval${msg:+: $msg}"
+      [ -n "$pane" ] || label="opencode·${where:-bg}: needs approval${msg:+: $msg}"
+      cmd_mark "${pane:--}" opencode "$label" "$key"
+      ;;
+    idle)
+      _reg_upsert opencode "$key" "$pid" "${pane:--}" "done" "$cwd" opencode
+      [ "$(opt @radar-needinput on)" = "on" ] || exit 0
+      label="opencode finished — your turn"
+      [ -n "$pane" ] || label="opencode·${where:-bg}: finished — your turn"
+      cmd_mark "${pane:--}" opencode "$label" "$key"
+      ;;
+    error)
+      [ "$(opt @radar-needinput on)" = "on" ] || exit 0
+      label="opencode: ${msg:-error}"
+      [ -n "$pane" ] || label="opencode·${where:-bg}: ${msg:-error}"
+      cmd_mark "${pane:--}" opencode "$label" "$key"
+      ;;
+    end)
+      _reg_remove "$key"
+      _drop_session_marks "$key"
+      _sync_bar
+      ;;
+  esac
+}
+
+# Public API for any other agent that wants radar tracking: register with a
+# stable key + its own pid, end when it exits. Liveness GC does the rest.
+cmd_agent_register() {  # agent-register <kind> <key> <pid> <pane> [cwd]
+  local kind="${1:-}" key="${2:-}" pid="${3:-0}" pane="${4:--}" cwd="${5:-}"
+  [ -n "$kind" ] && [ -n "$key" ] || { echo "usage: agent-register <kind> <key> <pid> <pane> [cwd]" >&2; exit 2; }
+  _reg_upsert "$kind" "$key" "$pid" "$pane" working "$cwd" "$kind"
+}
+
+cmd_agent_end() {  # agent-end <kind> <key>
+  local key="${2:-}"
+  [ -n "$key" ] || { echo "usage: agent-end <kind> <key>" >&2; exit 2; }
+  _reg_remove "$key"
+  _drop_session_marks "$key"
+  _sync_bar
+}
+
+cmd_registry() {  # debug: registry rows + per-row liveness verdicts
+  if [ ! -r "$REG_FILE" ] || [ ! -s "$REG_FILE" ]; then
+    echo "registry: empty ($REG_FILE)"; return 0
+  fi
+  local kind key pid pane started last state cwd proc verdict now age
+  now="$(date +%s)"
+  printf '%-9s %-40s %-8s %-8s %-6s %s\n' KIND KEY PANE STATE AGE LIVENESS
+  while IFS=$'\t' read -r kind key pid pane started _last state cwd proc; do
+    [ -n "$kind" ] || continue
+    if [ "${pid:-0}" -gt 0 ] 2>/dev/null; then
+      if ! kill -0 "$pid" 2>/dev/null; then verdict="dead: pid $pid gone → GC next tick"
+      elif ps -p "$pid" -o command= 2>/dev/null | head -1 | grep -Fqi "$proc"; then verdict="alive: pid $pid ($proc)"
+      else verdict="dead: pid $pid reused (argv is no longer $proc) → GC next tick"; fi
+    else
+      verdict="pid unresolved → liveness via pane scan only"
+    fi
+    age=$(( now - ${started:-now} )); [ "$age" -lt 0 ] && age=0
+    printf '%-9s %-40s %-8s %-8s %-6s %s\n' "$kind" "$key" "$pane" "$state" "${age}s" "$verdict"
+  done < "$REG_FILE"
+}
+
+cmd_doctor() {  # one-stop "why is this row (not) showing?"
+  local o v now agents
+  now="$(date +%s)"
+  echo "tmux-radar doctor"
+  echo "================="
+  printf '%-11s %s\n' 'state dir' "$STATE_DIR"
+  printf '%-11s %s\n' 'marks' "$STATE_FILE"
+  printf '%-11s %s\n' 'registry' "$REG_FILE"
+  have_tmux && printf '%-11s reachable\n' 'tmux' || printf '%-11s NOT reachable (marks/bar inert)\n' 'tmux'
+  echo
+  echo "-- options in effect --"
+  for o in @radar-needinput @radar-needinput-commands @radar-bar @radar-bar-ttl \
+           @radar-retitle @radar-claude-bg @radar-claude-bg-ignore; do
+    v="$(opt "$o" '(default)')"
+    printf '  %-26s %s\n' "$o" "$v"
+  done
+  echo
+  echo "-- agent registry --"
+  cmd_registry | sed 's/^/  /'
+  echo
+  echo "-- marks --"
+  if [ -r "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
+    local pane epoch src key label _title why lvl
+    while IFS=$'\t' read -r pane epoch src key label _title; do
+      [ -n "$pane" ] || continue
+      lvl=notice
+      case "$(printf '%s %s' "$src" "$label" | tr '[:upper:]' '[:lower:]')" in
+        *finished*|*'your turn'*|*'turn complete'*|*'task complete'*|*done*|*任务完成*|*完成*) lvl=done ;;
+        *permission*|*approval*|*approve*|*'needs input'*|*waiting*|*'action required'*|*需要你*|*等待*) lvl=action ;;
+      esac
+      why="no liveness source — GC candidate"
+      if [ -r "$REG_FILE" ] && awk -F '\t' -v k="$key" 'NF >= 9 && $2 == k { found=1 } END { exit !found }' "$REG_FILE" 2>/dev/null; then
+        why="registry row exists (see verdict above)"
+      elif [ "$lvl" = done ]; then
+        why="done-level: kept until handled${pane:+ / pane dies}"
+      fi
+      printf '  %-8s %-7s %-9s %-40s %ss old · %s\n    %s\n' "$pane" "$lvl" "$src" "$key" "$(( now - ${epoch:-now} ))" "$why" "$label"
+    done < "$STATE_FILE"
+  else
+    echo "  (none)"
+  fi
+  echo
+  echo "-- agent panes (process scan) --"
+  agents="$(_agent_panes | tr '\001' '\n' || true)"
+  if [ -z "$agents" ]; then echo "  scan failed (ps/tmux unavailable)"
+  else printf '%s\n' "$agents" | sed '1d;/^$/d' | sed 's/^/  /'
+       printf '%s\n' "$agents" | sed '1d;/^$/d' | grep -q . || echo "  (none detected)"
+  fi
+  if [ -x "$SCRIPT_DIR/install-hooks.sh" ]; then
+    echo
+    echo "-- hooks --"
+    "$SCRIPT_DIR/install-hooks.sh" status 2>/dev/null | sed 's/^/  /' || echo "  (status unavailable)"
+  fi
 }
 
 case "${1:-}" in
@@ -491,13 +899,20 @@ case "${1:-}" in
   clear-window)  shift; cmd_clear_window "${1:-}" ;;
   clear-all)     cmd_clear_all ;;
   tick)          cmd_tick ;;
-  claude-mark)   cmd_claude_mark ;;
-  claude-stop)   cmd_claude_stop ;;
-  claude-clear)  cmd_claude_clear ;;
-  codex-hook)    cmd_codex_hook ;;
-  codex)         shift; cmd_codex "${1:-}" ;;
-  agent-panes)   _agent_panes | tr '\001' '\n' ;;   # debug: which panes host an agent
-  resolve-pane)  _resolve_pane_by_proc ;;           # debug: pane of this process tree
-  resolve-cwd)   shift; _resolve_pane_by_cwd "${1:-$PWD}" ;;  # debug: pane owning a cwd
-  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|claude-mark|claude-stop|claude-clear|codex-hook|codex <json>|agent-panes|resolve-pane|resolve-cwd [cwd]}" >&2; exit 2 ;;
+  claude-mark)     cmd_claude_mark ;;
+  claude-stop)     cmd_claude_stop ;;
+  claude-clear)    cmd_claude_clear ;;
+  claude-register) cmd_claude_register ;;
+  claude-end)      cmd_claude_end ;;
+  codex-hook)      cmd_codex_hook ;;
+  codex)           shift; cmd_codex "${1:-}" ;;
+  opencode-hook)   cmd_opencode_hook ;;
+  agent-register)  shift; cmd_agent_register "${1:-}" "${2:-}" "${3:-0}" "${4:--}" "${5:-}" ;;
+  agent-end)       shift; cmd_agent_end "${1:-}" "${2:-}" ;;
+  registry)        cmd_registry ;;                   # debug: registry + liveness verdicts
+  doctor)          cmd_doctor ;;                     # debug: full "why is this row here?"
+  agent-panes)     _agent_panes | tr '\001' '\n' ;;  # debug: which panes host an agent
+  resolve-pane)    _resolve_pane_by_proc ;;          # debug: pane of this process tree
+  resolve-cwd)     shift; _resolve_pane_by_cwd "${1:-$PWD}" ;;  # debug: pane owning a cwd
+  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|claude-mark|claude-stop|claude-clear|claude-register|claude-end|codex-hook|codex <json>|opencode-hook|agent-register <kind> <key> <pid> <pane> [cwd]|agent-end <kind> <key>|registry|doctor|agent-panes|resolve-pane|resolve-cwd [cwd]}" >&2; exit 2 ;;
 esac

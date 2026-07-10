@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Install / uninstall the AI-status hooks for Claude Code and Codex so they flag
-# action-required prompts and finished-turn notices in tmux.
+# Install / uninstall the AI-status hooks for Claude Code, Codex and opencode
+# so they flag action-required prompts and finished-turn notices in tmux.
 #
 # Edits, idempotently and with a timestamped backup:
-#   ~/.claude/settings.json   (Claude hooks)
-#   ~/.codex/config.toml      (Codex hooks + legacy notify fallback)
+#   ~/.claude/settings.json                 (Claude hooks)
+#   ~/.codex/config.toml                    (Codex hooks + legacy notify fallback)
+#   ~/.config/opencode/plugins/tmux-radar.js (opencode plugin, path baked in)
 #
 # Usage: install-hooks.sh [install|uninstall|status]
 set -euo pipefail
@@ -14,14 +15,16 @@ NOTIFY="${TMUX_RADAR_NOTIFY:-${TMUX_SWITCHER_NOTIFY:-$SCRIPT_DIR/needinput-notif
 CODEX_WRAP="${TMUX_RADAR_CODEX_WRAP:-${TMUX_SWITCHER_CODEX_WRAP:-$SCRIPT_DIR/codex-notify-wrap.sh}}"
 CLAUDE_SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 CODEX_CONFIG="${CODEX_CONFIG:-$HOME/.codex/config.toml}"
+OPENCODE_DIR="${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}"
+OPENCODE_PLUGIN="$OPENCODE_DIR/plugins/tmux-radar.js"
 
-# NOTE: SessionEnd is intentionally NOT hooked. It fires the instant a session
-# ends — which immediately follows Stop for short-lived / print-mode / background
-# runs — so a SessionEnd clear would wipe the "Claude finished — your turn" mark
-# before you ever see it. Marks are cleared when you navigate to the window
-# (session-window-changed hook) and dead panes are filtered from the view.
-CLAUDE_EVENTS=(Notification Stop UserPromptSubmit)
-CLAUDE_SUBCMDS=(claude-mark claude-stop claude-clear)
+# NOTE: SessionEnd IS hooked (claude-end), with selective semantics: it removes
+# the session from the agent registry and clears its action/notice marks (a
+# "needs your input" mark for a dead session is a lie), but KEEPS done-level
+# "finished — your turn" marks. Short-lived / print-mode runs fire Stop then
+# SessionEnd back-to-back, and their finished mark must survive that.
+CLAUDE_EVENTS=(SessionStart Notification Stop UserPromptSubmit SessionEnd)
+CLAUDE_SUBCMDS=(claude-register claude-mark claude-stop claude-clear claude-end)
 CODEX_NOTIFY_JSON="[\"$NOTIFY\", \"codex\"]"
 CODEX_HOOK_CMD="$NOTIFY codex-hook"
 CODEX_HOOK_BEGIN="# BEGIN tmux-radar Codex hooks"
@@ -38,11 +41,13 @@ claude_install() {
   cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak.$(date +%Y%m%d%H%M%S)"
   jq empty "$CLAUDE_SETTINGS" 2>/dev/null || die "$CLAUDE_SETTINGS is not valid JSON"
   # Migration: older versions hooked SessionEnd -> claude-clear, which wiped the
-  # "finished" mark the moment a session ended. Strip it so upgrades self-heal.
+  # "finished" mark the moment a session ended. Strip ONLY that legacy wiring
+  # (exact command match) — a broad "$NOTIFY "-prefix strip would delete the
+  # claude-end hook we install below on every reinstall.
   local mtmp; mtmp="$(mktemp)"
-  jq --arg p "$NOTIFY " '
+  jq --arg legacy "$NOTIFY claude-clear" '
     if (.hooks // {}).SessionEnd then
-      .hooks.SessionEnd |= ( map(.hooks |= map(select((.command // "") | startswith($p) | not)))
+      .hooks.SessionEnd |= ( map(.hooks |= map(select((.command // "") != $legacy)))
                              | map(select((.hooks // []) | length > 0)) )
       | if (.hooks.SessionEnd | length) == 0 then del(.hooks.SessionEnd) else . end
     else . end
@@ -78,7 +83,7 @@ claude_uninstall() {
 claude_status() {
   if command -v jq >/dev/null 2>&1 && [ -f "$CLAUDE_SETTINGS" ]; then
     local c; c="$(jq --arg p "$NOTIFY " '[.hooks // {} | .. | .command? // empty | select(startswith($p))] | length' "$CLAUDE_SETTINGS" 2>/dev/null || echo 0)"
-    echo "Claude hooks installed: ${c:-0}/3"
+    echo "Claude hooks installed: ${c:-0}/5"
   else echo "Claude settings: (none / jq missing)"; fi
 }
 
@@ -180,12 +185,56 @@ codex_status() {
   else echo "Codex notify fallback: not installed"; fi
 }
 
+# opencode is detected via its config dir or binary; without either we skip
+# rather than create ~/.config/opencode for a tool that isn't there.
+opencode_present() {
+  [ -d "$OPENCODE_DIR" ] || command -v opencode >/dev/null 2>&1
+}
+
+opencode_install() {
+  if ! opencode_present; then
+    info "opencode not found (no $OPENCODE_DIR, no 'opencode' on PATH) — skipped"
+    return 0
+  fi
+  local src="$SCRIPT_DIR/opencode-tmux-notify.js" tmp esc
+  [ -f "$src" ] || die "$src not found"
+  mkdir -p "$(dirname "$OPENCODE_PLUGIN")"
+  tmp="$(mktemp)"
+  # bake the absolute notify path into the plugin template. Escape the sed
+  # replacement (& = whole match, # = our delimiter, \ = escape) and reject
+  # a path that can't survive a JS string literal.
+  case "$NOTIFY" in
+    *'"'*|*$'\n'*) die "notify path contains a quote/newline; cannot template: $NOTIFY" ;;
+  esac
+  esc="$(printf '%s' "$NOTIFY" | sed 's/[&#\\]/\\&/g')"
+  sed "s#__TMUX_RADAR_NOTIFY__#$esc#g" "$src" > "$tmp"
+  if [ -f "$OPENCODE_PLUGIN" ] && ! cmp -s "$tmp" "$OPENCODE_PLUGIN"; then
+    cp "$OPENCODE_PLUGIN" "$OPENCODE_PLUGIN.bak.$(date +%Y%m%d%H%M%S)"
+  fi
+  mv "$tmp" "$OPENCODE_PLUGIN"
+  info "opencode plugin -> $OPENCODE_PLUGIN"
+}
+
+opencode_uninstall() {
+  if [ -f "$OPENCODE_PLUGIN" ]; then
+    rm -f "$OPENCODE_PLUGIN"; info "removed opencode plugin"
+  else
+    info "no opencode plugin installed"
+  fi
+}
+
+opencode_status() {
+  if ! opencode_present; then echo "opencode: not installed (skipped)"
+  elif [ -f "$OPENCODE_PLUGIN" ]; then echo "opencode plugin: installed"
+  else echo "opencode plugin: absent"; fi
+}
+
 [ -x "$NOTIFY" ] || die "$NOTIFY not found/executable"
 
 case "${1:-install}" in
-  install)   echo "Installing tmux-radar AI-status hooks:"; claude_install; codex_install
-             echo "Done. Restart Claude/Codex sessions (or open new ones) to pick up the hooks." ;;
-  uninstall) echo "Uninstalling tmux-radar AI-status hooks:"; claude_uninstall; codex_uninstall ;;
-  status)    claude_status; codex_status ;;
+  install)   echo "Installing tmux-radar AI-status hooks:"; claude_install; codex_install; opencode_install
+             echo "Done. Restart Claude/Codex/opencode sessions (or open new ones) to pick up the hooks." ;;
+  uninstall) echo "Uninstalling tmux-radar AI-status hooks:"; claude_uninstall; codex_uninstall; opencode_uninstall ;;
+  status)    claude_status; codex_status; opencode_status ;;
   *) die "usage: install-hooks.sh [install|uninstall|status]" ;;
 esac

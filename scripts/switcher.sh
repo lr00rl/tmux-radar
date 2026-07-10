@@ -19,6 +19,9 @@ SELF="$SCRIPT_DIR/switcher.sh"
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
 MRU_FILE="${TMUX_RADAR_MRU_FILE:-${TMUX_SWITCHER_MRU_FILE:-$STATE_DIR/window-mru}}"
 NEEDINPUT_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
+# agent-session registry written by needinput-notify.sh hooks (TSV, 9 fields:
+# kind key pid pane started last_event state cwd proc); readers need no lock
+REGISTRY_FILE="${TMUX_RADAR_REGISTRY_FILE:-$STATE_DIR/agent-registry}"
 MRU_RECORD="$SCRIPT_DIR/mru-record.sh"
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
@@ -52,7 +55,7 @@ short_path() {  # short_path <path> -> compact display path
 
 needinput_commands() {  # newline-separated process names watched by AI status
   local configured
-  configured="${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude')}}"
+  configured="${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude opencode')}}"
   printf '%s\n' "$configured" | tr ',:' '  '
 }
 
@@ -192,16 +195,19 @@ list_recent() {  # $1 = expand
 }
 
 list_needinput() {  # pane-level AI-status process view; hook-marked panes float first
-  local live flags ps_rows commands
+  local live flags ps_rows commands reg now
   live="$(tmux list-panes -a -F \
     '#{pane_id}'$'\t''#{session_name}:#{window_index}'$'\t''#{pane_index}'$'\t''#{window_name}'$'\t''#{pane_title}'$'\t''#{pane_current_command}'$'\t''#{pane_current_path}'$'\t''#{pane_pid}'$'\t''#{pane_tty}' 2>/dev/null)"
   [ -n "$live" ] || return 0
   flags=""; [ -r "$NEEDINPUT_FILE" ] && flags="$(cat "$NEEDINPUT_FILE" 2>/dev/null || true)"
+  reg=""; [ -r "$REGISTRY_FILE" ] && reg="$(cat "$REGISTRY_FILE" 2>/dev/null || true)"
   ps_rows="$(ps -axo pid=,ppid=,tty=,command= 2>/dev/null || true)"
   commands="$(needinput_commands)"
+  now="$(date +%s)"
 
-  { printf '__PANES__\n%s\n__FLAGS__\n%s\n__PS__\n%s\n' "$live" "$flags" "$ps_rows"; } |
-    LC_ALL=C awk -F '\t' -v cmds="$commands" -v C="$C" -v Y="$Y" -v G="$G" -v M="$M" -v D="$D" -v R="$R" '
+  # __REG__ must come after __PS__: registry liveness checks the ps snapshot
+  { printf '__PANES__\n%s\n__FLAGS__\n%s\n__PS__\n%s\n__REG__\n%s\n' "$live" "$flags" "$ps_rows" "$reg"; } |
+    LC_ALL=C awk -F '\t' -v cmds="$commands" -v now="$now" -v C="$C" -v Y="$Y" -v G="$G" -v M="$M" -v D="$D" -v R="$R" '
       function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
       function clean_tty(t) { sub(/^\/dev\//, "", t); return t }
       function first_word(s, x) { x=trim(s); sub(/[[:space:]].*/, "", x); return x }
@@ -216,6 +222,14 @@ list_needinput() {  # pane-level AI-status process view; hook-marked panes float
       function level_word(level) { return (level == "action" ? "ACTION" : (level == "done" ? "DONE" : (level == "notice" ? "NOTICE" : "ACTIVE"))) }
       function level_icon(level) { return (level == "action" ? "⚠" : (level == "done" ? "✓" : (level == "notice" ? "!" : "·"))) }
       function badge(level) { return level_color(level) level_icon(level) " " level_word(level) " " R }
+      function age_str(sec) {
+        sec += 0
+        if (sec < 0) sec = 0
+        if (sec < 60) return sec "s"
+        if (sec < 3600) return int(sec / 60) "m"
+        if (sec < 86400) return int(sec / 3600) "h"
+        return int(sec / 86400) "d"
+      }
       function proc_match(argv0, raw, n, a, i, c, wanted) {
         raw=tolower(argv0); gsub(/\\/, "/", raw)
         n=split(raw, a, "/")
@@ -232,8 +246,10 @@ list_needinput() {  # pane-level AI-status process view; hook-marked panes float
         if (pane == "" || cmd == "") return
         if (!(pane in ai)) ai[pane]=1
         ai_cmd[pane SUBSEP cmd]=1
+        # registry kinds outside the watch list must still show in cmds_for
+        if (!(cmd in cmd_known)) { cmd_known[cmd]=1; cmd_order[++cmd_n]=cmd }
       }
-      function emit_pane(pane, level,    is_flagged, display_title, title, matched, hint) {
+      function emit_pane(pane, level,    is_flagged, display_title, title, matched, hint, tail) {
         is_flagged=(pane in flagged)
         if (level == "") level=(is_flagged ? flag_level[pane] : "active")
         display_title=ti[pane]
@@ -256,9 +272,16 @@ list_needinput() {  # pane-level AI-status process view; hook-marked panes float
           if (flag_source[pane] != "") hint=flag_source[pane] ": " hint
           if (hint != "") hint=" · " level_color(level) level_word(level) ": " hint R
         }
+        # trailing dim age: mark age when flagged, registry kind/state/uptime otherwise
+        tail=""
+        if (is_flagged) {
+          if (flag_epoch[pane] > 0) tail=" " D "· " age_str(now - flag_epoch[pane]) R
+        } else if (pane in reg_state) {
+          tail=" " D "· " reg_kind[pane] " " reg_state[pane] " · " age_str(now - reg_started[pane]) R
+        }
         printf "%s\t%s%s%s%s %s%s%s\t%s%s · %s · %s%s%s\n", \
           pane_target[pane], badge(level), C, wt[pane] "." pidx[pane], R, wn[pane], title, R, \
-          D, matched, cm[pane], pa[pane], R, hint
+          D, matched, cm[pane], pa[pane], R, hint tail
       }
       function cmds_for(pane,    i, out, cmd) {
         out=""
@@ -286,12 +309,14 @@ list_needinput() {  # pane-level AI-status process view; hook-marked panes float
           if (c == "") continue
           want[c]=raw_cmds[i]
           cmd_order[++real_cmd_n]=raw_cmds[i]
+          cmd_known[raw_cmds[i]]=1
         }
         cmd_n=real_cmd_n
       }
       $0 == "__PANES__" { mode="panes"; next }
       $0 == "__FLAGS__" { mode="flags"; next }
       $0 == "__PS__" { mode="ps"; next }
+      $0 == "__REG__" { mode="reg"; next }
       mode == "panes" && $0 != "" {
         pane=$1
         wt[pane]=$2; pidx[pane]=$3; wn[pane]=$4; ti[pane]=$5; cm[pane]=$6; pa[pane]=$7
@@ -320,6 +345,18 @@ list_needinput() {  # pane-level AI-status process view; hook-marked panes float
         next
       }
       mode == "ps" && $0 != "" { read_ps($0); next }
+      mode == "reg" && $0 != "" {
+        # kind key pid pane started last_event state cwd proc — authoritative
+        # AI-pane detector; pid must be in the ps snapshot (0 = unresolved,
+        # trust tick GC); newest last_event wins when a pane has two rows
+        if (NF < 9 || $4 == "" || $4 == "-") next
+        if ($3 + 0 > 0 && !($3 in proc_parent)) next
+        if (($4 in reg_last) && reg_last[$4] > $6 + 0) next
+        reg_last[$4]=$6 + 0
+        reg_kind[$4]=$1; reg_started[$4]=$5 + 0; reg_state[$4]=$7
+        add_match($4, $1)
+        next
+      }
       END {
         for (pid in proc_cmd) {
           tty=proc_tty[pid]
@@ -388,15 +425,122 @@ do_list() {  # do_list [view] [expand]
   esac
 }
 
+_age_since() {  # _age_since <epoch> -> 45s / 3m / 2h / 1d
+  local s
+  s=$(( $(date +%s) - ${1:-0} ))
+  [ "$s" -lt 0 ] && s=0
+  if [ "$s" -lt 60 ]; then printf '%ss' "$s"
+  elif [ "$s" -lt 3600 ]; then printf '%sm' $(( s / 60 ))
+  elif [ "$s" -lt 86400 ]; then printf '%sh' $(( s / 3600 ))
+  else printf '%sd' $(( s / 86400 )); fi
+}
+
+_level_for() {  # _level_for <source> <label>; mirrors the list awk level_for
+  local l
+  l="$(printf '%s %s' "${1:-}" "${2:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$l" in
+    *finished*|*'your turn'*|*'turn complete'*|*'task complete'*|*done*|*任务完成*|*完成*)
+      printf 'done'; return 0 ;;
+  esac
+  case "$l" in
+    *'needs approval'*|*'needs your permission'*|*'needs input'*|*waiting*input*|*'waiting on you'*|*wait*input*|*permission*|*approval*|*'action required'*|*approve*|*拿不准*|*需要你*|*需要*许可*|*需要*批准*|*等待*输入*)
+      printf 'action'; return 0 ;;
+  esac
+  printf 'notice'
+}
+
+_pane_status_header() {  # $1 = pane %id; tech header + separator when the pane has a mark/registry row
+  local pane="$1" mark="" reg="" level="" icon='·' color="$D" parts kind sid
+  local m_epoch="" m_src="" m_key="" m_label=""
+  local r_kind="" r_key="" r_pid="" r_started="" r_state="" r_cwd="" alive
+  [ -n "$pane" ] || return 0
+  [ -r "$NEEDINPUT_FILE" ] && mark="$(awk -F '\t' -v p="$pane" '$1 == p { print; exit }' "$NEEDINPUT_FILE" 2>/dev/null || true)"
+  [ -r "$REGISTRY_FILE" ] && reg="$(awk -F '\t' -v p="$pane" '$4 == p { r=$0 } END { if (r != "") print r }' "$REGISTRY_FILE" 2>/dev/null || true)"
+  [ -n "$mark" ] || [ -n "$reg" ] || return 0
+  # \037-joined field extraction: tab is IFS whitespace, empty fields would collapse
+  if [ -n "$mark" ]; then
+    IFS=$'\037' read -r m_epoch m_src m_key m_label <<< "$(printf '%s' "$mark" |
+      awk -F '\t' '{ printf "%s\037%s\037%s\037%s", $2, $3, $4, (NF >= 5 ? $5 : $4) }')"
+    level="$(_level_for "$m_src" "$m_label")"
+    case "$level" in
+      action) icon='⚠'; color="$M" ;;
+      done)   icon='✓'; color="$G" ;;
+      *)      icon='!'; color="$Y" ;;
+    esac
+  fi
+  if [ -n "$reg" ]; then
+    IFS=$'\037' read -r r_kind r_key r_pid r_started r_state r_cwd <<< "$(printf '%s' "$reg" |
+      awk -F '\t' '{ printf "%s\037%s\037%s\037%s\037%s\037%s", $1, $2, $3, $5, $7, $8 }')"
+  fi
+  kind="${r_kind:-$m_src}"
+  parts="$icon ${kind:-?}"
+  [ -n "$r_state" ] && parts="$parts · $r_state"
+  [ -n "$m_epoch" ] && parts="$parts · mark $(_age_since "$m_epoch") ago"
+  sid="${r_key:-$m_key}"
+  case "$sid" in
+    s:*) sid="${sid#s:}"; parts="$parts · sid $(printf '%.8s' "$sid")…" ;;
+  esac
+  if [ -n "$r_pid" ] && [ "$r_pid" -gt 0 ] 2>/dev/null; then
+    alive=dead; kill -0 "$r_pid" 2>/dev/null && alive=alive
+    parts="$parts · pid $r_pid $alive"
+  fi
+  [ -n "$r_started" ] && [ "$r_started" -gt 0 ] 2>/dev/null && parts="$parts · up $(_age_since "$r_started")"
+  [ -n "$r_cwd" ] && parts="$parts · $(short_path "$r_cwd")"
+  printf '%s%s%s\n' "$color" "$parts" "$R"
+  [ -n "$m_label" ] && printf '%s%s:%s %s\n' "$D" "${m_src:-mark}" "$R" "$m_label"
+  printf '%s────────────────────────────────────────%s\n' "$D" "$R"
+}
+
+_preview_bg() {  # $1 = 1-based index among paneless (-) marks, need-input file order
+  local idx="$1" line="" reg="" verdict
+  local epoch="" src="" key="" label="" r_kind="" r_pid="" r_state="" r_cwd=""
+  [ -r "$NEEDINPUT_FILE" ] && line="$(awk -F '\t' -v n="$idx" \
+    '$1 == "-" { if (++c == n + 0) { print; exit } }' "$NEEDINPUT_FILE" 2>/dev/null || true)"
+  if [ -z "$line" ]; then
+    printf 'Background AI session\n\nThis mark is no longer in the state file (handled or GCd since the list rendered).\nReload the view (C-i) to refresh.\n'
+    return 0
+  fi
+  IFS=$'\037' read -r epoch src key label <<< "$(printf '%s' "$line" |
+    awk -F '\t' '{ printf "%s\037%s\037%s\037%s", $2, $3, $4, (NF >= 5 ? $5 : $4) }')"
+  [ -n "$key" ] && [ -r "$REGISTRY_FILE" ] && reg="$(awk -F '\t' -v k="$key" \
+    '$2 == k { r=$0 } END { if (r != "") print r }' "$REGISTRY_FILE" 2>/dev/null || true)"
+  printf 'Background AI session (no tmux pane)\n\n'
+  printf '  label:  %s\n' "$label"
+  printf '  source: %s\n' "$src"
+  printf '  key:    %s\n' "${key:-—}"
+  printf '  age:    %s\n' "$(_age_since "$epoch")"
+  if [ -n "$reg" ]; then
+    IFS=$'\037' read -r r_kind r_pid r_state r_cwd <<< "$(printf '%s' "$reg" |
+      awk -F '\t' '{ printf "%s\037%s\037%s\037%s", $1, $3, $7, $8 }')"
+    verdict='dead (cleared on next tick)'
+    if [ "${r_pid:-0}" -gt 0 ] 2>/dev/null && kill -0 "$r_pid" 2>/dev/null; then verdict='alive'; fi
+    printf '  agent:  %s · %s · pid %s %s' "$r_kind" "$r_state" "${r_pid:-?}" "$verdict"
+    [ -n "$r_cwd" ] && printf ' · %s' "$(short_path "$r_cwd")"
+    printf '\n'
+  else
+    printf '  agent:  no registry row (session ended, or started before hooks were installed)\n'
+  fi
+  printf '\nNo pane to switch to. Run needinput-notify.sh doctor for the full diagnostic.\n'
+}
+
 do_preview() {
-  local t="${1:-}"
+  local t="${1:-}" out pane_id capture
   case "$t" in
-    __bg__:*)  printf 'Background AI session\n\nThis status came from an agent hook, but tmux-radar could not resolve it to a live tmux pane.\nThere is no pane to switch to for this row.\n' ;;
+    __bg__:*)  _preview_bg "${t#__bg__:}" ;;
     __noop__:*) printf 'This row is informational and has no tmux target.\n' ;;
     __hdr__:*) tmux list-windows -t "${t#__hdr__:}" \
                  -F '  #{window_index}: #{window_name}  (#{window_panes} panes · #{pane_current_command})' 2>/dev/null ;;
     '')        : ;;
-    *)         tmux capture-pane -ep -t "$t" 2>/dev/null || echo "(no preview available)" ;;
+    *)
+      # one tmux client call: pane id (line 1) then the capture
+      out="$(tmux display-message -p -t "$t" '#{pane_id}' ';' capture-pane -ep -t "$t" 2>/dev/null || true)"
+      if [ -z "$out" ]; then echo "(no preview available)"; return 0; fi
+      pane_id="${out%%$'\n'*}"
+      capture=""
+      case "$out" in *$'\n'*) capture="${out#*$'\n'}" ;; esac
+      _pane_status_header "$pane_id" || true
+      printf '%s\n' "$capture"
+      ;;
   esac
 }
 

@@ -32,6 +32,7 @@
 #   @radar-ai-watch-autonomy auto-safe             watch: auto-safe|suggest|auto
 #   @radar-ai-poll           5                     watch: seconds between polls
 #   @radar-ai-max-calls      40                    watch: cost cap on brain calls
+#   @radar-ai-timeout        120                   hard limit for one brain call
 #   @radar-ai-capture-lines  120                   pane lines fed to the brain
 #   @radar-ai-monitor        on                    open companion monitor pane
 #   @radar-ai-monitor-pos    top                   top|bottom|right
@@ -66,6 +67,16 @@ STATE_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_
 WATCH_DIR="$STATE_DIR/ai-watch"
 LOG="${TMUX_RADAR_AI_LOG:-${TMUX_SWITCHER_AI_LOG:-$STATE_DIR/ai.log}}"
 mkdir -p "$STATE_DIR" "$WATCH_DIR"
+
+# A resident watcher runs the brain in this shell, not inside command
+# substitution, so its signal trap can always terminate the complete process
+# tree. The pidfile is a second line of defence for `stop` and `cleanup`.
+BRAIN_PID=""
+BRAIN_PGID=""
+BRAIN_PID_FILE=""
+BRAIN_OUT_FILE=""
+BRAIN_BOUND_PANE=""
+BRAIN_RESULT=""
 
 opt() {
   local key="$1" def="$2" v legacy
@@ -204,6 +215,86 @@ _state_get() {  # _state_get <watch-file> <key>
   awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$1" 2>/dev/null || true
 }
 
+_process_tree_pids() {  # _process_tree_pids <root-pid>; descendants first
+  local root="$1"
+  case "$root" in ''|*[!0-9]*) return 0 ;; esac
+  ps -axo pid=,ppid= 2>/dev/null | awk -v root="$root" '
+    { n++; pid[n]=$1; ppid[n]=$2 }
+    END {
+      keep[root]=1
+      for (pass=1; pass<=n; pass++)
+        for (i=1; i<=n; i++)
+          if (keep[ppid[i]]) keep[pid[i]]=1
+      for (i=n; i>=1; i--)
+        if (pid[i] != root && keep[pid[i]]) print pid[i]
+      print root
+    }'
+}
+
+_terminate_process_tree() {  # _terminate_process_tree <root-pid> [process-group-id]
+  local root="$1" pgid="${2:-}" tree pid alive
+  case "$root" in ''|*[!0-9]*) return 0 ;; esac
+  case "$pgid" in
+    ''|*[!0-9]*|"$$") pgid="" ;;
+  esac
+  if [ -n "$pgid" ]; then
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 -- "-$pgid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -0 -- "-$pgid" 2>/dev/null && kill -KILL -- "-$pgid" 2>/dev/null || true
+    return 0
+  fi
+  tree="$(_process_tree_pids "$root")"
+  [ -n "$tree" ] || tree="$root"
+  for pid in $tree; do kill -TERM "$pid" 2>/dev/null || true; done
+  for _ in 1 2 3 4 5; do
+    alive=0
+    for pid in $tree; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    [ "$alive" -eq 0 ] && break
+    sleep 0.1
+  done
+  # A CLI wrapper may ignore TERM or fail to forward it to its native child.
+  # Kill every PID captured before the parent can orphan its descendants.
+  for pid in $tree; do
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  done
+}
+
+_terminate_brain_file() {  # _terminate_brain_file <brain-pidfile>
+  local file="$1" pid pgid output
+  [ -r "$file" ] || return 0
+  pid="$(_state_get "$file" pid)"
+  pgid="$(_state_get "$file" pgid)"
+  output="$(_state_get "$file" output)"
+  _terminate_process_tree "$pid" "$pgid"
+  [ -n "$output" ] && rm -f "$output"
+  rm -f "$file"
+}
+
+# shellcheck disable=SC2329  # invoked from the watcher's signal trap
+_terminate_current_brain() {
+  local pid="${BRAIN_PID:-}" pgid="${BRAIN_PGID:-}" file="${BRAIN_PID_FILE:-}" output="${BRAIN_OUT_FILE:-}"
+  [ -n "$pid" ] && _terminate_process_tree "$pid" "$pgid"
+  [ -n "$output" ] && rm -f "$output"
+  [ -n "$file" ] && rm -f "$file"
+  BRAIN_PID=""
+  BRAIN_PGID=""
+  BRAIN_OUT_FILE=""
+}
+
+# shellcheck disable=SC2329  # invoked from the process-owner signal traps
+_brain_owner_signal() {
+  local rc="$1"
+  trap - TERM INT HUP
+  _terminate_current_brain
+  exit "$rc"
+}
+trap '_brain_owner_signal 143' TERM
+trap '_brain_owner_signal 130' INT
+trap '_brain_owner_signal 129' HUP
+
 _clip_lines() {  # _clip_lines <width> <max-lines> [file]
   local width="$1" max="$2"
   awk -v w="$width" -v max="$max" '
@@ -325,30 +416,75 @@ _resolve_pane() {
 # Codex is read-only + ephemeral; only its --output-schema'd last message is used.
 # ---------------------------------------------------------------------------
 _brain() {
-  local schema="$1" prompt="$2" out custom profile err
+  local schema="$1" prompt="$2" out custom profile err pid rc=0 started timeout stop_reason="" had_job_control=0
+  BRAIN_RESULT=""
   out="$(mktemp "${TMPDIR:-/tmp}/tmuxai.XXXXXX")"
+  BRAIN_OUT_FILE="$out"
   err="${TMUX_RADAR_AI_ERR:-${TMUX_SWITCHER_AI_ERR:-/dev/null}}"
   [ "$err" = "/dev/null" ] || : > "$err" 2>/dev/null || true
   # env seam (tests) wins over the user-facing option; both replace codex with
   # any command that reads the prompt on stdin and prints decision JSON.
   custom="${TMUX_RADAR_AI_CMD:-${TMUX_SWITCHER_AI_CMD:-$(opt @radar-ai-cmd '')}}"
+  case "$-" in *m*) had_job_control=1 ;; esac
+  set -m
   if [ -n "$custom" ]; then
-    printf '%s' "$prompt" | eval "$custom" > "$out" 2>"$err" || true
+    (printf '%s' "$prompt" | eval "$custom" > "$out" 2>"$err") &
   elif [ -n "$(opt @radar-ai-profile '')" ]; then
     # a codex profile bundles model/effort/etc in ~/.codex/config.toml; the
     # safety flags (read-only, ephemeral) stay ours and are not overridable
     profile="$(opt @radar-ai-profile '')"
     codex exec -p "$profile" \
       -s read-only --ephemeral --skip-git-repo-check \
-      --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" || true
+      --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" &
   else
     codex exec \
       -m "$(opt @radar-ai-model gpt-5.3-codex-spark)" \
       -c model_reasoning_effort="$(opt @radar-ai-effort low)" \
       -s read-only --ephemeral --skip-git-repo-check \
-      --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" || true
+      --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" &
   fi
-  cat "$out" 2>/dev/null; rm -f "$out"
+  BRAIN_PID=$!
+  BRAIN_PGID="$BRAIN_PID"
+  [ "$had_job_control" -eq 1 ] || set +m
+  pid="$BRAIN_PID"
+  started="$(now)"
+  timeout="$(opt @radar-ai-timeout 120)"
+  case "$timeout" in ''|*[!0-9]*) timeout=120 ;; esac
+  [ "$timeout" -lt 5 ] && timeout=5
+  if [ -n "${BRAIN_PID_FILE:-}" ]; then
+    {
+      printf 'pid=%s\npgid=%s\nwatch_pid=%s\npane=%s\nstarted=%s\noutput=%s\n' \
+        "$pid" "$BRAIN_PGID" "$$" "${BRAIN_BOUND_PANE:-}" "$started" "$out"
+    } > "$BRAIN_PID_FILE"
+  fi
+
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ -n "${BRAIN_BOUND_PANE:-}" ] && \
+       ! tmux display-message -p -t "$BRAIN_BOUND_PANE" '#{pane_id}' >/dev/null 2>&1; then
+      stop_reason="target pane $BRAIN_BOUND_PANE disappeared"
+      _terminate_process_tree "$pid" "$BRAIN_PGID"
+      break
+    fi
+    if [ "$(( $(now) - started ))" -ge "$timeout" ]; then
+      stop_reason="brain call exceeded ${timeout}s timeout"
+      _terminate_process_tree "$pid" "$BRAIN_PGID"
+      break
+    fi
+    sleep 0.2
+  done
+  if wait "$pid" 2>/dev/null; then rc=0; else rc=$?; fi
+  BRAIN_PID=""
+  BRAIN_PGID=""
+  [ -n "${BRAIN_PID_FILE:-}" ] && rm -f "$BRAIN_PID_FILE"
+  if [ -n "$stop_reason" ]; then
+    printf 'tmux-radar: %s\n' "$stop_reason" >> "$err" 2>/dev/null || true
+    audit "brain-stop\t${BRAIN_BOUND_PANE:--}\t$stop_reason"
+  elif [ "$rc" -ne 0 ]; then
+    audit "brain-exit\t${BRAIN_BOUND_PANE:--}\trc=$rc"
+  fi
+  BRAIN_RESULT="$(cat "$out" 2>/dev/null || true)"
+  rm -f "$out"
+  BRAIN_OUT_FILE=""
 }
 
 _brain_label() {
@@ -385,7 +521,7 @@ cmd_decide() {
   need_jq
   have_brain || { echo "codex 未安装/不可用，无法决策。"; return 3; }
   local pane autonomy policy goal cap cap_tail where json pretty_json action text safe reason extra="" prompt backend
-  local excerpt_lines errfile err_tail
+  local excerpt_lines errfile err_tail TMUX_RADAR_AI_ERR="" TMUX_SWITCHER_AI_ERR=""
   pane="$(_resolve_pane "${1:-}")" || { echo "no target pane"; return 5; }
   autonomy="${2:-$(opt @radar-ai-autonomy confirm)}"
   policy="${3:-}"
@@ -412,10 +548,15 @@ cmd_decide() {
       "$excerpt_lines" "$(opt @radar-ai-capture-lines 120)" "$cap_tail")"
   fi
   if [ -n "${TMUX_RADAR_AI_DETAIL:-${TMUX_SWITCHER_AI_DETAIL:-}}" ]; then
-    json="$(TMUX_RADAR_AI_ERR="$errfile" TMUX_SWITCHER_AI_ERR="$errfile" _brain "$(_skill_file decide.schema.json)" "$prompt")"
-  else
-    json="$(_brain "$(_skill_file decide.schema.json)" "$prompt")"
+    TMUX_RADAR_AI_ERR="$errfile"
+    TMUX_SWITCHER_AI_ERR="$errfile"
   fi
+  BRAIN_BOUND_PANE="$pane"
+  BRAIN_PID_FILE="$(_wbase "$pane").brain.pid"
+  _brain "$(_skill_file decide.schema.json)" "$prompt"
+  json="$BRAIN_RESULT"
+  BRAIN_BOUND_PANE=""
+  BRAIN_PID_FILE=""
   pretty_json="$(_pretty_json "$json")"
   action="$(printf '%s' "$json" | jq -r '.action // "unknown"' 2>/dev/null || echo unknown)"
   text="$(printf '%s' "$json" | jq -r '.text // ""' 2>/dev/null || echo '')"
@@ -495,10 +636,10 @@ cmd_watch_loop() {
   printf '%s▶ 开始监控%s %s%s\n%s  策略 %s · 自主度 %s · 轮询 %ss · 决策上限 %s 次%s\n' \
     "$CG" "$CR" "$(_pane_label "$pane")" "${goal:+  ${CD}· ${goal}${CR}}" \
     "$CD" "${policy:-安全项自动}" "$auto" "$poll" "$maxcalls" "$CR"
-  # $wf is a function-local, so an EXIT trap would see it out-of-scope after the
-  # loop returns (rm no-ops). Trap signals only (wf is in scope mid-loop); clean
-  # up normal exits explicitly after the loop.
-  trap 'rm -f "$wf"; exit 0' TERM INT
+  # Keep the brain in this shell's lifecycle. Signals from `stop`, monitor-pane
+  # Ctrl-C/close, or tmux teardown terminate every descendant before state is
+  # removed, so a Codex CLI child cannot be reparented to PID 1.
+  trap 'trap - TERM INT HUP; _terminate_current_brain; rm -f "$wf"; exit 0' TERM INT HUP
 
   while :; do
     tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1 || { echo "pane $pane gone"; break; }
@@ -584,8 +725,18 @@ monitor_size() {  # monitor_size <pane> <height|width> <requested> <min> <reserv
   printf '%s' "$requested"
 }
 
+_abort_watch_launch() {  # _abort_watch_launch <pane> <watcher-pid>
+  local pane="$1" pid="$2" base
+  base="$(_wbase "$pane")"
+  [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  [ -n "$pid" ] && wait "$pid" 2>/dev/null || true
+  _terminate_brain_file "$base.brain.pid"
+  rm -f "$base.watch" "$base.out" "$base.timeline" "$base.detail" \
+    "$base.detail.log" "$base.brain.err"
+}
+
 cmd_watch() {  # detach the loop so the caller (popup/menu) can return
-  local pane goal policy poll auto wf base feed pos mon_size err layout mon_pane detail_cmd timeline_cmd single_cmd
+  local pane goal policy poll auto wf base feed pos mon_size err layout mon_pane detail_cmd timeline_cmd single_cmd watch_pid
   local -a split_args
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane"; return 1; }
   goal="${2:-}"; policy="${3:-}"; poll="${4:-}"; auto="${5:-}"
@@ -598,6 +749,7 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
   : > "$base.detail"
   : > "$base.detail.log"
   nohup bash "$SELF" _watch_loop "$pane" "$goal" "$policy" "$poll" "$auto" >"$feed" 2>&1 &
+  watch_pid=$!
   disown 2>/dev/null || true
   # Companion monitor: a split next to the watched pane, not a covering popup.
   # In the default split layout, the monitor region is split again into
@@ -631,8 +783,10 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
         if err="$(tmux split-window "${split_args[@]}" -d -t "$pane" "$single_cmd" 2>&1)"; then
           audit "monitor-start\t$pane\t$pos\tsingle\tsize=$mon_size"
         else
-          printf '%s⚠ 监控 pane 打开失败%s（watch 仍在运行）%s\n' "$CY" "$CR" "${err:+: $err}"
+          printf '%s⚠ 监控 pane 打开失败，已停止 watch%s%s\n' "$CY" "$CR" "${err:+: $err}"
           audit "monitor-fail\t$pane\t$pos\tsingle\tsize=${mon_size:-?}\t$err"
+          _abort_watch_launch "$pane" "$watch_pid"
+          return 1
         fi
       elif mon_pane="$(tmux split-window "${split_args[@]}" -P -F '#{pane_id}' -d -t "$pane" "$timeline_cmd" 2>&1)"; then
         if [ "$pos" = "right" ]; then
@@ -644,12 +798,16 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
         fi
         audit "monitor-start\t$pane\t$pos\tsplit\tsize=$mon_size"
       else
-        printf '%s⚠ 监控 pane 打开失败%s（watch 仍在运行）%s\n' "$CY" "$CR" "${mon_pane:+: $mon_pane}"
+        printf '%s⚠ 监控 pane 打开失败，已停止 watch%s%s\n' "$CY" "$CR" "${mon_pane:+: $mon_pane}"
         audit "monitor-fail\t$pane\t$pos\tsplit\tsize=${mon_size:-?}\t$mon_pane"
+        _abort_watch_launch "$pane" "$watch_pid"
+        return 1
       fi
     else
-      printf '%s⚠ 目标 pane 太小，未打开监控 pane%s（watch 仍在运行）\n' "$CY" "$CR"
+      printf '%s⚠ 目标 pane 太小，未打开监控 pane；已停止 watch%s\n' "$CY" "$CR"
       audit "monitor-skip\t$pane\t$pos\tpane-too-small"
+      _abort_watch_launch "$pane" "$watch_pid"
+      return 1
     fi
   fi
   printf '%s✓ 已开始监控%s %s%s%s\n' "$CG" "$CR" "$(_pane_label "$pane")" \
@@ -679,21 +837,33 @@ cmd_watch_setup() {
 }
 
 cmd_stop() {
-  local target="${1:-all}" wf pid
+  local target="${1:-all}" wf pid brain_file
   if [ "$target" = "all" ]; then
     for wf in "$WATCH_DIR"/*.watch; do
       [ -e "$wf" ] || continue
       pid="$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)"
+      brain_file="${wf%.watch}.brain.pid"
       [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+      _terminate_brain_file "$brain_file"
       rm -f "$wf"
+    done
+    for brain_file in "$WATCH_DIR"/*.brain.pid; do
+      [ -e "$brain_file" ] || continue
+      _terminate_brain_file "$brain_file"
     done
     echo "stopped all watchers"; return 0
   fi
   target="$(_resolve_pane "$target" 2>/dev/null || echo "$target")"
   wf="$(_wf "$target")"
-  [ -f "$wf" ] || { echo "no watcher for $target"; return 0; }
+  brain_file="${wf%.watch}.brain.pid"
+  if [ ! -f "$wf" ]; then
+    _terminate_brain_file "$brain_file"
+    echo "no watcher for $target"
+    return 0
+  fi
   pid="$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)"
   [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  _terminate_brain_file "$brain_file"
   rm -f "$wf"; echo "stopped watcher for $target"
 }
 
@@ -748,7 +918,10 @@ _monitor_loop() {  # _monitor_loop <timeline|detail|combined> <pane>
   # append-only, so tmux scrollback stays useful and countdown updates do not
   # repaint the whole pane.
   printf '\033[?25l\033[H\033[J'
-  trap 'printf "\033[r\033[?25h"; exit 0' TERM INT
+  # The companion pane owns the watch from the user's point of view. Closing it
+  # or pressing Ctrl-C must stop the watcher instead of leaving a hidden brain
+  # call running after its visible control surface is gone.
+  trap 'printf "\033[r\033[?25h"; "$SELF" stop "$pane" >/dev/null 2>&1 || true; exit 0' TERM INT HUP
   while [ -f "$wf" ]; do
     cols="$(tput cols 2>/dev/null || echo 100)"
     rows="$(tput lines 2>/dev/null || echo 24)"
@@ -801,7 +974,10 @@ cmd_ask() {
   autonomy="$(opt @radar-ai-autonomy confirm)"
   snap="$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{?pane_active,*,} #{pane_current_command} #{pane_current_path} "#{pane_title}"' 2>/dev/null || true)"
   echo "· thinking…"
-  json="$(_brain "$PROMPT_DIR/control.schema.json" "$(_skill control.md)"$'\n\n'"CURRENT TMUX PANES:"$'\n'"$snap"$'\n\n'"CURRENT PANE: ${TMUX_PANE:-?}"$'\n'"USER REQUEST: $req")"
+  BRAIN_BOUND_PANE=""
+  BRAIN_PID_FILE=""
+  _brain "$PROMPT_DIR/control.schema.json" "$(_skill control.md)"$'\n\n'"CURRENT TMUX PANES:"$'\n'"$snap"$'\n\n'"CURRENT PANE: ${TMUX_PANE:-?}"$'\n'"USER REQUEST: $req"
+  json="$BRAIN_RESULT"
   explain="$(printf '%s' "$json" | jq -r '.explain // ""' 2>/dev/null || echo '')"
   cmds_file="$(mktemp "${TMPDIR:-/tmp}/tmuxask.XXXXXX")"
   printf '%s' "$json" | jq -r '.commands[]? // empty' 2>/dev/null > "$cmds_file" || true
@@ -881,9 +1057,10 @@ cmd_cleanup() {
     [ -e "$wf" ] || continue
     pid="$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)"
     kill -0 "$pid" 2>/dev/null && continue
+    _terminate_brain_file "${wf%.watch}.brain.pid"
     rm -f "$wf" "${wf%.watch}.out" "${wf%.watch}.timeline" "${wf%.watch}.detail" "${wf%.watch}.detail.log" "${wf%.watch}.brain.err"; n=$((n+1))
   done
-  for f in "$WATCH_DIR"/*.out "$WATCH_DIR"/*.timeline "$WATCH_DIR"/*.detail "$WATCH_DIR"/*.detail.log "$WATCH_DIR"/*.brain.err; do
+  for f in "$WATCH_DIR"/*.out "$WATCH_DIR"/*.timeline "$WATCH_DIR"/*.detail "$WATCH_DIR"/*.detail.log "$WATCH_DIR"/*.brain.err "$WATCH_DIR"/*.brain.pid; do
     [ -e "$f" ] || continue
     case "$f" in
       *.out) base="${f%.out}" ;;
@@ -891,9 +1068,12 @@ cmd_cleanup() {
       *.detail.log) base="${f%.detail.log}" ;;
       *.detail) base="${f%.detail}" ;;
       *.brain.err) base="${f%.brain.err}" ;;
+      *.brain.pid) base="${f%.brain.pid}" ;;
       *) base="${f%.*}" ;;
     esac
-    [ -f "$base.watch" ] || rm -f "$f"
+    if [ ! -f "$base.watch" ]; then
+      case "$f" in *.brain.pid) _terminate_brain_file "$f" ;; *) rm -f "$f" ;; esac
+    fi
   done
   live_pids=""
   for wf in "$WATCH_DIR"/*.watch; do

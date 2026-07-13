@@ -130,6 +130,7 @@ Set these **before** the plugin loads:
 | `@radar-ai-watch-autonomy` | `auto-safe` | Resident `watch`: `auto-safe` (auto-send only safe replies, escalate the rest), `suggest`, `auto`. |
 | `@radar-ai-poll` | `5` | Idle-listen interval while watching a pane. The next interval starts after a model decision/action returns, so slow decisions do not overlap. |
 | `@radar-ai-max-calls` | `40` | Cost cap: a watcher pauses after this many model calls. |
+| `@radar-ai-timeout` | `120` | Hard limit in seconds for one model call (minimum `5`). A timed-out Codex wrapper and all of its children are terminated as one process group. |
 | `@radar-ai-capture-lines` | `120` | Pane lines fed to the model per decision. |
 | `@radar-ai-watch-always-allow` | `off` | While watching, prefer the TUI's "don't ask again / always allow" option for **safe** actions (fewer interruptions, lower safety). Menu entry `W` enables it per-watch. |
 | `@radar-ai-monitor` | `on` | Open companion monitor pane(s) next to a watched pane, showing live countdown/status plus the supervisor's timeline/details (self-closes when the watch ends). |
@@ -274,7 +275,11 @@ review older events without fighting a one-second refresh. Only the pane excerpt
 is shortened in the detail view; model context still uses
 `@radar-ai-capture-lines`. It self-closes when the watch ends. Set
 `@radar-ai-monitor-layout 'single'` to keep one combined detail pane. The
-**`W`** menu entry starts a watch with
+monitor is also the watch's visible owner: pressing **Ctrl-C** in either
+monitor pane, closing it, or closing the target pane stops the watcher and its
+in-flight model process group immediately. A model call is additionally capped
+by `@radar-ai-timeout`, so a wedged CLI/API request cannot survive invisibly.
+The **`W`** menu entry starts a watch with
 **always-allow**: for safe approvals the AI prefers the TUI's "don't ask again"
 so the agent runs with fewer interruptions (convenience over per-action vetting;
 off by default).
@@ -291,8 +296,10 @@ then sends the keystrokes, gated by three safeguards:
 - **Escalation** — anything destructive, irreversible, or ambiguous (rm, force
   push, deleting data, credentials, deploys, or "I'm not sure") is **never**
   auto-sent; it re-marks the pane needs-input and pauses so you decide.
-- **Audit + caps** — every action is appended to `~/.local/state/tmux/ai.log`,
-  and a watcher pauses after `@radar-ai-max-calls` model calls.
+- **Audit + caps** — every action is appended to `~/.local/state/tmux/ai.log`;
+  a watcher pauses after `@radar-ai-max-calls` calls, and each call has a hard
+  `@radar-ai-timeout`. Every call runs in its own process group, so stopping the
+  watch also terminates CLI wrappers, native Codex children, and MCP children.
 
 The "skill" the model follows lives in `scripts/prompts/*.md`: how to read each
 TUI's prompts, which menu option is the safe "Yes", and the safety rules.
@@ -370,7 +377,8 @@ when the bar renders (≤30s), and whenever the AI status view opens.
     background-session marks; `key` is `s:<claude session_id>` or the pane id).
   - `ai-watch/` — one `<pane>.watch` pid/state file per resident watcher, plus
     `<pane>.out` execution feed, `<pane>.timeline` monitor events, and
-    `<pane>.detail` last model-call detail.
+    `<pane>.detail` last model-call detail. While a model call is active,
+    `<pane>.brain.pid` records its PID/process group for `stop` and crash GC.
   - `ai.log` — the AI supervisor's audit log.
 - Environment overrides (mainly for scripting/tests): `TMUX_RADAR_STATE_DIR`,
   `TMUX_RADAR_MRU_FILE`, `TMUX_RADAR_NEEDINPUT_FILE`,

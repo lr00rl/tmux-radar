@@ -66,6 +66,52 @@ _radar_append_jsonl() {
   printf '%s\n' "$payload" >> "$path"
 }
 
+_radar_lock_mtime() {
+  stat -f '%m' "$1" 2>/dev/null
+}
+
+_radar_lock_is_stale() {
+  local lock_dir="$1" stale_after="${2:-10}" lock_pid="" now="" mtime="" age=""
+  [ -d "$lock_dir" ] || return 1
+  lock_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+  if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+    return 1
+  fi
+  now="$(date '+%s')"
+  mtime="$(_radar_lock_mtime "$lock_dir" || true)"
+  case "$mtime" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  age=$((now - mtime))
+  [ "$age" -ge "$stale_after" ]
+}
+
+_radar_lock_acquire() {
+  local lock_dir="$1" attempts="${2:-1000}" delay="${3:-0.01}" stale_after="${4:-10}" try=0
+  while [ "$try" -lt "$attempts" ]; do
+    if mkdir "$lock_dir" 2>/dev/null; then
+      if ! printf '%s\n' "$$" > "$lock_dir/pid"; then
+        rm -rf "$lock_dir"
+        sleep "$delay"
+        try=$((try + 1))
+        continue
+      fi
+      return 0
+    fi
+    if _radar_lock_is_stale "$lock_dir" "$stale_after"; then
+      rm -rf "$lock_dir"
+      continue
+    fi
+    sleep "$delay"
+    try=$((try + 1))
+  done
+  return 1
+}
+
+_radar_lock_release() {
+  rm -rf "$1"
+}
+
 _radar_watch_write() {
   local watch_file="$1" pane="$2" run_id="$3" run_dir="$4" pid="$5" channel="$6"
   local overview="${7:-}" detail="${8:-}"
@@ -141,7 +187,7 @@ radar_run_open() {
 }
 
 radar_state_set() {
-  local phase="$1" status="$2" next_kind="$3" next_at raw_next_at payload
+  local phase="$1" status="$2" next_kind="$3" raw_next_at payload
   raw_next_at="$(_radar_json_number "${4:-0}")"
   _radar_require_jq || return 1
   [ -n "$RADAR_RUN_DIR" ] || return 1
@@ -181,23 +227,53 @@ radar_event_append() {
 }
 
 radar_inbox_append() {
-  local payload extra_json="${4:-"{}"}"
+  local payload extra_json="${4:-"{}"}" inbox_path lock_path rc=0
   _radar_require_jq || return 1
   [ -n "$RADAR_RUN_DIR" ] || return 1
   payload="$(_radar_current_event_json "$1" "$2" "$3" "$extra_json")" || return 1
-  _radar_append_jsonl "$RADAR_RUN_DIR/inbox.jsonl" "$payload"
+  inbox_path="$RADAR_RUN_DIR/inbox.jsonl"
+  lock_path="$inbox_path.lock"
+  if ! _radar_lock_acquire "$lock_path"; then
+    return 1
+  fi
+  if ! _radar_append_jsonl "$inbox_path" "$payload"; then
+    rc=1
+  fi
+  if ! _radar_lock_release "$lock_path"; then
+    rc=1
+  fi
+  return "$rc"
 }
 
 radar_inbox_drain() {
-  local inbox_path tmp_path
+  local inbox_path lock_path snapshot_path rc=0
   [ -n "$RADAR_RUN_DIR" ] || return 1
   inbox_path="$RADAR_RUN_DIR/inbox.jsonl"
-  [ -s "$inbox_path" ] || return 0
-  tmp_path="$(mktemp "$RADAR_RUN_DIR/.inbox.XXXXXX")" || return 1
-  mv "$inbox_path" "$tmp_path"
-  cat "$tmp_path"
-  rm -f "$tmp_path"
-  : > "$inbox_path"
+  lock_path="$inbox_path.lock"
+  if ! _radar_lock_acquire "$lock_path"; then
+    return 1
+  fi
+  if [ -s "$inbox_path" ]; then
+    snapshot_path="$(mktemp "$RADAR_RUN_DIR/.inbox-drain.XXXXXX")" || rc=1
+    if [ "$rc" -eq 0 ] && ! mv "$inbox_path" "$snapshot_path"; then
+      rc=1
+    fi
+  fi
+  if [ "$rc" -eq 0 ] && ! : > "$inbox_path"; then
+    rc=1
+  fi
+  if ! _radar_lock_release "$lock_path"; then
+    rc=1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    [ -n "${snapshot_path:-}" ] && rm -f "$snapshot_path"
+    return "$rc"
+  fi
+  [ -n "${snapshot_path:-}" ] || return 0
+  cat "$snapshot_path"
+  rc=$?
+  rm -f "$snapshot_path"
+  return "$rc"
 }
 
 radar_run_finalize() {

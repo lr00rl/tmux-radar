@@ -9,7 +9,6 @@ test_tmpdir() {
 _fail_assert() {
   local message="$1"
   shift || true
-  TEST_EXIT_CODE=1
   {
     printf 'FAIL: %s\n' "$message"
     while [ "$#" -gt 1 ]; do

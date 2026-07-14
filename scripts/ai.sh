@@ -60,7 +60,11 @@ case "${LC_ALL:-${LANG:-}}" in *[Uu][Tt][Ff]*) ;; *) export LANG=en_US.UTF-8 ;; 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SELF")"
 PROMPT_DIR="$SCRIPT_DIR/prompts"
+AI_RUNTIME_LIB="$SCRIPT_DIR/lib/ai-runtime.sh"
 NOTIFY="$SCRIPT_DIR/needinput-notify.sh"
+[ -r "$AI_RUNTIME_LIB" ] || { echo "tmux-radar AI needs $AI_RUNTIME_LIB" >&2; exit 1; }
+# shellcheck source=scripts/lib/ai-runtime.sh
+. "$AI_RUNTIME_LIB"
 
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
 STATE_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
@@ -1124,11 +1128,49 @@ cmd_menu() {
     "列出 AI pane"                     l "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF list\""
 }
 
+_event_kind_valid() {
+  case "$1" in
+    approval|input_required|turn_complete|user_resumed|screen_idle|manual_reassess) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_emit_event_usage() {
+  echo "usage: ai.sh emit-event <pane> <kind> <source> <label>" >&2
+}
+
+cmd_emit_event() {
+  local pane="${1:-}" kind="${2:-}" source="${3:-}" label="${4-}"
+  local sanitized
+  if [ -z "$pane" ] || [ -z "$kind" ] || [ -z "$source" ] || [ "${4+x}" != x ]; then
+    _emit_event_usage
+    return 2
+  fi
+  if ! _event_kind_valid "$kind"; then
+    echo "emit-event: invalid kind: $kind" >&2
+    _emit_event_usage
+    return 2
+  fi
+  sanitized="$(_flat "$label")"
+  if ! radar_run_open "$pane" >/dev/null 2>&1; then
+    return 0
+  fi
+  [ -d "${RADAR_RUN_DIR:-}" ] || return 0
+  if ! radar_inbox_append "$kind" "$source" "$sanitized" '{}'; then
+    echo "emit-event: failed to append event" >&2
+    return 1
+  fi
+  if [ -n "${RADAR_RUN_CHANNEL:-}" ] && have_tmux; then
+    tmux wait-for -S "$RADAR_RUN_CHANNEL" >/dev/null 2>&1 || true
+  fi
+}
+
 rc=0
 case "${1:-}" in
   ask)          shift; cmd_ask "$@" || rc=$? ;;
   decide)       shift; cmd_decide "${1:-}" "${2:-}" "${3:-}" "${4:-}" || rc=$? ;;
   watch)        shift; cmd_watch "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" || rc=$? ;;
+  emit-event)   shift; cmd_emit_event "$@" || rc=$? ;;
   watch-setup)  shift; cmd_watch_setup "${1:-}" || rc=$? ;;
   _watch_loop)  shift; cmd_watch_loop "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" || rc=$? ;;
   monitor)      shift; cmd_monitor "${1:-}" || rc=$? ;;
@@ -1139,7 +1181,7 @@ case "${1:-}" in
   list)         cmd_list || rc=$? ;;
   cleanup)      cmd_cleanup || rc=$? ;;
   menu)         cmd_menu || rc=$? ;;
-  *) echo "usage: ai.sh {ask [req]|decide [pane] [autonomy] [policy]|watch <pane> [goal] [policy] [poll] [autonomy]|watch-setup [pane]|monitor <pane>|monitor-timeline <pane>|monitor-detail <pane>|stop <pane|all>|status|list|cleanup|menu}" >&2; exit 2 ;;
+  *) echo "usage: ai.sh {ask [req]|decide [pane] [autonomy] [policy]|watch <pane> [goal] [policy] [poll] [autonomy]|emit-event <pane> <kind> <source> <label>|watch-setup [pane]|monitor <pane>|monitor-timeline <pane>|monitor-detail <pane>|stop <pane|all>|status|list|cleanup|menu}" >&2; exit 2 ;;
 esac
 # menu-launched popups set this so the result stays on screen until a keypress
 if [ -n "${TMUX_RADAR_AI_PAUSE:-${TMUX_SWITCHER_AI_PAUSE:-}}" ] && [ -t 0 ]; then

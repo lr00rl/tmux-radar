@@ -4,7 +4,8 @@
 #
 # Edits, idempotently and with a timestamped backup:
 #   ~/.claude/settings.json   (Claude hooks)
-#   ~/.codex/config.toml      (Codex hooks + legacy notify fallback)
+#   ~/.codex/config.toml      (Codex trust marker + legacy notify fallback)
+#   ~/.codex/hooks.json       (Codex native hooks)
 #
 # Usage: install-hooks.sh [install|uninstall|status]
 set -euo pipefail
@@ -14,29 +15,324 @@ NOTIFY="${TMUX_RADAR_NOTIFY:-${TMUX_SWITCHER_NOTIFY:-$SCRIPT_DIR/needinput-notif
 CODEX_WRAP="${TMUX_RADAR_CODEX_WRAP:-${TMUX_SWITCHER_CODEX_WRAP:-$SCRIPT_DIR/codex-notify-wrap.sh}}"
 CLAUDE_SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 CODEX_CONFIG="${CODEX_CONFIG:-$HOME/.codex/config.toml}"
+CODEX_HOOKS_JSON="${CODEX_HOOKS_JSON:-$HOME/.codex/hooks.json}"
 
 # NOTE: SessionEnd is intentionally NOT hooked. It fires the instant a session
 # ends — which immediately follows Stop for short-lived / print-mode / background
-# runs — so a SessionEnd clear would wipe the "Claude finished — your turn" mark
-# before you ever see it. Marks are cleared when you navigate to the window
-# (session-window-changed hook) and dead panes are filtered from the view.
+# runs — so a SessionEnd clear would wipe the "finished" mark the moment a session
+# ended. Marks are cleared when you navigate to the window (session-window-changed
+# hook) and dead panes are filtered from the view.
 CLAUDE_EVENTS=(Notification Stop UserPromptSubmit)
 CLAUDE_SUBCMDS=(claude-mark claude-stop claude-clear)
+CODEX_EVENTS=(PermissionRequest Stop UserPromptSubmit)
 CODEX_NOTIFY_JSON="[\"$NOTIFY\", \"codex\"]"
 CODEX_HOOK_CMD="$NOTIFY codex-hook"
 CODEX_HOOK_BEGIN="# BEGIN tmux-radar Codex hooks"
 CODEX_HOOK_END="# END tmux-radar Codex hooks"
 
+RADAR_TS="$(date +%Y%m%d%H%M%S)"
+
 die()  { echo "error: $*" >&2; exit 1; }
 info() { echo "  $*"; }
 need_jq() { command -v jq >/dev/null 2>&1 || die "jq is required (brew install jq)"; }
+
+toml_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+backup_file() {
+  local path="$1"
+  [ -f "$path" ] || return 0
+  cp "$path" "$path.bak.$RADAR_TS"
+}
+
+append_marker_block() {
+  local block_file="$1" marker_file="$2"
+  cat "$block_file"
+  if [ -s "$marker_file" ]; then
+    printf '\n%s\n' "$CODEX_HOOK_BEGIN"
+    cat "$marker_file"
+    printf '%s\n' "$CODEX_HOOK_END"
+  fi
+}
+
+strip_marker_block() {
+  local path="$1"
+  awk -v begin="$CODEX_HOOK_BEGIN" -v end="$CODEX_HOOK_END" '
+    $0 == begin { skip = 1; next }
+    $0 == end { skip = 0; next }
+    !skip { print }
+  ' "$path"
+}
+
+codex_event_label() {
+  case "$1" in
+    PermissionRequest) printf 'permission_request' ;;
+    Stop) printf 'stop' ;;
+    UserPromptSubmit) printf 'user_prompt_submit' ;;
+    *) die "unknown Codex event: $1" ;;
+  esac
+}
+
+ensure_codex_files() {
+  mkdir -p "$(dirname "$CODEX_CONFIG")" "$(dirname "$CODEX_HOOKS_JSON")"
+  [ -f "$CODEX_CONFIG" ] || printf 'notify = %s\n' "$CODEX_NOTIFY_JSON" > "$CODEX_CONFIG"
+  [ -f "$CODEX_HOOKS_JSON" ] || printf '{"hooks":{}}\n' > "$CODEX_HOOKS_JSON"
+}
+
+validate_codex_hooks_json() {
+  need_jq
+  [ -f "$CODEX_HOOKS_JSON" ] || return 0
+  jq empty "$CODEX_HOOKS_JSON" >/dev/null 2>&1 || die "$CODEX_HOOKS_JSON is not valid JSON"
+}
+
+codex_has_notify() {
+  [ -f "$CODEX_CONFIG" ] || return 1
+  grep -qF "codex-notify-wrap.sh" "$CODEX_CONFIG" && return 0
+  grep -qF 'needinput-notify.sh", "codex' "$CODEX_CONFIG" && return 0
+  grep -qF 'needinput-notify.sh","codex' "$CODEX_CONFIG" && return 0
+  grep -qF 'needinput-notify.sh\", \"codex' "$CODEX_CONFIG" && return 0
+  grep -qF 'needinput-notify.sh\",\"codex' "$CODEX_CONFIG" && return 0
+  grep -qF 'needinput-notify.sh\\\",\\\"codex' "$CODEX_CONFIG" && return 0
+  return 1
+}
+
+codex_native_count_for_event() {
+  local event="$1"
+  [ -f "$CODEX_HOOKS_JSON" ] || { echo 0; return 0; }
+  jq -r --arg event "$event" --arg command "$CODEX_HOOK_CMD" '
+    [(.hooks[$event] // [])[]?.hooks[]? | select(.type == "command" and .command == $command)] | length
+  ' "$CODEX_HOOKS_JSON" 2>/dev/null || echo 0
+}
+
+codex_native_position() {
+  local event="$1"
+  jq -r --arg event "$event" --arg command "$CODEX_HOOK_CMD" '
+    (.hooks[$event] // [])
+    | to_entries[]
+    | .key as $group
+    | .value.hooks
+    | to_entries[]
+    | select(.value.type == "command" and .value.command == $command)
+    | "\($group):\(.key)"
+  ' "$CODEX_HOOKS_JSON"
+}
+
+codex_trusted_hash() {
+  local event="$1" group_index="$2" handler_index="$3" label
+  label="$(codex_event_label "$event")"
+  jq -c --arg event "$event" --arg event_name "$label" --argjson group_index "$group_index" --argjson handler_index "$handler_index" '
+    .hooks[$event][$group_index] as $entry
+    | $entry.hooks[$handler_index] as $hook
+    | ({event_name:$event_name}
+      + (if ($entry.matcher // "") != "" then {matcher:$entry.matcher} else {} end)
+      + {hooks:[({type:"command", command:$hook.command, timeout:(($hook.timeout // 600) | if . < 1 then 1 else . end), async:false}
+          + (if ($hook.statusMessage // "") != "" then {statusMessage:$hook.statusMessage} else {} end))]})
+  ' "$CODEX_HOOKS_JSON" | jq -S -c '.' | shasum -a 256 | awk '{print "sha256:" $1}'
+}
+
+build_codex_trust_entries() {
+  local event position group_index handler_index trust_key trust_hash
+  for event in "${CODEX_EVENTS[@]}"; do
+    position="$(codex_native_position "$event")"
+    [ -n "$position" ] || continue
+    group_index="${position%%:*}"
+    handler_index="${position##*:}"
+    trust_key="$CODEX_HOOKS_JSON:$(codex_event_label "$event"):$group_index:$handler_index"
+    trust_hash="$(codex_trusted_hash "$event" "$group_index" "$handler_index")"
+    printf '[hooks.state."%s"]\n' "$(toml_escape "$trust_key")"
+    printf 'trusted_hash = "%s"\n\n' "$trust_hash"
+  done
+}
+
+merge_codex_hooks_json() {
+  local mode="$1" tmp
+  tmp="$(mktemp "$(dirname "$CODEX_HOOKS_JSON")/.hooks.XXXXXX")" || die "mktemp failed for $CODEX_HOOKS_JSON"
+  jq --arg command "$CODEX_HOOK_CMD" --arg mode "$mode" '
+    .hooks = (.hooks // {})
+    | reduce ["PermissionRequest","Stop","UserPromptSubmit"][] as $event (.;
+        .hooks[$event] = ((.hooks[$event] // [])
+          | map(
+              .hooks = ((.hooks // []) | map(select(.type != "command" or .command != $command)))
+            )
+          | map(select((.hooks // []) | length > 0))
+          | if $mode == "install" then . + [{hooks:[{type:"command", command:$command}]}] else . end
+        )
+      )
+  ' "$CODEX_HOOKS_JSON" > "$tmp" || {
+    rm -f "$tmp"
+    die "failed to merge $CODEX_HOOKS_JSON"
+  }
+  backup_file "$CODEX_HOOKS_JSON"
+  mv "$tmp" "$CODEX_HOOKS_JSON"
+}
+
+install_notify_fallback() {
+  local base tmp escaped_wrap
+  tmp="$(mktemp "$(dirname "$CODEX_CONFIG")/.config.XXXXXX")" || die "mktemp failed for $CODEX_CONFIG"
+  base="$(mktemp "$(dirname "$CODEX_CONFIG")/.config-base.XXXXXX")" || die "mktemp failed for $CODEX_CONFIG"
+  strip_marker_block "$CODEX_CONFIG" > "$base"
+  if grep -qF "$CODEX_WRAP" "$base"; then
+    cp "$base" "$tmp"
+    info "Codex notify already integrated (legacy fallback)" >&2
+  elif grep -qF "$NOTIFY" "$base"; then
+    cp "$base" "$tmp"
+    info "Codex notify already integrated (legacy fallback)" >&2
+  elif grep -qE '^[[:space:]]*notify[[:space:]]*=[[:space:]]*\[' "$base"; then
+    escaped_wrap="$(toml_escape "$CODEX_WRAP")"
+    awk -v wrap="$escaped_wrap" '
+      BEGIN { inserted = 0 }
+      !inserted && /^[[:space:]]*notify[[:space:]]*=[[:space:]]*\[/ {
+        open = index($0, "[")
+        if (open > 0) {
+          print substr($0, 1, open) "\"" wrap "\", " substr($0, open + 1)
+          inserted = 1
+          next
+        }
+      }
+      { print }
+      END { if (!inserted) exit 42 }
+    ' "$base" > "$tmp" || {
+      rm -f "$base" "$tmp"
+      die "could not auto-wrap Codex notify in $CODEX_CONFIG"
+    }
+    if grep -qF "$CODEX_WRAP" "$tmp"; then
+      info "Codex notify -> wrapped existing chain (preserved fallback)" >&2
+    else
+      rm -f "$base" "$tmp"
+      die "could not auto-wrap Codex notify in $CODEX_CONFIG"
+    fi
+  else
+    cat "$base" > "$tmp"
+    printf '\nnotify = %s\n' "$CODEX_NOTIFY_JSON" >> "$tmp"
+    info "Codex notify -> appended (direct fallback)" >&2
+  fi
+  cat "$tmp"
+  rm -f "$base" "$tmp"
+}
+
+remove_notify_fallback() {
+  local base tmp escaped_wrap direct_line
+  base="$(mktemp "$(dirname "$CODEX_CONFIG")/.config-base.XXXXXX")" || die "mktemp failed for $CODEX_CONFIG"
+  tmp="$(mktemp "$(dirname "$CODEX_CONFIG")/.config.XXXXXX")" || die "mktemp failed for $CODEX_CONFIG"
+  strip_marker_block "$CODEX_CONFIG" > "$base"
+  if grep -qF "$CODEX_WRAP" "$base"; then
+    escaped_wrap="$(toml_escape "$CODEX_WRAP")"
+    awk -v wrap="$escaped_wrap" '
+      BEGIN { removed = 0; needle = "\"" wrap "\"," }
+      !removed && /^[[:space:]]*notify[[:space:]]*=/ {
+        pos = index($0, needle)
+        if (pos > 0) {
+          tail = substr($0, pos + length(needle))
+          sub(/^[[:space:]]*/, "", tail)
+          print substr($0, 1, pos - 1) tail
+          removed = 1
+          next
+        }
+      }
+      { print }
+      END { if (!removed) exit 42 }
+    ' "$base" > "$tmp" || {
+      rm -f "$base" "$tmp"
+      die "could not safely unwrap Codex notify in $CODEX_CONFIG"
+    }
+    info "unwrapped Codex notify (restored chain)" >&2
+  elif grep -qF "$NOTIFY" "$base"; then
+    direct_line="notify = $CODEX_NOTIFY_JSON"
+    awk -v owned="$direct_line" '
+      $0 == owned && !removed { removed = 1; next }
+      { print }
+      END { if (!removed) exit 42 }
+    ' "$base" > "$tmp" || {
+      cp "$base" "$tmp"
+      info "Codex direct notify was modified; preserved it for manual review" >&2
+    }
+    if ! grep -qF "$NOTIFY" "$tmp"; then
+      info "removed direct Codex notify" >&2
+    fi
+  else
+    cp "$base" "$tmp"
+    info "Codex notify not ours / absent" >&2
+  fi
+  cat "$tmp"
+  rm -f "$base" "$tmp"
+}
+
+write_codex_config_with_marker() {
+  local base_file="$1" marker_file="$2"
+  local tmp
+  tmp="$(mktemp "$(dirname "$CODEX_CONFIG")/.config-final.XXXXXX")" || die "mktemp failed for $CODEX_CONFIG"
+  append_marker_block "$base_file" "$marker_file" > "$tmp"
+  backup_file "$CODEX_CONFIG"
+  mv "$tmp" "$CODEX_CONFIG"
+}
+
+codex_install() {
+  local base_file marker_file
+  validate_codex_hooks_json
+  ensure_codex_files
+  merge_codex_hooks_json install
+  base_file="$(mktemp "$(dirname "$CODEX_CONFIG")/.config-base.XXXXXX")" || die "mktemp failed for $CODEX_CONFIG"
+  marker_file="$(mktemp "$(dirname "$CODEX_CONFIG")/.config-marker.XXXXXX")" || die "mktemp failed for $CODEX_CONFIG"
+  install_notify_fallback > "$base_file"
+  build_codex_trust_entries > "$marker_file"
+  write_codex_config_with_marker "$base_file" "$marker_file"
+  rm -f "$base_file" "$marker_file"
+  local event
+  for event in "${CODEX_EVENTS[@]}"; do
+    info "Codex native $event -> $CODEX_HOOK_CMD"
+  done
+}
+
+codex_uninstall() {
+  local base_file marker_file
+  if [ ! -f "$CODEX_CONFIG" ] && [ ! -f "$CODEX_HOOKS_JSON" ]; then
+    info "no Codex hook configuration"
+    return 0
+  fi
+  if [ -f "$CODEX_HOOKS_JSON" ]; then
+    validate_codex_hooks_json
+    merge_codex_hooks_json uninstall
+    info "removed Codex native hooks from $CODEX_HOOKS_JSON"
+  fi
+  [ -f "$CODEX_CONFIG" ] || { info "no $CODEX_CONFIG"; return 0; }
+  base_file="$(mktemp "$(dirname "$CODEX_CONFIG")/.config-base.XXXXXX")" || die "mktemp failed for $CODEX_CONFIG"
+  marker_file="$(mktemp "$(dirname "$CODEX_CONFIG")/.config-marker.XXXXXX")" || die "mktemp failed for $CODEX_CONFIG"
+  remove_notify_fallback > "$base_file"
+  : > "$marker_file"
+  write_codex_config_with_marker "$base_file" "$marker_file"
+  rm -f "$base_file" "$marker_file"
+  info "removed Codex trust marker"
+}
+
+codex_status() {
+  local event count
+  if [ ! -f "$CODEX_HOOKS_JSON" ]; then
+    for event in "${CODEX_EVENTS[@]}"; do
+      echo "Codex native $event: not installed"
+    done
+  elif ! jq empty "$CODEX_HOOKS_JSON" >/dev/null 2>&1; then
+    echo "Codex hooks JSON: invalid ($CODEX_HOOKS_JSON)"
+  else
+    for event in "${CODEX_EVENTS[@]}"; do
+      count="$(codex_native_count_for_event "$event")"
+      if [ "${count:-0}" -gt 0 ]; then
+        echo "Codex native $event: installed (${count})"
+      else
+        echo "Codex native $event: not installed"
+      fi
+    done
+  fi
+  if codex_has_notify; then echo "Codex legacy notify fallback: installed"
+  else echo "Codex legacy notify fallback: not installed"; fi
+}
 
 claude_install() {
   need_jq
   mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
   [ -f "$CLAUDE_SETTINGS" ] || echo '{}' > "$CLAUDE_SETTINGS"
-  cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak.$(date +%Y%m%d%H%M%S)"
-  jq empty "$CLAUDE_SETTINGS" 2>/dev/null || die "$CLAUDE_SETTINGS is not valid JSON"
+  jq empty "$CLAUDE_SETTINGS" >/dev/null 2>&1 || die "$CLAUDE_SETTINGS is not valid JSON"
+  backup_file "$CLAUDE_SETTINGS"
   # Migration: older versions hooked SessionEnd -> claude-clear, which wiped the
   # "finished" mark the moment a session ended. Strip it so upgrades self-heal.
   local mtmp; mtmp="$(mktemp)"
@@ -62,7 +358,7 @@ claude_install() {
 claude_uninstall() {
   need_jq
   [ -f "$CLAUDE_SETTINGS" ] || { info "no $CLAUDE_SETTINGS"; return 0; }
-  cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak.$(date +%Y%m%d%H%M%S)"
+  backup_file "$CLAUDE_SETTINGS"
   local tmp; tmp="$(mktemp)"
   jq --arg p "$NOTIFY " '
     if .hooks then
@@ -82,110 +378,23 @@ claude_status() {
   else echo "Claude settings: (none / jq missing)"; fi
 }
 
-# Detect our scripts in the notify chain even when another tool (e.g. the
-# Codex desktop app) re-wrapped notify and buried ours inside a JSON-escaped
-# `--previous-notify` argument, where full paths appear as `\/Users\/...`.
-codex_has_notify() {
-  [ -f "$CODEX_CONFIG" ] || return 1
-  grep -qF "codex-notify-wrap.sh" "$CODEX_CONFIG" && return 0
-  grep -qF 'needinput-notify.sh", "codex' "$CODEX_CONFIG" && return 0
-  grep -qF 'needinput-notify.sh","codex' "$CODEX_CONFIG" && return 0
-  grep -qF 'needinput-notify.sh\", \"codex' "$CODEX_CONFIG" && return 0
-  grep -qF 'needinput-notify.sh\",\"codex' "$CODEX_CONFIG" && return 0
-  grep -qF 'needinput-notify.sh\\\",\\\"codex' "$CODEX_CONFIG" && return 0
-  return 1
-}
-
-codex_hook_count() {
-  [ -f "$CODEX_CONFIG" ] || { echo 0; return 0; }
-  local count
-  count="$(grep -F "$CODEX_HOOK_CMD" "$CODEX_CONFIG" 2>/dev/null | wc -l | tr -d '[:space:]')"
-  [ "${count:-0}" -gt 3 ] && count=3
-  echo "${count:-0}"
-}
-
-codex_has_hooks() {
-  [ "$(codex_hook_count)" -ge 3 ]
-}
-
-codex_install_hooks() {
-  if codex_has_hooks; then
-    info "Codex hooks already integrated"; return 0
-  fi
-  cat >> "$CODEX_CONFIG" <<EOF
-
-$CODEX_HOOK_BEGIN
-[[hooks.PermissionRequest]]
-[[hooks.PermissionRequest.hooks]]
-type = "command"
-command = '$CODEX_HOOK_CMD'
-
-[[hooks.Stop]]
-[[hooks.Stop.hooks]]
-type = "command"
-command = '$CODEX_HOOK_CMD'
-
-[[hooks.UserPromptSubmit]]
-[[hooks.UserPromptSubmit.hooks]]
-type = "command"
-command = '$CODEX_HOOK_CMD'
-$CODEX_HOOK_END
-EOF
-  info "Codex hooks -> PermissionRequest/Stop/UserPromptSubmit"
-}
-
-codex_install() {
-  mkdir -p "$(dirname "$CODEX_CONFIG")"
-  if [ ! -f "$CODEX_CONFIG" ]; then
-    printf 'notify = %s\n' "$CODEX_NOTIFY_JSON" > "$CODEX_CONFIG"
-    info "Codex notify -> created $CODEX_CONFIG (direct)"
-  fi
-  cp "$CODEX_CONFIG" "$CODEX_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
-  if codex_has_notify; then
-    info "Codex notify already integrated (legacy fallback)"
-  else
-    if grep -qE '^[[:space:]]*notify[[:space:]]*=[[:space:]]*\[' "$CODEX_CONFIG"; then
-      sed -i '' "s#^\([[:space:]]*notify[[:space:]]*=[[:space:]]*\[\)#\1\"$CODEX_WRAP\", #" "$CODEX_CONFIG"
-      if grep -qF "$CODEX_WRAP" "$CODEX_CONFIG"; then info "Codex notify -> wrapped existing chain (preserved fallback)"
-      else echo "  WARNING: could not auto-wrap Codex notify (multi-line array?). Prepend \"$CODEX_WRAP\" manually." >&2; fi
-    else
-      printf '\nnotify = %s\n' "$CODEX_NOTIFY_JSON" >> "$CODEX_CONFIG"
-      info "Codex notify -> appended (direct fallback)"
-    fi
-  fi
-  codex_install_hooks
-}
-
-codex_uninstall() {
-  [ -f "$CODEX_CONFIG" ] || { info "no $CODEX_CONFIG"; return 0; }
-  cp "$CODEX_CONFIG" "$CODEX_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
-  if grep -qF "$CODEX_HOOK_BEGIN" "$CODEX_CONFIG"; then
-    sed -i '' "/$(printf '%s' "$CODEX_HOOK_BEGIN" | sed 's/[]\[^$.*/]/\\&/g')/,/$(printf '%s' "$CODEX_HOOK_END" | sed 's/[]\[^$.*/]/\\&/g')/d" "$CODEX_CONFIG"
-    info "removed Codex hooks"
-  fi
-  if grep -qF "$CODEX_WRAP" "$CODEX_CONFIG"; then
-    sed -i '' "s#\"$CODEX_WRAP\", ##" "$CODEX_CONFIG"; info "unwrapped Codex notify (restored chain)"
-  elif grep -qF "$NOTIFY" "$CODEX_CONFIG"; then
-    grep -vF "$NOTIFY" "$CODEX_CONFIG" > "$CODEX_CONFIG.tmp" && mv "$CODEX_CONFIG.tmp" "$CODEX_CONFIG"; info "removed direct Codex notify"
-  elif codex_has_notify; then
-    echo "  WARNING: our wrap is buried (JSON-escaped) inside another notify chain in $CODEX_CONFIG." >&2
-    echo "  Remove the codex-notify-wrap.sh entry from that chain manually." >&2
-  else info "Codex notify not ours / absent"; fi
-}
-
-codex_status() {
-  local c; c="$(codex_hook_count)"
-  echo "Codex hooks installed: ${c:-0}/3"
-  if codex_has_notify; then echo "Codex notify fallback: installed"
-  else echo "Codex notify fallback: not installed"; fi
-}
-
 [ -x "$NOTIFY" ] || die "$NOTIFY not found/executable"
 
 case "${1:-install}" in
-  install)   echo "Installing tmux-radar AI-status hooks:"; claude_install; codex_install
-             echo "Done. Restart Claude/Codex sessions (or open new ones) to pick up the hooks." ;;
-  uninstall) echo "Uninstalling tmux-radar AI-status hooks:"; claude_uninstall; codex_uninstall ;;
-  status)    claude_status; codex_status ;;
+  install)
+    echo "Installing tmux-radar AI-status hooks:"
+    codex_install
+    claude_install
+    echo "Done. Restart Claude/Codex sessions (or open new ones) to pick up the hooks."
+    ;;
+  uninstall)
+    echo "Uninstalling tmux-radar AI-status hooks:"
+    codex_uninstall
+    claude_uninstall
+    ;;
+  status)
+    claude_status
+    codex_status
+    ;;
   *) die "usage: install-hooks.sh [install|uninstall|status]" ;;
 esac

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016
 # Mark / clear panes and sessions with AI-status notices, driven by Claude Code
 # hooks plus Codex hooks / legacy notify. Single state file under $STATE_DIR:
 #
@@ -33,6 +34,8 @@ STATE_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_
 BG_TTL="${TMUX_RADAR_BG_TTL:-${TMUX_SWITCHER_BG_TTL:-86400}}"   # paneless marks expire after 24h
 LOCK="$STATE_DIR/.need-input.lock"
 
+[ "${TMUX_RADAR_INTERNAL:-0}" = 1 ] && exit 0
+
 mkdir -p "$STATE_DIR"
 
 have_tmux() { command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2>&1; }
@@ -53,6 +56,21 @@ opt() {  # opt <option> <default> (empty/no server -> default)
 }
 
 _san() { printf '%s' "${1:-}" | tr '\t\n' '  '; }
+
+_watch_field() {
+  awk -F= -v key="$2" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$1" 2>/dev/null || true
+}
+
+_watch_event() {  # _watch_event <pane> <kind> <source> <label>
+  local pane="$1" kind="$2" source="$3" label="$4" wf run_dir
+  [ -n "$pane" ] || return 0
+  wf="$STATE_DIR/ai-watch/$(printf '%s' "$pane" | tr -c 'A-Za-z0-9' '_').watch"
+  [ -r "$wf" ] || return 0
+  run_dir="$(_watch_field "$wf" run_dir)"
+  [ -d "$run_dir" ] || return 0
+  "$SCRIPT_DIR/ai.sh" emit-event "$pane" "$kind" "$source" "$(_san "$label")" >/dev/null 2>&1 || true
+}
+
 
 # One tmux round-trip: "<pane_id> <on_screen 0|1>" per live pane, records
 # joined with \001 (BSD awk rejects newlines in -v values).
@@ -240,7 +258,7 @@ _refresh_titles() {
 _drop_rows() {  # _drop_rows <awk-condition-marking-rows-to-DROP> [extra -v args...]
   local cond="$1"; shift || true
   if [ -r "$STATE_FILE" ] && [ "$(opt @radar-retitle on)" != "off" ]; then
-    local victims line pane title
+    local victims pane title
     victims="$(awk -F '\t' "$@" "NF >= 6 && ($cond) { print \$1 \"\t\" \$6 }" "$STATE_FILE" 2>/dev/null || true)"
     while IFS=$'\t' read -r pane title; do
       [ -n "$pane" ] && [ -n "$title" ] && _restore_title "$pane" "$title"
@@ -395,32 +413,43 @@ _claude_target() {  # sets PANE / KEY / WHERE from hook json in $1
 }
 
 cmd_claude_mark() {  # Notification hook (permission request / waiting on you)
-  local json msg; json="$(cat 2>/dev/null || true)"
-  [ "$(opt @radar-needinput on)" = "on" ] || exit 0
-  msg="$(_json_field message "$json")"; [ -n "$msg" ] || msg="Claude needs input"
+  local json msg
+  json="$(cat 2>/dev/null || true)"
+  msg="$(_json_field message "$json")"
+  [ -n "$msg" ] || msg="Claude needs input"
   _claude_target "$json"
   if [ "$PANE" = "-" ]; then
     [ "$(opt @radar-claude-bg on)" = "on" ] || exit 0
     msg="Claude·${WHERE:-bg}: ${msg}"
+  else
+    _watch_event "$PANE" input_required claude "$msg"
   fi
+  [ "$(opt @radar-needinput on)" = "on" ] || exit 0
   cmd_mark "$PANE" claude "$msg" "$KEY"
 }
 
 cmd_claude_stop() {  # Stop hook (turn finished — your move)
-  local json; json="$(cat 2>/dev/null || true)"
-  [ "$(opt @radar-needinput on)" = "on" ] || exit 0
+  local json msg
+  json="$(cat 2>/dev/null || true)"
   _claude_target "$json"
-  local msg="Claude finished — your turn"
+  msg="Claude finished — your turn"
   if [ "$PANE" = "-" ]; then
     [ "$(opt @radar-claude-bg on)" = "on" ] || exit 0
     msg="Claude·${WHERE:-bg}: finished — your turn"
+  else
+    _watch_event "$PANE" turn_complete claude "$msg"
   fi
+  [ "$(opt @radar-needinput on)" = "on" ] || exit 0
   cmd_mark "$PANE" claude "$msg" "$KEY"
 }
 
 cmd_claude_clear() {  # UserPromptSubmit hook (you replied)
-  local json; json="$(cat 2>/dev/null || true)"
+  local json
+  json="$(cat 2>/dev/null || true)"
   _claude_target "$json"
+  if [ "$PANE" != "-" ] && [ -n "$PANE" ]; then
+    _watch_event "$PANE" user_resumed claude 'Claude resumed by user'
+  fi
   if [ -n "$KEY" ] && [ "${KEY#s:}" != "$KEY" ]; then cmd_clear_key "$KEY"
   elif [ "$PANE" != "-" ] && [ -n "$PANE" ]; then cmd_clear_pane "$PANE"
   fi
@@ -431,6 +460,16 @@ _codex_pane() {
   pane="${TMUX_PANE:-}"
   [ -n "$pane" ] || pane="$(_resolve_pane_by_proc || true)"
   printf '%s' "$pane"
+}
+
+_codex_event_kind() {
+  case "$1" in
+    PermissionRequest|exec_approval_request|apply_patch_approval_request|request_permissions) printf 'approval' ;;
+    Stop|task_complete|agent-turn-complete|turn_complete) printf 'turn_complete' ;;
+    request_user_input) printf 'input_required' ;;
+    UserPromptSubmit) printf 'user_resumed' ;;
+    *) return 1 ;;
+  esac
 }
 
 _codex_label() {  # _codex_label <event-or-type> <json>
@@ -449,6 +488,9 @@ _codex_label() {  # _codex_label <event-or-type> <json>
     request_user_input)
       printf 'Codex needs your input'
       ;;
+    UserPromptSubmit)
+      printf 'Codex resumed by user'
+      ;;
     *)
       if [ -n "$event" ]; then printf 'Codex: %s' "$event"
       else printf 'Codex needs input'; fi
@@ -457,31 +499,50 @@ _codex_label() {  # _codex_label <event-or-type> <json>
 }
 
 cmd_codex_hook() {  # Codex native hooks pass JSON on stdin
-  local json event pane
+  local json event pane kind label
   json="$(cat 2>/dev/null || true)"
-  [ "$(opt @radar-needinput on)" = "on" ] || exit 0
   event="$(_json_field hook_event_name "$json")"
   [ -n "$event" ] || exit 0
   pane="$(_codex_pane)"
   case "$event" in
     UserPromptSubmit)
-      [ -n "$pane" ] && cmd_clear_pane "$pane"
+      if [ -n "$pane" ]; then
+        _watch_event "$pane" user_resumed codex "$(_codex_label "$event" "$json")"
+        cmd_clear_pane "$pane"
+      fi
       ;;
     PermissionRequest|Stop)
       [ -n "$pane" ] || exit 0
-      cmd_mark "$pane" codex "$(_codex_label "$event" "$json")"
+      kind="$(_codex_event_kind "$event")" || exit 0
+      label="$(_codex_label "$event" "$json")"
+      _watch_event "$pane" "$kind" codex "$label"
+      [ "$(opt @radar-needinput on)" = "on" ] || exit 0
+      cmd_mark "$pane" codex "$label"
       ;;
   esac
 }
 
 cmd_codex() {  # Codex notify passes its event JSON as the last argv argument
-  local json="${1:-}" type pane
-  [ "$(opt @radar-needinput on)" = "on" ] || exit 0
+  local json="${1:-}" type pane kind label
   type="$(_json_field type "$json")"
   [ -n "$type" ] || exit 0
   pane="$(_codex_pane)"
-  [ -n "$pane" ] || exit 0
-  cmd_mark "$pane" codex "$(_codex_label "$type" "$json")"
+  case "$type" in
+    UserPromptSubmit)
+      if [ -n "$pane" ]; then
+        _watch_event "$pane" user_resumed codex "$(_codex_label "$type" "$json")"
+        cmd_clear_pane "$pane"
+      fi
+      ;;
+    *)
+      [ -n "$pane" ] || exit 0
+      kind="$(_codex_event_kind "$type")" || exit 0
+      label="$(_codex_label "$type" "$json")"
+      _watch_event "$pane" "$kind" codex "$label"
+      [ "$(opt @radar-needinput on)" = "on" ] || exit 0
+      cmd_mark "$pane" codex "$label"
+      ;;
+  esac
 }
 
 case "${1:-}" in

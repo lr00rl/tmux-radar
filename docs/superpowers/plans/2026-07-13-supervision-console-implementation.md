@@ -12,7 +12,7 @@
 
 ## File Map
 
-- Create `scripts/lib/ai-runtime.sh`: run IDs, config provenance, atomic state, event/inbox journals, final reports, retention cleanup.
+- Create `scripts/lib/ai-runtime.sh`: run IDs, config provenance, atomic state, event journal, lock-free inbox spool, final reports, retention cleanup.
 - Create `scripts/ai-monitor.sh`: overview renderer, five detail views, keyboard loop, responsive pane content, completion hold.
 - Modify `scripts/ai.sh`: source runtime library, quick/advanced setup, event-driven state machine, serialized brain calls, execution verification, right-rail launcher, CLI compatibility.
 - Modify `scripts/needinput-notify.sh`: internal-supervisor suppression and watcher event emission from Claude/Codex hooks.
@@ -95,7 +95,7 @@ radar_run_finalize() { :; }
 radar_cleanup_runs() { :; }
 ```
 
-Use `jq -cn` for JSON construction, `mktemp` plus `mv` for atomic snapshots, append-only JSONL for journals, and `umask 077`. A live `.watch` pointer remains key/value text for compatibility and includes `run_id`, `run_dir`, `pid`, `pane`, and monitor pane IDs.
+Use `jq -cn` for JSON construction, `mktemp` plus `mv` for atomic snapshots, append-only JSONL for the canonical event journal, and `umask 077`. Implement the inbox as per-event files: append writes a complete private temp file under `inbox/` and atomically renames it to a ready extension; drain atomically moves ready files into a unique private batch before reading them. Concurrent appenders must land in either the current or next batch, concurrent drainers must never claim the same event, and incomplete temp files must never be visible. A live `.watch` pointer remains key/value text for compatibility and includes `run_id`, `run_dir`, `pid`, `pane`, and monitor pane IDs.
 
 - [ ] **Step 4: Verify runtime behavior**
 
@@ -130,13 +130,13 @@ Cover four contracts:
 # Active watch: PermissionRequest appends approval and signals its channel.
 printf '%s' '{"hook_event_name":"PermissionRequest","tool_name":"exec_command"}' |
   TMUX_PANE=%39 bash "$ROOT/scripts/needinput-notify.sh" codex-hook
-assert_json "$RUN_DIR/inbox.jsonl" 'select(.kind == "approval" and .source == "codex")'
+assert_contains "$(radar_run_open %39 >/dev/null; radar_inbox_drain)" '"kind":"approval"'
 assert_contains "$TMP/tmux.calls" 'wait-for -S radar-run-39'
 
 # Stop maps to turn_complete, never to input_required.
 printf '%s' '{"hook_event_name":"Stop"}' |
   TMUX_PANE=%39 bash "$ROOT/scripts/needinput-notify.sh" codex-hook
-assert_json "$RUN_DIR/inbox.jsonl" 'select(.kind == "turn_complete")'
+assert_contains "$(radar_run_open %39 >/dev/null; radar_inbox_drain)" '"kind":"turn_complete"'
 
 # UserPromptSubmit maps to user_resumed and still clears the global mark.
 # TMUX_RADAR_INTERNAL=1 produces neither a mark nor an inbox event.

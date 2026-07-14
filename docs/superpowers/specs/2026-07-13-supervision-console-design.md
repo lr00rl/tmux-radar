@@ -234,13 +234,15 @@ $STATE_DIR/ai-runs/<run-id>/
   config.json             immutable launch snapshot + provenance
   state.json              atomic latest state
   events.jsonl            canonical append-only event journal
-  inbox.jsonl             hook events awaiting consumption
+  inbox/                  atomically published hook-event spool
   decisions/0001.json     raw structured model output
   decisions/0001.meta.json
   screens/0001.txt        only when screen logging is enabled
   backend/0001.stderr
   final.json              completion/stop summary
 ```
+
+Each inbox event is written to a private temporary file and atomically renamed to a ready file. Drainers atomically claim ready files into private batches; events published during a drain remain for the next batch. This avoids shared-lock reclamation races, partial JSON reads, and truncation races while preserving exact-once ownership.
 
 The global `ai.log` remains a compact cross-run index. Monitor UI is derived from structured state and journals, not a second independent truth.
 

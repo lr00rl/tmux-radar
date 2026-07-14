@@ -8,7 +8,7 @@ TMP="$(test_tmpdir runtime)"
 CLEANUP_PIDS=""
 TEST_EXIT_CODE=0
 trap 'TEST_EXIT_CODE=$?' ERR
-SYSTEM_MV="$(command -v mv)"
+SYSTEM_MKTEMP="$(command -v mktemp)"
 
 cleanup() {
   local rc="${TEST_EXIT_CODE:-$?}"
@@ -117,72 +117,89 @@ if [ ! -e "$active_dir" ]; then
   _fail_assert "active run referenced by watch file must be retained" "run_dir" "$active_dir"
 fi
 
-radar_run_create %55 '{"goal":"stale reclaim regression"}'
-stale_reclaim_run_dir="$RADAR_RUN_DIR"
-stale_reclaim_lock="$stale_reclaim_run_dir/inbox.jsonl.lock"
-stale_reclaim_output="$TMP/stale-reclaim.jsonl"
-: > "$stale_reclaim_output"
-mkdir -p "$stale_reclaim_lock"
-printf '%s\n' 999999 > "$stale_reclaim_lock/pid"
-touch -t 199901010000 "$stale_reclaim_lock" "$stale_reclaim_lock/pid"
-
-(
-  RADAR_TEST_LOCK_RECLAIM_MARK="$TMP/reclaim-a.mark"
-  RADAR_TEST_LOCK_RECLAIM_WAIT="$TMP/reclaim-a.release"
-  RADAR_TEST_LOCK_RECLAIM_DONE_MARK="$TMP/reclaim-a.done"
-  radar_inbox_append approval reclaim "event 1" '{"event_id":1}'
-) &
-stale_a_pid=$!
-CLEANUP_PIDS="$CLEANUP_PIDS $stale_a_pid"
-wait_for_file "$TMP/reclaim-a.mark"
-
-(
-  RADAR_TEST_LOCK_ACQUIRE_MARK="$TMP/reclaim-b.mark"
-  RADAR_TEST_LOCK_ACQUIRE_WAIT="$TMP/reclaim-b.release"
-  radar_inbox_append approval reclaim "event 2" '{"event_id":2}'
-) &
-stale_b_pid=$!
-CLEANUP_PIDS="$CLEANUP_PIDS $stale_b_pid"
-wait_for_file "$TMP/reclaim-b.mark"
-assert_file "$stale_reclaim_lock/pid"
-
-: > "$TMP/reclaim-a.release"
-wait_for_file "$TMP/reclaim-a.done"
-assert_file "$stale_reclaim_lock/pid"
-
-: > "$TMP/reclaim-b.release"
-wait_for_exit "$stale_b_pid"
-wait_for_exit "$stale_a_pid"
-wait "$stale_b_pid"
-wait "$stale_a_pid"
-
-drain_into "$stale_reclaim_output"
-assert_eq "2" "$(jq -s 'length' "$stale_reclaim_output")" "stale reclaim event count"
+radar_run_create %66 '{"goal":"no-clobber publication regression"}'
+no_clobber_run_dir="$RADAR_RUN_DIR"
+no_clobber_inbox_dir="$no_clobber_run_dir/inbox"
+no_clobber_output="$TMP/no-clobber.jsonl"
+radar_inbox_append approval hook "event 1" '{"event_id":1}'
+existing_ready_file="$(find "$no_clobber_inbox_dir" -maxdepth 1 -name '*.ready' -print -quit)"
+existing_ready_base="$(basename "$existing_ready_file" .ready)"
+mktemp() {
+  if [ "${RADAR_TEST_COLLIDE_MKTEMP:-0}" = 1 ] &&
+    [ "$#" -eq 1 ] &&
+    [ "$1" = "$no_clobber_inbox_dir/.tmp.XXXXXX" ]; then
+    collision_path="$no_clobber_inbox_dir/.tmp.$existing_ready_base"
+    : > "$collision_path"
+    printf '%s\n' "$collision_path"
+    RADAR_TEST_COLLIDE_MKTEMP=0
+    return 0
+  fi
+  "$SYSTEM_MKTEMP" "$@"
+}
+RADAR_TEST_COLLIDE_MKTEMP=1
+radar_inbox_append approval hook "event 2" '{"event_id":2}'
+unset -f mktemp
+assert_eq "2" "$(find "$no_clobber_inbox_dir" -maxdepth 1 -name '*.ready' | wc -l | tr -d '[:space:]')" "no-clobber publication keeps both ready files"
+drain_into "$no_clobber_output"
+assert_eq "2" "$(jq -s 'length' "$no_clobber_output")" "no-clobber drain event count"
 if ! jq -se '
   length == 2 and
   ([.[].event_id] | sort == [1, 2])
-' "$stale_reclaim_output" >/dev/null; then
-  _fail_assert "stale reclaim must preserve exact-once inbox events" "file" "$stale_reclaim_output" "actual" "$(cat "$stale_reclaim_output")"
+' "$no_clobber_output" >/dev/null; then
+  _fail_assert "no-clobber publication must keep both events" "file" "$no_clobber_output" "actual" "$(cat "$no_clobber_output")"
 fi
-CLEANUP_PIDS=""
+
+radar_run_create %67 '{"goal":"read failure preservation regression"}'
+read_failure_run_dir="$RADAR_RUN_DIR"
+read_failure_inbox_dir="$read_failure_run_dir/inbox"
+read_failure_output="$TMP/read-failure.jsonl"
+read_failure_recovered="$TMP/read-failure-recovered.jsonl"
+radar_inbox_append approval hook "event 1" '{"event_id":1}'
+cat() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      "$read_failure_run_dir"/.inbox-batch.*/*.ready) return 1 ;;
+    esac
+  done
+  command cat "$@"
+}
+if radar_inbox_drain > "$read_failure_output"; then
+  _fail_assert "radar_inbox_drain should fail when batch read fails" "run_dir" "$read_failure_run_dir"
+fi
+unset -f cat
+read_failure_batch_dir="$(find "$read_failure_run_dir" -maxdepth 1 -type d -name '.inbox-batch.*' -print -quit)"
+assert_file "$read_failure_batch_dir/$(basename "$(find "$read_failure_batch_dir" -maxdepth 1 -name '*.ready' -print -quit)")"
+mv "$(find "$read_failure_batch_dir" -maxdepth 1 -name '*.ready' -print -quit)" "$read_failure_inbox_dir/"
+rmdir "$read_failure_batch_dir"
+drain_into "$read_failure_recovered"
+assert_eq "1" "$(jq -s 'length' "$read_failure_recovered")" "read failure preserved claimed event"
+assert_json "$read_failure_recovered" 'select(.event_id == 1)'
 
 radar_run_create %77 '{"goal":"concurrency regression"}'
 concurrency_run_dir="$RADAR_RUN_DIR"
-concurrency_output="$TMP/concurrency-drain.jsonl"
+concurrency_inbox_dir="$concurrency_run_dir/inbox"
+concurrency_output_a="$TMP/concurrency-drain-a.jsonl"
+concurrency_output_b="$TMP/concurrency-drain-b.jsonl"
+concurrency_output_final="$TMP/concurrency-drain-final.jsonl"
+concurrency_output_all="$TMP/concurrency-drain-all.jsonl"
 concurrency_expected=48
-: > "$concurrency_output"
+partial_tmp="$(mktemp "$concurrency_inbox_dir/.tmp.partial.XXXXXX")"
+printf '%s' '{"event_id":999' > "$partial_tmp"
+: > "$concurrency_output_a"
+: > "$concurrency_output_b"
+: > "$concurrency_output_final"
+: > "$concurrency_output_all"
 
-mv() {
-  if [ "${RADAR_TEST_SLOW_INBOX_RENAME:-0}" = 1 ] && [ "$#" -ge 2 ] &&
-    [ "$1" = "$concurrency_run_dir/inbox.jsonl" ]; then
-    "$SYSTEM_MV" "$@"
-    sleep 0.02
-    return
-  fi
-  "$SYSTEM_MV" "$@"
+drainer_loop() {
+  local outfile="$1" rounds="$2" delay="$3" round=0
+  while [ "$round" -lt "$rounds" ]; do
+    drain_into "$outfile"
+    sleep "$delay"
+    round=$((round + 1))
+  done
 }
 
-RADAR_TEST_SLOW_INBOX_RENAME=1
 append_pids=""
 i=0
 while [ "$i" -lt 4 ]; do
@@ -201,40 +218,34 @@ while [ "$i" -lt 4 ]; do
   i=$((i + 1))
 done
 
-drain_round=0
-while :; do
-  drain_into "$concurrency_output"
-  live_appenders=0
-  for pid in $append_pids; do
-    if kill -0 "$pid" 2>/dev/null; then
-      live_appenders=1
-      break
-    fi
-  done
-  if [ "$live_appenders" -eq 0 ] && [ "$drain_round" -ge 10 ]; then
-    break
-  fi
-  sleep 0.004
-  drain_round=$((drain_round + 1))
-done
+drainer_loop "$concurrency_output_a" 40 0.004 &
+drainer_a_pid=$!
+CLEANUP_PIDS="$CLEANUP_PIDS $drainer_a_pid"
+drainer_loop "$concurrency_output_b" 40 0.004 &
+drainer_b_pid=$!
+CLEANUP_PIDS="$CLEANUP_PIDS $drainer_b_pid"
 
 for pid in $append_pids; do
   wait "$pid"
 done
+wait "$drainer_a_pid"
+wait "$drainer_b_pid"
+drain_into "$concurrency_output_final"
+assert_file "$partial_tmp"
+rm -f "$partial_tmp"
 CLEANUP_PIDS=""
-drain_into "$concurrency_output"
-unset -f mv
-RADAR_TEST_SLOW_INBOX_RENAME=0
 
-line_count="$(awk 'END { print NR + 0 }' "$concurrency_output")"
-parsed_count="$(jq -s 'length' "$concurrency_output")"
+cat "$concurrency_output_a" "$concurrency_output_b" "$concurrency_output_final" > "$concurrency_output_all"
+line_count="$(awk 'END { print NR + 0 }' "$concurrency_output_all")"
+parsed_count="$(jq -s 'length' "$concurrency_output_all")"
 assert_eq "$line_count" "$parsed_count" "every drained line parses as JSON"
 assert_eq "$concurrency_expected" "$parsed_count" "all concurrent inbox events accounted for"
 if ! jq -se '
   length == 48 and
-  ([.[].event_id] | sort == [range(1; 49)])
-' "$concurrency_output" >/dev/null; then
-  _fail_assert "concurrent drains must preserve every event exactly once" "file" "$concurrency_output" "actual" "$(cat "$concurrency_output")"
+  ([.[].event_id] | sort == [range(1; 49)]) and
+  ([.[].event_id] | index(999) | not)
+' "$concurrency_output_all" >/dev/null; then
+  _fail_assert "concurrent drains must preserve every event exactly once" "file" "$concurrency_output_all" "actual" "$(cat "$concurrency_output_all")"
 fi
 
 printf 'PASS: structured run runtime\n'

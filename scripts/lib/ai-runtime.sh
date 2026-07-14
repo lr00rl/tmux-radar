@@ -66,88 +66,32 @@ _radar_append_jsonl() {
   printf '%s\n' "$payload" >> "$path"
 }
 
-_radar_lock_mtime() {
-  stat -f '%m' "$1" 2>/dev/null
+_radar_inbox_dir() {
+  printf '%s/inbox' "$RADAR_RUN_DIR"
 }
 
-_radar_test_lock_pause() {
-  local mark_file="${1:-}" wait_file="${2:-}" done_file="${3:-}" tries=0
-  if [ -n "$mark_file" ]; then
-    printf '%s\n' "$$" > "$mark_file"
-  fi
-  if [ -n "$wait_file" ]; then
-    while [ ! -e "$wait_file" ] && [ "$tries" -lt 2000 ]; do
-      sleep 0.01
-      tries=$((tries + 1))
-    done
-    [ -e "$wait_file" ] || return 1
-  fi
-  if [ -n "$done_file" ]; then
-    printf '%s\n' "$$" > "$done_file"
-  fi
+_radar_inbox_batch_dir() {
+  mktemp -d "$RADAR_RUN_DIR/.inbox-batch.XXXXXX"
 }
 
-_radar_lock_is_stale() {
-  local lock_dir="$1" stale_after="${2:-10}" lock_pid="" now="" mtime="" age=""
-  [ -d "$lock_dir" ] || return 1
-  lock_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
-  if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
-    return 1
-  fi
-  now="$(date '+%s')"
-  mtime="$(_radar_lock_mtime "$lock_dir" || true)"
-  case "$mtime" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  age=$((now - mtime))
-  [ "$age" -ge "$stale_after" ]
-}
-
-_radar_lock_reclaim_stale() {
-  local lock_dir="$1" reclaim_dir
-  reclaim_dir="${lock_dir}.reclaim.$$.$RANDOM"
-  mv "$lock_dir" "$reclaim_dir" 2>/dev/null || return 1
-  if ! _radar_test_lock_pause \
-    "${RADAR_TEST_LOCK_RECLAIM_MARK:-}" \
-    "${RADAR_TEST_LOCK_RECLAIM_WAIT:-}" \
-    "${RADAR_TEST_LOCK_RECLAIM_DONE_MARK:-}"; then
-    rm -rf "$reclaim_dir"
-    return 1
-  fi
-  rm -rf "$reclaim_dir"
-}
-
-_radar_lock_acquire() {
-  local lock_dir="$1" attempts="${2:-1000}" delay="${3:-0.01}" stale_after="${4:-10}" try=0
-  while [ "$try" -lt "$attempts" ]; do
-    if mkdir "$lock_dir" 2>/dev/null; then
-      if ! printf '%s\n' "$$" > "$lock_dir/pid"; then
-        rm -rf "$lock_dir"
-        sleep "$delay"
-        try=$((try + 1))
-        continue
-      fi
-      if ! _radar_test_lock_pause \
-        "${RADAR_TEST_LOCK_ACQUIRE_MARK:-}" \
-        "${RADAR_TEST_LOCK_ACQUIRE_WAIT:-}" \
-        ""; then
-        rm -rf "$lock_dir"
-        return 1
-      fi
+_radar_inbox_publish_ready() {
+  local tmp_path="$1" inbox_dir="$2" base_name ready_path attempt=0
+  base_name="$(basename "$tmp_path")"
+  base_name="${base_name#.tmp.}"
+  while [ "$attempt" -lt 32 ]; do
+    ready_path="$inbox_dir/$base_name"
+    if [ "$attempt" -gt 0 ]; then
+      ready_path="${ready_path}.${attempt}.${RANDOM}"
+    fi
+    ready_path="${ready_path}.ready"
+    if ln "$tmp_path" "$ready_path" 2>/dev/null; then
+      rm -f "$tmp_path" || true
       return 0
     fi
-    if _radar_lock_is_stale "$lock_dir" "$stale_after" &&
-      _radar_lock_reclaim_stale "$lock_dir"; then
-      continue
-    fi
-    sleep "$delay"
-    try=$((try + 1))
+    attempt=$((attempt + 1))
   done
+  rm -f "$tmp_path"
   return 1
-}
-
-_radar_lock_release() {
-  rm -rf "$1"
 }
 
 _radar_watch_write() {
@@ -202,7 +146,7 @@ radar_run_create() {
   )" || return 1
   _radar_write_snapshot "$run_dir/config.json" "$config_payload" || return 1
   : > "$run_dir/events.jsonl"
-  : > "$run_dir/inbox.jsonl"
+  mkdir -p "$run_dir/inbox"
   _radar_watch_write "$watch_file" "$pane" "$run_id" "$run_dir" "$$" "$channel" "" "" || return 1
   _radar_use_run "$pane" "$run_id" "$run_dir" "$channel"
 }
@@ -265,53 +209,43 @@ radar_event_append() {
 }
 
 radar_inbox_append() {
-  local payload extra_json="${4:-"{}"}" inbox_path lock_path rc=0
+  local payload extra_json="${4:-"{}"}" inbox_dir tmp_path
   _radar_require_jq || return 1
   [ -n "$RADAR_RUN_DIR" ] || return 1
   payload="$(_radar_current_event_json "$1" "$2" "$3" "$extra_json")" || return 1
-  inbox_path="$RADAR_RUN_DIR/inbox.jsonl"
-  lock_path="$inbox_path.lock"
-  if ! _radar_lock_acquire "$lock_path"; then
+  inbox_dir="$(_radar_inbox_dir)"
+  mkdir -p "$inbox_dir"
+  tmp_path="$(mktemp "$inbox_dir/.tmp.XXXXXX")" || return 1
+  if ! printf '%s\n' "$payload" > "$tmp_path"; then
+    rm -f "$tmp_path"
     return 1
   fi
-  if ! _radar_append_jsonl "$inbox_path" "$payload"; then
-    rc=1
+  if ! _radar_inbox_publish_ready "$tmp_path" "$inbox_dir"; then
+    return 1
   fi
-  if ! _radar_lock_release "$lock_path"; then
-    rc=1
-  fi
-  return "$rc"
 }
 
 radar_inbox_drain() {
-  local inbox_path lock_path snapshot_path rc=0
+  local inbox_dir batch_dir ready_path batch_path moved=0
   [ -n "$RADAR_RUN_DIR" ] || return 1
-  inbox_path="$RADAR_RUN_DIR/inbox.jsonl"
-  lock_path="$inbox_path.lock"
-  if ! _radar_lock_acquire "$lock_path"; then
+  inbox_dir="$(_radar_inbox_dir)"
+  mkdir -p "$inbox_dir"
+  batch_dir="$(_radar_inbox_batch_dir)" || return 1
+  for ready_path in "$inbox_dir"/*.ready; do
+    [ -e "$ready_path" ] || continue
+    batch_path="$batch_dir/$(basename "$ready_path")"
+    if mv "$ready_path" "$batch_path" 2>/dev/null; then
+      moved=1
+    fi
+  done
+  if [ "$moved" -eq 0 ]; then
+    rmdir "$batch_dir" 2>/dev/null || rm -rf "$batch_dir"
+    return 0
+  fi
+  if ! cat "$batch_dir"/*.ready; then
     return 1
   fi
-  if [ -s "$inbox_path" ]; then
-    snapshot_path="$(mktemp "$RADAR_RUN_DIR/.inbox-drain.XXXXXX")" || rc=1
-    if [ "$rc" -eq 0 ] && ! mv "$inbox_path" "$snapshot_path"; then
-      rc=1
-    fi
-  fi
-  if [ "$rc" -eq 0 ] && ! : > "$inbox_path"; then
-    rc=1
-  fi
-  if ! _radar_lock_release "$lock_path"; then
-    rc=1
-  fi
-  if [ "$rc" -ne 0 ]; then
-    [ -n "${snapshot_path:-}" ] && rm -f "$snapshot_path"
-    return "$rc"
-  fi
-  [ -n "${snapshot_path:-}" ] || return 0
-  cat "$snapshot_path"
-  rc=$?
-  rm -f "$snapshot_path"
-  return "$rc"
+  rm -rf "$batch_dir"
 }
 
 radar_run_finalize() {

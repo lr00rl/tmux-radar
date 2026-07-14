@@ -62,13 +62,15 @@ _watch_field() {
 }
 
 _watch_event() {  # _watch_event <pane> <kind> <source> <label>
-  local pane="$1" kind="$2" source="$3" label="$4" wf run_dir
+  local pane="$1" kind="$2" source="$3" label="$4" wf run_dir run_id
   [ -n "$pane" ] || return 0
   wf="$STATE_DIR/ai-watch/$(printf '%s' "$pane" | tr -c 'A-Za-z0-9' '_').watch"
   [ -r "$wf" ] || return 0
   run_dir="$(_watch_field "$wf" run_dir)"
-  [ -d "$run_dir" ] || return 0
-  "$SCRIPT_DIR/ai.sh" emit-event "$pane" "$kind" "$source" "$(_san "$label")" >/dev/null 2>&1 || true
+  run_id="$(_watch_field "$wf" run_id)"
+  [ -d "$run_dir" ] && [ -n "$run_id" ] || return 0
+  TMUX_RADAR_EXPECT_RUN_ID="$run_id" \
+    "$SCRIPT_DIR/ai.sh" emit-event "$pane" "$kind" "$source" "$(_san "$label")" >/dev/null 2>&1 || true
 }
 
 

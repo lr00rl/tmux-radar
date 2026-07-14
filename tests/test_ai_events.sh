@@ -223,7 +223,7 @@ radar_position_for_event() {
     | .key as $group
     | .value.hooks
     | to_entries[]
-    | select(.value.type == "command" and .value.command == $command)
+    | select(.value.type == "command" and .value.command == $command and .value.timeout == 5 and .value.statusMessage == "tmux-radar lifecycle bridge")
     | "\($group):\(.key)"
   ' "$CODEX_HOOKS_JSON"
 }
@@ -256,7 +256,7 @@ trusted_hash = "sha256:old-radar"
 # END tmux-radar Codex hooks
 EOFCONF
 
-  cat > "$CODEX_HOOKS_JSON" <<'EOFJSON'
+  cat > "$CODEX_HOOKS_JSON" <<EOFJSON
 {
   "hooks": {
     "PermissionRequest": [
@@ -269,6 +269,18 @@ EOFCONF
             "timeout": 5,
             "async": true,
             "statusMessage": "OMX permission"
+          }
+        ]
+      },
+      {
+        "matcher": "^user-scope",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$ROOT/scripts/needinput-notify.sh codex-hook",
+            "timeout": 77,
+            "async": true,
+            "statusMessage": "user-owned same command"
           }
         ]
       }
@@ -322,6 +334,15 @@ drain_run_to_file %39 "$EVENT_FILE"
 expect_event_kind "$EVENT_FILE" approval codex
 assert_eq 'Line one Line two' "$(jq -r '.label' "$EVENT_FILE")" "emit-event sanitizes label"
 assert_contains "$(cat "$TEST_TMUX_CALLS")" 'wait-for -S radar-run-39' 'emit-event signals channel'
+
+new_run %49 'old generation'
+old_run_id="$RADAR_RUN_ID"
+new_run %49 'new generation'
+reset_fake_tmux_logs
+TMUX_RADAR_EXPECT_RUN_ID="$old_run_id" \
+  bash "$ROOT/scripts/ai.sh" emit-event %49 approval codex 'stale old-run event'
+assert_eq '' "$(radar_run_open %49 >/dev/null; radar_inbox_drain)" 'stale event must not enter a replacement run'
+assert_eq '' "$(cat "$TEST_TMUX_CALLS")" 'stale event must not signal a replacement run'
 
 reset_fake_tmux_logs
 if ! bash "$ROOT/scripts/ai.sh" emit-event %88 approval codex 'missing watch is benign' >"$TMP/emit-nowatch.out" 2>"$TMP/emit-nowatch.err"; then
@@ -457,7 +478,8 @@ radar_command="$ROOT/scripts/needinput-notify.sh codex-hook"
 assert_json "$CODEX_HOOKS_JSON" '.hooks.PermissionRequest[0].matcher == "^omx"'
 assert_json "$CODEX_HOOKS_JSON" '.hooks.Stop[0].hooks[0].command == "/usr/bin/omx stop"'
 assert_json "$CODEX_HOOKS_JSON" '.hooks.UserPromptSubmit[0].hooks[0].command == "/usr/bin/user resume"'
-assert_eq '3' "$(jq -r --arg command "$radar_command" '[.hooks.PermissionRequest[], .hooks.Stop[], .hooks.UserPromptSubmit[] | .hooks[] | select(.type == "command" and .command == $command)] | length' "$CODEX_HOOKS_JSON")" 'radar native handlers installed exactly once per event'
+assert_eq '3' "$(jq -r --arg command "$radar_command" '[.hooks.PermissionRequest[], .hooks.Stop[], .hooks.UserPromptSubmit[] | .hooks[] | select(.type == "command" and .command == $command and .timeout == 5 and .statusMessage == "tmux-radar lifecycle bridge")] | length' "$CODEX_HOOKS_JSON")" 'radar native handlers installed exactly once per event'
+assert_json "$CODEX_HOOKS_JSON" '[.hooks.PermissionRequest[] | select(.matcher == "^user-scope") | .hooks[] | select(.command == "'"$radar_command"'" and .timeout == 77 and .statusMessage == "user-owned same command")] | length == 1'
 assert_not_contains "$(cat "$CODEX_CONFIG")" '[[hooks.PermissionRequest]]' 'no radar native arrays remain in toml'
 assert_not_contains "$(cat "$CODEX_CONFIG")" '[[hooks.Stop]]' 'no radar native arrays remain in toml'
 assert_not_contains "$(cat "$CODEX_CONFIG")" '[[hooks.UserPromptSubmit]]' 'no radar native arrays remain in toml'
@@ -484,7 +506,8 @@ for event in PermissionRequest Stop UserPromptSubmit; do
 done
 
 bash "$ROOT/scripts/install-hooks.sh" uninstall >"$TMP/uninstall.out" 2>"$TMP/uninstall.err"
-assert_eq '0' "$(jq -r --arg command "$radar_command" '[.hooks.PermissionRequest[], .hooks.Stop[], .hooks.UserPromptSubmit[] | .hooks[] | select(.type == "command" and .command == $command)] | length' "$CODEX_HOOKS_JSON")" 'uninstall removes only radar handlers'
+assert_eq '0' "$(jq -r --arg command "$radar_command" '[.hooks.PermissionRequest[], .hooks.Stop[], .hooks.UserPromptSubmit[] | .hooks[] | select(.type == "command" and .command == $command and .timeout == 5 and .statusMessage == "tmux-radar lifecycle bridge")] | length' "$CODEX_HOOKS_JSON")" 'uninstall removes only radar-owned handlers'
+assert_json "$CODEX_HOOKS_JSON" '[.hooks.PermissionRequest[] | select(.matcher == "^user-scope") | .hooks[] | select(.command == "'"$radar_command"'" and .timeout == 77 and .statusMessage == "user-owned same command")] | length == 1'
 assert_json "$CODEX_HOOKS_JSON" '.hooks.PermissionRequest[0].hooks[0].command == "/usr/bin/omx permission"'
 assert_contains "$(cat "$CODEX_CONFIG")" 'sha256:keep-me' 'unrelated trust entry preserved'
 assert_not_contains "$(cat "$CODEX_CONFIG")" '/old/hooks.json:permission_request:0:0' 'stale radar trust removed'
@@ -495,7 +518,7 @@ assert_not_contains "$(cat "$CODEX_CONFIG")" "$ROOT/scripts/codex-notify-wrap.sh
 isolated_hooks="$TMP/home/.codex/hooks-without-config.json"
 isolated_config="$TMP/home/.codex/config-does-not-exist.toml"
 cat > "$isolated_hooks" <<EOFJSON
-{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"$radar_command"},{"type":"command","command":"/usr/bin/user-stop"}]}]}}
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"$radar_command","timeout":5,"statusMessage":"tmux-radar lifecycle bridge"}]},{"hooks":[{"type":"command","command":"/usr/bin/user-stop"}]}]}}
 EOFJSON
 rm -f "$isolated_config"
 CODEX_CONFIG="$isolated_config" CODEX_HOOKS_JSON="$isolated_hooks" \
@@ -529,5 +552,17 @@ bad_missing_config_rc=$?
 set -e
 [ "$bad_missing_config_rc" -ne 0 ] || _fail_assert 'malformed hooks.json must fail before creating config.toml'
 [ ! -e "$missing_config" ] || _fail_assert 'malformed hooks.json created an unrelated config file' 'file' "$missing_config"
+
+seed_install_fixtures
+printf '%s\n' '{invalid claude settings' > "$CLAUDE_SETTINGS"
+cp "$CODEX_CONFIG" "$TMP/config.before-transaction-failure"
+cp "$CODEX_HOOKS_JSON" "$TMP/hooks.before-transaction-failure"
+set +e
+bash "$ROOT/scripts/install-hooks.sh" install >"$TMP/transaction-failure.out" 2>"$TMP/transaction-failure.err"
+transaction_failure_rc=$?
+set -e
+[ "$transaction_failure_rc" -ne 0 ] || _fail_assert 'invalid Claude settings must fail the full hook transaction'
+assert_file_same "$CODEX_CONFIG" "$TMP/config.before-transaction-failure" 'Codex config rolled back after downstream Claude failure'
+assert_file_same "$CODEX_HOOKS_JSON" "$TMP/hooks.before-transaction-failure" 'Codex hooks rolled back after downstream Claude failure'
 
 printf 'PASS: ai hook events and codex hook installation\n'

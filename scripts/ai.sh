@@ -1141,7 +1141,7 @@ _emit_event_usage() {
 
 cmd_emit_event() {
   local pane="${1:-}" kind="${2:-}" source="${3:-}" label="${4-}"
-  local sanitized
+  local sanitized expected_run_id="${TMUX_RADAR_EXPECT_RUN_ID:-}"
   if [ -z "$pane" ] || [ -z "$kind" ] || [ -z "$source" ] || [ "${4+x}" != x ]; then
     _emit_event_usage
     return 2
@@ -1153,6 +1153,9 @@ cmd_emit_event() {
   fi
   sanitized="$(_flat "$label")"
   if ! radar_run_open "$pane" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ -n "$expected_run_id" ] && [ "$RADAR_RUN_ID" != "$expected_run_id" ]; then
     return 0
   fi
   [ -d "${RADAR_RUN_DIR:-}" ] || return 0

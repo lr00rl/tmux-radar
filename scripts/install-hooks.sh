@@ -27,6 +27,8 @@ CLAUDE_SUBCMDS=(claude-mark claude-stop claude-clear)
 CODEX_EVENTS=(PermissionRequest Stop UserPromptSubmit)
 CODEX_NOTIFY_JSON="[\"$NOTIFY\", \"codex\"]"
 CODEX_HOOK_CMD="$NOTIFY codex-hook"
+CODEX_HOOK_TIMEOUT=5
+CODEX_HOOK_STATUS="tmux-radar lifecycle bridge"
 CODEX_HOOK_BEGIN="# BEGIN tmux-radar Codex hooks"
 CODEX_HOOK_END="# END tmux-radar Codex hooks"
 
@@ -44,6 +46,62 @@ backup_file() {
   local path="$1"
   [ -f "$path" ] || return 0
   cp "$path" "$path.bak.$RADAR_TS"
+}
+
+TXN_DIR=""
+TXN_COMMITTED=0
+TXN_PATHS=()
+
+transaction_restore() {
+  local i path
+  set +e
+  i=0
+  for path in "${TXN_PATHS[@]}"; do
+    if [ -f "$TXN_DIR/$i.exists" ]; then
+      mkdir -p "$(dirname "$path")"
+      cp "$TXN_DIR/$i.data" "$path"
+    else
+      rm -f "$path"
+    fi
+    i=$((i + 1))
+  done
+}
+
+transaction_cleanup() {
+  [ -n "$TXN_DIR" ] && rm -rf "$TXN_DIR"
+  TXN_DIR=""
+}
+
+transaction_exit() {
+  local rc=$?
+  trap - EXIT HUP INT TERM
+  if [ "$TXN_COMMITTED" -ne 1 ]; then
+    transaction_restore
+  fi
+  transaction_cleanup
+  exit "$rc"
+}
+
+transaction_start() {
+  local path i=0
+  TXN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tmux-radar-hooks.XXXXXX")" || die "cannot create hook transaction"
+  TXN_COMMITTED=0
+  TXN_PATHS=("$@")
+  for path in "${TXN_PATHS[@]}"; do
+    if [ -f "$path" ]; then
+      cp "$path" "$TXN_DIR/$i.data"
+      : > "$TXN_DIR/$i.exists"
+    fi
+    i=$((i + 1))
+  done
+  trap transaction_exit EXIT
+  trap 'exit 130' HUP INT TERM
+}
+
+transaction_commit() {
+  TXN_COMMITTED=1
+  trap - EXIT HUP INT TERM
+  transaction_cleanup
 }
 
 append_marker_block() {
@@ -100,20 +158,22 @@ codex_has_notify() {
 codex_native_count_for_event() {
   local event="$1"
   [ -f "$CODEX_HOOKS_JSON" ] || { echo 0; return 0; }
-  jq -r --arg event "$event" --arg command "$CODEX_HOOK_CMD" '
-    [(.hooks[$event] // [])[]?.hooks[]? | select(.type == "command" and .command == $command)] | length
+  jq -r --arg event "$event" --arg command "$CODEX_HOOK_CMD" --arg status "$CODEX_HOOK_STATUS" --argjson timeout "$CODEX_HOOK_TIMEOUT" '
+    [(.hooks[$event] // [])[]?.hooks[]?
+      | select(.type == "command" and .command == $command and .timeout == $timeout and .statusMessage == $status)]
+    | length
   ' "$CODEX_HOOKS_JSON" 2>/dev/null || echo 0
 }
 
 codex_native_position() {
   local event="$1"
-  jq -r --arg event "$event" --arg command "$CODEX_HOOK_CMD" '
+  jq -r --arg event "$event" --arg command "$CODEX_HOOK_CMD" --arg status "$CODEX_HOOK_STATUS" --argjson timeout "$CODEX_HOOK_TIMEOUT" '
     (.hooks[$event] // [])
     | to_entries[]
     | .key as $group
     | .value.hooks
     | to_entries[]
-    | select(.value.type == "command" and .value.command == $command)
+    | select(.value.type == "command" and .value.command == $command and .value.timeout == $timeout and .value.statusMessage == $status)
     | "\($group):\(.key)"
   ' "$CODEX_HOOKS_JSON"
 }
@@ -148,15 +208,28 @@ build_codex_trust_entries() {
 merge_codex_hooks_json() {
   local mode="$1" tmp
   tmp="$(mktemp "$(dirname "$CODEX_HOOKS_JSON")/.hooks.XXXXXX")" || die "mktemp failed for $CODEX_HOOKS_JSON"
-  jq --arg command "$CODEX_HOOK_CMD" --arg mode "$mode" '
+  jq --arg command "$CODEX_HOOK_CMD" --arg status "$CODEX_HOOK_STATUS" --argjson timeout "$CODEX_HOOK_TIMEOUT" --arg mode "$mode" '
+    def radar_hook:
+      (type == "object") and
+      (.type == "command") and
+      (.command == $command) and
+      (.timeout == $timeout) and
+      (.statusMessage == $status) and
+      ((.async // false) == false) and
+      (((keys_unsorted - ["type","command","timeout","statusMessage","async"]) | length) == 0);
+    def radar_group:
+      (type == "object") and
+      (((keys_unsorted - ["hooks"]) | length) == 0) and
+      (((.hooks // []) | type) == "array") and
+      (((.hooks // []) | length) == 1) and
+      ((.hooks[0] | radar_hook));
     .hooks = (.hooks // {})
     | reduce ["PermissionRequest","Stop","UserPromptSubmit"][] as $event (.;
         .hooks[$event] = ((.hooks[$event] // [])
-          | map(
-              .hooks = ((.hooks // []) | map(select(.type != "command" or .command != $command)))
-            )
-          | map(select((.hooks // []) | length > 0))
-          | if $mode == "install" then . + [{hooks:[{type:"command", command:$command}]}] else . end
+          | map(select(radar_group | not))
+          | if $mode == "install" then
+              . + [{hooks:[{type:"command", command:$command, timeout:$timeout, statusMessage:$status}]}]
+            else . end
         )
       )
   ' "$CODEX_HOOKS_JSON" > "$tmp" || {
@@ -383,14 +456,18 @@ claude_status() {
 case "${1:-install}" in
   install)
     echo "Installing tmux-radar AI-status hooks:"
+    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON"
     codex_install
     claude_install
+    transaction_commit
     echo "Done. Restart Claude/Codex sessions (or open new ones) to pick up the hooks."
     ;;
   uninstall)
     echo "Uninstalling tmux-radar AI-status hooks:"
+    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON"
     codex_uninstall
     claude_uninstall
+    transaction_commit
     ;;
   status)
     claude_status

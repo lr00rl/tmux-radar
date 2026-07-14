@@ -253,6 +253,22 @@ test_menu_routes_v_to_advanced_setup() {
   assert_contains "$action" "'#{pane_id}' advanced" 'v selects advanced mode'
 }
 
+test_native_tpm_menu_matches_goal_first_setup_routes() {
+  local entrypoint
+  entrypoint="$(cat "$ROOT/tmux-radar.tmux")"
+  assert_contains "$entrypoint" 'MONITOR_POP="display-popup -E -w 90% -h 85%"' \
+    'native prefix+A menu reserves the supervision popup'
+  assert_contains "$entrypoint" "watch-setup '#{pane_id}' quick" \
+    'native w binding uses quick goal-first setup'
+  assert_contains "$entrypoint" "watch-setup '#{pane_id}' quick always-allow" \
+    'native W binding uses quick goal-first setup with always-allow'
+  assert_contains "$entrypoint" "watch-setup '#{pane_id}' advanced" \
+    'native v binding uses advanced goal-first setup'
+  case "$entrypoint" in
+    *'run-shell \"$SCRIPTS/ai.sh watch'*) _fail_assert 'native menu bypasses goal entry with direct watch' ;;
+  esac
+}
+
 test_blank_goal_uses_explicit_default() {
   local config_file="$TMP/default-goal.json"
   run_ai _build-watch-config %39 '' > "$config_file"
@@ -511,6 +527,7 @@ run_test 'invalid numeric overrides surface rejection details' test_invalid_nume
 run_test 'menu routes w to quick setup' test_menu_routes_w_to_quick_setup
 run_test 'menu routes W to quick setup with always-allow' test_menu_routes_W_to_quick_setup_with_always_allow
 run_test 'menu routes v to advanced setup' test_menu_routes_v_to_advanced_setup
+run_test 'native prefix+A menu matches goal-first setup routes' test_native_tpm_menu_matches_goal_first_setup_routes
 run_test 'blank goal uses explicit default' test_blank_goal_uses_explicit_default
 run_test 'quick goal reaches config byte-for-byte' test_quick_goal_reaches_config_byte_for_byte
 run_test '_decode-goal preserves terminal newlines before sentinel' test_decode_goal_preserves_terminal_newlines_before_sentinel

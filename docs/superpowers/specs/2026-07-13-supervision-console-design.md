@@ -242,7 +242,7 @@ $STATE_DIR/ai-runs/<run-id>/
   final.json              completion/stop summary
 ```
 
-Each inbox event is written to a private temporary file and atomically renamed to a ready file. Drainers atomically claim ready files into private batches; events published during a drain remain for the next batch. This avoids shared-lock reclamation races, partial JSON reads, and truncation races while preserving exact-once ownership.
+Each inbox event is written to a private temporary file and atomically published with a no-clobber hard link. Drainers atomically claim ready files into private batches; events published during a drain remain for the next batch. This avoids shared-lock reclamation races, partial JSON reads, overwrite collisions, and truncation races while preserving exact-once ownership among live drainers. A claimed batch is deleted only after a successful read; failed or interrupted batches remain as recovery evidence for the watcher event-ID dedupe path.
 
 The global `ai.log` remains a compact cross-run index. Monitor UI is derived from structured state and journals, not a second independent truth.
 

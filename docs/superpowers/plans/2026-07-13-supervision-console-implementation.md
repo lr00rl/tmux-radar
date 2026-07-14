@@ -95,7 +95,7 @@ radar_run_finalize() { :; }
 radar_cleanup_runs() { :; }
 ```
 
-Use `jq -cn` for JSON construction, `mktemp` plus `mv` for atomic snapshots, append-only JSONL for the canonical event journal, and `umask 077`. Implement the inbox as per-event files: append writes a complete private temp file under `inbox/` and atomically renames it to a ready extension; drain atomically moves ready files into a unique private batch before reading them. Concurrent appenders must land in either the current or next batch, concurrent drainers must never claim the same event, and incomplete temp files must never be visible. A live `.watch` pointer remains key/value text for compatibility and includes `run_id`, `run_dir`, `pid`, `pane`, and monitor pane IDs.
+Use `jq -cn` for JSON construction, `mktemp` plus `mv` for atomic snapshots, append-only JSONL for the canonical event journal, and `umask 077`. Implement the inbox as per-event files: append writes a complete private temp file under `inbox/` and atomically publishes it with a no-clobber hard link; drain atomically moves ready files into a unique private batch before reading them. Concurrent appenders must land in either the current or next batch, concurrent drainers must never claim the same event, incomplete temp files must never be visible, and a failed batch read must preserve the claimed files and return nonzero. A live `.watch` pointer remains key/value text for compatibility and includes `run_id`, `run_dir`, `pid`, `pane`, and monitor pane IDs.
 
 - [ ] **Step 4: Verify runtime behavior**
 

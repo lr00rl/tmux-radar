@@ -431,6 +431,7 @@ claude_install() {
 claude_uninstall() {
   need_jq
   [ -f "$CLAUDE_SETTINGS" ] || { info "no $CLAUDE_SETTINGS"; return 0; }
+  jq empty "$CLAUDE_SETTINGS" >/dev/null 2>&1 || die "$CLAUDE_SETTINGS is not valid JSON"
   backup_file "$CLAUDE_SETTINGS"
   local tmp; tmp="$(mktemp)"
   jq --arg p "$NOTIFY " '

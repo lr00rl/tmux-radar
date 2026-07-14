@@ -565,4 +565,18 @@ set -e
 assert_file_same "$CODEX_CONFIG" "$TMP/config.before-transaction-failure" 'Codex config rolled back after downstream Claude failure'
 assert_file_same "$CODEX_HOOKS_JSON" "$TMP/hooks.before-transaction-failure" 'Codex hooks rolled back after downstream Claude failure'
 
+seed_install_fixtures
+printf '%s\n' '{}' > "$CLAUDE_SETTINGS"
+bash "$ROOT/scripts/install-hooks.sh" install >"$TMP/transaction-uninstall-setup.out" 2>"$TMP/transaction-uninstall-setup.err"
+printf '%s\n' '{invalid claude settings' > "$CLAUDE_SETTINGS"
+cp "$CODEX_CONFIG" "$TMP/config.before-uninstall-failure"
+cp "$CODEX_HOOKS_JSON" "$TMP/hooks.before-uninstall-failure"
+set +e
+bash "$ROOT/scripts/install-hooks.sh" uninstall >"$TMP/transaction-uninstall-failure.out" 2>"$TMP/transaction-uninstall-failure.err"
+transaction_uninstall_failure_rc=$?
+set -e
+[ "$transaction_uninstall_failure_rc" -ne 0 ] || _fail_assert 'invalid Claude settings must fail the full uninstall transaction'
+assert_file_same "$CODEX_CONFIG" "$TMP/config.before-uninstall-failure" 'Codex config rolled back after downstream Claude uninstall failure'
+assert_file_same "$CODEX_HOOKS_JSON" "$TMP/hooks.before-uninstall-failure" 'Codex hooks rolled back after downstream Claude uninstall failure'
+
 printf 'PASS: ai hook events and codex hook installation\n'

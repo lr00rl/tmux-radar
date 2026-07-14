@@ -116,6 +116,7 @@ git commit -m "Make every supervision run independently auditable" \
 ### Task 2: Hook Event Inbox and Internal Suppression
 
 **Files:**
+- Modify: `scripts/ai.sh`
 - Modify: `scripts/needinput-notify.sh`
 - Modify: `scripts/install-hooks.sh`
 - Create: `tests/test_ai_events.sh`
@@ -141,7 +142,14 @@ assert_json "$RUN_DIR/inbox.jsonl" 'select(.kind == "turn_complete")'
 # TMUX_RADAR_INTERNAL=1 produces neither a mark nor an inbox event.
 ```
 
-Use a fake `tmux` that records `wait-for -S`, `show-option`, title, and mark calls. Seed `<pane>.watch` with `run_dir`, `run_id`, and `channel`.
+Use a fake `tmux` that records `wait-for -S`, `show-option`, title, and mark calls. Seed `<pane>.watch` with `run_dir`, `run_id`, and `channel`. Use temporary Codex `hooks.json` and `config.toml` fixtures to assert that installation:
+
+- preserves every pre-existing OMX hook group and handler,
+- adds each radar handler exactly once to `PermissionRequest`, `Stop`, and `UserPromptSubmit`,
+- remains duplicate-free when run twice,
+- stores matching native-hook trust hashes without replacing unrelated trust entries,
+- leaves no radar `[[hooks.*]]` event arrays in `config.toml`, and
+- removes only radar-owned handlers and trust entries on uninstall.
 
 - [ ] **Step 2: Run and confirm no inbox events are emitted**
 
@@ -151,7 +159,7 @@ Expected: FAIL because `needinput-notify.sh` only mutates `need-input`.
 
 - [ ] **Step 3: Add event emission without slowing hooks**
 
-Add an early guard and one helper:
+Add an early guard and one helper. `ai.sh emit-event` opens the current run through `scripts/lib/ai-runtime.sh`, appends one sanitized event to the inbox, then signals the run channel:
 
 ```bash
 [ "${TMUX_RADAR_INTERNAL:-0}" = 1 ] && exit 0
@@ -175,6 +183,8 @@ Call it from Claude/Codex hook handlers after target resolution. Preserve existi
 
 Update `install-hooks.sh status` to report each required native event and legacy fallback separately. Keep installation idempotent and retain existing notify chains.
 
+Codex must have one canonical hook representation. Merge radar command handlers into `~/.codex/hooks.json` while preserving all OMX and user handlers. Remove radar-owned `[[hooks.PermissionRequest]]`, `[[hooks.Stop]]`, and `[[hooks.UserPromptSubmit]]` arrays from `~/.codex/config.toml`; the marker block there may contain only radar trust-state entries. Compute trust keys from the final JSON group/handler indexes and trust hashes from canonical, sorted compact JSON using the same event-name, timeout, async, matcher, and status-message identity Codex uses. Installation and uninstallation must be transactional enough that a malformed source file fails visibly instead of silently replacing it.
+
 - [ ] **Step 5: Run event and baseline lifecycle tests**
 
 Run:
@@ -189,7 +199,7 @@ Expected: all PASS and no hook command returns non-zero.
 - [ ] **Step 6: Commit the event slice**
 
 ```bash
-git add scripts/needinput-notify.sh scripts/install-hooks.sh tests/test_ai_events.sh
+git add scripts/ai.sh scripts/needinput-notify.sh scripts/install-hooks.sh tests/test_ai_events.sh
 git commit -m "Wake supervisors from native agent lifecycle events" \
   -m "Constraint: Hooks must remain fast, sanitized, and zero-exit" \
   -m "Rejected: Screen-text prompt detection | native hooks are authoritative" \

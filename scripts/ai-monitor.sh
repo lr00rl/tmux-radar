@@ -60,7 +60,15 @@ next_label() {
     VERIFYING) printf 'waiting for target change or resume hook' ;;
     PAUSED_USER) printf 'paused; press p to resume' ;;
     PAUSED_ERROR) printf 'paused on error; inspect Decision/Logs' ;;
-    COMPLETED|DONE) printf 'completion hold' ;;
+    COMPLETED|DONE)
+      if [ "$kind" = manual_close ]; then
+        printf 'kept open; press q to close'
+      else
+        case "$at" in ''|*[!0-9]*) at=0 ;; esac
+        remaining=$((at - now)); [ "$remaining" -lt 0 ] && remaining=0
+        printf 'auto-close in %ss; press k to keep' "$remaining"
+      fi
+      ;;
     *)
       case "$at" in ''|*[!0-9]*) at=0 ;; esac
       remaining=$((at - now)); [ "$remaining" -lt 0 ] && remaining=0
@@ -72,7 +80,7 @@ next_label() {
 
 overview_rows() {
   local state="$RUN_DIR/state.json" config="$RUN_DIR/config.json" phase status goal policy autonomy
-  local calls max_calls retry poll model profile effort logging retention event source elapsed started queued next_kind next_at color
+  local calls max_calls retry poll model profile effort logging retention event source elapsed started queued next_kind next_at color final summary
   [ -r "$state" ] || return 1
   phase="$(jq -r '.phase // "CREATED"' "$state")"
   status="$(jq -r '.status // "starting"' "$state")"
@@ -93,13 +101,19 @@ overview_rows() {
   printf '%s%s tmux-radar supervisor %s%s  %s%s%s  %srun %s%s\n' "$BOLD" "$CYAN" "$RESET" "$DIM" "$color" "$phase" "$RESET" "$DIM" "$RUN_ID" "$RESET"
   printf '%sGoal%s      %s\n' "$BOLD" "$RESET" "$goal"
   printf '%sEvent%s     %s%s%s · source=%s · queued=%s · elapsed=%ss\n' "$BOLD" "$RESET" "$YELLOW" "${event:-none}" "$RESET" "${source:-none}" "$queued" "$elapsed"
-  printf '%sDecision%s  %s/%s · retry=%s · %s\n' "$BOLD" "$RESET" "$calls" "$max_calls" "$retry" "$status"
+  final="$RUN_DIR/final.json"
+  if [ -r "$final" ]; then
+    summary="$(jq -r '"\(.outcome) · decisions=\(.decision_count // 0) actions=\(.action_count // 0) errors=\(.error_count // 0) · \(.duration_seconds // 0)s"' "$final" 2>/dev/null || true)"
+    printf '%sOutcome%s   %s · %s\n' "$BOLD" "$RESET" "${summary:-completed}" "$status"
+  else
+    printf '%sDecision%s  %s/%s · retry=%s · %s\n' "$BOLD" "$RESET" "$calls" "$max_calls" "$retry" "$status"
+  fi
   printf '%sBrain%s     model=%s profile=%s effort=%s\n' "$BOLD" "$RESET" "$model" "${profile:--}" "$effort"
   printf '%sPolicy%s    %s · autonomy=%s\n' "$BOLD" "$RESET" "$policy" "$autonomy"
   printf '%sTrigger%s   hooks-first + stable screen · poll=%ss\n' "$BOLD" "$RESET" "$poll"
   printf '%sLogs%s      %s · retention=%sd\n' "$BOLD" "$RESET" "$logging" "$retention"
   printf '%sNext%s      %s\n' "$BOLD" "$RESET" "$(next_label "$phase" "$next_kind" "$next_at")"
-  printf '%sControls%s  p pause/resume · r reassess · c config · Enter target · q stop\n' "$DIM" "$RESET"
+  printf '%sControls%s  p pause/resume · r reassess · k keep · c config · Enter target · q stop\n' "$DIM" "$RESET"
 }
 
 draw_fixed_rows() {
@@ -214,7 +228,7 @@ detail_header() {
   local view="$1"
   printf '%s tmux-radar detail %s  %srun %s%s\n' "$CYAN" "$RESET" "$DIM" "$RUN_ID" "$RESET"
   printf '%s1%s Timeline  %s2%s Decision  %s3%s Screen  %s4%s Config  %s5%s Logs\n' "$BOLD" "$RESET" "$BOLD" "$RESET" "$BOLD" "$RESET" "$BOLD" "$RESET" "$BOLD" "$RESET"
-  printf '%sp%s pause/resume  %sr%s reassess  %sc%s config  %sEnter%s target  %sq%s stop   view=%s\n' "$YELLOW" "$RESET" "$YELLOW" "$RESET" "$YELLOW" "$RESET" "$YELLOW" "$RESET" "$RED" "$RESET" "$view"
+  printf '%sp%s pause/resume  %sr%s reassess  %sk%s keep  %sc%s config  %sEnter%s target  %sq%s stop   view=%s\n' "$YELLOW" "$RESET" "$YELLOW" "$RESET" "$YELLOW" "$RESET" "$YELLOW" "$RESET" "$YELLOW" "$RESET" "$RED" "$RESET" "$view"
   printf '%s\n' '────────────────────────────────────────────────────────────────────────'
 }
 
@@ -241,6 +255,7 @@ handle_key() {
       else "$AI" pause "$PANE" >/dev/null 2>&1; fi
       ;;
     r) "$AI" emit-event "$PANE" manual_reassess monitor 'manual reassessment' >/dev/null 2>&1 ;;
+    k) "$AI" keep "$PANE" >/dev/null 2>&1 || true ;;
     q)
       STOP_ON_EXIT=0
       "$AI" stop "$PANE" >/dev/null 2>&1 || true

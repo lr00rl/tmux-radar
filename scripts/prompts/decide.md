@@ -16,8 +16,9 @@ it. Return ONLY the structured fields defined by the schema.
 - **`escalate`** — the assistant is waiting, but the decision is destructive,
   irreversible, high-stakes, or genuinely ambiguous. Hand it back to the human.
   (Equivalently: `action:"send"` with `safe:false`.)
-- **`done`** — the task looks finished: the assistant is idle at a shell prompt,
-  printed a completion/summary and is not asking anything, or the session ended.
+- **`done`** — the exact configured `GOAL` is visibly achieved. A turn ending,
+  an idle composer, or a shell prompt is not enough when the goal still has
+  unfinished work. Without a configured goal, use the visible task statement.
 
 ## How to answer common prompts (`send`)
 
@@ -69,3 +70,8 @@ than to approve the wrong destructive action.
 
 `reason` — one concise sentence: what the pane is asking and why your action is
 the safe choice. Write it in the user's language if the pane is in that language.
+
+When the schema supports them, also return `pane_state`, `goal_status`, `risk`,
+and a short `evidence` list. Evidence must be directly observable in the supplied
+pane text, such as a named approval prompt, a test result, or a completion
+summary. Do not expose hidden chain-of-thought or speculative internal reasoning.

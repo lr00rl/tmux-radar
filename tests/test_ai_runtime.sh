@@ -81,7 +81,13 @@ assert_contains "$drained_once" '测试面板' "inbox drain preserves CJK"
 assert_eq "" "$(radar_inbox_drain)" "second inbox drain empty"
 
 radar_run_finalize completed "goal reached"
-assert_json "$RADAR_RUN_DIR/final.json" '.outcome == "completed" and .reason == "goal reached" and .run_id == "'"$RADAR_RUN_ID"'"'
+assert_json "$RADAR_RUN_DIR/final.json" '
+  .outcome == "completed" and .reason == "goal reached" and
+  .run_id == "'"$RADAR_RUN_ID"'" and .goal == "监控到测试全绿" and
+  .duration_seconds >= 0 and .event_count == 1 and .decision_count == 0 and
+  .action_count == 0 and .error_count == 0 and
+  .log_path == "'"$RADAR_RUN_DIR"'" and .finalized_epoch > 0
+'
 assert_eq "600" "$(stat -f '%Lp' "$RADAR_RUN_DIR/final.json")" "final.json mode"
 
 stale_dir="$RADAR_RUNS_DIR/19990101-000000-pane-111"

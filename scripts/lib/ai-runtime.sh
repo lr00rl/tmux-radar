@@ -126,7 +126,7 @@ radar_watch_file() {
 
 radar_run_create() {
   local pane="$1" config_json="$2"
-  local pane_token stamp run_id run_dir watch_file channel config_payload
+  local pane_token stamp run_id run_dir watch_file channel config_payload created_epoch
   _radar_require_jq || return 1
   mkdir -p "$RADAR_WATCH_DIR" "$RADAR_RUNS_DIR"
   pane_token="$(_radar_pane_token "$pane")"
@@ -135,6 +135,7 @@ radar_run_create() {
   run_dir="$RADAR_RUNS_DIR/$run_id"
   watch_file="$(radar_watch_file "$pane")"
   channel="$(_radar_watch_channel "$pane")"
+  created_epoch="$(date '+%s')"
   mkdir -p "$run_dir"
   config_payload="$(
     jq -cn \
@@ -142,7 +143,8 @@ radar_run_create() {
       --arg run_id "$run_id" \
       --arg pane "$pane" \
       --arg timestamp "$(_radar_now_iso)" \
-      '$config + {run_id:$run_id, pane:$pane, created_at:$timestamp}'
+      --argjson created_epoch "$created_epoch" \
+      '$config + {run_id:$run_id, pane:$pane, created_at:$timestamp, created_epoch:$created_epoch}'
   )" || return 1
   _radar_write_snapshot "$run_dir/config.json" "$config_payload" || return 1
   : > "$run_dir/events.jsonl"
@@ -249,17 +251,57 @@ radar_inbox_drain() {
 }
 
 radar_run_finalize() {
-  local outcome="$1" reason="$2" payload
+  local outcome="$1" reason="$2" payload config events latest_decision
+  local now_epoch created_epoch duration event_count decision_count action_count error_count goal goal_status
   _radar_require_jq || return 1
   [ -n "$RADAR_RUN_DIR" ] || return 1
+  config="$RADAR_RUN_DIR/config.json"
+  events="$RADAR_RUN_DIR/events.jsonl"
+  now_epoch="$(date '+%s')"
+  created_epoch="$(jq -r '.created_epoch // 0' "$config" 2>/dev/null || printf 0)"
+  case "$created_epoch" in ''|*[!0-9]*) created_epoch=0 ;; esac
+  [ "$created_epoch" -gt 0 ] || created_epoch="$now_epoch"
+  duration=$((now_epoch - created_epoch)); [ "$duration" -ge 0 ] || duration=0
+  goal="$(jq -r '.goal // .values.goal.value // ""' "$config" 2>/dev/null || true)"
+  if [ -s "$events" ]; then
+    event_count="$(jq -s 'length' "$events" 2>/dev/null || printf 0)"
+    action_count="$(jq -s '[.[] | select(.sent == true)] | length' "$events" 2>/dev/null || printf 0)"
+    error_count="$(jq -s '[.[] | select(
+      (.kind // "" | test("failed|error|warning"; "i")) or
+      (.phase // "" | test("ERROR"; "i")) or
+      (.record // "" | test("error|warning"; "i"))
+    )] | length' "$events" 2>/dev/null || printf 0)"
+  else
+    event_count=0; action_count=0; error_count=0
+  fi
+  decision_count=0; latest_decision=""
+  if [ -d "$RADAR_RUN_DIR/decisions" ]; then
+    decision_count="$(find "$RADAR_RUN_DIR/decisions" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9].json' 2>/dev/null | wc -l | tr -d '[:space:]')"
+    latest_decision="$(find "$RADAR_RUN_DIR/decisions" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9].json' 2>/dev/null | sort | tail -n 1)"
+  fi
+  goal_status=""
+  [ -n "$latest_decision" ] && goal_status="$(jq -r '.goal_status // ""' "$latest_decision" 2>/dev/null || true)"
   payload="$(
     jq -cn \
       --arg outcome "$outcome" \
       --arg reason "$reason" \
       --arg run_id "$RADAR_RUN_ID" \
       --arg pane "$RADAR_RUN_PANE" \
+      --arg goal "$goal" \
+      --arg goal_status "$goal_status" \
+      --arg log_path "$RADAR_RUN_DIR" \
       --arg timestamp "$(_radar_now_iso)" \
-      '{outcome:$outcome, reason:$reason, run_id:$run_id, pane:$pane, finalized_at:$timestamp}'
+      --argjson finalized_epoch "$now_epoch" \
+      --argjson duration_seconds "$duration" \
+      --argjson event_count "${event_count:-0}" \
+      --argjson decision_count "${decision_count:-0}" \
+      --argjson action_count "${action_count:-0}" \
+      --argjson error_count "${error_count:-0}" \
+      '{outcome:$outcome, reason:$reason, run_id:$run_id, pane:$pane,
+        goal:$goal, goal_status:$goal_status, duration_seconds:$duration_seconds,
+        event_count:$event_count, decision_count:$decision_count,
+        action_count:$action_count, error_count:$error_count,
+        log_path:$log_path, finalized_at:$timestamp, finalized_epoch:$finalized_epoch}'
   )" || return 1
   _radar_write_snapshot "$RADAR_RUN_DIR/final.json" "$payload"
 }
@@ -276,14 +318,22 @@ _radar_run_protected() {
 }
 
 radar_cleanup_runs() {
-  local retention_days="${1:-7}" run_dir
+  local retention_days="${1:-7}" run_dir final_epoch cutoff now_epoch mtime
   mkdir -p "$RADAR_RUNS_DIR"
-  find "$RADAR_RUNS_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +"$retention_days" 2>/dev/null |
-    while IFS= read -r run_dir; do
-      [ -n "$run_dir" ] || continue
-      if _radar_run_protected "$run_dir"; then
-        continue
-      fi
-      rm -rf "$run_dir"
-    done
+  case "$retention_days" in ''|*[!0-9]*) retention_days=7 ;; esac
+  now_epoch="$(date '+%s')"; cutoff=$((now_epoch - retention_days * 86400))
+  for run_dir in "$RADAR_RUNS_DIR"/*; do
+    [ -d "$run_dir" ] || continue
+    _radar_run_protected "$run_dir" && continue
+    final_epoch="$(jq -r '.finalized_epoch // 0' "$run_dir/final.json" 2>/dev/null || printf 0)"
+    case "$final_epoch" in ''|*[!0-9]*) final_epoch=0 ;; esac
+    if [ "$final_epoch" -le 0 ]; then
+      mtime="$(stat -f '%m' "$run_dir/final.json" 2>/dev/null || stat -c '%Y' "$run_dir/final.json" 2>/dev/null || printf 0)"
+      case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac
+      final_epoch="$mtime"
+    fi
+    [ "$final_epoch" -gt 0 ] || continue
+    [ "$final_epoch" -le "$cutoff" ] || continue
+    rm -rf "$run_dir"
+  done
 }

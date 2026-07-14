@@ -176,6 +176,7 @@ reset_case() {
   export TEST_SEND_FAIL_AT=0
   export TMUX_RADAR_TEST_PRE_SEND_BLOCK=""
   export TMUX_RADAR_TEST_GATE_ATTEMPTS=""
+  export TMUX_RADAR_TEST_COMPLETION_DELAY=0
   : > "$TMUX_RADAR_NEEDINPUT_FILE"
   : > "$TEST_SENDS"
   : > "$TEST_SEND_COUNT"
@@ -204,8 +205,10 @@ start_watch() {
 }
 
 start_watch_config() {
-  local poll="$1" stable_threshold="$2" hooks_first="$3" goal="${4:-supervise until done}" config
-  config="$(TMUX_RADAR_SETUP_OVERRIDES="poll=$poll,stable_screen_threshold=$stable_threshold,hooks_first=$hooks_first" \
+  local poll="$1" stable_threshold="$2" hooks_first="$3" goal="${4:-supervise until done}" extra="${5:-}" config overrides
+  overrides="poll=$poll,stable_screen_threshold=$stable_threshold,hooks_first=$hooks_first"
+  [ -z "$extra" ] || overrides="$overrides,$extra"
+  config="$(TMUX_RADAR_SETUP_OVERRIDES="$overrides" \
     PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" _build-watch-config %1 "$goal")"
   PATH="$TMP/bin:$OLD_PATH" \
     bash "$ROOT/scripts/ai.sh" _watch_loop %1 '' '' '' '' "$config" \
@@ -619,5 +622,73 @@ case "$prompt" in
 esac
 stop_watch
 printf 'PASS: exact goal bytes reach config, state, and prompt\n'
+
+# 22. Decision logging keeps one structured decision, metadata, and backend
+# stderr per call without persisting the sensitive screen or prompt by default.
+reset_case decision-logging
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"tests are still running","pane_state":"working","goal_status":"working","risk":"low","evidence":["test command remains active"]}'
+start_watch_config 30 1 on 'monitor until tests pass' 'logging=decision,screen_snapshots=off'
+emit_event decision-log manual_reassess inspect
+wait_until 'structured decision log' "[ -s '$RUN_DIR/decisions/0001.json' ] && [ -s '$RUN_DIR/decisions/0001.meta.json' ] && [ -e '$RUN_DIR/backend/0001.stderr' ]"
+assert_json "$RUN_DIR/decisions/0001.json" '.action == "wait" and .pane_state == "working" and .goal_status == "working" and .risk == "low" and .evidence == ["test command remains active"]'
+assert_json "$RUN_DIR/decisions/0001.meta.json" '.call == 1 and .event_id == "decision-log" and .schema_valid == true and .backend_rc == 0 and .elapsed_seconds >= 0 and .timeout_seconds > 0'
+assert_eq 600 "$(stat -f '%Lp' "$RUN_DIR/decisions/0001.json")" 'decision log mode'
+assert_eq 600 "$(stat -f '%Lp' "$RUN_DIR/decisions/0001.meta.json")" 'decision metadata mode'
+assert_eq 600 "$(stat -f '%Lp' "$RUN_DIR/backend/0001.stderr")" 'backend stderr mode'
+[ ! -e "$RUN_DIR/screens" ] || _fail_assert 'decision logging must omit screens'
+[ ! -e "$RUN_DIR/prompts" ] || _fail_assert 'decision logging must omit prompts'
+stop_watch
+printf 'PASS: decision logging is structured and privacy-bounded\n'
+
+# 23. Full logging explicitly persists the exact pane capture and model prompt.
+reset_case full-logging
+printf 'screen-full-log-marker\n' > "$TEST_SCREEN"
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"continue","evidence":["screen-full-log-marker"]}'
+start_watch_config 30 1 on 'full audit goal' 'logging=full,screen_snapshots=off'
+emit_event full-log manual_reassess inspect
+wait_until 'full screen and prompt logs' "[ -s '$RUN_DIR/screens/0001.txt' ] && [ -s '$RUN_DIR/prompts/0001.txt' ]"
+assert_contains "$(cat "$RUN_DIR/screens/0001.txt")" 'screen-full-log-marker' 'full screen log content'
+assert_contains "$(cat "$RUN_DIR/prompts/0001.txt")" 'GOAL (set by the user for this watch): full audit goal' 'full prompt goal content'
+assert_contains "$(cat "$RUN_DIR/prompts/0001.txt")" 'screen-full-log-marker' 'full prompt pane content'
+assert_eq 600 "$(stat -f '%Lp' "$RUN_DIR/screens/0001.txt")" 'screen log mode'
+assert_eq 600 "$(stat -f '%Lp' "$RUN_DIR/prompts/0001.txt")" 'prompt log mode'
+stop_watch
+printf 'PASS: full logging persists explicit private evidence\n'
+
+# 24. Completion remains inspectable for the configured hold, reports its
+# summary, and auto-closes only after the deadline.
+reset_case completion-hold
+export TMUX_RADAR_TEST_COMPLETION_DELAY=3
+write_response 1 '{"action":"done","text":"","keys":[],"safe":true,"reason":"goal reached","pane_state":"done","goal_status":"done","risk":"low","evidence":["all tests passed"]}'
+start_watch_config 30 1 on 'finish all tests' 'completion_close_delay=3'
+completion_run_id="$(basename "$RUN_DIR")"
+emit_event completion-turn turn_complete complete
+wait_until 'completion final report' "[ -s '$RUN_DIR/final.json' ]" 400
+assert_file "$CASE/state/ai-watch/_1.watch"
+assert_json "$RUN_DIR/state.json" '.phase == "COMPLETED" and .next.kind == "auto_close" and .next.at > 0'
+assert_json "$RUN_DIR/final.json" '.outcome == "completed" and .reason == "goal reached" and .goal == "finish all tests" and .goal_status == "done" and .decision_count == 1 and .event_count > 0 and .duration_seconds >= 0 and .log_path == "'"$RUN_DIR"'"'
+report="$(PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" report "$completion_run_id")"
+assert_contains "$report" 'Outcome:   completed' 'report outcome'
+assert_contains "$report" 'Counts:    events=' 'report counts'
+assert_contains "$report" "Logs:      $RUN_DIR" 'report log path'
+wait_until 'completion auto-close' "[ ! -e '$CASE/state/ai-watch/_1.watch' ]" 400
+wait "$WATCH_PID" 2>/dev/null || true
+WATCH_PID=""
+printf 'PASS: completion hold exposes final report before auto-close\n'
+
+# 25. Keeping a completed run cancels auto-close until the user stops it.
+reset_case completion-keep
+export TMUX_RADAR_TEST_COMPLETION_DELAY=3
+write_response 1 '{"action":"done","text":"","keys":[],"safe":true,"reason":"kept result","goal_status":"done","evidence":["goal complete"]}'
+start_watch_config 30 1 on 'keep completion open' 'completion_close_delay=3'
+emit_event completion-keep-turn turn_complete complete
+wait_until 'keepable completion' "[ -s '$RUN_DIR/final.json' ]" 400
+PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" keep %1 >/dev/null
+wait_until 'completion keep marker' "[ -e '$RUN_DIR/keep-open' ]"
+sleep 3.2
+assert_file "$CASE/state/ai-watch/_1.watch"
+assert_json "$RUN_DIR/state.json" '.phase == "COMPLETED" and .next.kind == "manual_close" and .next.at == 0'
+stop_watch
+printf 'PASS: completion keep requires explicit close\n'
 
 printf 'PASS: serialized event-driven supervision suite\n'

@@ -16,6 +16,7 @@
 #   watch <pane> [goal] [policy] [poll] [autonomy]
 #                       resident: keep deciding for a pane until its task is done
 #   watch-setup [<pane>] interactive setup (goal / interval / approval policy)
+#   report [run-id|latest] print the final structured run summary
 #   stop  <pane|all>    stop a resident watcher
 #   status              list active watchers + recent decisions
 #   list                list AI panes and their AI-status state
@@ -532,6 +533,48 @@ _pretty_json() {
   fi
 }
 
+_decision_call_tag() {
+  local call="${WATCH_CALLS:-1}"
+  case "$call" in ''|*[!0-9]*) call=1 ;; esac
+  printf '%04d' "$call"
+}
+
+_persist_decision_call() {
+  local tag="$1" json="$2" backend="$3" autonomy="$4" policy="$5"
+  local decision_file meta_file payload model profile effort
+  [ -n "${RADAR_RUN_DIR:-}" ] || return 0
+  mkdir -p "$RADAR_RUN_DIR/decisions" "$RADAR_RUN_DIR/backend"
+  decision_file="$RADAR_RUN_DIR/decisions/$tag.json"
+  meta_file="$RADAR_RUN_DIR/decisions/$tag.meta.json"
+  if [ "$DECISION_SCHEMA_VALID" -eq 1 ]; then
+    _radar_write_snapshot "$decision_file" "$json"
+  else
+    payload="$(jq -cn --arg raw "$json" --arg error "$DECISION_SCHEMA_ERROR" \
+      '{valid:false,raw:$raw,error:$error}')"
+    _radar_write_snapshot "$decision_file" "$payload"
+  fi
+  model="$(opt @radar-ai-model gpt-5.6-luna)"
+  profile="$(opt @radar-ai-profile '')"
+  effort="$(opt @radar-ai-effort low)"
+  payload="$(jq -cn \
+    --arg run_id "$RADAR_RUN_ID" --arg pane "$RADAR_RUN_PANE" \
+    --arg event_id "${WATCH_EVENT_ID:-}" --arg backend "$backend" \
+    --arg autonomy "$autonomy" --arg policy "${policy:-safe-auto}" \
+    --arg model "$model" --arg profile "$profile" --arg effort "$effort" \
+    --arg schema_error "$DECISION_SCHEMA_ERROR" --arg completed_at "$(_radar_now_iso)" \
+    --argjson call "$((10#$tag))" --argjson started_at "${BRAIN_LAST_STARTED:-0}" \
+    --argjson elapsed_seconds "${BRAIN_LAST_ELAPSED:-0}" \
+    --argjson timeout_seconds "${BRAIN_LAST_TIMEOUT:-0}" \
+    --argjson backend_rc "${BRAIN_LAST_RC:-0}" \
+    --argjson schema_valid "$DECISION_SCHEMA_VALID" \
+    '{run_id:$run_id,pane:$pane,event_id:$event_id,call:$call,backend:$backend,
+      model:$model,profile:$profile,effort:$effort,autonomy:$autonomy,policy:$policy,
+      started_at:$started_at,elapsed_seconds:$elapsed_seconds,
+      timeout_seconds:$timeout_seconds,backend_rc:$backend_rc,
+      schema_valid:($schema_valid == 1),schema_error:$schema_error,completed_at:$completed_at}')"
+  _radar_write_snapshot "$meta_file" "$payload"
+}
+
 _watch_file_tail() {  # _watch_file_tail <file> <keep-lines>
   local file="$1" keep="${2:-240}" n tmp
   [ -f "$file" ] || return 0
@@ -1038,7 +1081,7 @@ cmd_decide() {
   need_jq
   have_brain || { echo "codex 未安装/不可用，无法决策。"; return 3; }
   local pane autonomy policy goal cap cap_tail where json pretty_json action text safe reason extra="" prompt backend
-  local excerpt_lines errfile err_tail TMUX_RADAR_AI_ERR="" TMUX_SWITCHER_AI_ERR=""
+  local excerpt_lines errfile err_tail call_tag="" logging snapshots TMUX_RADAR_AI_ERR="" TMUX_SWITCHER_AI_ERR=""
   pane="$(_resolve_pane "${1:-}")" || { echo "no target pane"; return 5; }
   autonomy="${2:-$(opt @radar-ai-autonomy confirm)}"
   policy="${3:-}"
@@ -1063,8 +1106,23 @@ cmd_decide() {
 
   prompt="$(_skill decide.md)$extra"$'\n\n'"PANE ($where):"$'\n'"$cap"
   backend="$(_brain_label)"
+  if [ -n "${RADAR_RUN_DIR:-}" ]; then
+    call_tag="$(_decision_call_tag)"
+    mkdir -p "$RADAR_RUN_DIR/decisions" "$RADAR_RUN_DIR/backend"
+    errfile="$RADAR_RUN_DIR/backend/$call_tag.stderr"
+    logging="${TMUX_RADAR_RUN_LOGGING:-decision}"
+    snapshots="${TMUX_RADAR_RUN_SCREEN_SNAPSHOTS:-off}"
+    if [ "$logging" = full ] || [ "$snapshots" = on ]; then
+      mkdir -p "$RADAR_RUN_DIR/screens"
+      _radar_write_snapshot "$RADAR_RUN_DIR/screens/$call_tag.txt" "$cap"
+    fi
+    if [ "$logging" = full ]; then
+      mkdir -p "$RADAR_RUN_DIR/prompts"
+      _radar_write_snapshot "$RADAR_RUN_DIR/prompts/$call_tag.txt" "$prompt"
+    fi
+  fi
   if [ -n "${TMUX_RADAR_AI_DETAIL:-${TMUX_SWITCHER_AI_DETAIL:-}}" ]; then
-    errfile="$(_wbase "$pane").brain.err"
+    [ -n "${errfile:-}" ] || errfile="$(_wbase "$pane").brain.err"
     _watch_detail "$pane" "模型请求中" "$(printf 'Backend: %s\nTarget: %s\nAutonomy: %s\nPolicy: %s\nGoal: %s\n\nPane excerpt shown here (last %s lines; model receives last %s lines):\n%s\n' \
       "$backend" "$where" "$autonomy" "${policy:-safe-auto}" "${goal:-<none>}" \
       "$excerpt_lines" "$(opt @radar-ai-capture-lines 120)" "$cap_tail")"
@@ -1090,6 +1148,10 @@ cmd_decide() {
     and (.keys | type == "array" and all(.[]; type == "string"))
     and (.safe | type == "boolean")
     and (.reason | type == "string")
+    and ((.pane_state? // null) == null or (.pane_state | IN("working","blocked","idle","done","unknown")))
+    and ((.goal_status? // null) == null or (.goal_status | IN("working","blocked","done","unclear")))
+    and ((.risk? // null) == null or (.risk | IN("low","medium","high","unknown")))
+    and ((.evidence? // null) == null or (.evidence | type == "array" and all(.[]; type == "string")))
   ' >/dev/null 2>&1; then
     DECISION_SCHEMA_VALID=1
     DECISION_SCHEMA_ERROR=""
@@ -1102,6 +1164,7 @@ cmd_decide() {
   else
     action="unknown"; text=""; safe=0; reason="$DECISION_SCHEMA_ERROR"
   fi
+  [ -z "$call_tag" ] || _persist_decision_call "$call_tag" "$json" "$backend" "$autonomy" "$policy"
   local keys=() _k                     # bash 3.2 (macOS) has no mapfile
   if [ "$DECISION_SCHEMA_VALID" -eq 1 ]; then
     while IFS= read -r _k; do [ -n "$_k" ] && keys+=("$_k"); done \
@@ -1818,15 +1881,44 @@ _watch_deliver_under_gate() {
   done
 }
 
+_watch_completion_hold() {
+  local deadline="$1" tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.1}" kept=0
+  while [ -r "$WATCH_WF" ]; do
+    if [ -e "$RADAR_RUN_DIR/keep-open" ]; then
+      if [ "$kept" -eq 0 ]; then
+        WATCH_STATUS="completed; kept open until q"
+        WATCH_NEXT_KIND="manual_close"
+        WATCH_NEXT_AT=0
+        _watch_state_snapshot
+        kept=1
+      fi
+    elif [ "$(now)" -ge "$deadline" ]; then
+      return 0
+    fi
+    sleep "$tick"
+  done
+}
+
 _watch_finalize() {
-  local outcome="$1" phase="$2" reason="$3"
+  local outcome="$1" phase="$2" reason="$3" delay deadline
   _delivery_cleanup
   _watch_kill_waiters
   _terminate_current_brain
-  _watch_phase "$phase" "$reason" none 0
-  radar_run_finalize "$outcome" "$reason"
-  WATCH_FINALIZED=1
-  rm -f "$WATCH_WF" "$BRAIN_PID_FILE" "$BRAIN_OUT_FILE" "$RADAR_RUN_DIR/paused"
+  if [ "$outcome" = completed ]; then
+    delay="${TMUX_RADAR_TEST_COMPLETION_DELAY:-${TMUX_RADAR_RUN_COMPLETION_CLOSE_DELAY:-12}}"
+    case "$delay" in ''|*[!0-9]*) delay=12 ;; esac
+    deadline=$(( $(now) + delay ))
+    _watch_phase "$phase" "$reason" auto_close "$deadline"
+    radar_run_finalize "$outcome" "$reason"
+    WATCH_FINALIZED=1
+    _watch_completion_hold "$deadline"
+  else
+    _watch_phase "$phase" "$reason" none 0
+    radar_run_finalize "$outcome" "$reason"
+    WATCH_FINALIZED=1
+  fi
+  rm -f "$WATCH_WF" "$BRAIN_PID_FILE" "$BRAIN_OUT_FILE" \
+    "$RADAR_RUN_DIR/paused" "$RADAR_RUN_DIR/keep-open"
 }
 
 _watch_signal_exit() {
@@ -1839,6 +1931,7 @@ _watch_signal_exit() {
     _watch_kill_waiters
     _terminate_current_brain
     [ -n "$WATCH_WF" ] && rm -f "$WATCH_WF"
+    [ -n "${RADAR_RUN_DIR:-}" ] && rm -f "$RADAR_RUN_DIR/paused" "$RADAR_RUN_DIR/keep-open"
   fi
   exit "$rc"
 }
@@ -2330,6 +2423,45 @@ cmd_resume() {
   [ -n "$RADAR_RUN_CHANNEL" ] && tmux wait-for -S "$RADAR_RUN_CHANNEL" >/dev/null 2>&1 || true
 }
 
+cmd_keep() {
+  local pane phase
+  pane="$(_resolve_pane "${1:-}" 2>/dev/null || echo "${1:-}")"
+  radar_run_open "$pane" >/dev/null 2>&1 || { echo "no watcher for $pane" >&2; return 1; }
+  phase="$(jq -r '.phase // ""' "$RADAR_RUN_DIR/state.json" 2>/dev/null || true)"
+  [ "$phase" = COMPLETED ] || { echo "watcher for $pane is not completed" >&2; return 1; }
+  : > "$RADAR_RUN_DIR/keep-open"
+  chmod 600 "$RADAR_RUN_DIR/keep-open" 2>/dev/null || true
+  [ -n "$RADAR_RUN_CHANNEL" ] && tmux wait-for -S "$RADAR_RUN_CHANNEL" >/dev/null 2>&1 || true
+  printf 'kept completion console open for %s\n' "$pane"
+}
+
+cmd_report() {
+  local requested="${1:-latest}" run_dir final
+  need_jq
+  case "$requested" in
+    ''|latest)
+      run_dir="$(find "$RADAR_RUNS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -n 1)"
+      ;;
+    */*) echo "report: invalid run id" >&2; return 2 ;;
+    *) run_dir="$RADAR_RUNS_DIR/$requested" ;;
+  esac
+  [ -n "$run_dir" ] && [ -d "$run_dir" ] || { echo "report: run not found: $requested" >&2; return 1; }
+  final="$run_dir/final.json"
+  [ -r "$final" ] || { echo "report: run has not finished: $(basename "$run_dir")" >&2; return 1; }
+  jq -r '
+    "tmux-radar supervision report",
+    "Run:       \(.run_id)",
+    "Target:    \(.pane)",
+    "Outcome:   \(.outcome)",
+    "Goal:      \(.goal // "")",
+    (if (.goal_status // "") == "" then empty else "Goal state: \(.goal_status)" end),
+    "Reason:    \(.reason)",
+    "Duration:  \(.duration_seconds // 0)s",
+    "Counts:    events=\(.event_count // 0) decisions=\(.decision_count // 0) actions=\(.action_count // 0) errors=\(.error_count // 0)",
+    "Logs:      \(.log_path)"
+  ' "$final"
+}
+
 cmd_stop() {
   local target="${1:-all}" wf pid brain_file
   if [ "$target" = "all" ]; then
@@ -2696,6 +2828,8 @@ case "${1:-}" in
   _launch-monitor) shift; _launch_monitor "${1:-}" "${2:-$(_wf "${1:-}")}" || rc=$? ;;
   pause)        shift; cmd_pause "${1:-}" || rc=$? ;;
   resume)       shift; cmd_resume "${1:-}" || rc=$? ;;
+  keep)         shift; cmd_keep "${1:-}" || rc=$? ;;
+  report)       shift; cmd_report "${1:-latest}" || rc=$? ;;
   monitor)      shift; cmd_monitor "${1:-}" || rc=$? ;;
   monitor-timeline) shift; cmd_monitor_timeline "${1:-}" || rc=$? ;;
   monitor-detail) shift; cmd_monitor_detail "${1:-}" || rc=$? ;;
@@ -2704,7 +2838,7 @@ case "${1:-}" in
   list)         cmd_list || rc=$? ;;
   cleanup)      cmd_cleanup || rc=$? ;;
   menu)         cmd_menu || rc=$? ;;
-  *) echo "usage: ai.sh {ask [req]|decide [pane] [autonomy] [policy]|watch <pane> [goal] [policy] [poll] [autonomy]|emit-event <pane> <kind> <source> <label>|watch-setup [pane]|pause <pane>|resume <pane>|monitor <pane>|monitor-timeline <pane>|monitor-detail <pane>|stop <pane|all>|status|list|cleanup|menu}" >&2; exit 2 ;;
+  *) echo "usage: ai.sh {ask [req]|decide [pane] [autonomy] [policy]|watch <pane> [goal] [policy] [poll] [autonomy]|emit-event <pane> <kind> <source> <label>|watch-setup [pane]|pause <pane>|resume <pane>|keep <pane>|report [run-id|latest]|monitor <pane>|monitor-timeline <pane>|monitor-detail <pane>|stop <pane|all>|status|list|cleanup|menu}" >&2; exit 2 ;;
 esac
 # menu-launched popups set this so the result stays on screen until a keypress
 if [ -n "${TMUX_RADAR_AI_PAUSE:-${TMUX_SWITCHER_AI_PAUSE:-}}" ] && [ -t 0 ]; then

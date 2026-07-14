@@ -412,6 +412,30 @@ test_pause_resume_controls_persist_and_signal() {
   assert_contains "$(cat "$TMP/tmux.calls")" 'wait-for -S radar-run-39' 'controls wake watcher channel'
 }
 
+test_completion_overview_shows_summary_countdown_and_keep_control() {
+  local output="$TMP/completion-monitor.out" run_dir="$TMP/state/ai-runs/test-run" deadline
+  seed_monitor_run
+  deadline=$(( $(date '+%s') + 9 ))
+  jq -cn --argjson deadline "$deadline" '{phase:"COMPLETED",status:"goal reached",next:{kind:"auto_close",at:$deadline},goal:"监控到测试全绿",policy:"safe-auto",autonomy:"auto-safe",poll:5,calls:1,max_calls:40,retry:0}' > "$run_dir/state.json"
+  jq -cn --arg path "$run_dir" '{outcome:"completed",reason:"goal reached",run_id:"test-run",pane:"%39",goal:"监控到测试全绿",goal_status:"done",duration_seconds:14,event_count:8,decision_count:1,action_count:0,error_count:0,log_path:$path}' > "$run_dir/final.json"
+  TMUX_RADAR_STATE_DIR="$TMP/state" PATH="$TMP/bin:$OLD_PATH" \
+    TEST_FAKE_TMUX="$TMP/bin/tmux" TEST_TMUX_CALLS="$TMP/tmux.calls" \
+    TEST_TMUX_SPLIT_COUNT="$TMP/split.count" \
+    bash "$ROOT/scripts/ai-monitor.sh" overview %39 --once > "$output"
+  assert_contains "$(cat "$output")" 'Outcome' 'completion overview labels final outcome'
+  assert_contains "$(cat "$output")" 'completed · decisions=1 actions=0 errors=0 · 14s' 'completion overview summarizes final counts'
+  assert_contains "$(cat "$output")" 'auto-close in ' 'completion overview shows countdown'
+  assert_contains "$(cat "$output")" 'k keep' 'completion overview exposes keep control'
+
+  jq '.next={kind:"manual_close",at:0} | .status="completed; kept open until q"' "$run_dir/state.json" > "$run_dir/state.next"
+  mv "$run_dir/state.next" "$run_dir/state.json"
+  TMUX_RADAR_STATE_DIR="$TMP/state" PATH="$TMP/bin:$OLD_PATH" \
+    TEST_FAKE_TMUX="$TMP/bin/tmux" TEST_TMUX_CALLS="$TMP/tmux.calls" \
+    TEST_TMUX_SPLIT_COUNT="$TMP/split.count" \
+    bash "$ROOT/scripts/ai-monitor.sh" overview %39 --once > "$output"
+  assert_contains "$(cat "$output")" 'kept open; press q to close' 'kept completion has honest close state'
+}
+
 write_fake_tmux
 mkdir -p "$TMP/state"
 
@@ -433,6 +457,7 @@ run_test 'medium layout creates compact right console' test_medium_layout_uses_o
 run_test 'narrow layout uses popup console' test_narrow_layout_uses_popup_without_target_split
 run_test 'monitor views derive from structured state without repeated clears' test_monitor_views_render_from_structured_run_without_refresh_loop
 run_test 'pause and resume controls persist and signal' test_pause_resume_controls_persist_and_signal
+run_test 'completion overview shows summary countdown and keep control' test_completion_overview_shows_summary_countdown_and_keep_control
 
 if [ "$FAILURES" -ne 0 ]; then
   printf '%s test(s) failed\n' "$FAILURES" >&2

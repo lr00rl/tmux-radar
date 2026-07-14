@@ -63,6 +63,7 @@ SCRIPT_DIR="$(dirname "$SELF")"
 PROMPT_DIR="$SCRIPT_DIR/prompts"
 AI_RUNTIME_LIB="$SCRIPT_DIR/lib/ai-runtime.sh"
 NOTIFY="$SCRIPT_DIR/needinput-notify.sh"
+AI_MONITOR="$SCRIPT_DIR/ai-monitor.sh"
 [ -r "$AI_RUNTIME_LIB" ] || { echo "tmux-radar AI needs $AI_RUNTIME_LIB" >&2; exit 1; }
 # shellcheck source=scripts/lib/ai-runtime.sh
 . "$AI_RUNTIME_LIB"
@@ -116,6 +117,8 @@ WATCH_RETRY_BACKOFF=15
 WATCH_EVENT_ID=""
 WATCH_PHASE="CREATED"
 WATCH_STATUS="starting"
+WATCH_NEXT_KIND="none"
+WATCH_NEXT_AT=0
 WATCH_FINALIZED=0
 WATCH_DELIVERY_FINGERPRINT=""
 
@@ -626,14 +629,18 @@ _watch_pointer_set_monitors() {
 }
 
 _watch_state_snapshot() {
-  local extra="${1:-}" payload tmp
+  local extra="${1:-}" payload tmp base timestamp
   [ -n "$extra" ] || extra='{}'
   [ -n "${RADAR_RUN_DIR:-}" ] || return 0
-  payload="$(jq -c \
+  if [ -r "$RADAR_RUN_DIR/state.json" ]; then base="$(cat "$RADAR_RUN_DIR/state.json")"; else base='{}'; fi
+  timestamp="$(_radar_now_iso)"
+  payload="$(printf '%s' "$base" | jq -c \
     --argjson extra "$extra" \
     --arg phase "$WATCH_PHASE" --arg status "$WATCH_STATUS" \
     --arg event_id "$WATCH_EVENT_ID" --arg goal "$WATCH_GOAL" \
     --arg policy "${WATCH_POLICY:-safe-auto}" --arg autonomy "$WATCH_AUTONOMY" \
+    --arg next_kind "$WATCH_NEXT_KIND" --argjson next_at "${WATCH_NEXT_AT:-0}" \
+    --arg run_id "$RADAR_RUN_ID" --arg pane "$WATCH_PANE" --arg timestamp "$timestamp" \
     --argjson poll "$(awk -v p="$WATCH_POLL" 'BEGIN { printf "%.6f", p+0 }')" \
     --argjson calls "$WATCH_CALLS" --argjson max_calls "$WATCH_MAX_CALLS" \
     --argjson retry "$WATCH_RETRY" --argjson waiter_pid "${WATCH_WAITER_PID:-0}" \
@@ -646,10 +653,11 @@ _watch_state_snapshot() {
     '. + $extra + {
       phase:$phase,status:$status,event_id:$event_id,goal:$goal,policy:$policy,
       autonomy:$autonomy,poll:$poll,calls:$calls,max_calls:$max_calls,retry:$retry,
+      next:{kind:$next_kind,at:$next_at},run_id:$run_id,pane:$pane,updated_at:$timestamp,
       waiter_pid:$waiter_pid,timer_pid:$timer_pid,
       model:{started_at:$model_started_at,elapsed:$model_elapsed,pid:$model_pid,
              pgid:$model_pgid,timeout:$model_timeout,call_count:$calls}
-    }' "$RADAR_RUN_DIR/state.json")" || return 1
+    }')" || return 1
   tmp="$(mktemp "$RADAR_RUN_DIR/.state.XXXXXX")" || return 1
   printf '%s\n' "$payload" > "$tmp"
   mv "$tmp" "$RADAR_RUN_DIR/state.json"
@@ -659,8 +667,7 @@ _watch_state_snapshot() {
 _watch_phase() {
   local phase="$1" status="$2" next_kind="${3:-none}" next_at="${4:-0}" extra="${5:-}"
   [ -n "$extra" ] || extra='{}'
-  WATCH_PHASE="$phase"; WATCH_STATUS="$status"; WATCH_NEXT_AT="$next_at"
-  radar_state_set "$phase" "$status" "$next_kind" "$next_at"
+  WATCH_PHASE="$phase"; WATCH_STATUS="$status"; WATCH_NEXT_KIND="$next_kind"; WATCH_NEXT_AT="$next_at"
   _watch_state_snapshot "$extra"
   radar_event_append phase watcher "$status" "$(jq -cn \
     --arg phase "$phase" --arg event_id "$WATCH_EVENT_ID" --argjson retry "$WATCH_RETRY" \
@@ -875,13 +882,23 @@ _pane_label() {
 # Resolve a pane target -> canonical %id. Empty arg falls back to $TMUX_PANE,
 # then to the most recently marked live pane in the AI-status state.
 _resolve_pane() {
-  local p="${1:-}"
+  local p="${1:-}" resolved
   [ -z "$p" ] && p="${TMUX_PANE:-}"
   if [ -z "$p" ] && [ -r "$STATE_FILE" ]; then
     p="$(awk -F '\t' '$1 != "-" && NF >= 2 { if ($2+0 >= best) { best=$2+0; win=$1 } } END { print win }' "$STATE_FILE" 2>/dev/null || true)"
   fi
   [ -n "$p" ] || return 1
-  tmux display-message -p -t "$p" '#{pane_id}' 2>/dev/null
+  case "$p" in
+    %*)
+      if tmux list-panes -a -F '#{pane_id}' 2>/dev/null | awk -v pane="$p" '$0 == pane { found=1 } END { exit !found }'; then
+        printf '%s\n' "$p"
+        return 0
+      fi
+      ;;
+  esac
+  resolved="$(tmux display-message -p -t "$p" '#{pane_id}' 2>/dev/null || true)"
+  [ -n "$resolved" ] || return 1
+  printf '%s\n' "$resolved"
 }
 
 # ---------------------------------------------------------------------------
@@ -1491,6 +1508,7 @@ _watch_defer_native_events() {  # hooks-first=off: keep takeover/manual events, 
 _watch_wait_for_batch() {
   local batch="$1" tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.05}"
   : > "$batch"
+  [ ! -e "$RADAR_RUN_DIR/paused" ] || return 3
   _watch_start_waiter
   _watch_start_timer "$WATCH_POLL"
   _watch_state_snapshot
@@ -1502,6 +1520,10 @@ _watch_wait_for_batch() {
     return 0
   fi
   while :; do
+    if [ -e "$RADAR_RUN_DIR/paused" ]; then
+      _watch_kill_waiters
+      return 3
+    fi
     tmux display-message -p -t "$WATCH_PANE" '#{pane_id}' >/dev/null 2>&1 || {
       _watch_kill_waiters
       return 2
@@ -1804,7 +1826,7 @@ _watch_finalize() {
   _watch_phase "$phase" "$reason" none 0
   radar_run_finalize "$outcome" "$reason"
   WATCH_FINALIZED=1
-  rm -f "$WATCH_WF" "$BRAIN_PID_FILE" "$BRAIN_OUT_FILE"
+  rm -f "$WATCH_WF" "$BRAIN_PID_FILE" "$BRAIN_OUT_FILE" "$RADAR_RUN_DIR/paused"
 }
 
 _watch_signal_exit() {
@@ -1894,6 +1916,19 @@ cmd_watch_loop() {
     set +e; _watch_wait_for_batch "$batch"; wait_rc=$?; set -e
     case "$wait_rc" in
       2) _watch_finalize stopped STOPPED "target pane disappeared"; break ;;
+      3)
+        _watch_phase PAUSED_USER "paused by user" resume 0
+        while [ -e "$RADAR_RUN_DIR/paused" ]; do
+          tmux display-message -p -t "$WATCH_PANE" '#{pane_id}' >/dev/null 2>&1 || {
+            _watch_finalize stopped STOPPED "target pane disappeared while paused"
+            break 2
+          }
+          sleep "${TMUX_RADAR_TEST_WAIT_TICK:-0.1}"
+        done
+        radar_event_append resumed monitor "supervision resumed" '{"record":"control"}'
+        WATCH_STABLE_COUNT=0
+        continue
+        ;;
       0) WATCH_STABLE_COUNT=0 ;;
       1)
         current_fingerprint="$(_watch_fingerprint || true)"
@@ -2107,9 +2142,73 @@ _abort_watch_launch() {  # _abort_watch_launch <pane> <watcher-pid>
     "$base.detail.log" "$base.brain.err"
 }
 
+_monitor_command() {  # _monitor_command <mode> <pane>
+  printf "TMUX_RADAR_STATE_DIR='%s' exec bash '%s' %s '%s'" \
+    "${STATE_DIR//\'/\'\\\'\'}" "${AI_MONITOR//\'/\'\\\'\'}" "$1" "${2//\'/\'\\\'\'}"
+}
+
+_launch_monitor() {  # _launch_monitor <target-pane> <watch-file>
+  local pane="$1" wf="$2" cols rows requested width max_width ratio pos
+  local detail_pane overview_pane compact_pane detail_cmd overview_cmd compact_cmd err
+  [ -x "$AI_MONITOR" ] || { echo "monitor executable missing: $AI_MONITOR" >&2; return 1; }
+  [ "$(opt @radar-ai-monitor on)" = on ] || { echo 'visible monitor is required for supervision' >&2; return 1; }
+  cols="$(tmux display-message -p -t "$pane" '#{pane_width}' 2>/dev/null || true)"
+  rows="$(tmux display-message -p -t "$pane" '#{pane_height}' 2>/dev/null || true)"
+  case "$cols" in ''|*[!0-9]*) cols=120 ;; esac
+  case "$rows" in ''|*[!0-9]*) rows=30 ;; esac
+  requested="${TMUX_RADAR_RUN_MONITOR_WIDTH:-$(opt @radar-ai-monitor-size-h 84)}"
+  case "$requested" in ''|*[!0-9]*) requested=84 ;; esac
+  ratio="${TMUX_RADAR_RUN_OVERVIEW_RATIO:-25}"; case "$ratio" in ''|*[!0-9]*) ratio=25 ;; esac
+  [ "$ratio" -ge 15 ] && [ "$ratio" -le 50 ] || ratio=25
+  pos="${TMUX_RADAR_RUN_MONITOR_POSITION:-$(opt @radar-ai-monitor-pos right)}"
+  detail_cmd="$(_monitor_command detail "$pane")"
+  overview_cmd="$(_monitor_command overview "$pane")"
+  compact_cmd="$(_monitor_command compact "$pane")"
+
+  # Explicit legacy top/bottom settings remain available for migration, but
+  # use the new single-process compact console instead of the old repaint loop.
+  case "$pos" in
+    top|bottom)
+      if [ "$pos" = top ]; then
+        compact_pane="$(tmux split-window -v -b -l "$(opt @radar-ai-monitor-size 12)" -P -F '#{pane_id}' -d -t "$pane" "$compact_cmd" 2>&1)" || {
+          err="$compact_pane"; echo "monitor split failed: $err" >&2; return 1; }
+      else
+        compact_pane="$(tmux split-window -v -l "$(opt @radar-ai-monitor-size 12)" -P -F '#{pane_id}' -d -t "$pane" "$compact_cmd" 2>&1)" || {
+          err="$compact_pane"; echo "monitor split failed: $err" >&2; return 1; }
+      fi
+      _watch_pointer_set_monitors "$wf" "" "$compact_pane"
+      tmux select-pane -t "$pane" >/dev/null 2>&1 || true
+      return 0
+      ;;
+  esac
+
+  if [ "$cols" -lt 120 ] || [ "$rows" -lt 24 ]; then
+    tmux display-popup -E -w 90% -h 85% "$compact_cmd" >/dev/null 2>&1 || return 1
+    _watch_pointer_set_monitors "$wf" popup popup
+    tmux select-pane -t "$pane" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  if [ "$cols" -ge 180 ]; then
+    width="$requested"; [ "$width" -lt 72 ] && width=72; [ "$width" -gt 112 ] && width=112
+    max_width=$((cols - 68)); [ "$width" -gt "$max_width" ] && width="$max_width"
+    detail_pane="$(tmux split-window -h -l "$width" -P -F '#{pane_id}' -d -t "$pane" "$detail_cmd" 2>&1)" || {
+      err="$detail_pane"; echo "monitor detail split failed: $err" >&2; return 1; }
+    overview_pane="$(tmux split-window -v -b -p "$ratio" -P -F '#{pane_id}' -d -t "$detail_pane" "$overview_cmd" 2>&1)" || {
+      err="$overview_pane"; tmux kill-pane -t "$detail_pane" >/dev/null 2>&1 || true
+      echo "monitor overview split failed: $err" >&2; return 1; }
+    _watch_pointer_set_monitors "$wf" "$overview_pane" "$detail_pane"
+  else
+    width=$((cols * 38 / 100)); [ "$width" -lt 52 ] && width=52; [ "$width" -gt 72 ] && width=72
+    compact_pane="$(tmux split-window -h -l "$width" -P -F '#{pane_id}' -d -t "$pane" "$compact_cmd" 2>&1)" || {
+      err="$compact_pane"; echo "monitor compact split failed: $err" >&2; return 1; }
+    _watch_pointer_set_monitors "$wf" "" "$compact_pane"
+  fi
+  tmux select-pane -t "$pane" >/dev/null 2>&1 || true
+}
+
 cmd_watch() {  # detach the loop so the caller (popup/menu) can return
-  local pane goal policy poll auto config_json="${6:-}" wf base feed pos mon_size err layout mon_pane detail_pane detail_cmd timeline_cmd single_cmd watch_pid overview_ratio detail_ratio
-  local -a split_args
+  local pane goal policy poll auto config_json="${6:-}" wf base feed watch_pid existing_detail existing_overview
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane"; return 1; }
   goal="${2:-}"; policy="${3:-}"; poll="${4:-}"; auto="${5:-}"
   if [ -n "$config_json" ]; then
@@ -2122,7 +2221,12 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
   fi
   wf="$(_wf "$pane")"; base="${wf%.watch}"; feed="$base.out"
   if [ -f "$wf" ] && kill -0 "$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)" 2>/dev/null; then
-    echo "already watching $pane (stop it first)"; return 0
+    existing_detail="$(_state_get "$wf" monitor_detail_pane)"
+    existing_overview="$(_state_get "$wf" monitor_overview_pane)"
+    case "$existing_detail" in %*) tmux select-pane -t "$existing_detail" >/dev/null 2>&1 || true ;;
+      *) case "$existing_overview" in %*) tmux select-pane -t "$existing_overview" >/dev/null 2>&1 || true ;; esac ;;
+    esac
+    echo "already watching $pane (run $(_state_get "$wf" run_id))"; return 0
   fi
   : > "$feed"                                  # create the feed before the monitor tails it
   : > "$base.timeline"
@@ -2138,69 +2242,11 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
     kill -0 "$watch_pid" 2>/dev/null || break
     sleep 0.01
   done
-  # Companion monitor: a split next to the watched pane, not a covering popup.
-  # In the default split layout, the monitor region is split again into
-  # timeline + detail panes. If the second split fails, the watcher still runs.
-  if [ "$(opt @radar-ai-monitor on)" = "on" ] && have_tmux; then
-    pos="$(opt @radar-ai-monitor-pos top)"
-    layout="$(opt @radar-ai-monitor-layout split)"
-    timeline_cmd="TMUX_RADAR_STATE_DIR='$STATE_DIR' exec bash '$SELF' monitor-timeline '$pane'"
-    detail_cmd="TMUX_RADAR_STATE_DIR='$STATE_DIR' exec bash '$SELF' monitor-detail '$pane'"
-    single_cmd="TMUX_RADAR_STATE_DIR='$STATE_DIR' exec bash '$SELF' monitor '$pane'"
-    split_args=()
-    case "$pos" in
-      bottom)
-        if mon_size="$(monitor_size "$pane" height "$(opt @radar-ai-monitor-size 12)" 8 4)"; then
-          split_args=(-v -l "$mon_size")
-        fi ;;
-      right)
-        if mon_size="$(monitor_size "$pane" width "$(opt @radar-ai-monitor-size-h 60)" 20 30)"; then
-          split_args=(-h -l "$mon_size")
-        fi ;;
-      *)
-        pos="top"
-        if mon_size="$(monitor_size "$pane" height "$(opt @radar-ai-monitor-size 12)" 8 4)"; then
-          split_args=(-v -b -l "$mon_size")
-        fi ;;
-    esac
-    if [ "${#split_args[@]}" -gt 0 ]; then
-      # pass STATE_DIR explicitly: the split pane inherits the tmux server env, not
-      # the watcher's, so this keeps the monitor's feed/pidfile paths in sync.
-      if [ "$layout" = "single" ]; then
-        if mon_pane="$(tmux split-window "${split_args[@]}" -P -F '#{pane_id}' -d -t "$pane" "$single_cmd" 2>&1)"; then
-          _watch_pointer_set_monitors "$wf" "$mon_pane" ""
-          audit "monitor-start\t$pane\t$pos\tsingle\tsize=$mon_size"
-        else
-          err="$mon_pane"
-          printf '%s⚠ 监控 pane 打开失败，已停止 watch%s%s\n' "$CY" "$CR" "${err:+: $err}"
-          audit "monitor-fail\t$pane\t$pos\tsingle\tsize=${mon_size:-?}\t$err"
-          _abort_watch_launch "$pane" "$watch_pid"
-          return 1
-        fi
-      elif mon_pane="$(tmux split-window "${split_args[@]}" -P -F '#{pane_id}' -d -t "$pane" "$timeline_cmd" 2>&1)"; then
-        if [ "$pos" = "right" ]; then
-          overview_ratio="${TMUX_RADAR_RUN_OVERVIEW_RATIO:-25}"
-          detail_ratio=$((100 - overview_ratio))
-          detail_pane="$(tmux split-window -v -P -F '#{pane_id}' -d -t "$mon_pane" -p "$detail_ratio" "$detail_cmd" 2>/dev/null || true)"
-          [ -n "$detail_pane" ] || audit "monitor-detail-fail\t$pane\t$pos\t$mon_pane"
-        else
-          detail_pane="$(tmux split-window -h -P -F '#{pane_id}' -d -t "$mon_pane" -p 58 "$detail_cmd" 2>/dev/null || true)"
-          [ -n "$detail_pane" ] || audit "monitor-detail-fail\t$pane\t$pos\t$mon_pane"
-        fi
-        _watch_pointer_set_monitors "$wf" "$mon_pane" "$detail_pane"
-        audit "monitor-start\t$pane\t$pos\tsplit\tsize=$mon_size"
-      else
-        printf '%s⚠ 监控 pane 打开失败，已停止 watch%s%s\n' "$CY" "$CR" "${mon_pane:+: $mon_pane}"
-        audit "monitor-fail\t$pane\t$pos\tsplit\tsize=${mon_size:-?}\t$mon_pane"
-        _abort_watch_launch "$pane" "$watch_pid"
-        return 1
-      fi
-    else
-      printf '%s⚠ 目标 pane 太小，未打开监控 pane；已停止 watch%s\n' "$CY" "$CR"
-      audit "monitor-skip\t$pane\t$pos\tpane-too-small"
-      _abort_watch_launch "$pane" "$watch_pid"
-      return 1
-    fi
+  if ! have_tmux || ! _launch_monitor "$pane" "$wf"; then
+    printf '%s⚠ 无法创建可见监控控制台，已停止 watch%s\n' "$CY" "$CR"
+    audit "monitor-fail\t$pane\tresponsive-launch"
+    _abort_watch_launch "$pane" "$watch_pid"
+    return 1
   fi
   printf '%s✓ 已开始监控%s %s%s%s\n' "$CG" "$CR" "$(_pane_label "$pane")" \
     "${goal:+  ${CD}· ${goal}${CR}}" "${policy:+  ${CY}[$policy]${CR}}"
@@ -2261,6 +2307,27 @@ cmd_watch_setup() {
   done
   cmd_watch "$pane" '' '' '' '' "$CONFIG_JSON"
   sleep "${TMUX_RADAR_SETUP_LAUNCH_PAUSE:-1.2}"
+}
+
+cmd_pause() {
+  local pane run_dir
+  pane="$(_resolve_pane "${1:-}" 2>/dev/null || echo "${1:-}")"
+  radar_run_open "$pane" >/dev/null 2>&1 || { echo "no watcher for $pane" >&2; return 1; }
+  run_dir="$RADAR_RUN_DIR"
+  : > "$run_dir/paused"
+  chmod 600 "$run_dir/paused" 2>/dev/null || true
+  radar_event_append paused monitor "paused by user" '{"record":"control"}'
+  [ -n "$RADAR_RUN_CHANNEL" ] && tmux wait-for -S "$RADAR_RUN_CHANNEL" >/dev/null 2>&1 || true
+}
+
+cmd_resume() {
+  local pane run_dir
+  pane="$(_resolve_pane "${1:-}" 2>/dev/null || echo "${1:-}")"
+  radar_run_open "$pane" >/dev/null 2>&1 || { echo "no watcher for $pane" >&2; return 1; }
+  run_dir="$RADAR_RUN_DIR"
+  rm -f "$run_dir/paused"
+  radar_event_append resume_requested monitor "resume requested" '{"record":"control"}'
+  [ -n "$RADAR_RUN_CHANNEL" ] && tmux wait-for -S "$RADAR_RUN_CHANNEL" >/dev/null 2>&1 || true
 }
 
 cmd_stop() {
@@ -2626,6 +2693,9 @@ case "${1:-}" in
   emit-event)   shift; cmd_emit_event "$@" || rc=$? ;;
   watch-setup)  shift; cmd_watch_setup "${1:-}" "${2:-quick}" "${3:-}" || rc=$? ;;
   _watch_loop)  shift; cmd_watch_loop "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" || rc=$? ;;
+  _launch-monitor) shift; _launch_monitor "${1:-}" "${2:-$(_wf "${1:-}")}" || rc=$? ;;
+  pause)        shift; cmd_pause "${1:-}" || rc=$? ;;
+  resume)       shift; cmd_resume "${1:-}" || rc=$? ;;
   monitor)      shift; cmd_monitor "${1:-}" || rc=$? ;;
   monitor-timeline) shift; cmd_monitor_timeline "${1:-}" || rc=$? ;;
   monitor-detail) shift; cmd_monitor_detail "${1:-}" || rc=$? ;;
@@ -2634,7 +2704,7 @@ case "${1:-}" in
   list)         cmd_list || rc=$? ;;
   cleanup)      cmd_cleanup || rc=$? ;;
   menu)         cmd_menu || rc=$? ;;
-  *) echo "usage: ai.sh {ask [req]|decide [pane] [autonomy] [policy]|watch <pane> [goal] [policy] [poll] [autonomy]|emit-event <pane> <kind> <source> <label>|watch-setup [pane]|monitor <pane>|monitor-timeline <pane>|monitor-detail <pane>|stop <pane|all>|status|list|cleanup|menu}" >&2; exit 2 ;;
+  *) echo "usage: ai.sh {ask [req]|decide [pane] [autonomy] [policy]|watch <pane> [goal] [policy] [poll] [autonomy]|emit-event <pane> <kind> <source> <label>|watch-setup [pane]|pause <pane>|resume <pane>|monitor <pane>|monitor-timeline <pane>|monitor-detail <pane>|stop <pane|all>|status|list|cleanup|menu}" >&2; exit 2 ;;
 esac
 # menu-launched popups set this so the result stays on screen until a keypress
 if [ -n "${TMUX_RADAR_AI_PAUSE:-${TMUX_SWITCHER_AI_PAUSE:-}}" ] && [ -t 0 ]; then

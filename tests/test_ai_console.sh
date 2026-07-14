@@ -38,12 +38,24 @@ case "$cmd" in
     ;;
   display-message)
     case "$*" in
+      *pane_width*) printf '%s\n' "${TEST_PANE_WIDTH:-284}" ;;
+      *pane_height*) printf '%s\n' "${TEST_PANE_HEIGHT:-54}" ;;
       *pane_id*) printf '%s\n' '%39' ;;
       *) printf '%s\n' 'test:0.0 codex' ;;
     esac
     ;;
   display-menu)
     printf '%s\n' "$@" > "$TEST_TMUX_MENU_ARGS"
+    ;;
+  split-window)
+    printf 'split-window %s\n' "$*" >> "$TEST_TMUX_CALLS"
+    n="$(cat "$TEST_TMUX_SPLIT_COUNT" 2>/dev/null || printf 90)"
+    n=$((n + 1)); printf '%s\n' "$n" > "$TEST_TMUX_SPLIT_COUNT"
+    printf '%%%s\n' "$n"
+    ;;
+  display-popup|select-pane|kill-pane|wait-for|capture-pane)
+    printf '%s %s\n' "$cmd" "$*" >> "$TEST_TMUX_CALLS"
+    [ "$cmd" != capture-pane ] || printf 'target line one\ntarget line two\n'
     ;;
   *)
     exit 0
@@ -59,9 +71,40 @@ run_ai() {
     BASH_ENV="$TMP/bashenv" \
     TEST_FAKE_TMUX="$TMP/bin/tmux" \
     TEST_TMUX_MENU_ARGS="$TMP/menu.args" \
+    TEST_TMUX_CALLS="$TMP/tmux.calls" \
+    TEST_TMUX_SPLIT_COUNT="$TMP/split.count" \
+    TEST_PANE_WIDTH="${TEST_PANE_WIDTH:-284}" \
+    TEST_PANE_HEIGHT="${TEST_PANE_HEIGHT:-54}" \
     TMUX_RADAR_STATE_DIR="$TMP/state" \
     TMUX_RADAR_NEEDINPUT_FILE="$TMP/state/need-input" \
     bash "$ROOT/scripts/ai.sh" "$@"
+}
+
+seed_monitor_run() {
+  local config run_dir="$TMP/state/ai-runs/test-run" wf="$TMP/state/ai-watch/_39.watch"
+  rm -rf "$run_dir"; mkdir -p "$run_dir/inbox" "$run_dir/backend"
+  config="$(run_ai _build-watch-config %39 '监控到测试全绿')"
+  printf '%s\n' "$config" | jq -c '. + {run_id:"test-run",created_at:"2026-07-13T00:00:00Z"}' > "$run_dir/config.json"
+  printf '%s\n' '{"phase":"ARMED","status":"waiting for native event","next":{"kind":"idle","at":0},"goal":"监控到测试全绿","policy":"safe-auto","autonomy":"auto-safe","poll":5,"calls":1,"max_calls":40,"retry":0}' > "$run_dir/state.json"
+  printf '%s\n' '{"timestamp":"2026-07-13T00:00:01Z","record":"incoming","kind":"approval","source":"codex","label":"permission requested"}' > "$run_dir/events.jsonl"
+  mkdir -p "$(dirname "$wf")"
+  cat > "$wf" <<EOF
+run_id=test-run
+run_dir=$run_dir
+pid=$$
+pane=%39
+channel=radar-run-39
+monitor_overview_pane=
+monitor_detail_pane=
+started=$(date '+%s')
+EOF
+  printf '%s\n' 90 > "$TMP/split.count"
+  : > "$TMP/tmux.calls"
+}
+
+clear_layout_calls() {
+  printf '%s\n' 90 > "$TMP/split.count"
+  : > "$TMP/tmux.calls"
 }
 
 run_test() {
@@ -296,6 +339,79 @@ test_config_reaches_run_config_and_runtime_without_codex() {
   '
 }
 
+test_wide_layout_uses_right_rail_with_25_75_split() {
+  local calls detail_line overview_line wf="$TMP/state/ai-watch/_39.watch"
+  seed_monitor_run
+  TEST_PANE_WIDTH=284 TEST_PANE_HEIGHT=54 run_ai _launch-monitor %39 "$wf"
+  calls="$(cat "$TMP/tmux.calls")"
+  assert_contains "$calls" 'split-window -h -l 84' 'wide layout creates right rail'
+  assert_contains "$calls" "ai-monitor.sh' detail" 'wide layout starts detail first'
+  assert_contains "$calls" 'split-window -v -b -p 25' 'wide layout creates overview above at 25 percent'
+  assert_contains "$calls" "ai-monitor.sh' overview" 'wide layout starts overview renderer'
+  assert_contains "$calls" 'select-pane -t %39' 'wide layout restores target focus'
+  detail_line="$(awk "/ai-monitor.sh' detail/{print NR; exit}" "$TMP/tmux.calls")"
+  overview_line="$(awk "/ai-monitor.sh' overview/{print NR; exit}" "$TMP/tmux.calls")"
+  [ "$detail_line" -lt "$overview_line" ] || _fail_assert 'detail pane must be created before overview'
+  assert_contains "$(cat "$wf")" 'monitor_overview_pane=%92' 'watch pointer stores overview pane'
+  assert_contains "$(cat "$wf")" 'monitor_detail_pane=%91' 'watch pointer stores detail pane'
+}
+
+test_medium_layout_uses_one_compact_right_console() {
+  local calls wf="$TMP/state/ai-watch/_39.watch"
+  seed_monitor_run; clear_layout_calls
+  TEST_PANE_WIDTH=150 TEST_PANE_HEIGHT=40 run_ai _launch-monitor %39 "$wf"
+  calls="$(cat "$TMP/tmux.calls")"
+  assert_contains "$calls" 'split-window -h -l 57' 'medium layout reserves proportional right rail'
+  assert_contains "$calls" "ai-monitor.sh' compact" 'medium layout uses compact console'
+  case "$calls" in *"ai-monitor.sh' overview"*) _fail_assert 'medium layout must not create separate overview pane' ;; esac
+}
+
+test_narrow_layout_uses_popup_without_target_split() {
+  local calls wf="$TMP/state/ai-watch/_39.watch"
+  seed_monitor_run; clear_layout_calls
+  TEST_PANE_WIDTH=100 TEST_PANE_HEIGHT=30 run_ai _launch-monitor %39 "$wf"
+  calls="$(cat "$TMP/tmux.calls")"
+  assert_contains "$calls" 'display-popup -E -w 90% -h 85%' 'narrow layout uses large popup'
+  assert_contains "$calls" "ai-monitor.sh' compact" 'narrow popup uses compact console'
+  case "$calls" in *'split-window'*) _fail_assert 'narrow layout must not split target pane' ;; esac
+}
+
+count_clear_sequences() {
+  LC_ALL=C grep -ao $'\033\[2J' "$1" 2>/dev/null | wc -l | tr -d ' '
+}
+
+test_monitor_views_render_from_structured_run_without_refresh_loop() {
+  local output="$TMP/monitor.out" view clears
+  seed_monitor_run
+  TMUX_RADAR_STATE_DIR="$TMP/state" PATH="$TMP/bin:$OLD_PATH" \
+    TEST_FAKE_TMUX="$TMP/bin/tmux" TEST_TMUX_CALLS="$TMP/tmux.calls" \
+    TEST_TMUX_SPLIT_COUNT="$TMP/split.count" TEST_PANE_WIDTH=284 TEST_PANE_HEIGHT=54 \
+    bash "$ROOT/scripts/ai-monitor.sh" overview %39 --once > "$output"
+  assert_contains "$(cat "$output")" '监控到测试全绿' 'overview shows exact goal'
+  assert_contains "$(cat "$output")" 'native hook or stable-screen fallback' 'overview reports honest next trigger'
+  clears="$(count_clear_sequences "$output")"; [ "$clears" -le 1 ] || _fail_assert 'overview clears more than once' 'actual' "$clears"
+  for view in Timeline Decision Screen Config Logs; do
+    TMUX_RADAR_STATE_DIR="$TMP/state" PATH="$TMP/bin:$OLD_PATH" \
+      TEST_FAKE_TMUX="$TMP/bin/tmux" TEST_TMUX_CALLS="$TMP/tmux.calls" \
+      TEST_TMUX_SPLIT_COUNT="$TMP/split.count" \
+      bash "$ROOT/scripts/ai-monitor.sh" detail %39 "$view" --once > "$output"
+    assert_contains "$(cat "$output")" "$view" "detail renders $view tab"
+    clears="$(count_clear_sequences "$output")"; [ "$clears" -le 1 ] || _fail_assert "$view clears more than once" 'actual' "$clears"
+  done
+}
+
+test_pause_resume_controls_persist_and_signal() {
+  local run_dir="$TMP/state/ai-runs/test-run"
+  seed_monitor_run
+  run_ai pause %39
+  assert_file "$run_dir/paused"
+  assert_json "$run_dir/events.jsonl" 'select(.kind == "paused" and .record == "control")'
+  run_ai resume %39
+  [ ! -e "$run_dir/paused" ] || _fail_assert 'resume leaves pause sentinel'
+  assert_json "$run_dir/events.jsonl" 'select(.kind == "resume_requested" and .record == "control")'
+  assert_contains "$(cat "$TMP/tmux.calls")" 'wait-for -S radar-run-39' 'controls wake watcher channel'
+}
+
 write_fake_tmux
 mkdir -p "$TMP/state"
 
@@ -312,6 +428,11 @@ run_test 'quick goal reaches config byte-for-byte' test_quick_goal_reaches_confi
 run_test '_decode-goal preserves terminal newlines before sentinel' test_decode_goal_preserves_terminal_newlines_before_sentinel
 run_test 'advanced summary lists all grouped fields and provenance' test_advanced_summary_lists_every_group_field_and_provenance
 run_test 'immutable config reaches run config and per-run runtime' test_config_reaches_run_config_and_runtime_without_codex
+run_test 'wide layout creates right-side 25/75 console' test_wide_layout_uses_right_rail_with_25_75_split
+run_test 'medium layout creates compact right console' test_medium_layout_uses_one_compact_right_console
+run_test 'narrow layout uses popup console' test_narrow_layout_uses_popup_without_target_split
+run_test 'monitor views derive from structured state without repeated clears' test_monitor_views_render_from_structured_run_without_refresh_loop
+run_test 'pause and resume controls persist and signal' test_pause_resume_controls_persist_and_signal
 
 if [ "$FAILURES" -ne 0 ]; then
   printf '%s test(s) failed\n' "$FAILURES" >&2

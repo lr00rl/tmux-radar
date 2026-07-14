@@ -106,7 +106,11 @@ TMUXEOF
   cat > "$TMP/bin/fake-backend" <<'BACKENDEOF'
 #!/usr/bin/env bash
 set -eu
-cat >/dev/null
+if [ -n "${TEST_PROMPT_FILE:-}" ]; then
+  cat > "$TEST_PROMPT_FILE"
+else
+  cat >/dev/null
+fi
 printf '%s\n' "${TMUX_RADAR_INTERNAL:-}" >> "$TEST_INTERNAL_LOG"
 mkdir "$TEST_ACTIVE_LOCK" 2>/dev/null || {
   printf 'concurrent\n' >> "$TEST_CONCURRENT"
@@ -164,6 +168,7 @@ reset_case() {
   export TEST_WAITER_PIDS="$CASE/waiter.pids"
   export TEST_BLOCK_BACKEND="$CASE/block-backend"
   export TEST_RESPONSES="$CASE/responses"
+  export TEST_PROMPT_FILE="$CASE/prompt.txt"
   export TEST_ROOT="$ROOT"
   export TEST_AI_TIMEOUT=5
   export TEST_MAX_CALLS=40
@@ -195,6 +200,21 @@ start_watch() {
   wait_until 'watch pointer' "[ -s '$CASE/state/ai-watch/_1.watch' ]"
   RUN_DIR="$(awk -F= '$1 == "run_dir" { print $2; exit }' "$CASE/state/ai-watch/_1.watch")"
   [ -n "$RUN_DIR" ] || _fail_assert 'watch pointer lacks run_dir'
+  wait_until 'initial state snapshot' "[ -s '$RUN_DIR/state.json' ]"
+}
+
+start_watch_config() {
+  local poll="$1" stable_threshold="$2" hooks_first="$3" goal="${4:-supervise until done}" config
+  config="$(TMUX_RADAR_SETUP_OVERRIDES="poll=$poll,stable_screen_threshold=$stable_threshold,hooks_first=$hooks_first" \
+    PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" _build-watch-config %1 "$goal")"
+  PATH="$TMP/bin:$OLD_PATH" \
+    bash "$ROOT/scripts/ai.sh" _watch_loop %1 '' '' '' '' "$config" \
+    >"$CASE/watch.out" 2>"$CASE/watch.err" &
+  WATCH_PID=$!
+  wait_until 'watch pointer' "[ -s '$CASE/state/ai-watch/_1.watch' ]"
+  RUN_DIR="$(awk -F= '$1 == "run_dir" { print $2; exit }' "$CASE/state/ai-watch/_1.watch")"
+  [ -n "$RUN_DIR" ] || _fail_assert 'watch pointer lacks run_dir'
+  wait_until 'initial configured state snapshot' "[ -s '$RUN_DIR/state.json' ]"
 }
 
 stop_watch() {
@@ -538,5 +558,66 @@ done < "$TEST_WAITER_PIDS"
 [ ! -e "$CASE/state/ai-watch/_1.watch" ] || _fail_assert 'live watch pointer survived termination'
 assert_json "$RUN_DIR/final.json" '.outcome == "stopped"'
 printf 'PASS: watcher cleanup leaves no owned process or live pointer\n'
+
+# 19. A configured stable-screen threshold requires consecutive stable samples,
+# and a screen change resets the count.
+reset_case stable-threshold
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"stable threshold reached"}'
+start_watch_config 0.12 2 on
+sleep 0.14
+printf 'screen-reset\n' > "$TEST_SCREEN"
+sleep 0.16
+assert_eq 0 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'screen change resets consecutive stable count'
+wait_until 'thresholded screen-idle decision' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 1 ]"
+assert_eq screen_idle "$(jq -r 'select(.record == "incoming") | .kind' "$RUN_DIR/events.jsonl" | tail -n 1)" 'threshold emits screen_idle event'
+stop_watch
+printf 'PASS: stable-screen threshold counts consecutive unchanged samples\n'
+
+# 20. hooks_first=off journals native events without immediate model calls;
+# user takeover still supersedes, while manual reassessment and idle continue.
+reset_case hooks-disabled
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"manual still works"}'
+write_response 2 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"idle still works"}'
+start_watch_config 0.3 1 off
+kill -STOP "$WATCH_PID"
+emit_event hooks-stale-approval approval approval
+emit_event hooks-user-resumed user_resumed resumed
+kill -CONT "$WATCH_PID"
+wait_until 'hooks-off takeover supersedes approval' "jq -e 'select(.kind == \"superseded\" and .supersedes_event_id == \"hooks-stale-approval\")' '$RUN_DIR/events.jsonl' >/dev/null"
+assert_eq 0 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'hooks-off user resume causes no model call'
+emit_event hooks-approval approval approval
+emit_event hooks-input input_required input
+emit_event hooks-turn turn_complete turn
+wait_until 'hooks-off native events deferred' "[ \"\$(jq -s '[.[] | select(.kind == \"hook_deferred\")] | length' '$RUN_DIR/events.jsonl')\" = 3 ]"
+assert_eq 0 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'hooks-off native events cause no immediate model call'
+emit_event hooks-manual manual_reassess manual
+wait_until 'hooks-off manual reassessment' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 1 ]"
+wait_until 'hooks-off idle fallback' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 2 ]" 240
+stop_watch
+printf 'PASS: hooks-first off defers native events but keeps fallback triggers\n'
+
+# 21. A terminal newline in the goal survives config, runtime state, and the
+# exact model prompt boundary.
+reset_case exact-goal
+goal=$'  exact\ngoal  \n'
+printf '%s' "$goal" > "$CASE/expected-goal"
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"goal preserved"}'
+start_watch_config 30 1 on "$goal"
+jq -j '.goal' "$RUN_DIR/config.json" > "$CASE/config-goal"
+cmp -s "$CASE/expected-goal" "$CASE/config-goal" || _fail_assert 'config goal bytes changed'
+jq -j '.goal' "$RUN_DIR/state.json" > "$CASE/state-goal"
+cmp -s "$CASE/expected-goal" "$CASE/state-goal" || _fail_assert 'state goal bytes changed' \
+  'expected_hex' "$(od -An -tx1 "$CASE/expected-goal" | tr -d ' \n')" \
+  'actual_hex' "$(od -An -tx1 "$CASE/state-goal" | tr -d ' \n')"
+emit_event exact-goal-manual manual_reassess manual
+wait_until 'exact goal prompt' "[ -s '$TEST_PROMPT_FILE' ]"
+prompt="$(cat "$TEST_PROMPT_FILE")"
+expected_prompt=$'GOAL (set by the user for this watch):   exact\ngoal  \nSteer the pane toward completing this goal.'
+case "$prompt" in
+  *"$expected_prompt"*) : ;;
+  *) _fail_assert 'prompt goal bytes changed' 'expected fragment' "$expected_prompt" 'prompt' "$prompt" ;;
+esac
+stop_watch
+printf 'PASS: exact goal bytes reach config, state, and prompt\n'
 
 printf 'PASS: serialized event-driven supervision suite\n'

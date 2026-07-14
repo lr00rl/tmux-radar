@@ -24,7 +24,7 @@
 #
 # Config (tmux options, all optional):
 #   @radar-ai-key            A                     menu key (prefix + A)
-#   @radar-ai-model          gpt-5.3-codex-spark   Codex model slug (spark = fast tier)
+#   @radar-ai-model          gpt-5.6-luna          Codex model slug (fast tier)
 #   @radar-ai-effort         low                   minimal|low|medium|high|xhigh
 #   @radar-ai-profile        (none)                codex config profile (-p); overrides model/effort
 #   @radar-ai-cmd            (none)                replace Codex entirely: shell cmd,
@@ -111,6 +111,8 @@ WATCH_AUTONOMY="auto-safe"
 WATCH_MAX_CALLS=40
 WATCH_CALLS=0
 WATCH_RETRY=0
+WATCH_RETRY_LIMIT=3
+WATCH_RETRY_BACKOFF=15
 WATCH_EVENT_ID=""
 WATCH_PHASE="CREATED"
 WATCH_STATUS="starting"
@@ -123,7 +125,26 @@ DELIVERY_GATE_DIR=""
 DELIVERY_PENDING_FILE=""
 
 opt() {
-  local key="$1" def="$2" v legacy
+  local key="$1" def="$2" v legacy run_var=""
+  case "$key" in
+    @radar-ai-cmd) run_var=TMUX_RADAR_RUN_COMMAND ;;
+    @radar-ai-profile) run_var=TMUX_RADAR_RUN_PROFILE ;;
+    @radar-ai-model) run_var=TMUX_RADAR_RUN_MODEL ;;
+    @radar-ai-effort) run_var=TMUX_RADAR_RUN_EFFORT ;;
+    @radar-ai-watch-autonomy) run_var=TMUX_RADAR_RUN_AUTONOMY ;;
+    @radar-ai-watch-always-allow) run_var=TMUX_RADAR_RUN_ALWAYS_ALLOW ;;
+    @radar-ai-poll) run_var=TMUX_RADAR_RUN_POLL ;;
+    @radar-ai-max-calls) run_var=TMUX_RADAR_RUN_MAX_DECISIONS ;;
+    @radar-ai-timeout) run_var=TMUX_RADAR_RUN_TIMEOUT ;;
+    @radar-ai-capture-lines) run_var=TMUX_RADAR_RUN_CAPTURE_LINES ;;
+    @radar-ai-monitor-excerpt-lines) run_var=TMUX_RADAR_RUN_MONITOR_EXCERPT_LINES ;;
+    @radar-ai-monitor-pos) run_var=TMUX_RADAR_RUN_MONITOR_POSITION ;;
+    @radar-ai-monitor-size-h) run_var=TMUX_RADAR_RUN_MONITOR_WIDTH ;;
+  esac
+  if [ -n "$run_var" ] && [ "${!run_var+x}" = x ]; then
+    printf '%s' "${!run_var}"
+    return
+  fi
   v="$(tmux show-option -gqv "$key" 2>/dev/null || true)"
   if [ -n "$v" ]; then printf '%s' "$v"; return; fi
   case "$key" in
@@ -133,6 +154,315 @@ opt() {
       ;;
   esac
   if [ -n "${v:-}" ]; then printf '%s' "$v"; else printf '%s' "$def"; fi
+}
+
+_explicit_opt() {  # _explicit_opt <tmux-option>; empty means no inherited value
+  local key="$1" value legacy
+  value="$(tmux show-option -gqv "$key" 2>/dev/null || true)"
+  if [ -z "$value" ]; then
+    case "$key" in
+      @radar-*)
+        legacy="@switcher-${key#@radar-}"
+        value="$(tmux show-option -gqv "$legacy" 2>/dev/null || true)"
+        ;;
+    esac
+  fi
+  printf '%s' "$value"
+}
+
+_config_constraint() {
+  case "$1" in
+    autonomy) printf 'one of suggest, confirm, auto-safe, auto' ;;
+    approval_policy) printf 'one of safe-auto, manual, always-allow' ;;
+    always_allow|hooks_first|screen_snapshots) printf 'one of on, off' ;;
+    poll) printf 'number from 0.05 to 3600' ;;
+    stable_screen_threshold) printf 'integer from 1 to 20' ;;
+    effort) printf 'one of minimal, low, medium, high, xhigh' ;;
+    timeout) printf 'integer from 5 to 3600' ;;
+    max_decisions) printf 'integer from 1 to 10000' ;;
+    retry_limit) printf 'integer from 0 to 10' ;;
+    retry_backoff) printf 'integer from 0 to 3600' ;;
+    capture_lines) printf 'integer from 20 to 5000' ;;
+    monitor_excerpt_lines) printf 'integer from 3 to 500' ;;
+    monitor_position) printf 'one of top, bottom, right' ;;
+    monitor_width) printf 'integer from 20 to 240' ;;
+    overview_ratio) printf 'integer from 15 to 50' ;;
+    completion_close_delay) printf 'integer from 0 to 60' ;;
+    logging) printf 'one of decision, full' ;;
+    retention_days) printf 'integer from 0 to 3650' ;;
+    goal|command|profile|model) printf 'any text value' ;;
+    *) printf 'a known watch configuration key' ;;
+  esac
+}
+
+_config_value_valid() {
+  local key="$1" value="$2"
+  case "$key" in
+    goal|command|profile|model) return 0 ;;
+    autonomy) case "$value" in suggest|confirm|auto-safe|auto) return 0 ;; esac ;;
+    approval_policy) case "$value" in safe-auto|manual|always-allow) return 0 ;; esac ;;
+    always_allow|hooks_first|screen_snapshots) case "$value" in on|off) return 0 ;; esac ;;
+    effort) case "$value" in minimal|low|medium|high|xhigh) return 0 ;; esac ;;
+    monitor_position) case "$value" in top|bottom|right) return 0 ;; esac ;;
+    logging) case "$value" in decision|full) return 0 ;; esac ;;
+    poll)
+      case "$value" in ''|*[!0-9.]*) return 1 ;; esac
+      awk -v n="$value" 'BEGIN {
+        exit !(n ~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/ && n >= 0.05 && n <= 3600)
+      }'
+      return $?
+      ;;
+    stable_screen_threshold) _integer_between "$value" 1 20; return $?
+      ;;
+    timeout) _integer_between "$value" 5 3600; return $?
+      ;;
+    max_decisions) _integer_between "$value" 1 10000; return $?
+      ;;
+    retry_limit) _integer_between "$value" 0 10; return $?
+      ;;
+    retry_backoff) _integer_between "$value" 0 3600; return $?
+      ;;
+    capture_lines) _integer_between "$value" 20 5000; return $?
+      ;;
+    monitor_excerpt_lines) _integer_between "$value" 3 500; return $?
+      ;;
+    monitor_width) _integer_between "$value" 20 240; return $?
+      ;;
+    overview_ratio) _integer_between "$value" 15 50; return $?
+      ;;
+    completion_close_delay) _integer_between "$value" 0 60; return $?
+      ;;
+    retention_days) _integer_between "$value" 0 3650; return $?
+      ;;
+  esac
+  return 1
+}
+
+_integer_between() {
+  local value="$1" min="$2" max="$3"
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$value" -ge "$min" ] && [ "$value" -le "$max" ]
+}
+
+_config_value_type() {
+  case "$1" in
+    poll|stable_screen_threshold|timeout|max_decisions|retry_limit|retry_backoff|capture_lines|monitor_excerpt_lines|monitor_width|overview_ratio|completion_close_delay|retention_days)
+      printf number ;;
+    *) printf string ;;
+  esac
+}
+
+_config_set() {  # mutates CONFIG_JSON; preserves old effective value on rejection
+  local key="$1" value="$2" source="$3" noisy="${4:-1}" type constraint
+  if ! _config_value_valid "$key" "$value"; then
+    constraint="$(_config_constraint "$key")"
+    [ "$noisy" -eq 0 ] || printf 'rejected %s=%s; allowed: %s\n' "$key" "$value" "$constraint" >&2
+    return 1
+  fi
+  type="$(_config_value_type "$key")"
+  if [ "$type" = number ]; then
+    CONFIG_JSON="$(printf '%s' "$CONFIG_JSON" | jq -c --arg key "$key" --arg source "$source" \
+      --argjson value "$value" '.values[$key] = {value:$value,source:$source}')"
+  else
+    CONFIG_JSON="$(printf '%s' "$CONFIG_JSON" | jq -c --arg key "$key" --arg source "$source" \
+      --arg value "$value" '.values[$key] = {value:$value,source:$source}')"
+  fi
+  return 0
+}
+
+_config_apply_overrides() {
+  local overrides="$1" source="$2" item key value
+  [ -n "$overrides" ] || return 0
+  while [ -n "$overrides" ]; do
+    case "$overrides" in
+      *,*) item="${overrides%%,*}"; overrides="${overrides#*,}" ;;
+      *) item="$overrides"; overrides="" ;;
+    esac
+    key="${item%%=*}"
+    if [ "$item" = "$key" ]; then
+      printf 'rejected %s; allowed: key=value\n' "$item" >&2
+      continue
+    fi
+    value="${item#*=}"
+    _config_set "$key" "$value" "$source" 1 || true
+  done
+}
+
+_config_apply_tmux() {
+  local key option value
+  while IFS=$'\t' read -r key option; do
+    value="$(_explicit_opt "$option")"
+    [ -n "$value" ] || continue
+    _config_set "$key" "$value" tmux 1 || true
+  done <<'EOF'
+autonomy	@radar-ai-watch-autonomy
+approval_policy	@radar-ai-approval-policy
+always_allow	@radar-ai-watch-always-allow
+hooks_first	@radar-ai-hooks-first
+poll	@radar-ai-poll
+stable_screen_threshold	@radar-ai-stable-screen-threshold
+command	@radar-ai-cmd
+profile	@radar-ai-profile
+model	@radar-ai-model
+effort	@radar-ai-effort
+timeout	@radar-ai-timeout
+max_decisions	@radar-ai-max-calls
+retry_limit	@radar-ai-retry-limit
+retry_backoff	@radar-ai-retry-backoff
+capture_lines	@radar-ai-capture-lines
+monitor_excerpt_lines	@radar-ai-monitor-excerpt-lines
+monitor_position	@radar-ai-monitor-pos
+monitor_width	@radar-ai-monitor-size-h
+overview_ratio	@radar-ai-overview-ratio
+completion_close_delay	@radar-ai-completion-close-delay
+logging	@radar-ai-logging
+screen_snapshots	@radar-ai-screen-snapshots
+retention_days	@radar-ai-retention-days
+EOF
+}
+
+cmd_build_watch_config() {
+  local pane="$1" raw_goal="${2-}" goal goal_source
+  need_jq
+  if [ -n "$raw_goal" ]; then goal="$raw_goal"; goal_source=custom
+  else goal='推进当前任务直到完成'; goal_source=default
+  fi
+  CONFIG_JSON="$(jq -cn --arg pane "$pane" --arg goal "$goal" --arg goal_source "$goal_source" '
+    {pane:$pane,goal:$goal,values:{
+      goal:{value:$goal,source:$goal_source},
+      autonomy:{value:"auto-safe",source:"default"},
+      approval_policy:{value:"safe-auto",source:"default"},
+      always_allow:{value:"off",source:"default"},
+      hooks_first:{value:"on",source:"default"},
+      poll:{value:5,source:"default"},
+      stable_screen_threshold:{value:1,source:"default"},
+      command:{value:"",source:"default"},
+      profile:{value:"",source:"default"},
+      model:{value:"gpt-5.6-luna",source:"default"},
+      effort:{value:"low",source:"default"},
+      timeout:{value:120,source:"default"},
+      max_decisions:{value:40,source:"default"},
+      retry_limit:{value:3,source:"default"},
+      retry_backoff:{value:15,source:"default"},
+      capture_lines:{value:120,source:"default"},
+      monitor_excerpt_lines:{value:16,source:"default"},
+      monitor_position:{value:"right",source:"default"},
+      monitor_width:{value:84,source:"default"},
+      overview_ratio:{value:25,source:"default"},
+      completion_close_delay:{value:12,source:"default"},
+      logging:{value:"decision",source:"default"},
+      screen_snapshots:{value:"off",source:"default"},
+      retention_days:{value:7,source:"default"}
+    }}')"
+  _config_apply_tmux
+  _config_apply_overrides "${TMUX_RADAR_SETUP_OVERRIDES:-}" custom
+  _config_apply_overrides "${TMUX_RADAR_RUNTIME_OVERRIDES:-}" runtime
+  CONFIG_JSON="$(printf '%s' "$CONFIG_JSON" | jq -c '.goal=.values.goal.value')"
+  printf '%s\n' "$CONFIG_JSON"
+}
+
+cmd_decode_goal() {
+  local raw="${1-}" mode=quick sentinel='__RADAR_ADVANCED__'
+  case "$raw" in
+    *"$sentinel") mode=advanced; raw="${raw%"$sentinel"}" ;;
+  esac
+  printf '%s\t%s' "$mode" "$raw"
+}
+
+cmd_render_watch_config() {
+  local config="$1" group fields key value source
+  need_jq
+  while IFS=$'\t' read -r group fields; do
+    printf '%s\n' "$group"
+    for key in $fields; do
+      value="$(_config_read "$config" "$key")"
+      source="$(printf '%s' "$config" | jq -r --arg key "$key" '.values[$key].source')"
+      printf '  %-26s = %s [%s]\n' "$key" "$value" "$source"
+    done
+  done <<'EOF'
+Intent	goal
+Authority	autonomy approval_policy always_allow
+Triggering	hooks_first poll stable_screen_threshold
+Brain	command profile model effort timeout
+Budget	max_decisions retry_limit retry_backoff
+Context	capture_lines monitor_excerpt_lines
+Console	monitor_position monitor_width overview_ratio completion_close_delay
+Logging	logging screen_snapshots retention_days
+EOF
+}
+
+_config_read() {  # command substitution safe even when a value ends in newlines
+  local config="$1" key="$2" marker='__RADAR_VALUE_END_8F3A1C__' encoded
+  encoded="$(printf '%s' "$config" | jq -jr --arg key "$key" '.values[$key].value, "__RADAR_VALUE_END_8F3A1C__"')"
+  printf '%s' "${encoded%"$marker"}"
+}
+
+_config_assign() {  # _config_assign <config> <key> <variable>; preserves terminal newlines
+  local config="$1" key="$2" target="$3" marker='__RADAR_VALUE_END_8F3A1C__' encoded
+  encoded="$(printf '%s' "$config" | jq -jr --arg key "$key" '.values[$key].value, "__RADAR_VALUE_END_8F3A1C__"')" || return 1
+  encoded="${encoded%"$marker"}"
+  printf -v "$target" '%s' "$encoded"
+}
+
+_apply_watch_config() {
+  local config="$1"
+  _config_assign "$config" goal TMUX_RADAR_RUN_GOAL
+  _config_assign "$config" autonomy TMUX_RADAR_RUN_AUTONOMY
+  _config_assign "$config" approval_policy TMUX_RADAR_RUN_APPROVAL_POLICY
+  _config_assign "$config" always_allow TMUX_RADAR_RUN_ALWAYS_ALLOW
+  _config_assign "$config" hooks_first TMUX_RADAR_RUN_HOOKS_FIRST
+  _config_assign "$config" poll TMUX_RADAR_RUN_POLL
+  _config_assign "$config" stable_screen_threshold TMUX_RADAR_RUN_STABLE_SCREEN_THRESHOLD
+  _config_assign "$config" command TMUX_RADAR_RUN_COMMAND
+  _config_assign "$config" profile TMUX_RADAR_RUN_PROFILE
+  _config_assign "$config" model TMUX_RADAR_RUN_MODEL
+  _config_assign "$config" effort TMUX_RADAR_RUN_EFFORT
+  _config_assign "$config" timeout TMUX_RADAR_RUN_TIMEOUT
+  _config_assign "$config" max_decisions TMUX_RADAR_RUN_MAX_DECISIONS
+  _config_assign "$config" retry_limit TMUX_RADAR_RUN_RETRY_LIMIT
+  _config_assign "$config" retry_backoff TMUX_RADAR_RUN_RETRY_BACKOFF
+  _config_assign "$config" capture_lines TMUX_RADAR_RUN_CAPTURE_LINES
+  _config_assign "$config" monitor_excerpt_lines TMUX_RADAR_RUN_MONITOR_EXCERPT_LINES
+  _config_assign "$config" monitor_position TMUX_RADAR_RUN_MONITOR_POSITION
+  _config_assign "$config" monitor_width TMUX_RADAR_RUN_MONITOR_WIDTH
+  _config_assign "$config" overview_ratio TMUX_RADAR_RUN_OVERVIEW_RATIO
+  _config_assign "$config" completion_close_delay TMUX_RADAR_RUN_COMPLETION_CLOSE_DELAY
+  _config_assign "$config" logging TMUX_RADAR_RUN_LOGGING
+  _config_assign "$config" screen_snapshots TMUX_RADAR_RUN_SCREEN_SNAPSHOTS
+  _config_assign "$config" retention_days TMUX_RADAR_RUN_RETENTION_DAYS
+  export TMUX_RADAR_RUN_GOAL TMUX_RADAR_RUN_AUTONOMY TMUX_RADAR_RUN_APPROVAL_POLICY
+  export TMUX_RADAR_RUN_ALWAYS_ALLOW TMUX_RADAR_RUN_HOOKS_FIRST TMUX_RADAR_RUN_POLL
+  export TMUX_RADAR_RUN_STABLE_SCREEN_THRESHOLD TMUX_RADAR_RUN_COMMAND TMUX_RADAR_RUN_PROFILE
+  export TMUX_RADAR_RUN_MODEL TMUX_RADAR_RUN_EFFORT TMUX_RADAR_RUN_TIMEOUT
+  export TMUX_RADAR_RUN_MAX_DECISIONS TMUX_RADAR_RUN_RETRY_LIMIT TMUX_RADAR_RUN_RETRY_BACKOFF
+  export TMUX_RADAR_RUN_CAPTURE_LINES TMUX_RADAR_RUN_MONITOR_EXCERPT_LINES
+  export TMUX_RADAR_RUN_MONITOR_POSITION TMUX_RADAR_RUN_MONITOR_WIDTH TMUX_RADAR_RUN_OVERVIEW_RATIO
+  export TMUX_RADAR_RUN_COMPLETION_CLOSE_DELAY TMUX_RADAR_RUN_LOGGING
+  export TMUX_RADAR_RUN_SCREEN_SNAPSHOTS TMUX_RADAR_RUN_RETENTION_DAYS
+}
+
+_watch_runtime_json() {
+  jq -cn \
+    --arg goal "$TMUX_RADAR_RUN_GOAL" --arg autonomy "$TMUX_RADAR_RUN_AUTONOMY" \
+    --arg approval_policy "$TMUX_RADAR_RUN_APPROVAL_POLICY" --arg always_allow "$TMUX_RADAR_RUN_ALWAYS_ALLOW" \
+    --arg hooks_first "$TMUX_RADAR_RUN_HOOKS_FIRST" --arg command "$TMUX_RADAR_RUN_COMMAND" \
+    --arg profile "$TMUX_RADAR_RUN_PROFILE" --arg model "$TMUX_RADAR_RUN_MODEL" --arg effort "$TMUX_RADAR_RUN_EFFORT" \
+    --arg monitor_position "$TMUX_RADAR_RUN_MONITOR_POSITION" --arg logging "$TMUX_RADAR_RUN_LOGGING" \
+    --arg screen_snapshots "$TMUX_RADAR_RUN_SCREEN_SNAPSHOTS" \
+    --argjson poll "$TMUX_RADAR_RUN_POLL" --argjson stable_screen_threshold "$TMUX_RADAR_RUN_STABLE_SCREEN_THRESHOLD" \
+    --argjson timeout "$TMUX_RADAR_RUN_TIMEOUT" --argjson max_decisions "$TMUX_RADAR_RUN_MAX_DECISIONS" \
+    --argjson retry_limit "$TMUX_RADAR_RUN_RETRY_LIMIT" --argjson retry_backoff "$TMUX_RADAR_RUN_RETRY_BACKOFF" \
+    --argjson capture_lines "$TMUX_RADAR_RUN_CAPTURE_LINES" --argjson monitor_excerpt_lines "$TMUX_RADAR_RUN_MONITOR_EXCERPT_LINES" \
+    --argjson monitor_width "$TMUX_RADAR_RUN_MONITOR_WIDTH" --argjson overview_ratio "$TMUX_RADAR_RUN_OVERVIEW_RATIO" \
+    --argjson completion_close_delay "$TMUX_RADAR_RUN_COMPLETION_CLOSE_DELAY" --argjson retention_days "$TMUX_RADAR_RUN_RETENTION_DAYS" \
+    '{goal:$goal,autonomy:$autonomy,approval_policy:$approval_policy,always_allow:$always_allow,
+      hooks_first:$hooks_first,poll:$poll,stable_screen_threshold:$stable_screen_threshold,
+      command:$command,profile:$profile,model:$model,effort:$effort,timeout:$timeout,
+      max_decisions:$max_decisions,retry_limit:$retry_limit,retry_backoff:$retry_backoff,
+      capture_lines:$capture_lines,monitor_excerpt_lines:$monitor_excerpt_lines,
+      monitor_position:$monitor_position,monitor_width:$monitor_width,overview_ratio:$overview_ratio,
+      completion_close_delay:$completion_close_delay,logging:$logging,
+      screen_snapshots:$screen_snapshots,retention_days:$retention_days}'
 }
 have_tmux() { command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2>&1; }
 need_jq()  { command -v jq >/dev/null 2>&1 || { echo "tmux-radar AI needs 'jq'." >&2; exit 3; }; }
@@ -588,7 +918,7 @@ _brain() {
       --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" &
   else
     TMUX_RADAR_INTERNAL=1 codex exec \
-      -m "$(opt @radar-ai-model gpt-5.3-codex-spark)" \
+      -m "$(opt @radar-ai-model gpt-5.6-luna)" \
       -c model_reasoning_effort="$(opt @radar-ai-effort low)" \
       -s read-only --ephemeral --skip-git-repo-check \
       --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" &
@@ -660,7 +990,7 @@ _brain_label() {
     printf 'codex profile: %s (read-only, ephemeral)' "$profile"
   else
     printf 'codex exec: model=%s effort=%s (read-only, ephemeral)' \
-      "$(opt @radar-ai-model gpt-5.3-codex-spark)" "$(opt @radar-ai-effort low)"
+      "$(opt @radar-ai-model gpt-5.6-luna)" "$(opt @radar-ai-effort low)"
   fi
 }
 
@@ -697,7 +1027,12 @@ cmd_decide() {
   policy="${3:-}"
   goal="${4:-}"
   if [ -n "$goal" ]; then
-    extra=$'\n\nGOAL (set by the user for this watch): '"$goal"$'\nSteer the pane toward completing this goal. If the pane asks a question whose answer is implied by the goal, answer it; only report `done` when the goal itself looks achieved.'
+    extra=$'\n\nGOAL (set by the user for this watch): '"$goal"
+    case "$goal" in
+      *$'\n') : ;;
+      *) extra="$extra"$'\n' ;;
+    esac
+    extra="${extra}Steer the pane toward completing this goal. If the pane asks a question whose answer is implied by the goal, answer it; only report \`done\` when the goal itself looks achieved."
   fi
   if [ "$policy" = "always-allow" ]; then
     extra="$extra"$'\n\nPOLICY: watch-until-done with ALWAYS-ALLOW enabled. When the pending action is SAFE and the prompt offers a "Yes, and don\'t ask again" / "always allow" / "don\'t ask again for … commands" option, PREFER that option so the agent stops interrupting for this command type. Still escalate anything destructive or ambiguous; NEVER pick an always-allow option for an unsafe action.'
@@ -1125,6 +1460,34 @@ _watch_coalesce_batch() {
   rm -f "$accepted" "$unique" "$retained"
 }
 
+_watch_defer_native_events() {  # hooks-first=off: keep takeover/manual events, journal native triggers
+  local batch="$1" retained="$RADAR_RUN_DIR/.hooks-retained.$$" event normalized kind event_id
+  [ "${WATCH_HOOKS_FIRST:-on}" = off ] || return 0
+  [ -s "$batch" ] || return 0
+  # Let the normal coalescer see a takeover together with stale prompts so it
+  # can record the stronger supersession relation instead of merely deferring.
+  if jq -e 'select(.kind == "user_resumed")' "$batch" >/dev/null 2>&1; then
+    return 0
+  fi
+  : > "$retained"
+  while IFS= read -r event; do
+    [ -n "$event" ] || continue
+    normalized="$(_watch_normalize_event "$event")" || continue
+    kind="$(printf '%s' "$normalized" | jq -r '.kind')"
+    case "$kind" in
+      approval|input_required|turn_complete)
+        normalized="$(_watch_record_incoming "$normalized")" || continue
+        event_id="$(printf '%s' "$normalized" | jq -r '.event_id')"
+        radar_event_append hook_deferred watcher "hooks-first disabled; waiting for idle fallback" "$(jq -cn \
+          --arg event_id "$event_id" --arg original_kind "$kind" \
+          '{record:"hook_deferred",event_id:$event_id,original_kind:$original_kind,reason:"hooks_first_off"}')"
+        ;;
+      *) printf '%s\n' "$normalized" >> "$retained" ;;
+    esac
+  done < "$batch"
+  mv "$retained" "$batch"
+}
+
 _watch_wait_for_batch() {
   local batch="$1" tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.05}"
   : > "$batch"
@@ -1199,7 +1562,8 @@ _watch_retry_batch() {
 }
 
 _watch_retry_delay() {
-  local retry="$1" current_kind="$2" schedule="${TMUX_RADAR_TEST_RETRY_DELAYS:-15,30,60}"
+  local retry="$1" current_kind="$2" base="${WATCH_RETRY_BACKOFF:-15}" schedule
+  schedule="${TMUX_RADAR_TEST_RETRY_DELAYS:-$base,$((base * 2)),$((base * 4))}"
   local old_ifs="$IFS" delay tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.05}"
   local batch="$RADAR_RUN_DIR/.retry-batch.$$" batch_rc
   IFS=,
@@ -1458,30 +1822,61 @@ _watch_signal_exit() {
 }
 
 cmd_watch_loop() {
-  local pane goal policy poll auto maxcalls config batch wait_rc coalesce_rc event_kind
+  local pane goal policy poll auto maxcalls config supplied_config="${6:-}" batch wait_rc coalesce_rc event_kind
   local rc valid failure evidence_fingerprint delivery_fingerprint armed_fingerprint current_fingerprint guard_rc
   local retry_rc retry_cancelled verify_rc
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane" >&2; return 1; }
-  goal="${2:-}"
-  policy="${3:-}"
-  [ -z "$policy" ] && [ "$(opt @radar-ai-watch-always-allow off)" = on ] && policy="always-allow"
-  poll="${4:-}"; case "$poll" in ''|*[!0-9.]*) poll="$(opt @radar-ai-poll 5)" ;; esac
-  auto="${5:-}"; [ -n "$auto" ] || auto="$(opt @radar-ai-watch-autonomy auto-safe)"
-  maxcalls="$(opt @radar-ai-max-calls 40)"; case "$maxcalls" in ''|*[!0-9]*) maxcalls=40 ;; esac
+  if [ -n "$supplied_config" ]; then
+    config="$supplied_config"
+    _apply_watch_config "$config"
+    pane="$(printf '%s' "$config" | jq -r '.pane')"
+    goal="$TMUX_RADAR_RUN_GOAL"
+    policy="$TMUX_RADAR_RUN_APPROVAL_POLICY"
+    [ "$TMUX_RADAR_RUN_ALWAYS_ALLOW" = on ] && policy=always-allow
+    poll="$TMUX_RADAR_RUN_POLL"
+    auto="$TMUX_RADAR_RUN_AUTONOMY"
+    maxcalls="$TMUX_RADAR_RUN_MAX_DECISIONS"
+    WATCH_RETRY_LIMIT="$TMUX_RADAR_RUN_RETRY_LIMIT"
+    WATCH_RETRY_BACKOFF="$TMUX_RADAR_RUN_RETRY_BACKOFF"
+    WATCH_HOOKS_FIRST="$TMUX_RADAR_RUN_HOOKS_FIRST"
+    WATCH_STABLE_THRESHOLD="$TMUX_RADAR_RUN_STABLE_SCREEN_THRESHOLD"
+  else
+    goal="${2:-}"
+    policy="${3:-}"
+    [ -z "$policy" ] && [ "$(opt @radar-ai-watch-always-allow off)" = on ] && policy="always-allow"
+    poll="${4:-}"; case "$poll" in ''|*[!0-9.]*) poll="$(opt @radar-ai-poll 5)" ;; esac
+    auto="${5:-}"; [ -n "$auto" ] || auto="$(opt @radar-ai-watch-autonomy auto-safe)"
+    maxcalls="$(opt @radar-ai-max-calls 40)"; case "$maxcalls" in ''|*[!0-9]*) maxcalls=40 ;; esac
+    WATCH_HOOKS_FIRST="$(opt @radar-ai-hooks-first on)"
+    case "$WATCH_HOOKS_FIRST" in on|off) : ;; *) WATCH_HOOKS_FIRST=on ;; esac
+    WATCH_STABLE_THRESHOLD="$(opt @radar-ai-stable-screen-threshold 1)"
+    case "$WATCH_STABLE_THRESHOLD" in ''|*[!0-9]*) WATCH_STABLE_THRESHOLD=1 ;; esac
+    [ "$WATCH_STABLE_THRESHOLD" -ge 1 ] 2>/dev/null || WATCH_STABLE_THRESHOLD=1
+    config="$(jq -cn --arg goal "$goal" --arg policy "${policy:-safe-auto}" --arg autonomy "$auto" \
+      --argjson poll "$(awk -v p="$poll" 'BEGIN { printf "%.6f", p+0 }')" --argjson max_calls "$maxcalls" '
+      {goal:$goal,policy:$policy,autonomy:$autonomy,poll:$poll,max_calls:$max_calls,
+       source:{kind:"watch_cli",provenance:"legacy-compatible"},
+       provenance:{goal:"argument",policy:"argument_or_tmux",autonomy:"argument_or_tmux",
+                   poll:"argument_or_tmux",max_calls:"tmux_or_default"}}
+    ')"
+  fi
 
   WATCH_PANE="$pane"; WATCH_WF="$(_wf "$pane")"; WATCH_STARTED="$(now)"
   WATCH_POLL="$poll"; WATCH_GOAL="$goal"; WATCH_POLICY="$policy"
   WATCH_AUTONOMY="$auto"; WATCH_MAX_CALLS="$maxcalls"; WATCH_CALLS=0
   WATCH_RETRY=0; WATCH_EVENT_ID=""; WATCH_LAST_DECISION=""; WATCH_FINALIZED=0
-  config="$(jq -cn --arg goal "$goal" --arg policy "${policy:-safe-auto}" --arg autonomy "$auto" \
-    --argjson poll "$(awk -v p="$poll" 'BEGIN { printf "%.6f", p+0 }')" --argjson max_calls "$maxcalls" '
-    {goal:$goal,policy:$policy,autonomy:$autonomy,poll:$poll,max_calls:$max_calls,
-     source:{kind:"watch_cli",provenance:"legacy-compatible"},
-     provenance:{goal:"argument",policy:"argument_or_tmux",autonomy:"argument_or_tmux",
-                 poll:"argument_or_tmux",max_calls:"tmux_or_default"}}
-  ')"
+  WATCH_STABLE_COUNT=0
   radar_run_create "$pane" "$config"
   WATCH_WF="$(radar_watch_file "$pane")"
+  if [ -n "${TMUX_RADAR_TEST_RUNTIME_FILE:-}" ] && [ -n "$supplied_config" ]; then
+    _watch_runtime_json > "$TMUX_RADAR_TEST_RUNTIME_FILE"
+  fi
+  if [ -n "${TMUX_RADAR_RUN_RETENTION_DAYS:-}" ]; then
+    radar_cleanup_runs "$TMUX_RADAR_RUN_RETENTION_DAYS"
+  fi
+  if [ -n "${TMUX_RADAR_TEST_EXIT_AFTER_CONFIG:-}" ]; then
+    return 0
+  fi
   trap '_watch_signal_exit TERM 143' TERM
   trap '_watch_signal_exit INT 130' INT
   trap '_watch_signal_exit HUP 129' HUP
@@ -1499,6 +1894,7 @@ cmd_watch_loop() {
     set +e; _watch_wait_for_batch "$batch"; wait_rc=$?; set -e
     case "$wait_rc" in
       2) _watch_finalize stopped STOPPED "target pane disappeared"; break ;;
+      0) WATCH_STABLE_COUNT=0 ;;
       1)
         current_fingerprint="$(_watch_fingerprint || true)"
         if [ -z "$current_fingerprint" ]; then
@@ -1506,18 +1902,33 @@ cmd_watch_loop() {
           break
         fi
         if [ "$current_fingerprint" != "$armed_fingerprint" ]; then
+          WATCH_STABLE_COUNT=0
           radar_event_append idle_reset watcher "screen changed during idle interval" "$(jq -cn \
             --arg before "$armed_fingerprint" --arg after "$current_fingerprint" \
             '{record:"idle_reset",before:$before,after:$after}')"
           continue
         fi
+        WATCH_STABLE_COUNT=$((WATCH_STABLE_COUNT + 1))
+        if [ "$WATCH_STABLE_COUNT" -lt "$WATCH_STABLE_THRESHOLD" ]; then
+          radar_event_append idle_stable watcher "stable sample $WATCH_STABLE_COUNT/$WATCH_STABLE_THRESHOLD" "$(jq -cn \
+            --argjson count "$WATCH_STABLE_COUNT" --argjson threshold "$WATCH_STABLE_THRESHOLD" \
+            '{record:"idle_stable",count:$count,threshold:$threshold}')"
+          continue
+        fi
+        WATCH_STABLE_COUNT=0
         WATCH_IDLE_SEQ=$(( ${WATCH_IDLE_SEQ:-0} + 1 ))
         WATCH_EVENT_ID="idle-$RADAR_RUN_ID-$WATCH_IDLE_SEQ"
         jq -cn --arg id "$WATCH_EVENT_ID" --arg pane "$pane" --arg timestamp "$(_radar_now_iso)" \
           --argjson event_order "$(_watch_next_event_order)" \
-          '{kind:"idle",source:"watcher",label:"idle fallback",event_id:$id,pane:$pane,timestamp:$timestamp,event_order:$event_order}' > "$batch"
+          '{kind:"screen_idle",source:"watcher",label:"idle fallback",event_id:$id,pane:$pane,timestamp:$timestamp,event_order:$event_order}' > "$batch"
         ;;
     esac
+    _watch_defer_native_events "$batch"
+    if [ ! -s "$batch" ]; then
+      WATCH_EVENT_ID=""
+      _watch_phase ARMED "native events deferred; waiting for idle fallback" idle 0
+      continue
+    fi
     _watch_phase EVENT_PENDING "event batch ready" event 0
     set +e; _watch_coalesce_batch "$batch"; coalesce_rc=$?; set -e
     : > "$batch"
@@ -1562,7 +1973,7 @@ cmd_watch_loop() {
       [ "$valid" -eq 1 ] && break
       radar_event_append decision_failed watcher "$failure" "$(jq -cn --arg event_id "$WATCH_EVENT_ID" \
         --arg reason "$failure" --argjson retry "$WATCH_RETRY" '{record:"decision_error",event_id:$event_id,reason:$reason,retry:$retry}')"
-      if [ "$WATCH_RETRY" -ge 3 ]; then
+      if [ "$WATCH_RETRY" -ge "$WATCH_RETRY_LIMIT" ]; then
         _watch_phase PAUSED_ERROR "$failure; retry exhausted" none 0
         _escalate "$pane" "AI 监控连续决策失败，已暂停: $failure"
         radar_run_finalize paused_error "$failure"
@@ -1697,10 +2108,18 @@ _abort_watch_launch() {  # _abort_watch_launch <pane> <watcher-pid>
 }
 
 cmd_watch() {  # detach the loop so the caller (popup/menu) can return
-  local pane goal policy poll auto wf base feed pos mon_size err layout mon_pane detail_pane detail_cmd timeline_cmd single_cmd watch_pid
+  local pane goal policy poll auto config_json="${6:-}" wf base feed pos mon_size err layout mon_pane detail_pane detail_cmd timeline_cmd single_cmd watch_pid overview_ratio detail_ratio
   local -a split_args
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane"; return 1; }
   goal="${2:-}"; policy="${3:-}"; poll="${4:-}"; auto="${5:-}"
+  if [ -n "$config_json" ]; then
+    _apply_watch_config "$config_json"
+    goal="$TMUX_RADAR_RUN_GOAL"
+    policy="$TMUX_RADAR_RUN_APPROVAL_POLICY"
+    [ "$TMUX_RADAR_RUN_ALWAYS_ALLOW" = on ] && policy=always-allow
+    poll="$TMUX_RADAR_RUN_POLL"
+    auto="$TMUX_RADAR_RUN_AUTONOMY"
+  fi
   wf="$(_wf "$pane")"; base="${wf%.watch}"; feed="$base.out"
   if [ -f "$wf" ] && kill -0 "$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)" 2>/dev/null; then
     echo "already watching $pane (stop it first)"; return 0
@@ -1709,7 +2128,7 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
   : > "$base.timeline"
   : > "$base.detail"
   : > "$base.detail.log"
-  nohup bash "$SELF" _watch_loop "$pane" "$goal" "$policy" "$poll" "$auto" >"$feed" 2>&1 &
+  nohup bash "$SELF" _watch_loop "$pane" "$goal" "$policy" "$poll" "$auto" "$config_json" >"$feed" 2>&1 &
   watch_pid=$!
   disown 2>/dev/null || true
   # The structured watcher owns creation of the compatibility pointer. Wait a
@@ -1760,7 +2179,9 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
         fi
       elif mon_pane="$(tmux split-window "${split_args[@]}" -P -F '#{pane_id}' -d -t "$pane" "$timeline_cmd" 2>&1)"; then
         if [ "$pos" = "right" ]; then
-          detail_pane="$(tmux split-window -v -P -F '#{pane_id}' -d -t "$mon_pane" -p 55 "$detail_cmd" 2>/dev/null || true)"
+          overview_ratio="${TMUX_RADAR_RUN_OVERVIEW_RATIO:-25}"
+          detail_ratio=$((100 - overview_ratio))
+          detail_pane="$(tmux split-window -v -P -F '#{pane_id}' -d -t "$mon_pane" -p "$detail_ratio" "$detail_cmd" 2>/dev/null || true)"
           [ -n "$detail_pane" ] || audit "monitor-detail-fail\t$pane\t$pos\t$mon_pane"
         else
           detail_pane="$(tmux split-window -h -P -F '#{pane_id}' -d -t "$mon_pane" -p 58 "$detail_cmd" 2>/dev/null || true)"
@@ -1785,26 +2206,61 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
     "${goal:+  ${CD}· ${goal}${CR}}" "${policy:+  ${CY}[$policy]${CR}}"
 }
 
-# Interactive setup for a watch: goal / poll interval / approval policy, read
-# from the popup tty. Runs in a display-popup so there is no tmux menu/quoting
-# escaping to fight, and every choice is per-watch (no global option flips).
+# Interactive setup for quick and advanced launch. Every editable value lives
+# in CONFIG_JSON, so the launch summary and the watcher consume one truth.
+_advanced_edit_config() {
+  local key value
+  while :; do
+    printf '\n'
+    cmd_render_watch_config "$CONFIG_JSON"
+    printf '\n%sEdit field (Enter = done)%s\n> ' "$CD" "$CR"
+    readline_tty key
+    [ -n "$key" ] || break
+    if ! printf '%s' "$CONFIG_JSON" | jq -e --arg key "$key" '.values | has($key)' >/dev/null; then
+      printf 'rejected %s; allowed: a field listed above\n' "$key" >&2
+      continue
+    fi
+    printf 'value for %s> ' "$key"
+    readline_tty value
+    _config_set "$key" "$value" custom 1 || true
+    CONFIG_JSON="$(printf '%s' "$CONFIG_JSON" | jq -c '.goal=.values.goal.value')"
+  done
+}
+
 cmd_watch_setup() {
-  local pane goal poll ans policy="" auto=""
+  local pane mode="${2:-quick}" preset="${3:-}" raw decoded goal ans config decode_marker='__RADAR_DECODE_END_71C4__'
   pane="$(_resolve_pane "${1:-}")" || { echo "watch-setup: no target pane"; return 1; }
-  _hdr "AI 常驻监控 · 设置" "$(_pane_label "$pane")"
-  printf '%s目标（回车 = 通用：推进直到任务完成）%s\n> ' "$CD" "$CR"
-  readline_tty goal
-  printf '\n%s轮询间隔秒（回车 = %s）%s\n> ' "$CD" "$(opt @radar-ai-poll 5)" "$CR"
-  readline_tty poll
-  printf '\n%s批准策略%s\n' "$CD" "$CR"
-  printf '  1) 安全项自动批准，其余上报给你（默认）\n'
-  printf '  2) always-allow — 安全项可选“不再询问”，更省心\n'
-  printf '  3) 仅建议 — 只播报，不代按任何键\n> '
-  readline_tty ans
-  case "$ans" in 2) policy="always-allow" ;; 3) auto="suggest" ;; esac
-  echo
-  cmd_watch "$pane" "$goal" "$policy" "$poll" "$auto"
-  sleep 1.2   # let the popup show the result before it closes
+  case "$mode" in quick|advanced) ;; *) echo "watch-setup: mode must be quick or advanced" >&2; return 2 ;; esac
+  _hdr "AI 常驻监控 · 目标" "$(_pane_label "$pane")"
+  printf '%s目标（回车 = 推进当前任务直到完成；Tab = 高级设置）%s\n> ' "$CD" "$CR"
+  bind '"\t":"__RADAR_ADVANCED__\C-m"' 2>/dev/null || true
+  readline_tty raw
+  decoded="$(cmd_decode_goal "$raw"; printf '%s' "$decode_marker")"
+  decoded="${decoded%"$decode_marker"}"
+  goal="${decoded#*$'\t'}"
+  [ "${decoded%%$'\t'*}" = advanced ] && mode=advanced
+  config="$(cmd_build_watch_config "$pane" "$goal")"
+  CONFIG_JSON="$config"
+  if [ "$preset" = always-allow ]; then
+    _config_set always_allow on custom 1
+    _config_set approval_policy always-allow custom 1
+  fi
+  [ "$mode" = advanced ] && _advanced_edit_config
+  while :; do
+    printf '\n'
+    _hdr "AI 常驻监控 · 启动摘要" "$(_pane_label "$pane")"
+    cmd_render_watch_config "$CONFIG_JSON"
+    printf '\n%sEnter = start · a = advanced · Esc = cancel%s\n> ' "$CD" "$CR"
+    readline_tty ans
+    case "$ans" in
+      '') break ;;
+      a|A) _advanced_edit_config ;;
+      $'\e'|q|Q) echo '已取消'; return 0 ;;
+      *) printf 'Enter, a, or Esc only.\n' >&2 ;;
+    esac
+  done
+  cmd_watch "$pane" '' '' '' '' "$CONFIG_JSON"
+  sleep "${TMUX_RADAR_SETUP_LAUNCH_PAUSE:-1.2}"
 }
 
 cmd_stop() {
@@ -2086,9 +2542,9 @@ cmd_menu() {
     "指挥 tmux（自然语言）"             a "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF ask\"" \
     "让当前 pane 继续 / 决定一次"        c "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF decide '#{pane_id}'\"" \
     "" \
-    "常驻监控当前 pane 直到完成"         w "run-shell \"$SELF watch '#{pane_id}'\"" \
-    "常驻监控 + always-allow（更省心）"  W "run-shell \"$SELF watch '#{pane_id}' '' always-allow\"" \
-    "自定义监控（目标 / 间隔 / 策略）…"   v "$pop \"$SELF watch-setup '#{pane_id}'\"" \
+    "常驻监控当前 pane 直到完成"         w "$pop \"$SELF watch-setup '#{pane_id}' quick\"" \
+    "常驻监控 + always-allow（更省心）"  W "$pop \"$SELF watch-setup '#{pane_id}' quick always-allow\"" \
+    "自定义监控（目标 / 间隔 / 策略）…"   v "$pop \"$SELF watch-setup '#{pane_id}' advanced\"" \
     "" \
     "状态 / 最近决策"                   s "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF status\"" \
     "停止全部监控"                      S "run-shell \"$SELF stop all\"" \
@@ -2161,12 +2617,15 @@ cmd_emit_event() {
 
 rc=0
 case "${1:-}" in
+  _decode-goal) shift; cmd_decode_goal "${1-}" || rc=$? ;;
+  _build-watch-config) shift; cmd_build_watch_config "${1:-}" "${2-}" || rc=$? ;;
+  _render-watch-config) shift; cmd_render_watch_config "${1:-}" || rc=$? ;;
   ask)          shift; cmd_ask "$@" || rc=$? ;;
   decide)       shift; cmd_decide "${1:-}" "${2:-}" "${3:-}" "${4:-}" || rc=$? ;;
   watch)        shift; cmd_watch "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" || rc=$? ;;
   emit-event)   shift; cmd_emit_event "$@" || rc=$? ;;
-  watch-setup)  shift; cmd_watch_setup "${1:-}" || rc=$? ;;
-  _watch_loop)  shift; cmd_watch_loop "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" || rc=$? ;;
+  watch-setup)  shift; cmd_watch_setup "${1:-}" "${2:-quick}" "${3:-}" || rc=$? ;;
+  _watch_loop)  shift; cmd_watch_loop "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" || rc=$? ;;
   monitor)      shift; cmd_monitor "${1:-}" || rc=$? ;;
   monitor-timeline) shift; cmd_monitor_timeline "${1:-}" || rc=$? ;;
   monitor-detail) shift; cmd_monitor_detail "${1:-}" || rc=$? ;;

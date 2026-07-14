@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/tmux-radar-lifecycle.XXXXXX")"
 WATCH_PID=""
 MONITOR_PID=""
+RUN_DIR=""
 
 process_alive() {
   kill -0 "$1" 2>/dev/null
@@ -27,6 +28,29 @@ wait_for_exit() {
     sleep 0.05
   done
   return 1
+}
+
+current_run_dir() {
+  local watch_file="$TMP/state/ai-watch/_1.watch"
+  [ -r "$watch_file" ] || return 1
+  awk -F= '$1 == "run_dir" { print $2; exit }' "$watch_file"
+}
+
+assert_stopped_run() {
+  local run_dir="$1" context="$2"
+  if [ ! -s "$run_dir/final.json" ]; then
+    printf 'FAIL: structured final outcome missing after %s\n' "$context" >&2
+    return 1
+  fi
+  if ! jq -e '.outcome == "stopped" and (.reason | length > 0)' "$run_dir/final.json" >/dev/null; then
+    printf 'FAIL: structured final outcome is not stopped after %s\n' "$context" >&2
+    cat "$run_dir/final.json" >&2
+    return 1
+  fi
+  if [ -e "$TMP/state/ai-watch/_1.watch" ]; then
+    printf 'FAIL: live watch pointer survived %s\n' "$context" >&2
+    return 1
+  fi
 }
 
 cleanup() {
@@ -111,6 +135,7 @@ wait_for_file "$TMP/brain.pids" || {
   cat "$TMP/watch.err" >&2 || true
   exit 1
 }
+RUN_DIR="$(current_run_dir)"
 
 PATH="$TMP/bin:$PATH" \
 BASH_ENV="$TMP/bashenv" \
@@ -143,6 +168,7 @@ if [ "$failed" -ne 0 ]; then
   cat "$TMP/watch.err" >&2 || true
   exit 1
 fi
+assert_stopped_run "$RUN_DIR" "monitor-pane termination"
 
 WATCH_PID=""
 printf 'PASS: monitor-pane termination stops watcher and full brain process tree\n'
@@ -167,6 +193,7 @@ wait_for_file "$TMP/brain.pids" || {
   printf 'FAIL: fake brain never started for target-pane test\n' >&2
   exit 1
 }
+RUN_DIR="$(current_run_dir)"
 read -r brain_pid brain_child_pid < "$TMP/brain.pids"
 rm -f "$TMP/pane-alive"
 
@@ -178,6 +205,7 @@ for pid in "$WATCH_PID" "$brain_pid" "$brain_child_pid"; do
   fi
 done
 [ "$failed" -eq 0 ] || exit 1
+assert_stopped_run "$RUN_DIR" "target-pane removal"
 
 WATCH_PID=""
 printf 'PASS: target-pane removal stops watcher and full brain process tree\n'
@@ -203,6 +231,7 @@ wait_for_file "$TMP/brain.pids" || {
   printf 'FAIL: fake brain never started for timeout test\n' >&2
   exit 1
 }
+RUN_DIR="$(current_run_dir)"
 read -r brain_pid brain_child_pid < "$TMP/brain.pids"
 
 failed=0
@@ -217,6 +246,7 @@ done
 kill -TERM "$WATCH_PID" 2>/dev/null || true
 wait "$WATCH_PID" 2>/dev/null || true
 WATCH_PID=""
+assert_stopped_run "$RUN_DIR" "brain timeout owner shutdown"
 printf 'PASS: brain-call timeout stops the full brain process tree\n'
 
 # One-shot popup commands own their model process just like resident watchers.

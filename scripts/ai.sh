@@ -913,18 +913,17 @@ _delivery_owner_field() {
 }
 
 _delivery_gate_reap_stale() {
-  local gate="$1" owner observed_pid observed_token tomb moved_token
-  owner="$gate/owner"
-  [ -r "$owner" ] || return 1
-  observed_pid="$(_delivery_owner_field "$owner" pid)"
-  observed_token="$(_delivery_owner_field "$owner" token)"
+  local gate="$1" observed_pid observed_token tomb moved_token
+  [ -r "$gate" ] || return 1
+  observed_pid="$(_delivery_owner_field "$gate" pid)"
+  observed_token="$(_delivery_owner_field "$gate" token)"
   case "$observed_pid" in ''|*[!0-9]*) return 1 ;; esac
   kill -0 "$observed_pid" 2>/dev/null && return 1
   [ -n "$observed_token" ] || return 1
 
   tomb="${gate}.stale.${observed_token}.$$"
   if ! mv "$gate" "$tomb" 2>/dev/null; then return 1; fi
-  moved_token="$(_delivery_owner_field "$tomb/owner" token)"
+  moved_token="$(_delivery_owner_field "$tomb" token)"
   if [ "$moved_token" = "$observed_token" ]; then
     rm -rf "$tomb"
     return 0
@@ -938,22 +937,23 @@ _delivery_gate_reap_stale() {
 }
 
 _delivery_gate_acquire() {
-  local attempts="${TMUX_RADAR_TEST_GATE_ATTEMPTS:-500}" attempt=0 owner pid token
+  local attempts="${TMUX_RADAR_TEST_GATE_ATTEMPTS:-500}" attempt=0 pid token private
   [ -n "${RADAR_RUN_DIR:-}" ] || return 1
   case "$attempts" in ''|*[!0-9]*) attempts=500 ;; esac
   [ "$attempts" -gt 0 ] || attempts=1
   DELIVERY_GATE_DIR="$RADAR_RUN_DIR/.delivery-gate"
   token="$$-${RANDOM:-0}-$(date '+%s')"
+  private="$RADAR_RUN_DIR/.delivery-owner.$token"
+  printf 'pid=%s\ntoken=%s\ncreated=%s\n' "$$" "$token" "$(date '+%s')" > "$private"
   while [ "$attempt" -lt "$attempts" ]; do
-    if mkdir "$DELIVERY_GATE_DIR" 2>/dev/null; then
-      printf 'pid=%s\ntoken=%s\ncreated=%s\n' "$$" "$token" "$(date '+%s')" > "$DELIVERY_GATE_DIR/owner"
+    if ln "$private" "$DELIVERY_GATE_DIR" 2>/dev/null; then
+      rm -f "$private"
       DELIVERY_GATE_TOKEN="$token"
       DELIVERY_GATE_HELD=1
       return 0
     fi
-    owner="$DELIVERY_GATE_DIR/owner"
-    if [ -r "$owner" ]; then
-      pid="$(_delivery_owner_field "$owner" pid)"
+    if [ -r "$DELIVERY_GATE_DIR" ]; then
+      pid="$(_delivery_owner_field "$DELIVERY_GATE_DIR" pid)"
       case "$pid" in ''|*[!0-9]*) : ;; *)
         if ! kill -0 "$pid" 2>/dev/null; then _delivery_gate_reap_stale "$DELIVERY_GATE_DIR" || true; fi
         ;;
@@ -962,19 +962,18 @@ _delivery_gate_acquire() {
     attempt=$((attempt + 1))
     sleep 0.01
   done
+  rm -f "$private"
   DELIVERY_GATE_HELD=0
   DELIVERY_GATE_TOKEN=""
   return 1
 }
 
 _delivery_gate_release() {
-  local owner current
+  local current
   [ "${DELIVERY_GATE_HELD:-0}" -eq 1 ] || return 0
-  owner="$DELIVERY_GATE_DIR/owner"
-  current="$(_delivery_owner_field "$owner" token)"
+  current="$(_delivery_owner_field "$DELIVERY_GATE_DIR" token)"
   if [ -n "$DELIVERY_GATE_TOKEN" ] && [ "$current" = "$DELIVERY_GATE_TOKEN" ]; then
-    rm -f "$owner"
-    rmdir "$DELIVERY_GATE_DIR" 2>/dev/null || true
+    rm -f "$DELIVERY_GATE_DIR"
   fi
   DELIVERY_GATE_HELD=0
   DELIVERY_GATE_TOKEN=""

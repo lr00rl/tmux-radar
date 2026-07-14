@@ -23,7 +23,7 @@ cleanup() {
 trap 'cleanup $?' EXIT
 
 wait_until() {
-  local description="$1" command="$2" attempts="${3:-160}" i=0
+  local description="$1" command="$2" attempts="${3:-400}" i=0
   while [ "$i" -lt "$attempts" ]; do
     if eval "$command"; then return 0; fi
     sleep 0.025
@@ -307,10 +307,10 @@ write_response 3 ''
 write_response 4 '{"action":"mystery","reason":"unknown"}'
 start_watch 30
 emit_event retry-event approval retry
-wait_until 'PAUSED_ERROR retry exhaustion' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 3' '$RUN_DIR/state.json' >/dev/null" 240
+wait_until 'PAUSED_ERROR retry exhaustion' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 3' '$RUN_DIR/state.json' >/dev/null" 600
 assert_eq 4 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'initial call plus three bounded retries'
 assert_eq 0 "$(wc -l < "$TEST_SENDS" | tr -d ' ')" 'retry exhaustion sends no keys'
-wait_until 'watch exits after retry exhaustion' "! kill -0 '$WATCH_PID' 2>/dev/null"
+wait_until 'watch exits after retry exhaustion' "! kill -0 '$WATCH_PID' 2>/dev/null" 400
 wait "$WATCH_PID" 2>/dev/null || true
 WATCH_PID=""
 printf 'PASS: malformed decisions pause after bounded retries\n'

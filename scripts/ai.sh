@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC1091,SC2034,SC2329
+# shellcheck disable=SC1091,SC2034,SC2153,SC2329
 # tmux-radar AI supervisor — an AI (Codex) that watches the AI coding TUIs
 # running inside your tmux panes (Claude Code / Codex), answers their prompts on
 # your behalf, and arranges your tmux layout from natural language.
@@ -632,13 +632,19 @@ _watch_state_write() {  # pane started poll goal policy auto maxcalls calls quie
 }
 
 _watch_pointer_write() {
-  local wf="$WATCH_WF" tmp run_id run_dir channel overview detail
+  local wf="$WATCH_WF" tmp run_id run_dir channel overview detail monitors_file
   [ -n "$wf" ] || return 0
   run_id="$(_state_get "$wf" run_id)"; [ -n "$run_id" ] || run_id="${RADAR_RUN_ID:-}"
   run_dir="$(_state_get "$wf" run_dir)"; [ -n "$run_dir" ] || run_dir="${RADAR_RUN_DIR:-}"
   channel="$(_state_get "$wf" channel)"; [ -n "$channel" ] || channel="${RADAR_RUN_CHANNEL:-}"
-  overview="$(_state_get "$wf" monitor_overview_pane)"
-  detail="$(_state_get "$wf" monitor_detail_pane)"
+  monitors_file="$run_dir/monitors"
+  if [ -r "$monitors_file" ]; then
+    overview="$(_state_get "$monitors_file" monitor_overview_pane)"
+    detail="$(_state_get "$monitors_file" monitor_detail_pane)"
+  else
+    overview="$(_state_get "$wf" monitor_overview_pane)"
+    detail="$(_state_get "$wf" monitor_detail_pane)"
+  fi
   tmp="$(mktemp "${wf}.XXXXXX")" || return 1
   {
     printf 'run_id=%s\nrun_dir=%s\nchannel=%s\n' "$run_id" "$run_dir" "$channel"
@@ -656,8 +662,16 @@ _watch_pointer_write() {
 }
 
 _watch_pointer_set_monitors() {
-  local wf="$1" overview="${2:-}" detail="${3:-}" tmp
+  local wf="$1" overview="${2:-}" detail="${3:-}" tmp run_dir monitors_file monitors_tmp
   [ -r "$wf" ] || return 0
+  run_dir="$(_state_get "$wf" run_dir)"
+  if [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
+    monitors_file="$run_dir/monitors"
+    monitors_tmp="$(mktemp "$run_dir/.monitors.XXXXXX")" || return 1
+    printf 'monitor_overview_pane=%s\nmonitor_detail_pane=%s\n' \
+      "$overview" "$detail" > "$monitors_tmp"
+    mv "$monitors_tmp" "$monitors_file"
+  fi
   tmp="$(mktemp "${wf}.XXXXXX")" || return 1
   awk -F= -v overview="$overview" -v detail="$detail" '
     $1 == "monitor_overview_pane" { print "monitor_overview_pane=" overview; seen_overview=1; next }
@@ -2240,9 +2254,25 @@ _monitor_command() {  # _monitor_command <mode> <pane>
     "${STATE_DIR//\'/\'\\\'\'}" "${AI_MONITOR//\'/\'\\\'\'}" "$1" "${2//\'/\'\\\'\'}"
 }
 
+_popup_inner_geometry() {  # _popup_inner_geometry <width-percent> <height-percent>
+  local width_percent="$1" height_percent="$2" client_cols client_rows inner_cols inner_rows
+  client_cols="$(tmux display-message -p '#{client_width}' 2>/dev/null || true)"
+  client_rows="$(tmux display-message -p '#{client_height}' 2>/dev/null || true)"
+  case "$client_cols" in ''|*[!0-9]*) client_cols="$(tput cols 2>/dev/null || printf 120)" ;; esac
+  case "$client_rows" in ''|*[!0-9]*) client_rows="$(tput lines 2>/dev/null || printf 40)" ;; esac
+  case "$client_cols" in ''|*[!0-9]*) client_cols=120 ;; esac
+  case "$client_rows" in ''|*[!0-9]*) client_rows=40 ;; esac
+  inner_cols=$((client_cols * width_percent / 100 - 2))
+  inner_rows=$((client_rows * height_percent / 100 - 2))
+  [ "$inner_cols" -ge 40 ] || inner_cols=40
+  [ "$inner_rows" -ge 12 ] || inner_rows=12
+  printf '%s\t%s\n' "$inner_cols" "$inner_rows"
+}
+
 _launch_monitor() {  # _launch_monitor <target-pane> <watch-file>
   local pane="$1" wf="$2" cols rows requested width max_width ratio pos
   local detail_pane overview_pane compact_pane detail_cmd overview_cmd compact_cmd err
+  local popup_geometry popup_cols popup_rows
   [ -x "$AI_MONITOR" ] || { echo "monitor executable missing: $AI_MONITOR" >&2; return 1; }
   [ "$(opt @radar-ai-monitor on)" = on ] || { echo 'visible monitor is required for supervision' >&2; return 1; }
   cols="$(tmux display-message -p -t "$pane" '#{pane_width}' 2>/dev/null || true)"
@@ -2276,6 +2306,19 @@ _launch_monitor() {  # _launch_monitor <target-pane> <watch-file>
   esac
 
   if [ "$cols" -lt 120 ] || [ "$rows" -lt 24 ]; then
+    popup_geometry="$(_popup_inner_geometry 90 85)"
+    popup_cols="${popup_geometry%%$'\t'*}"
+    popup_rows="${popup_geometry#*$'\t'}"
+    if [ "${TMUX_RADAR_REUSE_POPUP:-0}" = 1 ]; then
+      _watch_pointer_set_monitors "$wf" popup popup
+      if [ "${TMUX_RADAR_TEST_MONITOR_ONCE:-0}" = 1 ]; then
+        TMUX_RADAR_MONITOR_COLS="$popup_cols" TMUX_RADAR_MONITOR_ROWS="$popup_rows" \
+          TMUX_RADAR_STATE_DIR="$STATE_DIR" exec bash "$AI_MONITOR" compact "$pane" --once
+      fi
+      TMUX_RADAR_MONITOR_COLS="$popup_cols" TMUX_RADAR_MONITOR_ROWS="$popup_rows" \
+        TMUX_RADAR_STATE_DIR="$STATE_DIR" exec bash "$AI_MONITOR" compact "$pane"
+    fi
+    compact_cmd="TMUX_RADAR_MONITOR_COLS=$popup_cols TMUX_RADAR_MONITOR_ROWS=$popup_rows $compact_cmd"
     tmux display-popup -E -w 90% -h 85% "$compact_cmd" >/dev/null 2>&1 || return 1
     _watch_pointer_set_monitors "$wf" popup popup
     tmux select-pane -t "$pane" >/dev/null 2>&1 || true
@@ -2398,7 +2441,7 @@ cmd_watch_setup() {
       *) printf 'Enter, a, or Esc only.\n' >&2 ;;
     esac
   done
-  cmd_watch "$pane" '' '' '' '' "$CONFIG_JSON"
+  TMUX_RADAR_REUSE_POPUP=1 cmd_watch "$pane" '' '' '' '' "$CONFIG_JSON"
   sleep "${TMUX_RADAR_SETUP_LAUNCH_PAUSE:-1.2}"
 }
 
@@ -2736,14 +2779,16 @@ cmd_cleanup() {
 # the plugin binding.
 # ---------------------------------------------------------------------------
 cmd_menu() {
-  local pop; pop="display-popup -E -w 80% -h 70%"
+  local pop monitor_pop
+  pop="display-popup -E -w 80% -h 70%"
+  monitor_pop="display-popup -E -w 90% -h 85%"
   tmux display-menu -T "#[align=centre] tmux AI 主管 " -x C -y C \
     "指挥 tmux（自然语言）"             a "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF ask\"" \
     "让当前 pane 继续 / 决定一次"        c "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF decide '#{pane_id}'\"" \
     "" \
-    "常驻监控当前 pane 直到完成"         w "$pop \"$SELF watch-setup '#{pane_id}' quick\"" \
-    "常驻监控 + always-allow（更省心）"  W "$pop \"$SELF watch-setup '#{pane_id}' quick always-allow\"" \
-    "自定义监控（目标 / 间隔 / 策略）…"   v "$pop \"$SELF watch-setup '#{pane_id}' advanced\"" \
+    "常驻监控当前 pane 直到完成"         w "$monitor_pop \"$SELF watch-setup '#{pane_id}' quick\"" \
+    "常驻监控 + always-allow（更省心）"  W "$monitor_pop \"$SELF watch-setup '#{pane_id}' quick always-allow\"" \
+    "自定义监控（目标 / 间隔 / 策略）…"   v "$monitor_pop \"$SELF watch-setup '#{pane_id}' advanced\"" \
     "" \
     "状态 / 最近决策"                   s "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF status\"" \
     "停止全部监控"                      S "run-shell \"$SELF stop all\"" \

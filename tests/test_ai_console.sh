@@ -38,6 +38,8 @@ case "$cmd" in
     ;;
   display-message)
     case "$*" in
+      *client_width*) printf '%s\n' 80 ;;
+      *client_height*) printf '%s\n' 24 ;;
       *pane_width*) printf '%s\n' "${TEST_PANE_WIDTH:-284}" ;;
       *pane_height*) printf '%s\n' "${TEST_PANE_HEIGHT:-54}" ;;
       *pane_id*) printf '%s\n' '%39' ;;
@@ -75,6 +77,8 @@ run_ai() {
     TEST_TMUX_SPLIT_COUNT="$TMP/split.count" \
     TEST_PANE_WIDTH="${TEST_PANE_WIDTH:-284}" \
     TEST_PANE_HEIGHT="${TEST_PANE_HEIGHT:-54}" \
+    TMUX_RADAR_REUSE_POPUP="${TMUX_RADAR_REUSE_POPUP:-0}" \
+    TMUX_RADAR_TEST_MONITOR_ONCE="${TMUX_RADAR_TEST_MONITOR_ONCE:-0}" \
     TMUX_RADAR_STATE_DIR="$TMP/state" \
     TMUX_RADAR_NEEDINPUT_FILE="$TMP/state/need-input" \
     bash "$ROOT/scripts/ai.sh" "$@"
@@ -223,6 +227,7 @@ test_menu_routes_w_to_quick_setup() {
   run_ai menu
   action="$(menu_action_for_key w)"
   assert_contains "$action" 'watch-setup' 'w uses shared setup flow'
+  assert_contains "$action" 'display-popup -E -w 90% -h 85%' 'w reserves a full supervision setup console'
   assert_contains "$action" "'#{pane_id}' quick" 'w selects quick mode'
   case "$action" in
     *always-allow*) _fail_assert 'w must not preset always-allow' 'actual' "$action" ;;
@@ -234,6 +239,7 @@ test_menu_routes_W_to_quick_setup_with_always_allow() {
   run_ai menu
   action="$(menu_action_for_key W)"
   assert_contains "$action" 'watch-setup' 'W uses shared setup flow'
+  assert_contains "$action" 'display-popup -E -w 90% -h 85%' 'W reserves a full supervision setup console'
   assert_contains "$action" "'#{pane_id}' quick always-allow" \
     'W selects quick mode with always-allow preset'
 }
@@ -243,6 +249,7 @@ test_menu_routes_v_to_advanced_setup() {
   run_ai menu
   action="$(menu_action_for_key v)"
   assert_contains "$action" 'watch-setup' 'v uses shared setup flow'
+  assert_contains "$action" 'display-popup -E -w 90% -h 85%' 'v reserves a full advanced setup console'
   assert_contains "$action" "'#{pane_id}' advanced" 'v selects advanced mode'
 }
 
@@ -354,6 +361,9 @@ test_wide_layout_uses_right_rail_with_25_75_split() {
   [ "$detail_line" -lt "$overview_line" ] || _fail_assert 'detail pane must be created before overview'
   assert_contains "$(cat "$wf")" 'monitor_overview_pane=%92' 'watch pointer stores overview pane'
   assert_contains "$(cat "$wf")" 'monitor_detail_pane=%91' 'watch pointer stores detail pane'
+  assert_file "$TMP/state/ai-runs/test-run/monitors"
+  assert_contains "$(cat "$TMP/state/ai-runs/test-run/monitors")" 'monitor_overview_pane=%92' 'run ownership stores overview pane'
+  assert_contains "$(cat "$TMP/state/ai-runs/test-run/monitors")" 'monitor_detail_pane=%91' 'run ownership stores detail pane'
 }
 
 test_medium_layout_uses_one_compact_right_console() {
@@ -372,12 +382,30 @@ test_narrow_layout_uses_popup_without_target_split() {
   TEST_PANE_WIDTH=100 TEST_PANE_HEIGHT=30 run_ai _launch-monitor %39 "$wf"
   calls="$(cat "$TMP/tmux.calls")"
   assert_contains "$calls" 'display-popup -E -w 90% -h 85%' 'narrow layout uses large popup'
+  assert_contains "$calls" 'TMUX_RADAR_MONITOR_COLS=70 TMUX_RADAR_MONITOR_ROWS=18' 'narrow popup receives its real inner geometry'
   assert_contains "$calls" "ai-monitor.sh' compact" 'narrow popup uses compact console'
   case "$calls" in *'split-window'*) _fail_assert 'narrow layout must not split target pane' ;; esac
 }
 
+test_narrow_setup_reuses_existing_popup_for_monitor() {
+  local calls output="$TMP/reused-popup.out" wf="$TMP/state/ai-watch/_39.watch"
+  seed_monitor_run; clear_layout_calls
+  TMUX_RADAR_REUSE_POPUP=1 TMUX_RADAR_TEST_MONITOR_ONCE=1 \
+    TEST_PANE_WIDTH=100 TEST_PANE_HEIGHT=30 run_ai _launch-monitor %39 "$wf" > "$output"
+  calls="$(cat "$TMP/tmux.calls")"
+  case "$calls" in *'display-popup'*) _fail_assert 'setup popup reuse must not request a nested popup' ;; esac
+  case "$calls" in *'split-window'*) _fail_assert 'setup popup reuse must not split target pane' ;; esac
+  assert_contains "$(cat "$wf")" 'monitor_overview_pane=popup' 'reused popup stores overview ownership'
+  assert_contains "$(cat "$wf")" 'monitor_detail_pane=popup' 'reused popup stores detail ownership'
+  assert_contains "$(cat "$output")" '监控到测试全绿' 'reused setup popup renders compact monitor'
+}
+
 count_clear_sequences() {
   LC_ALL=C grep -ao $'\033\[2J' "$1" 2>/dev/null | wc -l | tr -d ' '
+}
+
+strip_ansi() {
+  LC_ALL=C awk -v esc="$(printf '\033')" '{ gsub(esc "\\[[0-9;?]*[ -/]*[@-~]", ""); print }'
 }
 
 test_monitor_views_render_from_structured_run_without_refresh_loop() {
@@ -398,6 +426,42 @@ test_monitor_views_render_from_structured_run_without_refresh_loop() {
     assert_contains "$(cat "$output")" "$view" "detail renders $view tab"
     clears="$(count_clear_sequences "$output")"; [ "$clears" -le 1 ] || _fail_assert "$view clears more than once" 'actual' "$clears"
   done
+}
+
+test_compact_console_keeps_actions_readable_at_narrow_width() {
+  local output="$TMP/compact-narrow.out" plain="$TMP/compact-narrow.txt"
+  seed_monitor_run
+  TERM=xterm-256color COLUMNS=70 LINES=18 \
+    TMUX_RADAR_STATE_DIR="$TMP/state" PATH="$TMP/bin:$OLD_PATH" \
+    TEST_FAKE_TMUX="$TMP/bin/tmux" TEST_TMUX_CALLS="$TMP/tmux.calls" \
+    TEST_TMUX_SPLIT_COUNT="$TMP/split.count" \
+    bash "$ROOT/scripts/ai-monitor.sh" compact %39 --once > "$output"
+  strip_ansi < "$output" > "$plain"
+
+  assert_contains "$(cat "$plain")" 'Goal  监控到测试全绿' 'compact view keeps exact goal visible'
+  assert_contains "$(cat "$plain")" 'Next  native hook or stable-screen fallback' 'compact view explains what it is waiting for'
+  assert_contains "$(cat "$plain")" '[1] Timeline  [2] Decision  [3] Screen' 'compact view lists primary detail views'
+  assert_contains "$(cat "$plain")" '[4] Config    [5] Logs' 'compact view lists configuration and logs'
+  assert_contains "$(cat "$plain")" '[p] Pause/resume  [r] Reassess now  [k] Keep open' 'compact view lists run controls without truncation'
+  assert_contains "$(cat "$plain")" '[Enter] Target pane  [q] Stop supervision' 'compact view lists navigation and stop controls'
+  case "$(cat "$plain")" in
+    *'Enter t…'*) _fail_assert 'compact controls were clipped before visible width' ;;
+  esac
+}
+
+test_compact_console_renders_requested_detail_view() {
+  local output="$TMP/compact-config.out" plain="$TMP/compact-config.txt"
+  seed_monitor_run
+  TERM=xterm-256color COLUMNS=70 LINES=30 \
+    TMUX_RADAR_STATE_DIR="$TMP/state" PATH="$TMP/bin:$OLD_PATH" \
+    TEST_FAKE_TMUX="$TMP/bin/tmux" TEST_TMUX_CALLS="$TMP/tmux.calls" \
+    TEST_TMUX_SPLIT_COUNT="$TMP/split.count" \
+    bash "$ROOT/scripts/ai-monitor.sh" compact %39 Config --once > "$output"
+  strip_ansi < "$output" > "$plain"
+
+  assert_contains "$(cat "$plain")" 'View  Config' 'compact console names the selected detail view'
+  assert_contains "$(cat "$plain")" 'Effective configuration' 'compact console renders selected configuration details'
+  assert_contains "$(cat "$plain")" 'Authority' 'compact configuration keeps grouped detail available'
 }
 
 test_pause_resume_controls_persist_and_signal() {
@@ -455,7 +519,10 @@ run_test 'immutable config reaches run config and per-run runtime' test_config_r
 run_test 'wide layout creates right-side 25/75 console' test_wide_layout_uses_right_rail_with_25_75_split
 run_test 'medium layout creates compact right console' test_medium_layout_uses_one_compact_right_console
 run_test 'narrow layout uses popup console' test_narrow_layout_uses_popup_without_target_split
+run_test 'narrow setup reuses its popup for monitor' test_narrow_setup_reuses_existing_popup_for_monitor
 run_test 'monitor views derive from structured state without repeated clears' test_monitor_views_render_from_structured_run_without_refresh_loop
+run_test 'compact console keeps actions readable at narrow width' test_compact_console_keeps_actions_readable_at_narrow_width
+run_test 'compact console renders requested detail view' test_compact_console_renders_requested_detail_view
 run_test 'pause and resume controls persist and signal' test_pause_resume_controls_persist_and_signal
 run_test 'completion overview shows summary countdown and keep control' test_completion_overview_shows_summary_countdown_and_keep_control
 

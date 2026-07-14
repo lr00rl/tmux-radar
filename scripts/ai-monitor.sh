@@ -27,7 +27,17 @@ json_value() { jq -r --arg key "$2" '.values[$key].value // "-"' "$1" 2>/dev/nul
 json_source() { jq -r --arg key "$2" '.values[$key].source // "-"' "$1" 2>/dev/null || printf '-'; }
 clip() {
   local width="$1"
-  awk -v width="$width" '{ gsub(/\t/, "  "); if (length($0) > width) print substr($0,1,width-1) "…"; else print }'
+  awk -v width="$width" -v esc="$(printf '\033')" '
+    {
+      gsub(/\t/, "  ")
+      line=$0
+      plain=line
+      csi=esc "\\[[0-9;?]*[ -/]*[@-~]"
+      gsub(csi, "", plain)
+      if (length(plain) <= width) { print line; next }
+      if (width <= 1) { print "…"; next }
+      print substr(plain, 1, width - 1) "…"
+    }'
 }
 
 open_run() {
@@ -116,27 +126,31 @@ overview_rows() {
   printf '%sControls%s  p pause/resume · r reassess · k keep · c config · Enter target · q stop\n' "$DIM" "$RESET"
 }
 
-draw_fixed_rows() {
-  local previous="$1" current="$2" cols="$3" count row old new
+draw_rows_at() {
+  local previous="$1" current="$2" cols="$3" start="$4" count row terminal_row old new rendered
   count="$(wc -l < "$current" | tr -d ' ')"; row=1
   while [ "$row" -le "$count" ]; do
     old="$(sed -n "${row}p" "$previous" 2>/dev/null || true)"
     new="$(sed -n "${row}p" "$current" 2>/dev/null || true)"
     if [ "$new" != "$old" ]; then
-      printf '\033[%s;1H\033[2K' "$row"
-      printf '%s\n' "$new" | clip "$cols"
+      terminal_row=$((start + row - 1))
+      printf '\033[%s;1H\033[2K' "$terminal_row"
+      rendered="$(printf '%s\n' "$new" | clip "$cols")"
+      printf '%s' "$rendered"
     fi
     row=$((row + 1))
   done
   cp "$current" "$previous"
 }
 
+draw_fixed_rows() { draw_rows_at "$1" "$2" "$3" 1; }
+
 overview_loop() {
   local once="$1" previous current cols last_cols=0
   previous="$(mktemp "${TMPDIR:-/tmp}/radar-overview.prev.XXXXXX")" || exit 1
   current="$(mktemp "${TMPDIR:-/tmp}/radar-overview.cur.XXXXXX")" || exit 1
   : > "$previous"
-  trap 'rm -f "$previous" "$current"; printf "\033[?25h"; [ "$STOP_ON_EXIT" -eq 0 ] || "$AI" stop "$PANE" >/dev/null 2>&1 || true' EXIT TERM INT HUP
+  trap 'rm -f "${previous:-}" "${current:-}"; printf "\033[?25h"; [ "$STOP_ON_EXIT" -eq 0 ] || "$AI" stop "$PANE" >/dev/null 2>&1 || true' EXIT TERM INT HUP
   printf '\033[?25l'
   while [ -r "$WATCH_FILE" ]; do
     cols="$(tput cols 2>/dev/null || printf 100)"; case "$cols" in ''|*[!0-9]*) cols=100 ;; esac
@@ -261,7 +275,13 @@ handle_key() {
       "$AI" stop "$PANE" >/dev/null 2>&1 || true
       return 10
       ;;
-    '') tmux select-pane -t "$PANE" >/dev/null 2>&1 || true ;;
+    '')
+      if [ "${COMPACT_POPUP:-0}" -eq 1 ]; then
+        STOP_ON_EXIT=0
+        return 11
+      fi
+      tmux select-pane -t "$PANE" >/dev/null 2>&1 || true
+      ;;
   esac
   return 0
 }
@@ -284,34 +304,164 @@ detail_loop() {
     fi
     [ "$once" -eq 1 ] && { STOP_ON_EXIT=0; break; }
     key=""
-    IFS= read -rsn1 -t 1 key </dev/tty 2>/dev/null || true
-    if [ "$key" = $'\033' ]; then IFS= read -rsn2 -t 0.02 _rest </dev/tty 2>/dev/null || true; continue; fi
-    handle_key "$key" || break
+    if IFS= read -rsn1 -t 1 key </dev/tty 2>/dev/null; then
+      if [ "$key" = $'\033' ]; then IFS= read -rsn2 -t 0.02 _rest </dev/tty 2>/dev/null || true; continue; fi
+      handle_key "$key" || break
+    fi
+  done
+}
+
+compact_goal_rows() {
+  local goal="$1" width="$2"
+  awk -v width="$width" '
+    {
+      gsub(/\t/, "  ")
+      text=text (text == "" ? "" : " / ") $0
+    }
+    END {
+      if (width < 8) width=8
+      if (length(text) <= width) { print text; print ""; exit }
+      split_at=width
+      while (split_at > 1 && substr(text, split_at, 1) != " ") split_at--
+      if (split_at <= 1) split_at=width
+      first=substr(text, 1, split_at)
+      rest=substr(text, split_at + 1)
+      sub(/^ +/, "", rest)
+      if (length(rest) > width) rest=substr(rest, 1, width - 1) "…"
+      print first
+      print rest
+    }' <<EOF
+$goal
+EOF
+}
+
+compact_rows() {
+  local cols="$1" state="$RUN_DIR/state.json" config="$RUN_DIR/config.json"
+  local phase status goal calls max_calls retry poll policy autonomy model effort logging retention
+  local event source queued elapsed started next_kind next_at color goal_width goal_first goal_second
+  phase="$(jq -r '.phase // "CREATED"' "$state")"
+  status="$(jq -r '.status // "starting"' "$state")"
+  goal="$(jq -r '.goal // "-"' "$state")"
+  calls="$(jq -r '.calls // 0' "$state")"; max_calls="$(jq -r '.max_calls // 0' "$state")"
+  retry="$(jq -r '.retry // 0' "$state")"; poll="$(jq -r '.poll // 0' "$state")"
+  case "$poll" in ''|*[!0-9.]*) ;; *) poll="$(awk -v value="$poll" 'BEGIN { printf "%g", value }')" ;; esac
+  policy="$(jq -r '.policy // "safe-auto"' "$state")"; autonomy="$(jq -r '.autonomy // "auto-safe"' "$state")"
+  next_kind="$(jq -r '.next.kind // "event"' "$state")"; next_at="$(jq -r '.next.at // 0' "$state")"
+  model="$(json_value "$config" model)"; effort="$(json_value "$config" effort)"
+  logging="$(json_value "$config" logging)"; retention="$(json_value "$config" retention_days)"
+  event="$(jq -r 'select(.record == "incoming") | .kind' "$RUN_DIR/events.jsonl" 2>/dev/null | tail -n 1)"
+  source="$(jq -r 'select(.record == "incoming") | .source' "$RUN_DIR/events.jsonl" 2>/dev/null | tail -n 1)"
+  queued="$(find "$RUN_DIR/inbox" -maxdepth 1 -name '*.ready' -type f 2>/dev/null | wc -l | tr -d ' ')"
+  started="$(field "$WATCH_FILE" started)"; case "$started" in ''|*[!0-9]*) started="$(date '+%s')" ;; esac
+  elapsed=$(( $(date '+%s') - started )); [ "$elapsed" -lt 0 ] && elapsed=0
+  color="$(phase_color "$phase")"
+  goal_width=$((cols - 6)); [ "$goal_width" -lt 8 ] && goal_width=8
+  goal_first="$(compact_goal_rows "$goal" "$goal_width" | sed -n '1p')"
+  goal_second="$(compact_goal_rows "$goal" "$goal_width" | sed -n '2p')"
+
+  printf '%s%s tmux-radar supervisor%s  %s%s%s · elapsed %ss\n' "$BOLD" "$CYAN" "$RESET" "$color" "$phase" "$RESET" "$elapsed"
+  printf '%sGoal%s  %s\n' "$BOLD" "$RESET" "$goal_first"
+  printf '      %s\n' "$goal_second"
+  printf '%sNow%s   %s\n' "$BOLD" "$RESET" "$status"
+  printf '%sNext%s  %s\n' "$BOLD" "$RESET" "$(next_label "$phase" "$next_kind" "$next_at")"
+  printf '%sProgress%s  decisions %s/%s · retry %s · queue %s\n' "$BOLD" "$RESET" "$calls" "$max_calls" "$retry" "$queued"
+  printf '%sEvent%s  %s · source %s\n' "$BOLD" "$RESET" "${event:-none}" "${source:-none}"
+  printf '%sPolicy%s  %s · %s · hooks-first · poll %ss\n' "$BOLD" "$RESET" "$policy" "$autonomy" "$poll"
+  printf '%sBrain%s  %s · effort %s · logs %s/%sd\n' "$BOLD" "$RESET" "$model" "$effort" "$logging" "$retention"
+}
+
+compact_is_popup() {
+  [ "$(field "$RUN_DIR/monitors" monitor_detail_pane)" = popup ]
+}
+
+compact_control_rows() {
+  local target_label='Target pane'
+  [ "${COMPACT_POPUP:-0}" -eq 0 ] || target_label='Hide monitor (run continues)'
+  printf '%sView%s  %s · [u]/[d] scroll detail\n' "$BOLD" "$RESET" "$DETAIL_VIEW"
+  printf '[1] Timeline  [2] Decision  [3] Screen\n'
+  printf '[4] Config    [5] Logs\n'
+  printf '[p] Pause/resume  [r] Reassess now  [k] Keep open\n'
+  printf '[Enter] %s  [q] Stop supervision\n' "$target_label"
+}
+
+compact_render_body() {
+  local output="$1" start="$2" end="$3" cols="$4" body_rows total start_line row line rendered
+  render_view "$DETAIL_VIEW" > "$output"
+  total="$(wc -l < "$output" | tr -d ' ')"
+  body_rows=$((end - start + 1)); [ "$body_rows" -gt 0 ] || return 0
+  if [ "${COMPACT_FOLLOW:-0}" -eq 1 ]; then
+    start_line=$((total - body_rows + 1)); [ "$start_line" -gt 0 ] || start_line=1
+  else
+    start_line=$((COMPACT_OFFSET + 1))
+    [ "$start_line" -le "$total" ] || start_line=$((total > 0 ? total : 1))
+  fi
+  COMPACT_OFFSET=$((start_line - 1))
+  row=0
+  while [ "$row" -lt "$body_rows" ]; do
+    line="$(sed -n "$((start_line + row))p" "$output" 2>/dev/null || true)"
+    printf '\033[%s;1H\033[2K' "$((start + row))"
+    if [ -n "$line" ]; then
+      rendered="$(printf '%s\n' "$line" | clip "$cols")"
+      printf '%s' "$rendered"
+    fi
+    row=$((row + 1))
   done
 }
 
 compact_loop() {
-  local once="$1" previous current cols last_cols=0 count=0 last_count=0 key rows
-  previous="$(mktemp "${TMPDIR:-/tmp}/radar-compact.prev.XXXXXX")" || exit 1
-  current="$(mktemp "${TMPDIR:-/tmp}/radar-compact.cur.XXXXXX")" || exit 1
-  : > "$previous"
-  DETAIL_VIEW=Timeline; DETAIL_REDRAW=0
-  trap 'rm -f "$previous" "$current"; printf "\033[r\033[?25h"; [ "$STOP_ON_EXIT" -eq 0 ] || "$AI" stop "$PANE" >/dev/null 2>&1 || true' EXIT TERM INT HUP
+  local once="$1" initial_view="${2:-Timeline}" cols last_cols=0 count=0 last_count=0 key rows
+  local body_start=10 body_end control_start body_rows old_view
+  COMPACT_PREVIOUS="$(mktemp "${TMPDIR:-/tmp}/radar-compact.prev.XXXXXX")" || exit 1
+  COMPACT_CURRENT="$(mktemp "${TMPDIR:-/tmp}/radar-compact.cur.XXXXXX")" || exit 1
+  COMPACT_PREVIOUS_CONTROLS="$(mktemp "${TMPDIR:-/tmp}/radar-compact-controls.prev.XXXXXX")" || exit 1
+  COMPACT_CONTROLS="$(mktemp "${TMPDIR:-/tmp}/radar-compact-controls.cur.XXXXXX")" || exit 1
+  COMPACT_BODY="$(mktemp "${TMPDIR:-/tmp}/radar-compact-body.XXXXXX")" || exit 1
+  : > "$COMPACT_PREVIOUS"; : > "$COMPACT_PREVIOUS_CONTROLS"
+  DETAIL_VIEW="$initial_view"; DETAIL_REDRAW=1; COMPACT_OFFSET=0; COMPACT_FOLLOW=0; COMPACT_POPUP=0
+  compact_is_popup && COMPACT_POPUP=1
+  [ "$DETAIL_VIEW" != Timeline ] || COMPACT_FOLLOW=1
+  trap 'rm -f "${COMPACT_PREVIOUS:-}" "${COMPACT_CURRENT:-}" "${COMPACT_PREVIOUS_CONTROLS:-}" "${COMPACT_CONTROLS:-}" "${COMPACT_BODY:-}"; printf "\033[r\033[?25h"; [ "$STOP_ON_EXIT" -eq 0 ] || "$AI" stop "$PANE" >/dev/null 2>&1 || true' EXIT TERM INT HUP
   printf '\033[?25l'
   while [ -r "$WATCH_FILE" ]; do
-    cols="$(tput cols 2>/dev/null || printf 80)"; rows="$(tput lines 2>/dev/null || printf 30)"
+    cols="${TMUX_RADAR_MONITOR_COLS:-$(tput cols 2>/dev/null || printf 80)}"
+    rows="${TMUX_RADAR_MONITOR_ROWS:-$(tput lines 2>/dev/null || printf 30)}"
     case "$cols" in ''|*[!0-9]*) cols=80 ;; esac; case "$rows" in ''|*[!0-9]*) rows=30 ;; esac
+    control_start=$((rows - 4)); [ "$control_start" -gt "$body_start" ] || control_start=$((body_start + 1))
+    body_end=$((control_start - 1)); body_rows=$((body_end - body_start + 1))
     if [ "$cols" -ne "$last_cols" ]; then
-      printf '\033[r\033[H\033[2J\033[12;%sr\033[12;1H' "$rows"
-      : > "$previous"; last_cols="$cols"; last_count=0
+      printf '\033[r\033[H\033[2J'
+      : > "$COMPACT_PREVIOUS"; : > "$COMPACT_PREVIOUS_CONTROLS"
+      last_cols="$cols"; last_count=0; DETAIL_REDRAW=1
     fi
-    overview_rows > "$current" || break
-    draw_fixed_rows "$previous" "$current" "$cols"
+    compact_rows "$cols" > "$COMPACT_CURRENT" || break
+    draw_rows_at "$COMPACT_PREVIOUS" "$COMPACT_CURRENT" "$cols" 1
+    compact_control_rows > "$COMPACT_CONTROLS"
+    draw_rows_at "$COMPACT_PREVIOUS_CONTROLS" "$COMPACT_CONTROLS" "$cols" "$control_start"
     count="$(wc -l < "$RUN_DIR/events.jsonl" | tr -d ' ')"
-    if [ "$count" -gt "$last_count" ]; then printf '\033[%s;1H' "$rows"; timeline_render "$((last_count + 1))"; last_count="$count"; fi
+    if [ "$DETAIL_REDRAW" -eq 1 ] || { [ "$DETAIL_VIEW" = Timeline ] && [ "$count" -gt "$last_count" ]; }; then
+      compact_render_body "$COMPACT_BODY" "$body_start" "$body_end" "$cols"
+      last_count="$count"; DETAIL_REDRAW=0
+    fi
     [ "$once" -eq 1 ] && { STOP_ON_EXIT=0; break; }
-    key=""; IFS= read -rsn1 -t 1 key </dev/tty 2>/dev/null || true
-    handle_key "$key" || break
+    key=""
+    if IFS= read -rsn1 -t 1 key </dev/tty 2>/dev/null; then
+      old_view="$DETAIL_VIEW"
+      case "$key" in
+        u)
+          COMPACT_FOLLOW=0; COMPACT_OFFSET=$((COMPACT_OFFSET - body_rows))
+          [ "$COMPACT_OFFSET" -ge 0 ] || COMPACT_OFFSET=0
+          DETAIL_REDRAW=1
+          ;;
+        d)
+          COMPACT_FOLLOW=0; COMPACT_OFFSET=$((COMPACT_OFFSET + body_rows)); DETAIL_REDRAW=1
+          ;;
+        *) handle_key "$key" || break ;;
+      esac
+      if [ "$DETAIL_VIEW" != "$old_view" ]; then
+        COMPACT_OFFSET=0; COMPACT_FOLLOW=0
+        [ "$DETAIL_VIEW" != Timeline ] || COMPACT_FOLLOW=1
+      fi
+    fi
   done
 }
 
@@ -326,6 +476,6 @@ for arg in "$@"; do case "$arg" in --once) once=1 ;; Timeline|Decision|Screen|Co
 case "$mode" in
   overview) overview_loop "$once" ;;
   detail) detail_loop "$once" "$view" ;;
-  compact) compact_loop "$once" ;;
+  compact) compact_loop "$once" "$view" ;;
   *) usage ;;
 esac

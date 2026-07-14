@@ -56,7 +56,7 @@ long-running agents.
 
 - tmux ≥ 3.2 (uses `display-popup`)
 - [`fzf`](https://github.com/junegunn/fzf)
-- `jq` (only for the optional Claude/Codex hook installer)
+- `jq` (AI-status hook installation and the optional supervisor runtime)
 
 ## Install (TPM)
 
@@ -120,7 +120,7 @@ Set these **before** the plugin loads:
 | `@radar-claude-bg-ignore` | `~/.claude:~/.claude-mem` | Colon-separated path prefixes; background sessions whose cwd starts with one (plugin observers, SDK helpers) are not tracked. |
 | `@radar-ai` | `off` | Enable the **AI supervisor** (`prefix + A` menu). Needs the `codex` CLI + `jq`. |
 | `@radar-ai-key` | `A` | Prefix key that opens the AI supervisor menu (capital `A` so a stray `prefix + a` can't trigger it). |
-| `@radar-ai-model` | `gpt-5.3-codex-spark` | Codex model slug the supervisor uses (`-spark` is the fast tier; pair with `effort minimal/low` for the fastest decisions). |
+| `@radar-ai-model` | `gpt-5.6-luna` | Codex model slug used by the supervisor's read-only decision calls. |
 | `@radar-ai-effort` | `low` | Reasoning effort per decision (`minimal`/`low`/`medium`/`high`/`xhigh`). |
 | `@radar-ai-profile` | *(none)* | Use a [codex config profile](https://github.com/openai/codex) (`codex exec -p <profile>`) instead of the model/effort options — bundle model, effort, etc. in `~/.codex/config.toml`. Safety flags (read-only, ephemeral) still apply. |
 | `@radar-ai-cmd` | *(none)* | Replace Codex entirely: any shell command that reads the prompt on **stdin** and prints the decision **JSON** on stdout (another CLI, a local model, …). |
@@ -128,17 +128,26 @@ Set these **before** the plugin loads:
 | `@radar-ai-prompt-dir` | *(none)* | Directory that **shadows** `scripts/prompts/` per file (`decide.md`, `control.md`, `*.schema.json`) — customize the default prompts without editing the plugin. |
 | `@radar-ai-autonomy` | `confirm` | One-shot `ask`/`decide`: `suggest` (print only), `confirm` (ask first), `auto`. |
 | `@radar-ai-watch-autonomy` | `auto-safe` | Resident `watch`: `auto-safe` (auto-send only safe replies, escalate the rest), `suggest`, `auto`. |
+| `@radar-ai-approval-policy` | `safe-auto` | Per-watch approval policy inherited by quick setup; `W` presets `always-allow`. |
+| `@radar-ai-hooks-first` | `on` | Let native Claude/Codex lifecycle hooks wake the watcher immediately. `off` keeps only manual and stable-screen fallback triggers. |
 | `@radar-ai-poll` | `5` | Idle-listen interval while watching a pane. The next interval starts after a model decision/action returns, so slow decisions do not overlap. |
+| `@radar-ai-stable-screen-threshold` | `1` | Consecutive unchanged idle samples required before the fallback asks the model. |
 | `@radar-ai-max-calls` | `40` | Cost cap: a watcher pauses after this many model calls. |
 | `@radar-ai-timeout` | `120` | Hard limit in seconds for one model call (minimum `5`). A timed-out Codex wrapper and all of its children are terminated as one process group. |
+| `@radar-ai-retry-limit` | `3` | Maximum retries after invalid JSON, backend failure, or timeout. |
+| `@radar-ai-retry-backoff` | `15` | Initial retry delay; production retries use 15/30/60 seconds by default. |
 | `@radar-ai-capture-lines` | `120` | Pane lines fed to the model per decision. |
 | `@radar-ai-watch-always-allow` | `off` | While watching, prefer the TUI's "don't ask again / always allow" option for **safe** actions (fewer interruptions, lower safety). Menu entry `W` enables it per-watch. |
 | `@radar-ai-monitor` | `on` | Open companion monitor pane(s) next to a watched pane, showing live countdown/status plus the supervisor's timeline/details (self-closes when the watch ends). |
-| `@radar-ai-monitor-pos` | `top` | Where the monitor pane opens: `top`, `bottom`, or `right`. |
-| `@radar-ai-monitor-size` | `12` | Monitor pane height in lines (`top`/`bottom`). |
-| `@radar-ai-monitor-size-h` | `60` | Monitor pane width in columns (`right`). |
-| `@radar-ai-monitor-layout` | `split` | `split` opens timeline + detail as two monitor panes; `single` keeps one combined pane. |
+| `@radar-ai-monitor-pos` | `right` | Preferred monitor position. Explicit legacy `top`/`bottom` values remain supported with a compact console. |
+| `@radar-ai-monitor-size` | `12` | Compact monitor height when `monitor-pos` is explicitly `top` or `bottom`. |
+| `@radar-ai-monitor-size-h` | `84` | Requested right-console width, responsively clamped to preserve the target pane. |
+| `@radar-ai-overview-ratio` | `25` | Percentage of a wide right console reserved for the fixed overview. |
 | `@radar-ai-monitor-excerpt-lines` | `16` | Pane-capture lines shown in the monitor detail view. The model still receives `@radar-ai-capture-lines`; this only keeps the UI readable. |
+| `@radar-ai-completion-close-delay` | `12` | Seconds to keep the final summary visible. Press `k` to keep it open or `q` to close now. |
+| `@radar-ai-logging` | `decision` | `decision` stores structured decisions/metadata/stderr; `full` also stores exact prompts and pane captures. |
+| `@radar-ai-screen-snapshots` | `off` | Persist per-call pane captures without enabling full prompt logging. These files may contain sensitive text. |
+| `@radar-ai-retention-days` | `7` | Retain inactive structured run directories for this many days. Live runs are never removed. |
 
 Legacy `@switcher-*` options are still honored as fallbacks, but new
 configuration should use `@radar-*`.
@@ -190,12 +199,13 @@ the hooks once:
 ```
 
 It edits `~/.claude/settings.json` (3 hooks: `Notification` + `Stop` mark the
-pane, `UserPromptSubmit` clears it) and `~/.codex/config.toml` (Codex native
-hooks: `PermissionRequest` marks approval prompts, `Stop` marks a finished turn,
-`UserPromptSubmit` clears old marks; legacy `notify` is still wrapped as a
-turn-ended fallback). Existing Codex notify chains are **wrapped** (preserved),
-not replaced. Restart Claude/Codex sessions afterward, then review/trust the new
-Codex hooks with `/hooks` if Codex prompts for hook trust.
+pane, `UserPromptSubmit` clears it) and merges native Codex command handlers into
+`~/.codex/hooks.json`: `PermissionRequest` marks approval prompts, `Stop` marks a
+finished turn, and `UserPromptSubmit` clears old marks. The managed block in
+`~/.codex/config.toml` contains only matching trust state plus the wrapped legacy
+`notify` turn-ended fallback. Existing OMX/user hook groups, handlers, trust
+entries, and notify chains are preserved. Restart Claude/Codex sessions after an
+install, then review `/hooks` if Codex asks you to trust the handlers.
 
 > `SessionEnd` is intentionally **not** hooked: it fires the instant a session
 > ends — right after `Stop` for short-lived / print-mode / background runs — so
@@ -254,62 +264,88 @@ CLI, logged in, plus `jq`). Then `prefix + A` opens a menu:
 |-----|-------|--------------|
 | `a` | **指挥 tmux（自然语言）** | Type a request ("split this window into build/test/lint"); Codex proposes a batch of tmux commands, you confirm, they run. |
 | `c` | **让当前 pane 继续 / 决定一次** | Reads the current pane (a Claude Code / Codex TUI waiting on you), figures out the right answer, and — after you confirm — sends the keystrokes. |
-| `w` | **常驻监控当前 pane 直到完成** | Starts a resident watcher: whenever the pane blocks on a prompt, the AI auto-answers the **safe** ones and keeps it moving until the task is done. |
-| `W` | **常驻监控 + always-allow** | Same, but for safe approvals the AI prefers the TUI's "don't ask again" option — fewer interruptions, lower safety. |
-| `v` | **自定义监控…** | Interactive setup for a watch: a **goal** for the AI to push toward, a **poll interval**, and a per-watch **approval policy** (safe-auto / always-allow / suggest-only). |
+| `w` | **常驻监控当前 pane 直到完成** | Opens the quick goal field, then a complete launch summary. Safe blocked prompts are handled until that exact goal is done. |
+| `W` | **常驻监控 + always-allow** | The same goal-first flow with always-allow preset for safe repeated approvals. |
+| `v` | **自定义监控…** | Opens the same flow in advanced mode, exposing every authority, trigger, brain, budget, context, console, and logging field with provenance. |
 | `s` / `S` / `l` | **状态 / 停止全部 / 列出 AI pane** | Manage watchers, read the recent decision log, and see which panes are running AI tools (detected via the process tree — reliable even though Claude Code's foreground binary is a bare version number). |
 
-Free-text prompts (the `a` request, the `v` goal) use **readline**, so CJK
-input edits by character — one backspace deletes one 中文 char — and the usual
-`←`/`→`/`Ctrl-W` editing keys work.
+`w`, `W`, and `v` are one setup flow, not three watcher implementations. `w`
+opens a readline-backed UTF-8 goal field; `W` does the same with always-allow
+preselected; `v` starts in advanced settings. `Tab` from the quick goal opens
+advanced settings, and a blank goal becomes the explicit
+`推进当前任务直到完成`. Before launch, the summary shows the exact goal and every
+effective field. Advanced rows include `[default]`, `[tmux]`, `[custom]`, or
+`[runtime]` provenance so inherited settings are not hidden. Readline edits CJK
+by character and supports the usual `←`/`→`/`Ctrl-W` keys.
 
-While a watcher runs, companion monitor pane(s) open next to the watched pane
-(top by default; `@radar-ai-monitor-pos`). The default `split` layout makes
-the monitor region two panes: **timeline** on the left (polls, quiet/marked
-state, decisions, pauses, completion) and **detail** on the right (countdown,
-backend/model command, parsed action, raw decision JSON, backend stderr, a
-short tail of the pane excerpt sent to the model, and the recent execution
-feed). The monitor keeps a fixed status bar at the top and appends new history
-below it instead of repainting the full pane, so tmux copy-mode / scrollback can
-review older events without fighting a one-second refresh. Only the pane excerpt
-is shortened in the detail view; model context still uses
-`@radar-ai-capture-lines`. It self-closes when the watch ends. Set
-`@radar-ai-monitor-layout 'single'` to keep one combined detail pane. The
-monitor is also the watch's visible owner: pressing **Ctrl-C** in either
-monitor pane, closing it, or closing the target pane stops the watcher and its
-in-flight model process group immediately. A model call is additionally capped
-by `@radar-ai-timeout`, so a wedged CLI/API request cannot survive invisibly.
-The **`W`** menu entry starts a watch with
-**always-allow**: for safe approvals the AI prefers the TUI's "don't ask again"
-so the agent runs with fewer interruptions (convenience over per-action vetting;
-off by default).
+The visible console adapts without hiding supervision:
 
-**Design — Codex is a read-only brain; the script is the only actor.** For every
-decision the plugin captures the pane, hands the text to `codex exec -s
-read-only --ephemeral` with a JSON `--output-schema`, and gets back a structured
-decision (`send` / `wait` / `done` / `escalate` + the exact keys). The **script**
-then sends the keystrokes, gated by three safeguards:
+| Target size | Console |
+|-------------|---------|
+| ≥180 columns | Right rail, clamped to 72–112 columns; fixed overview in the top 25%, detail in the lower 75%. |
+| 120–179 columns | One compact right-side console, normally 38% wide. |
+| <120 columns or <24 rows | 90% × 85% popup; the target pane is not split. |
 
-- **Autonomy** — `ask`/`decide` default to `confirm` (show the plan, ask first);
-  the resident `watch` uses `auto-safe` (auto-send only decisions the model
-  marked safe).
-- **Escalation** — anything destructive, irreversible, or ambiguous (rm, force
-  push, deleting data, credentials, deploys, or "I'm not sure") is **never**
-  auto-sent; it re-marks the pane needs-input and pauses so you decide.
-- **Audit + caps** — every action is appended to `~/.local/state/tmux/ai.log`;
-  a watcher pauses after `@radar-ai-max-calls` calls, and each call has a hard
-  `@radar-ai-timeout`. Every call runs in its own process group, so stopping the
-  watch also terminates CLI wrappers, native Codex children, and MCP children.
+If no monitor can be created, the watch is aborted. On wide layouts the detail
+pane is created first and the overview above it, then focus returns to the
+target. The overview repaints only changed rows. Timeline updates append, so a
+one-second countdown does not clear detail scrollback or move tmux copy-mode.
+The compact console keeps Goal, current phase, next trigger, policy, and brain
+fixed above a paged detail region; every available key remains visible in a
+fixed footer instead of being clipped into an ellipsis.
 
-The "skill" the model follows lives in `scripts/prompts/*.md`: how to read each
-TUI's prompts, which menu option is the safe "Yes", and the safety rules.
-Customize without touching the plugin: `@radar-ai-prompt-dir` shadows any
-prompt file with your own copy, and `@radar-ai-rules` (or
-`~/.config/tmux-radar/rules.md`) appends **your** approve/escalate rules to
-every decision with top priority. A watch's **goal** is also injected, so
-"监控到测试全绿" actually steers the decisions. Watchers only consult the model
-when a pane goes **quiet** (screen unchanged) or is already flagged needs-input,
-so an actively-working agent doesn't burn model calls.
+| Key | Console action |
+|-----|----------------|
+| `1`…`5` | Timeline, Decision, Screen, Config, or Logs |
+| `p` | Pause/resume supervision |
+| `r` | Request one fresh assessment |
+| `k` | Keep a completed summary open past auto-close |
+| `c` | Open the complete effective configuration view |
+| `u` / `d` | Page through the selected detail view in the compact console |
+| `Enter` | Return focus to the target from a split console; hide a narrow popup while supervision continues |
+| `q` | Stop the watch and close the console |
+
+`Timeline` is the append-only lifecycle feed. `Decision` shows structured model
+output, observable evidence, risk, exact text/keys, backend metadata, and policy
+result, not private chain-of-thought. `Screen` shows a short live tail while the
+configured capture can remain larger. `Config` lists all fields and provenance.
+`Logs` shows the run directory, available artifacts, recent backend stderr, and
+errors. In popup mode the launcher passes the popup's real inner dimensions to
+the renderer; terminal-reported outer client dimensions never overwrite the
+detail or control regions. `w`, `W`, and `v` reuse their setup popup for the
+monitor because tmux cannot reliably nest one `display-popup` inside another.
+
+Native lifecycle hooks are the primary trigger. Approval/input events request a
+decision immediately; turn-complete asks whether the exact goal is done;
+UserPromptSubmit cancels stale queued approvals and resets idle timing. A stable
+screen is only the fallback when a hook is absent or unsupported. The `poll`
+interval begins after the current decision/action/verification finishes. One
+watch owns at most one model process tree, so a slow call cannot create another
+call every five seconds; arrivals are durably queued and coalesced first.
+
+**Codex is a read-only brain; the script is the only actor.** Each call uses
+`codex exec -s read-only --ephemeral` plus a JSON output schema. The script then
+checks local types, policy, safety, current event ID, and the target screen
+fingerprint before sending exact keys. Destructive, irreversible, production,
+credential, remote-write, or ambiguous actions escalate regardless of
+always-allow. Invalid output and backend failures retry with bounded backoff;
+timeouts and all stop paths terminate the complete wrapper/Codex/MCP process
+group.
+
+Every run is stored under `~/.local/state/tmux/ai-runs/<run-id>/`. Default
+`decision` logging persists config, state, events, structured decisions,
+metadata, and backend stderr, but not pane captures or prompts. `full` adds exact
+screen and prompt files, which may contain source code, paths, commands, or
+secrets. All run files are user-only. The global `ai.log` remains a compact
+cross-run index; `ai.sh report latest` prints the final duration, reason, goal,
+counts, and log location.
+
+On goal completion the DONE notification is emitted and the final monitor stays
+visible for 12 seconds by default. Press `k` to retain it or `q` to close it.
+Closing the target, closing the visible monitor owner, pressing Ctrl-C, or
+stopping the watch also terminates every owned model process. Prompt behavior is
+customizable through `@radar-ai-prompt-dir` and `@radar-ai-rules` without editing
+the plugin.
 
 ### CLI reference
 
@@ -321,7 +357,13 @@ ai.sh decide [pane] [autonomy] [policy] [goal]
                                # read one pane, act once
 ai.sh watch <pane> [goal] [policy] [poll] [autonomy]
                                # resident watcher (policy: '' | always-allow)
-ai.sh watch-setup [pane]       # interactive goal/interval/policy setup
+ai.sh watch-setup [pane] [quick|advanced] [always-allow]
+                               # goal-first setup with full launch summary
+ai.sh emit-event <pane> <kind> <source> <label>
+                               # append/signal one sanitized watcher event
+ai.sh pause|resume <pane>      # pause or resume without ending the run
+ai.sh keep <pane>              # cancel a completed console's auto-close
+ai.sh report [run-id|latest]   # final outcome, goal, counts, duration, logs
 ai.sh stop <pane|all>          # stop watcher(s)
 ai.sh status                   # active watchers + recent decisions
 ai.sh list                     # AI panes with ⚠ action / ✓ done / ● watching state
@@ -330,8 +372,9 @@ ai.sh cleanup                  # GC watcher files, monitor panes, stale marks
 
 `decide` exit codes (what the watch loop keys off): `0` sent · `2` done ·
 `3` still working · `4` escalated to you · `5` error · `6` suggest-only/skipped.
-Every action is one TAB-separated line in `~/.local/state/tmux/ai.log`:
-`datetime ⇥ action ⇥ pane ⇥ detail…`.
+The cross-run index remains one TAB-separated line per audit action in
+`~/.local/state/tmux/ai.log`: `datetime ⇥ action ⇥ pane ⇥ detail…`. Canonical
+run evidence lives in `ai-runs/<run-id>/`.
 
 Need-input internals are inspectable too:
 
@@ -375,10 +418,19 @@ when the bar renders (≤30s), and whenever the AI status view opens.
   - `need-input` — one TAB-separated AI-status mark per line:
     `pane ⇥ epoch ⇥ source ⇥ key ⇥ label ⇥ saved_title` (`pane` is `-` for
     background-session marks; `key` is `s:<claude session_id>` or the pane id).
-  - `ai-watch/` — one `<pane>.watch` pid/state file per resident watcher, plus
-    `<pane>.out` execution feed, `<pane>.timeline` monitor events, and
-    `<pane>.detail` last model-call detail. While a model call is active,
-    `<pane>.brain.pid` records its PID/process group for `stop` and crash GC.
+  - `ai-watch/` — one small `<pane>.watch` compatibility pointer per live run,
+    including watcher PID, run directory, wake channel, and monitor pane IDs.
+    While a model call is active, `<pane>.brain.pid` records its PID/process
+    group for `stop` and crash GC. Legacy `.timeline`/`.detail` files remain a
+    presentation fallback, not canonical history.
+  - `ai-runs/<run-id>/` — `config.json` (immutable values + provenance), atomic
+    `state.json`, append-only `events.jsonl`, hook `inbox/`, per-call
+    `decisions/NNNN.json` + `.meta.json`, `backend/NNNN.stderr`, and
+    `final.json`. `monitors` records the overview/detail pane IDs or popup
+    ownership before the compatibility pointer is rewritten. `screens/` is
+    created only for snapshots/full logging;
+    `prompts/` only for full logging. Default retention is seven days and a run
+    referenced by a live `.watch` pointer is never collected.
   - `ai.log` — the AI supervisor's audit log.
 - Environment overrides (mainly for scripting/tests): `TMUX_RADAR_STATE_DIR`,
   `TMUX_RADAR_MRU_FILE`, `TMUX_RADAR_NEEDINPUT_FILE`,
@@ -401,8 +453,25 @@ when the bar renders (≤30s), and whenever the AI status view opens.
   default) via the pane's tty and process tree. `pane_current_command` showing
   a version number (`2.1.199`) is normal and does not matter. If you renamed
   the binary, add that name to `@radar-needinput-commands`.
-- **Hooks don't fire** — run `scripts/install-hooks.sh status`, and restart the
-  Claude/Codex sessions (hooks are read at session start).
+- **Hooks don't fire** — run `scripts/install-hooks.sh status`. It reports
+  Claude coverage plus each Codex native event (`PermissionRequest`, `Stop`,
+  `UserPromptSubmit`) and the legacy notify fallback separately. Re-run
+  `install`, then restart Claude/Codex sessions because hooks are read at
+  session start. A missing native hook is visible; stable-screen fallback does
+  not claim native coverage.
+- **A watcher seems to launch a new model every poll interval** — update the
+  plugin. Calls are serialized now: the idle interval begins only after the
+  current call/action verification ends, and queued hooks are coalesced. Inspect
+  `ai.sh report latest`, `ai.sh status`, and the run's `events.jsonl`/
+  `decisions/` before changing the interval.
+- **Where are the monitor logs?** — use `ai.sh report latest`. Default
+  `decision` logging deliberately omits screen/prompt persistence. Set
+  `@radar-ai-logging 'full'` only when you accept that exact prompts and pane
+  captures may contain source code, paths, commands, or secrets.
+- **The right console leaves too little room** — width is responsively clamped;
+  120–179-column targets use one compact right pane, and narrower targets use a
+  popup. An explicit legacy `@radar-ai-monitor-pos 'top'` or `'bottom'` remains
+  available during migration.
 - **Deleting CJK text in an AI popup misbehaves** — fixed (prompts use
   readline); update the plugin.
 - **The AI menu key** — default is capital `A` (`prefix + A`). If an old

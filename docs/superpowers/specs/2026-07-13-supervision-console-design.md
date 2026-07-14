@@ -36,7 +36,7 @@ The primary user is an AI-heavy tmux user supervising many long-running coding a
 
 ### Quick path: `w`
 
-`w` opens an 80% by 70% popup with:
+`w` opens a 90% by 85% popup with:
 
 - target label
 - one readline-backed UTF-8 goal field
@@ -88,8 +88,9 @@ The default changes from `top` to `right`. Existing explicit `@radar-ai-monitor-
 
 ### Narrow terminals
 
-- 120-179 columns: use a right single-pane console with a compact six-line overview embedded above detail.
-- Below 120 columns or below 24 rows: use a large popup console and keep the target pane unsplit.
+- 120-179 columns: use a right single-pane console with a compact fixed summary, paged detail region, and fixed controls.
+- Below 120 columns or below 24 rows: use a 90% by 85% popup console and keep the target pane unsplit. Reuse the setup popup rather than nesting another `display-popup`.
+- The launcher passes the computed inner popup rows and columns to the renderer; the popup process's tty reports outer client dimensions and is not a valid layout source.
 - If no visible monitor can be created, abort the watch. Hidden supervision is not an acceptable degraded state.
 
 ### Overview: top 25%
@@ -121,6 +122,12 @@ The detail pane has five keyboard views:
 5. `Logs`: run directory, file sizes, retention, recent backend stderr, and errors.
 
 Timeline is the default. A decision event automatically selects Decision unless the user has manually pinned another tab. Switching tabs clears and replays only the detail pane. Timeline and log updates append; the one-second overview refresh never writes into detail scrollback.
+
+Compact mode exposes the same five views, with `u`/`d` paging. Its complete
+key map remains fixed at the bottom. In a split console, `Enter` selects the
+target pane. In popup mode, `Enter` hides only the monitor while the watcher
+continues; `q` stops supervision. Input read timeouts are never interpreted as
+an Enter key.
 
 The UI exposes observable model inputs and structured outputs. It does not claim to expose private chain-of-thought. The label is `Decision evidence`, not `Model reasoning` or `Model conversation`.
 
@@ -234,6 +241,7 @@ $STATE_DIR/ai-runs/<run-id>/
   config.json             immutable launch snapshot + provenance
   state.json              atomic latest state
   events.jsonl            canonical append-only event journal
+  monitors                overview/detail pane IDs or popup ownership
   inbox/                  atomically published hook-event spool
   decisions/0001.json     raw structured model output
   decisions/0001.meta.json

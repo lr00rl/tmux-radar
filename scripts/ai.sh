@@ -115,6 +115,12 @@ WATCH_EVENT_ID=""
 WATCH_PHASE="CREATED"
 WATCH_STATUS="starting"
 WATCH_FINALIZED=0
+WATCH_DELIVERY_FINGERPRINT=""
+
+DELIVERY_GATE_HELD=0
+DELIVERY_GATE_TOKEN=""
+DELIVERY_GATE_DIR=""
+DELIVERY_PENDING_FILE=""
 
 opt() {
   local key="$1" def="$2" v legacy
@@ -424,6 +430,7 @@ _terminate_current_brain() {
 _brain_owner_signal() {
   local rc="$1"
   trap - TERM INT HUP
+  _delivery_cleanup
   _terminate_current_brain
   exit "$rc"
 }
@@ -900,6 +907,105 @@ _watch_next_event_order() {
   printf '%s' "$value"
 }
 
+_delivery_owner_field() {
+  local owner="$1" key="$2"
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$owner" 2>/dev/null || true
+}
+
+_delivery_gate_reap_stale() {
+  local gate="$1" owner observed_pid observed_token tomb moved_token
+  owner="$gate/owner"
+  [ -r "$owner" ] || return 1
+  observed_pid="$(_delivery_owner_field "$owner" pid)"
+  observed_token="$(_delivery_owner_field "$owner" token)"
+  case "$observed_pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$observed_pid" 2>/dev/null && return 1
+  [ -n "$observed_token" ] || return 1
+
+  tomb="${gate}.stale.${observed_token}.$$"
+  if ! mv "$gate" "$tomb" 2>/dev/null; then return 1; fi
+  moved_token="$(_delivery_owner_field "$tomb/owner" token)"
+  if [ "$moved_token" = "$observed_token" ]; then
+    rm -rf "$tomb"
+    return 0
+  fi
+
+  # The owner changed between observation and rename. Restore that live lock
+  # instead of deleting it; acquisitions only proceed while the canonical path
+  # exists, so no new owner can enter before this restoration attempt.
+  if [ ! -e "$gate" ]; then mv "$tomb" "$gate" 2>/dev/null || true; fi
+  return 1
+}
+
+_delivery_gate_acquire() {
+  local attempts="${TMUX_RADAR_TEST_GATE_ATTEMPTS:-500}" attempt=0 owner pid token
+  [ -n "${RADAR_RUN_DIR:-}" ] || return 1
+  case "$attempts" in ''|*[!0-9]*) attempts=500 ;; esac
+  [ "$attempts" -gt 0 ] || attempts=1
+  DELIVERY_GATE_DIR="$RADAR_RUN_DIR/.delivery-gate"
+  token="$$-${RANDOM:-0}-$(date '+%s')"
+  while [ "$attempt" -lt "$attempts" ]; do
+    if mkdir "$DELIVERY_GATE_DIR" 2>/dev/null; then
+      printf 'pid=%s\ntoken=%s\ncreated=%s\n' "$$" "$token" "$(date '+%s')" > "$DELIVERY_GATE_DIR/owner"
+      DELIVERY_GATE_TOKEN="$token"
+      DELIVERY_GATE_HELD=1
+      return 0
+    fi
+    owner="$DELIVERY_GATE_DIR/owner"
+    if [ -r "$owner" ]; then
+      pid="$(_delivery_owner_field "$owner" pid)"
+      case "$pid" in ''|*[!0-9]*) : ;; *)
+        if ! kill -0 "$pid" 2>/dev/null; then _delivery_gate_reap_stale "$DELIVERY_GATE_DIR" || true; fi
+        ;;
+      esac
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.01
+  done
+  DELIVERY_GATE_HELD=0
+  DELIVERY_GATE_TOKEN=""
+  return 1
+}
+
+_delivery_gate_release() {
+  local owner current
+  [ "${DELIVERY_GATE_HELD:-0}" -eq 1 ] || return 0
+  owner="$DELIVERY_GATE_DIR/owner"
+  current="$(_delivery_owner_field "$owner" token)"
+  if [ -n "$DELIVERY_GATE_TOKEN" ] && [ "$current" = "$DELIVERY_GATE_TOKEN" ]; then
+    rm -f "$owner"
+    rmdir "$DELIVERY_GATE_DIR" 2>/dev/null || true
+  fi
+  DELIVERY_GATE_HELD=0
+  DELIVERY_GATE_TOKEN=""
+  DELIVERY_GATE_DIR=""
+}
+
+_delivery_cleanup() {
+  _delivery_gate_release
+  if [ -n "${DELIVERY_PENDING_FILE:-}" ]; then rm -f "$DELIVERY_PENDING_FILE"; fi
+  DELIVERY_PENDING_FILE=""
+}
+
+_delivery_pending_exists() {
+  local pending
+  for pending in "$RADAR_RUN_DIR"/.delivery-pending.*; do
+    [ -e "$pending" ] && return 0
+  done
+  return 1
+}
+
+_delivery_wait_for_publishers() {
+  local attempt=0 max="${TMUX_RADAR_TEST_GATE_ATTEMPTS:-500}" tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.05}"
+  case "$max" in ''|*[!0-9]*) max=500 ;; esac
+  while _delivery_pending_exists; do
+    tmux display-message -p -t "$WATCH_PANE" '#{pane_id}' >/dev/null 2>&1 || return 2
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt "$max" ] || return 1
+    sleep "$tick"
+  done
+}
+
 _watch_event_priority() {
   case "$1" in
     approval|input_required) printf '0' ;;
@@ -907,6 +1013,10 @@ _watch_event_priority() {
     idle|screen_idle|manual_reassess) printf '2' ;;
     *) printf '3' ;;
   esac
+}
+
+_watch_event_actionable() {
+  case "$1" in approval|input_required|turn_complete) return 0 ;; *) return 1 ;; esac
 }
 
 _watch_normalize_event() {
@@ -932,7 +1042,7 @@ _watch_record_incoming() {
 _watch_coalesce_batch() {
   local batch="$1" accepted="$RADAR_RUN_DIR/.accepted.$$" unique="$RADAR_RUN_DIR/.unique.$$"
   local retained="$RADAR_RUN_DIR/.retained.$$" event normalized kind event_id winner_id winner_kind
-  local winner_priority event_priority
+  local winner_priority event_priority winner_actionable=0
   : > "$accepted"
   while IFS= read -r event; do
     [ -n "$event" ] || continue
@@ -969,20 +1079,16 @@ _watch_coalesce_batch() {
     return 10
   fi
   WATCH_EVENT_JSON="$(jq -s -c '
-    def priority:
-      if .kind == "approval" or .kind == "input_required" then 0
-      elif .kind == "turn_complete" then 1
-      elif .kind == "idle" or .kind == "screen_idle" or .kind == "manual_reassess" then 2
-      else 3 end;
-    map(. + {__priority:priority})
-    | (map(.__priority) | min) as $winning_priority
-    | map(select(.__priority == $winning_priority))
+    def actionable: .kind == "approval" or .kind == "input_required" or .kind == "turn_complete";
+    . as $events
+    | ($events | map(select(actionable))) as $actionable
+    | (if ($actionable | length) > 0 then $actionable else $events end)
     | max_by([(.event_order // 0), (.timestamp // ""), (.event_id // "")])
-    | del(.__priority)
   ' "$accepted")"
   winner_id="$(printf '%s' "$WATCH_EVENT_JSON" | jq -r '.event_id')"
   winner_kind="$(printf '%s' "$WATCH_EVENT_JSON" | jq -r '.kind')"
   winner_priority="$(_watch_event_priority "$winner_kind")"
+  _watch_event_actionable "$winner_kind" && winner_actionable=1
   normalized="$(_watch_record_incoming "$WATCH_EVENT_JSON")" || { rm -f "$accepted"; return 11; }
   WATCH_EVENT_JSON="$normalized"
   WATCH_EVENT_ID="$winner_id"
@@ -993,7 +1099,8 @@ _watch_coalesce_batch() {
     [ "$event_id" = "$winner_id" ] && continue
     kind="$(printf '%s' "$event" | jq -r '.kind')"
     event_priority="$(_watch_event_priority "$kind")"
-    if [ "$event_priority" = "$winner_priority" ]; then
+    if { [ "$winner_actionable" -eq 1 ] && _watch_event_actionable "$kind"; } || \
+       { [ "$winner_actionable" -eq 0 ] && [ "$event_priority" = "$winner_priority" ]; }; then
       _watch_record_incoming "$event" >/dev/null || continue
       radar_event_append coalesced watcher "coalesced into $winner_id" "$(printf '%s' "$event" | jq -c \
         --arg winner "$winner_id" '{record:"coalesced",event_id:.event_id,original_kind:.kind,coalesced_into_event_id:$winner}')"
@@ -1270,8 +1377,53 @@ _watch_pre_send_test_seam() {
   rm -f "$block.ready"
 }
 
+_watch_deliver_under_gate() {
+  local evidence="$1" current_kind="$2" guard_rc seam_rc wait_rc delivery
+  WATCH_DELIVERY_FINGERPRINT=""
+  if ! _delivery_gate_acquire; then return 20; fi
+
+  while :; do
+    set +e; _watch_post_decision_guard "$evidence" "$current_kind"; guard_rc=$?; set -e
+    case "$guard_rc" in
+      0) : ;;
+      *) _delivery_gate_release; return "$guard_rc" ;;
+    esac
+
+    set +e; _watch_pre_send_test_seam; seam_rc=$?; set -e
+    if [ "$seam_rc" -ne 0 ]; then _delivery_gate_release; return "$seam_rc"; fi
+
+    # Publishers create an intent before waiting on the gate. If one arrived
+    # after our drain, yield the gate, let it publish durably, reacquire, and
+    # repeat the drain before delivery. If no intent exists at this point,
+    # delivery is the earlier linearized operation and remains under the lock.
+    if _delivery_pending_exists; then
+      _delivery_gate_release
+      set +e; _delivery_wait_for_publishers; wait_rc=$?; set -e
+      [ "$wait_rc" -eq 0 ] || return "$wait_rc"
+      if ! _delivery_gate_acquire; then return 20; fi
+      continue
+    fi
+
+    delivery="$(_watch_fingerprint || true)"
+    if [ -z "$delivery" ]; then _delivery_gate_release; return 2; fi
+    if [ "$delivery" != "$evidence" ]; then
+      _watch_supersede_current evidence_changed "$current_kind"
+      _delivery_gate_release
+      return 12
+    fi
+    if ! _send "$WATCH_PANE" "$DECISION_TEXT" ${DECISION_KEYS[@]+"${DECISION_KEYS[@]}"}; then
+      _delivery_gate_release
+      return 21
+    fi
+    WATCH_DELIVERY_FINGERPRINT="$delivery"
+    _delivery_gate_release
+    return 0
+  done
+}
+
 _watch_finalize() {
   local outcome="$1" phase="$2" reason="$3"
+  _delivery_cleanup
   _watch_kill_waiters
   _terminate_current_brain
   _watch_phase "$phase" "$reason" none 0
@@ -1283,6 +1435,7 @@ _watch_finalize() {
 _watch_signal_exit() {
   local signal="$1" rc="$2"
   trap - TERM INT HUP
+  _delivery_cleanup
   if [ "$WATCH_FINALIZED" -eq 0 ] && [ -n "${RADAR_RUN_DIR:-}" ]; then
     _watch_finalize stopped STOPPED "watcher received $signal"
   else
@@ -1467,33 +1620,23 @@ cmd_watch_loop() {
         ;;
     esac
     _watch_phase EXECUTING "final delivery guard" none 0
-    set +e; _watch_pre_send_test_seam; guard_rc=$?; set -e
-    if [ "$guard_rc" -eq 2 ]; then
-      _watch_finalize stopped STOPPED "target pane disappeared at delivery boundary"
-      break
-    fi
-    set +e; _watch_post_decision_guard "$evidence_fingerprint" "$event_kind"; guard_rc=$?; set -e
+    set +e; _watch_deliver_under_gate "$evidence_fingerprint" "$event_kind"; guard_rc=$?; set -e
     case "$guard_rc" in
       0) : ;;
       2) _watch_finalize stopped STOPPED "target pane disappeared at final delivery guard"; break ;;
       10|12) WATCH_EVENT_ID=""; WATCH_RETRY=0; continue ;;
+      21)
+        radar_event_append delivery_failed watcher "tmux send-keys failed" "$(jq -cn \
+          --arg event_id "$WATCH_EVENT_ID" --arg pre "$evidence_fingerprint" \
+          '{record:"delivery_error",event_id:$event_id,sent:false,pre_send_fingerprint:$pre}')"
+        _escalate "$pane" "AI 监控发送按键失败，已暂停"
+        _watch_finalize delivery_error PAUSED_ERROR "tmux send-keys delivery failed"
+        break
+        ;;
+      20) _watch_finalize paused_error PAUSED_ERROR "delivery gate acquisition failed"; break ;;
       *) _watch_finalize paused_error PAUSED_ERROR "final delivery guard failed"; break ;;
     esac
-    delivery_fingerprint="$(_watch_fingerprint || true)"
-    [ -n "$delivery_fingerprint" ] || { _watch_finalize stopped STOPPED "target pane disappeared before send"; break; }
-    if [ "$delivery_fingerprint" != "$evidence_fingerprint" ]; then
-      _watch_supersede_current evidence_changed "$event_kind"
-      WATCH_EVENT_ID=""; WATCH_RETRY=0
-      continue
-    fi
-    if ! _send "$pane" "$DECISION_TEXT" ${DECISION_KEYS[@]+"${DECISION_KEYS[@]}"}; then
-      radar_event_append delivery_failed watcher "tmux send-keys failed" "$(jq -cn \
-        --arg event_id "$WATCH_EVENT_ID" --arg pre "$delivery_fingerprint" \
-        '{record:"delivery_error",event_id:$event_id,sent:false,pre_send_fingerprint:$pre}')"
-      _escalate "$pane" "AI 监控发送按键失败，已暂停"
-      _watch_finalize delivery_error PAUSED_ERROR "tmux send-keys delivery failed"
-      break
-    fi
+    delivery_fingerprint="$WATCH_DELIVERY_FINGERPRINT"
     radar_event_append sent watcher "${DECISION_REASON:-safe action sent}" "$(jq -cn --arg event_id "$WATCH_EVENT_ID" \
       --arg pre "$delivery_fingerprint" '{record:"execution",event_id:$event_id,sent:true,pre_send_fingerprint:$pre}')"
     _clearmark "$pane"
@@ -1954,7 +2097,7 @@ _emit_event_usage() {
 
 cmd_emit_event() {
   local pane="${1:-}" kind="${2:-}" source="${3:-}" label="${4-}"
-  local sanitized expected_run_id="${TMUX_RADAR_EXPECT_RUN_ID:-}" event_id event_order extra
+  local sanitized expected_run_id="${TMUX_RADAR_EXPECT_RUN_ID:-}" event_id event_order extra intent_token
   if [ -z "$pane" ] || [ -z "$kind" ] || [ -z "$source" ] || [ "${4+x}" != x ]; then
     _emit_event_usage
     return 2
@@ -1976,16 +2119,30 @@ cmd_emit_event() {
   if [ -z "$event_id" ]; then
     event_id="event-${RADAR_RUN_ID}-$(date '+%s')-$$-${RANDOM:-0}"
   fi
+  intent_token="$$-${RANDOM:-0}-$(date '+%s')"
+  DELIVERY_PENDING_FILE="$RADAR_RUN_DIR/.delivery-pending.$intent_token"
+  printf 'pid=%s\ntoken=%s\nevent_id=%s\n' "$$" "$intent_token" "$event_id" > "$DELIVERY_PENDING_FILE"
+  if ! _delivery_gate_acquire; then
+    rm -f "$DELIVERY_PENDING_FILE"
+    DELIVERY_PENDING_FILE=""
+    echo "emit-event: delivery gate acquisition failed" >&2
+    return 1
+  fi
   event_order="$(_watch_next_event_order)" || {
+    _delivery_cleanup
     echo "emit-event: failed to allocate event order" >&2
     return 1
   }
   extra="$(jq -cn --arg event_id "$event_id" --argjson event_order "$event_order" \
     '{event_id:$event_id,event_order:$event_order}')"
   if ! radar_inbox_append "$kind" "$source" "$sanitized" "$extra"; then
+    _delivery_cleanup
     echo "emit-event: failed to append event" >&2
     return 1
   fi
+  _delivery_gate_release
+  rm -f "$DELIVERY_PENDING_FILE"
+  DELIVERY_PENDING_FILE=""
   if [ -n "${RADAR_RUN_CHANNEL:-}" ] && have_tmux; then
     tmux wait-for -S "$RADAR_RUN_CHANNEL" >/dev/null 2>&1 || true
   fi

@@ -170,6 +170,7 @@ reset_case() {
   export TEST_BACKEND_NOTIFY=0
   export TEST_SEND_FAIL_AT=0
   export TMUX_RADAR_TEST_PRE_SEND_BLOCK=""
+  export TMUX_RADAR_TEST_GATE_ATTEMPTS=""
   : > "$TMUX_RADAR_NEEDINPUT_FILE"
   : > "$TEST_SENDS"
   : > "$TEST_SEND_COUNT"
@@ -384,37 +385,64 @@ assert_eq 1 "$(jq -s '[.[] | select(.kind == "superseded" and .supersedes_event_
 stop_watch
 printf 'PASS: user resume retains non-stale batch events\n'
 
-# 12. The final delivery-boundary guard catches takeover after policy gating.
+# 12. Publication after the final drain but before delivery cancels the send.
 reset_case final-send-guard
 write_response 1 '{"action":"send","text":"","keys":["Enter"],"safe":true,"reason":"must be cancelled"}'
 export TMUX_RADAR_TEST_PRE_SEND_BLOCK="$CASE/pre-send-block"
 touch "$TMUX_RADAR_TEST_PRE_SEND_BLOCK"
 start_watch 30
+
+# A live gate owner bounds hook latency and leaves no publication intent behind.
+mkdir "$RUN_DIR/.delivery-gate"
+printf 'pid=%s\ntoken=live-test\ncreated=%s\n' "$$" "$(date '+%s')" > "$RUN_DIR/.delivery-gate/owner"
+set +e
+gate_error="$(TMUX_RADAR_TEST_GATE_ATTEMPTS=3 emit_event gate-timeout manual_reassess blocked 2>&1)"
+gate_rc=$?
+set -e
+[ "$gate_rc" -ne 0 ] || _fail_assert 'live delivery gate should bound emit-event'
+case "$gate_error" in *'delivery gate'*) : ;; *) _fail_assert 'gate failure must be visible' 'output' "$gate_error" ;; esac
+assert_eq 0 "$(find "$RUN_DIR" -maxdepth 1 -name '.delivery-pending.*' | wc -l | tr -d ' ')" 'failed publication releases intent'
+rm -f "$RUN_DIR/.delivery-gate/owner"
+rmdir "$RUN_DIR/.delivery-gate"
+
+# A dead owner is recovered by the next publisher.
+mkdir "$RUN_DIR/.delivery-gate"
+printf 'pid=99999999\ntoken=stale-test\ncreated=1\n' > "$RUN_DIR/.delivery-gate/owner"
 emit_event final-race-approval approval approval
 wait_until 'final pre-send seam' "[ -s '$TMUX_RADAR_TEST_PRE_SEND_BLOCK.ready' ]" 600
-printf 'evidence changed at delivery boundary\n' > "$TEST_SCREEN"
-emit_event final-race-user user_resumed resumed
+
+# The publisher linearizes while the watcher is blocked after its final drain.
+PATH="$TMP/bin:$OLD_PATH" TMUX_RADAR_EVENT_ID=final-race-user \
+  bash "$ROOT/scripts/ai.sh" emit-event %1 user_resumed test resumed \
+  >"$CASE/emit.out" 2>"$CASE/emit.err" &
+emit_pid=$!
+wait_until 'publication intent after final drain' "find '$RUN_DIR' -maxdepth 1 -name '.delivery-pending.*' | grep -q ." 400
 rm -f "$TMUX_RADAR_TEST_PRE_SEND_BLOCK"
+wait "$emit_pid"
 wait_until 'final guard supersedes stale decision' "jq -e 'select(.kind == \"superseded\" and .supersedes_event_id == \"final-race-approval\")' '$RUN_DIR/events.jsonl' >/dev/null"
 sleep 0.1
 assert_eq 0 "$(wc -l < "$TEST_SENDS" | tr -d ' ')" 'final pre-send guard prevents stale delivery'
+assert_eq 1 "$(jq -s '[.[] | select(.record == "incoming" and .event_id == "final-race-user")] | length' "$RUN_DIR/events.jsonl")" 'takeover event remains durable after cancellation'
+assert_eq 0 "$(find "$RUN_DIR" -maxdepth 1 \( -name '.delivery-gate*' -o -name '.delivery-admission*' -o -name '.delivery-pending.*' -o -name '.delivery-closed' \) | wc -l | tr -d ' ')" 'delivery gate artifacts released'
 stop_watch
 printf 'PASS: final pre-send guard closes stale delivery window\n'
 
-# 13. Burst selection chooses the newest event at the winning priority.
+# 13. Burst selection chooses the newest actionable event regardless of kind.
 reset_case newest-burst
-write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"newest approval"}'
-write_response 2 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"retained turn"}'
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"newest turn"}'
+write_response 2 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"retained manual"}'
 start_watch 30
 kill -STOP "$WATCH_PID"
 emit_event burst-old-approval approval old
-emit_event burst-turn turn_complete turn
-emit_event burst-new-approval approval new
+emit_event burst-mid-input input_required input
+emit_event burst-new-turn turn_complete turn
+emit_event burst-manual manual_reassess manual
 kill -CONT "$WATCH_PID"
 wait_until 'burst winner model call' "jq -e 'select(.kind == \"model_started\")' '$RUN_DIR/events.jsonl' >/dev/null"
-assert_eq burst-new-approval "$(jq -r 'select(.kind == "model_started") | .event_id' "$RUN_DIR/events.jsonl" | head -n 1)" 'newest approval wins burst'
-assert_eq 1 "$(jq -s '[.[] | select(.kind == "coalesced" and .event_id == "burst-old-approval" and .coalesced_into_event_id == "burst-new-approval")] | length' "$RUN_DIR/events.jsonl")" 'older approval explicitly coalesced'
-assert_eq 1 "$(jq -s '[.[] | select(.kind == "requeued" and .event_id == "burst-turn")] | length' "$RUN_DIR/events.jsonl")" 'independent turn explicitly requeued'
+assert_eq burst-new-turn "$(jq -r 'select(.kind == "model_started") | .event_id' "$RUN_DIR/events.jsonl" | head -n 1)" 'newest actionable turn wins burst'
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "coalesced" and .event_id == "burst-old-approval" and .coalesced_into_event_id == "burst-new-turn")] | length' "$RUN_DIR/events.jsonl")" 'older approval explicitly coalesced'
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "coalesced" and .event_id == "burst-mid-input" and .coalesced_into_event_id == "burst-new-turn")] | length' "$RUN_DIR/events.jsonl")" 'older input explicitly coalesced'
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "requeued" and .event_id == "burst-manual" and .after_event_id == "burst-new-turn")] | length' "$RUN_DIR/events.jsonl")" 'lower-priority manual explicitly requeued'
 stop_watch
 printf 'PASS: burst coalescing selects newest actionable event\n'
 

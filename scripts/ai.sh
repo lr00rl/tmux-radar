@@ -937,14 +937,26 @@ _delivery_gate_reap_stale() {
 }
 
 _delivery_gate_acquire() {
-  local attempts="${TMUX_RADAR_TEST_GATE_ATTEMPTS:-500}" attempt=0 pid token private
+  local attempts="${TMUX_RADAR_TEST_GATE_ATTEMPTS:-500}" attempt=0 pid token private written_pid written_token
   [ -n "${RADAR_RUN_DIR:-}" ] || return 1
   case "$attempts" in ''|*[!0-9]*) attempts=500 ;; esac
   [ "$attempts" -gt 0 ] || attempts=1
   DELIVERY_GATE_DIR="$RADAR_RUN_DIR/.delivery-gate"
   token="$$-${RANDOM:-0}-$(date '+%s')"
   private="$RADAR_RUN_DIR/.delivery-owner.$token"
-  printf 'pid=%s\ntoken=%s\ncreated=%s\n' "$$" "$token" "$(date '+%s')" > "$private"
+  if [ "${TMUX_RADAR_TEST_GATE_OWNER_WRITE_FAIL:-0}" = 1 ] || \
+     ! printf 'pid=%s\ntoken=%s\ncreated=%s\n' "$$" "$token" "$(date '+%s')" > "$private"; then
+    rm -f "$private"
+    DELIVERY_GATE_DIR=""
+    return 1
+  fi
+  written_pid="$(_delivery_owner_field "$private" pid)"
+  written_token="$(_delivery_owner_field "$private" token)"
+  if [ "$written_pid" != "$$" ] || [ "$written_token" != "$token" ]; then
+    rm -f "$private"
+    DELIVERY_GATE_DIR=""
+    return 1
+  fi
   while [ "$attempt" -lt "$attempts" ]; do
     if ln "$private" "$DELIVERY_GATE_DIR" 2>/dev/null; then
       rm -f "$private"

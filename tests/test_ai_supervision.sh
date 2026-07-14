@@ -392,6 +392,15 @@ export TMUX_RADAR_TEST_PRE_SEND_BLOCK="$CASE/pre-send-block"
 touch "$TMUX_RADAR_TEST_PRE_SEND_BLOCK"
 start_watch 30
 
+# A failed private-owner write cannot publish a malformed canonical gate.
+set +e
+owner_error="$(TMUX_RADAR_TEST_GATE_OWNER_WRITE_FAIL=1 emit_event owner-write-fail manual_reassess blocked 2>&1)"
+owner_rc=$?
+set -e
+[ "$owner_rc" -ne 0 ] || _fail_assert 'failed owner write should reject emit-event'
+case "$owner_error" in *'delivery gate'*) : ;; *) _fail_assert 'owner write failure must be visible' 'output' "$owner_error" ;; esac
+assert_eq 0 "$(find "$RUN_DIR" -maxdepth 1 \( -name '.delivery-gate*' -o -name '.delivery-owner.*' -o -name '.delivery-pending.*' \) | wc -l | tr -d ' ')" 'failed owner write publishes no gate artifacts'
+
 # A fully published live gate bounds hook latency and leaves no intent behind.
 printf 'pid=%s\ntoken=live-test\ncreated=%s\n' "$$" "$(date '+%s')" > "$RUN_DIR/.delivery-gate"
 [ -f "$RUN_DIR/.delivery-gate" ] || _fail_assert 'canonical gate must be one atomic owner file'

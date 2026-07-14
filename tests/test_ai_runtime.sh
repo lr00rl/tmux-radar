@@ -117,6 +117,55 @@ if [ ! -e "$active_dir" ]; then
   _fail_assert "active run referenced by watch file must be retained" "run_dir" "$active_dir"
 fi
 
+radar_run_create %55 '{"goal":"stale reclaim regression"}'
+stale_reclaim_run_dir="$RADAR_RUN_DIR"
+stale_reclaim_lock="$stale_reclaim_run_dir/inbox.jsonl.lock"
+stale_reclaim_output="$TMP/stale-reclaim.jsonl"
+: > "$stale_reclaim_output"
+mkdir -p "$stale_reclaim_lock"
+printf '%s\n' 999999 > "$stale_reclaim_lock/pid"
+touch -t 199901010000 "$stale_reclaim_lock" "$stale_reclaim_lock/pid"
+
+(
+  RADAR_TEST_LOCK_RECLAIM_MARK="$TMP/reclaim-a.mark"
+  RADAR_TEST_LOCK_RECLAIM_WAIT="$TMP/reclaim-a.release"
+  RADAR_TEST_LOCK_RECLAIM_DONE_MARK="$TMP/reclaim-a.done"
+  radar_inbox_append approval reclaim "event 1" '{"event_id":1}'
+) &
+stale_a_pid=$!
+CLEANUP_PIDS="$CLEANUP_PIDS $stale_a_pid"
+wait_for_file "$TMP/reclaim-a.mark"
+
+(
+  RADAR_TEST_LOCK_ACQUIRE_MARK="$TMP/reclaim-b.mark"
+  RADAR_TEST_LOCK_ACQUIRE_WAIT="$TMP/reclaim-b.release"
+  radar_inbox_append approval reclaim "event 2" '{"event_id":2}'
+) &
+stale_b_pid=$!
+CLEANUP_PIDS="$CLEANUP_PIDS $stale_b_pid"
+wait_for_file "$TMP/reclaim-b.mark"
+assert_file "$stale_reclaim_lock/pid"
+
+: > "$TMP/reclaim-a.release"
+wait_for_file "$TMP/reclaim-a.done"
+assert_file "$stale_reclaim_lock/pid"
+
+: > "$TMP/reclaim-b.release"
+wait_for_exit "$stale_b_pid"
+wait_for_exit "$stale_a_pid"
+wait "$stale_b_pid"
+wait "$stale_a_pid"
+
+drain_into "$stale_reclaim_output"
+assert_eq "2" "$(jq -s 'length' "$stale_reclaim_output")" "stale reclaim event count"
+if ! jq -se '
+  length == 2 and
+  ([.[].event_id] | sort == [1, 2])
+' "$stale_reclaim_output" >/dev/null; then
+  _fail_assert "stale reclaim must preserve exact-once inbox events" "file" "$stale_reclaim_output" "actual" "$(cat "$stale_reclaim_output")"
+fi
+CLEANUP_PIDS=""
+
 radar_run_create %77 '{"goal":"concurrency regression"}'
 concurrency_run_dir="$RADAR_RUN_DIR"
 concurrency_output="$TMP/concurrency-drain.jsonl"

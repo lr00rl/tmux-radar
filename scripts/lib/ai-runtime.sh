@@ -70,6 +70,23 @@ _radar_lock_mtime() {
   stat -f '%m' "$1" 2>/dev/null
 }
 
+_radar_test_lock_pause() {
+  local mark_file="${1:-}" wait_file="${2:-}" done_file="${3:-}" tries=0
+  if [ -n "$mark_file" ]; then
+    printf '%s\n' "$$" > "$mark_file"
+  fi
+  if [ -n "$wait_file" ]; then
+    while [ ! -e "$wait_file" ] && [ "$tries" -lt 2000 ]; do
+      sleep 0.01
+      tries=$((tries + 1))
+    done
+    [ -e "$wait_file" ] || return 1
+  fi
+  if [ -n "$done_file" ]; then
+    printf '%s\n' "$$" > "$done_file"
+  fi
+}
+
 _radar_lock_is_stale() {
   local lock_dir="$1" stale_after="${2:-10}" lock_pid="" now="" mtime="" age=""
   [ -d "$lock_dir" ] || return 1
@@ -86,6 +103,20 @@ _radar_lock_is_stale() {
   [ "$age" -ge "$stale_after" ]
 }
 
+_radar_lock_reclaim_stale() {
+  local lock_dir="$1" reclaim_dir
+  reclaim_dir="${lock_dir}.reclaim.$$.$RANDOM"
+  mv "$lock_dir" "$reclaim_dir" 2>/dev/null || return 1
+  if ! _radar_test_lock_pause \
+    "${RADAR_TEST_LOCK_RECLAIM_MARK:-}" \
+    "${RADAR_TEST_LOCK_RECLAIM_WAIT:-}" \
+    "${RADAR_TEST_LOCK_RECLAIM_DONE_MARK:-}"; then
+    rm -rf "$reclaim_dir"
+    return 1
+  fi
+  rm -rf "$reclaim_dir"
+}
+
 _radar_lock_acquire() {
   local lock_dir="$1" attempts="${2:-1000}" delay="${3:-0.01}" stale_after="${4:-10}" try=0
   while [ "$try" -lt "$attempts" ]; do
@@ -96,10 +127,17 @@ _radar_lock_acquire() {
         try=$((try + 1))
         continue
       fi
+      if ! _radar_test_lock_pause \
+        "${RADAR_TEST_LOCK_ACQUIRE_MARK:-}" \
+        "${RADAR_TEST_LOCK_ACQUIRE_WAIT:-}" \
+        ""; then
+        rm -rf "$lock_dir"
+        return 1
+      fi
       return 0
     fi
-    if _radar_lock_is_stale "$lock_dir" "$stale_after"; then
-      rm -rf "$lock_dir"
+    if _radar_lock_is_stale "$lock_dir" "$stale_after" &&
+      _radar_lock_reclaim_stale "$lock_dir"; then
       continue
     fi
     sleep "$delay"

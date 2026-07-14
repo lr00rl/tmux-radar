@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC1091,SC2329
+# shellcheck disable=SC1091,SC2034,SC2329
 # tmux-radar AI supervisor — an AI (Codex) that watches the AI coding TUIs
 # running inside your tmux panes (Claude Code / Codex), answers their prompts on
 # your behalf, and arranges your tmux layout from natural language.
@@ -96,6 +96,8 @@ DECISION_TEXT=""
 DECISION_SAFE=0
 DECISION_REASON=""
 DECISION_KEYS=()
+DECISION_SCHEMA_VALID=0
+DECISION_SCHEMA_ERROR=""
 
 WATCH_WAITER_PID=""
 WATCH_TIMER_PID=""
@@ -661,8 +663,15 @@ _clearmark() { [ -x "$NOTIFY" ] && "$NOTIFY" clear "$1" >/dev/null 2>&1 || true;
 # Send a decision to a pane: literal text (may contain spaces), then key names.
 _send() {  # _send <pane> <text> <key> <key> ...
   local pane="$1" text="$2"; shift 2
-  [ -n "$text" ] && tmux send-keys -t "$pane" -l -- "$text" 2>/dev/null || true
-  local k; for k in "$@"; do [ -n "$k" ] && tmux send-keys -t "$pane" "$k" 2>/dev/null || true; done
+  if [ -n "$text" ]; then
+    tmux send-keys -t "$pane" -l -- "$text" 2>/dev/null || return 1
+  fi
+  local k
+  for k in "$@"; do
+    [ -n "$k" ] || continue
+    tmux send-keys -t "$pane" "$k" 2>/dev/null || return 1
+  done
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -712,13 +721,33 @@ cmd_decide() {
   BRAIN_BOUND_PANE=""
   BRAIN_PID_FILE=""
   pretty_json="$(_pretty_json "$json")"
-  action="$(printf '%s' "$json" | jq -r '.action // "unknown"' 2>/dev/null || echo unknown)"
-  text="$(printf '%s' "$json" | jq -r '.text // ""' 2>/dev/null || echo '')"
-  safe="$(printf '%s' "$json" | jq -r 'if .safe == false then "0" else "1" end' 2>/dev/null || echo 0)"
-  reason="$(printf '%s' "$json" | jq -r '.reason // ""' 2>/dev/null || echo '')"
+  DECISION_SCHEMA_VALID=0
+  DECISION_SCHEMA_ERROR="decision schema/type validation failed"
+  if printf '%s' "$json" | jq -e '
+    type == "object"
+    and (.action | type == "string")
+    and (.action == "send" or .action == "wait" or .action == "done" or .action == "escalate" or .action == "suggest")
+    and (.text | type == "string")
+    and (.keys | type == "array" and all(.[]; type == "string"))
+    and (.safe | type == "boolean")
+    and (.reason | type == "string")
+  ' >/dev/null 2>&1; then
+    DECISION_SCHEMA_VALID=1
+    DECISION_SCHEMA_ERROR=""
+  fi
+  if [ "$DECISION_SCHEMA_VALID" -eq 1 ]; then
+    action="$(printf '%s' "$json" | jq -r '.action')"
+    text="$(printf '%s' "$json" | jq -r '.text')"
+    safe="$(printf '%s' "$json" | jq -r 'if .safe == true then "1" else "0" end')"
+    reason="$(printf '%s' "$json" | jq -r '.reason')"
+  else
+    action="unknown"; text=""; safe=0; reason="$DECISION_SCHEMA_ERROR"
+  fi
   local keys=() _k                     # bash 3.2 (macOS) has no mapfile
-  while IFS= read -r _k; do [ -n "$_k" ] && keys+=("$_k"); done \
-    < <(printf '%s' "$json" | jq -r '.keys[]? // empty' 2>/dev/null || true)
+  if [ "$DECISION_SCHEMA_VALID" -eq 1 ]; then
+    while IFS= read -r _k; do [ -n "$_k" ] && keys+=("$_k"); done \
+      < <(printf '%s' "$json" | jq -r '.keys[]')
+  fi
   local plan; plan="$(printf 'text=%q keys=[%s]' "$text" "${keys[*]:-}")"
 
   DECISION_JSON="$json"
@@ -780,7 +809,11 @@ cmd_decide() {
     auto-safe|auto) : ;;   # safe already ensured above
     *) echo "unknown autonomy: $autonomy" >&2; return 5 ;;
   esac
-  _send "$pane" "$text" ${keys[@]+"${keys[@]}"}
+  if ! _send "$pane" "$text" ${keys[@]+"${keys[@]}"}; then
+    printf '%s⚠ %s 发送失败%s — %s\n' "$CM" "$pane" "$CR" "$plan"
+    audit "send-failed\t$pane\t$plan\t$reason"
+    return 5
+  fi
   printf '%s✓ %s 已发送:%s %s   %s(%s)%s\n' "$CG" "$pane" "$CR" "$plan" "$CD" "$reason" "$CR"; _clearmark "$pane"
   audit "send\t$pane\t$plan\t$reason"; return 0
 }
@@ -849,6 +882,33 @@ _watch_event_id() {
   printf 'radar-%s-%s' "$RADAR_RUN_ID" "$sum"
 }
 
+_watch_next_event_order() {
+  local lock="$RADAR_RUN_DIR/.event-order.lock" counter="$RADAR_RUN_DIR/.event-order"
+  local attempt=0 value=0 tmp
+  while ! mkdir "$lock" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 200 ] || return 1
+    sleep 0.005
+  done
+  [ -s "$counter" ] && value="$(cat "$counter" 2>/dev/null || echo 0)"
+  case "$value" in ''|*[!0-9]*) value=0 ;; esac
+  value=$((value + 1))
+  tmp="$(mktemp "$RADAR_RUN_DIR/.event-order.XXXXXX")" || { rmdir "$lock"; return 1; }
+  printf '%s\n' "$value" > "$tmp"
+  mv "$tmp" "$counter"
+  rmdir "$lock"
+  printf '%s' "$value"
+}
+
+_watch_event_priority() {
+  case "$1" in
+    approval|input_required) printf '0' ;;
+    turn_complete) printf '1' ;;
+    idle|screen_idle|manual_reassess) printf '2' ;;
+    *) printf '3' ;;
+  esac
+}
+
 _watch_normalize_event() {
   local event="$1" event_id
   event_id="$(printf '%s' "$event" | jq -r '.event_id // empty')"
@@ -870,8 +930,9 @@ _watch_record_incoming() {
 }
 
 _watch_coalesce_batch() {
-  local batch="$1" accepted="$RADAR_RUN_DIR/.accepted.$$" recorded="$RADAR_RUN_DIR/.recorded.$$"
-  local retained="$RADAR_RUN_DIR/.retained.$$" event normalized kind
+  local batch="$1" accepted="$RADAR_RUN_DIR/.accepted.$$" unique="$RADAR_RUN_DIR/.unique.$$"
+  local retained="$RADAR_RUN_DIR/.retained.$$" event normalized kind event_id winner_id winner_kind
+  local winner_priority event_priority
   : > "$accepted"
   while IFS= read -r event; do
     [ -n "$event" ] || continue
@@ -879,6 +940,10 @@ _watch_coalesce_batch() {
     _watch_event_seen "$(printf '%s' "$normalized" | jq -r '.event_id')" && continue
     printf '%s\n' "$normalized" >> "$accepted"
   done < "$batch"
+  if [ -s "$accepted" ]; then
+    jq -s -c 'unique_by(.event_id)[]' "$accepted" > "$unique"
+    mv "$unique" "$accepted"
+  fi
   if [ ! -s "$accepted" ]; then
     rm -f "$accepted"
     return 11
@@ -903,22 +968,43 @@ _watch_coalesce_batch() {
     rm -f "$accepted" "$retained"
     return 10
   fi
-  : > "$recorded"
-  while IFS= read -r event; do
-    normalized="$(_watch_record_incoming "$event")" || continue
-    printf '%s\n' "$normalized" >> "$recorded"
-  done < "$accepted"
   WATCH_EVENT_JSON="$(jq -s -c '
-    sort_by(
-      (if .kind == "approval" or .kind == "input_required" then 0
-       elif .kind == "turn_complete" then 1
-       elif .kind == "idle" or .kind == "screen_idle" or .kind == "manual_reassess" then 2
-       else 3 end),
-      (.timestamp // ""), (.event_id // "")
-    ) | .[0]
-  ' "$recorded")"
-  WATCH_EVENT_ID="$(printf '%s' "$WATCH_EVENT_JSON" | jq -r '.event_id')"
-  rm -f "$accepted" "$recorded"
+    def priority:
+      if .kind == "approval" or .kind == "input_required" then 0
+      elif .kind == "turn_complete" then 1
+      elif .kind == "idle" or .kind == "screen_idle" or .kind == "manual_reassess" then 2
+      else 3 end;
+    map(. + {__priority:priority})
+    | (map(.__priority) | min) as $winning_priority
+    | map(select(.__priority == $winning_priority))
+    | max_by([(.event_order // 0), (.timestamp // ""), (.event_id // "")])
+    | del(.__priority)
+  ' "$accepted")"
+  winner_id="$(printf '%s' "$WATCH_EVENT_JSON" | jq -r '.event_id')"
+  winner_kind="$(printf '%s' "$WATCH_EVENT_JSON" | jq -r '.kind')"
+  winner_priority="$(_watch_event_priority "$winner_kind")"
+  normalized="$(_watch_record_incoming "$WATCH_EVENT_JSON")" || { rm -f "$accepted"; return 11; }
+  WATCH_EVENT_JSON="$normalized"
+  WATCH_EVENT_ID="$winner_id"
+  : > "$retained"
+  while IFS= read -r event; do
+    [ -n "$event" ] || continue
+    event_id="$(printf '%s' "$event" | jq -r '.event_id')"
+    [ "$event_id" = "$winner_id" ] && continue
+    kind="$(printf '%s' "$event" | jq -r '.kind')"
+    event_priority="$(_watch_event_priority "$kind")"
+    if [ "$event_priority" = "$winner_priority" ]; then
+      _watch_record_incoming "$event" >/dev/null || continue
+      radar_event_append coalesced watcher "coalesced into $winner_id" "$(printf '%s' "$event" | jq -c \
+        --arg winner "$winner_id" '{record:"coalesced",event_id:.event_id,original_kind:.kind,coalesced_into_event_id:$winner}')"
+    else
+      radar_event_append requeued watcher "retained after burst winner $winner_id" "$(printf '%s' "$event" | jq -c \
+        --arg winner "$winner_id" '{record:"requeued",event_id:.event_id,original_kind:.kind,after_event_id:$winner}')"
+      printf '%s\n' "$event" >> "$retained"
+    fi
+  done < "$accepted"
+  _watch_requeue_file "$retained"
+  rm -f "$accepted" "$unique" "$retained"
 }
 
 _watch_wait_for_batch() {
@@ -962,8 +1048,42 @@ _watch_wait_for_batch() {
   done
 }
 
+_watch_retry_batch() {
+  local batch="$1" current_kind="$2" retained="$RADAR_RUN_DIR/.retry-retained.$$"
+  local event normalized kind
+  [ -s "$batch" ] || return 1
+  if ! jq -e 'select(.kind == "user_resumed")' "$batch" >/dev/null 2>&1; then
+    _watch_requeue_file "$batch"
+    return 1
+  fi
+  : > "$retained"
+  while IFS= read -r event; do
+    [ -n "$event" ] || continue
+    normalized="$(_watch_normalize_event "$event")" || continue
+    kind="$(printf '%s' "$normalized" | jq -r '.kind')"
+    case "$kind" in
+      user_resumed) _watch_record_incoming "$normalized" >/dev/null || true ;;
+      approval|input_required)
+        _watch_record_incoming "$normalized" >/dev/null || true
+        radar_event_append superseded watcher "superseded during retry backoff" "$(printf '%s' "$normalized" | jq -c \
+          '{record:"superseded",event_id:.event_id,supersedes_event_id:.event_id,supersedes_kind:.kind,reason:"user_resumed"}')"
+        ;;
+      *) printf '%s\n' "$normalized" >> "$retained" ;;
+    esac
+  done < "$batch"
+  _watch_requeue_file "$retained"
+  rm -f "$retained"
+  _watch_supersede_current user_resumed "$current_kind"
+  radar_event_append retry_cancelled watcher "retry cancelled by user_resumed" "$(jq -cn \
+    --arg event_id "$WATCH_EVENT_ID" --argjson retry "$WATCH_RETRY" \
+    '{record:"retry_cancelled",event_id:$event_id,retry:$retry,reason:"user_resumed"}')"
+  return 10
+}
+
 _watch_retry_delay() {
-  local retry="$1" schedule="${TMUX_RADAR_TEST_RETRY_DELAYS:-15,30,60}" old_ifs="$IFS" delay
+  local retry="$1" current_kind="$2" schedule="${TMUX_RADAR_TEST_RETRY_DELAYS:-15,30,60}"
+  local old_ifs="$IFS" delay tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.05}"
+  local batch="$RADAR_RUN_DIR/.retry-batch.$$" batch_rc
   IFS=,
   # Intentional field splitting turns the comma-separated test seam into the
   # three fixed production retry slots without arrays or Bash 4 features.
@@ -971,7 +1091,35 @@ _watch_retry_delay() {
   set -- $schedule
   IFS="$old_ifs"
   case "$retry" in 1) delay="${1:-15}" ;; 2) delay="${2:-30}" ;; *) delay="${3:-60}" ;; esac
-  _watch_wait_delay "$delay"
+  : > "$batch"
+  _watch_start_waiter
+  _watch_start_timer "$delay"
+  _watch_state_snapshot
+  radar_inbox_drain > "$batch"
+  while :; do
+    if [ -s "$batch" ]; then
+      set +e; _watch_retry_batch "$batch" "$current_kind"; batch_rc=$?; set -e
+      : > "$batch"
+      if [ "$batch_rc" -eq 10 ]; then
+        _watch_kill_waiters; rm -f "$batch"; return 10
+      fi
+    fi
+    tmux display-message -p -t "$WATCH_PANE" '#{pane_id}' >/dev/null 2>&1 || {
+      _watch_kill_waiters; rm -f "$batch"; return 2
+    }
+    if [ -e "$WATCH_TIMER_DONE" ]; then
+      _watch_kill_waiters; rm -f "$batch"; return 0
+    fi
+    if [ -e "$WATCH_WAITER_DONE" ]; then
+      _terminate_process_tree "$WATCH_WAITER_PID" ""
+      wait "$WATCH_WAITER_PID" 2>/dev/null || true
+      WATCH_WAITER_PID=""; rm -f "$WATCH_WAITER_DONE"
+      _watch_start_waiter
+      _watch_state_snapshot
+      radar_inbox_drain > "$batch"
+    fi
+    sleep "$tick"
+  done
 }
 
 _watch_requeue_file() {
@@ -982,7 +1130,7 @@ _watch_requeue_file() {
     kind="$(printf '%s' "$event" | jq -r '.kind')"
     source="$(printf '%s' "$event" | jq -r '.source // "unknown"')"
     label="$(printf '%s' "$event" | jq -r '.label // .kind')"
-    extra="$(printf '%s' "$event" | jq -c '{event_id:.event_id}')"
+    extra="$(printf '%s' "$event" | jq -c '{event_id:.event_id,event_order:(.event_order // 0)}')"
     radar_inbox_append "$kind" "$source" "$label" "$extra"
   done < "$file"
 }
@@ -1098,7 +1246,28 @@ _watch_verify_send() {
   radar_event_append verification_completed watcher "$reason" "$(jq -cn \
     --arg event_id "$WATCH_EVENT_ID" --arg reason "$reason" --arg pre "$pre" \
     '{record:"verification",event_id:$event_id,result:$reason,pre_send_fingerprint:$pre}')"
-  [ "$reason" != pane_death ]
+  case "$reason" in
+    pane_death) return 2 ;;
+    timeout)
+      _watch_phase PAUSED_ERROR "verification timeout: no observable send effect" none 0
+      radar_event_append verification_warning watcher "verification timeout" "$(jq -cn \
+        --arg event_id "$WATCH_EVENT_ID" --arg pre "$pre" \
+        '{record:"verification_warning",event_id:$event_id,result:"timeout",pre_send_fingerprint:$pre}')"
+      return 3
+      ;;
+    *) return 0 ;;
+  esac
+}
+
+_watch_pre_send_test_seam() {
+  local block="${TMUX_RADAR_TEST_PRE_SEND_BLOCK:-}" tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.05}"
+  [ -n "$block" ] || return 0
+  printf 'ready\n' > "$block.ready"
+  while [ -e "$block" ]; do
+    tmux display-message -p -t "$WATCH_PANE" '#{pane_id}' >/dev/null 2>&1 || return 2
+    sleep "$tick"
+  done
+  rm -f "$block.ready"
 }
 
 _watch_finalize() {
@@ -1126,7 +1295,8 @@ _watch_signal_exit() {
 
 cmd_watch_loop() {
   local pane goal policy poll auto maxcalls config batch wait_rc coalesce_rc event_kind
-  local rc valid failure pre armed_fingerprint current_fingerprint guard_rc
+  local rc valid failure evidence_fingerprint delivery_fingerprint armed_fingerprint current_fingerprint guard_rc
+  local retry_rc retry_cancelled verify_rc
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane" >&2; return 1; }
   goal="${2:-}"
   policy="${3:-}"
@@ -1180,7 +1350,8 @@ cmd_watch_loop() {
         WATCH_IDLE_SEQ=$(( ${WATCH_IDLE_SEQ:-0} + 1 ))
         WATCH_EVENT_ID="idle-$RADAR_RUN_ID-$WATCH_IDLE_SEQ"
         jq -cn --arg id "$WATCH_EVENT_ID" --arg pane "$pane" --arg timestamp "$(_radar_now_iso)" \
-          '{kind:"idle",source:"watcher",label:"idle fallback",event_id:$id,pane:$pane,timestamp:$timestamp}' > "$batch"
+          --argjson event_order "$(_watch_next_event_order)" \
+          '{kind:"idle",source:"watcher",label:"idle fallback",event_id:$id,pane:$pane,timestamp:$timestamp,event_order:$event_order}' > "$batch"
         ;;
     esac
     _watch_phase EVENT_PENDING "event batch ready" event 0
@@ -1194,10 +1365,10 @@ cmd_watch_loop() {
     esac
     event_kind="$(printf '%s' "$WATCH_EVENT_JSON" | jq -r '.kind')"
     _watch_phase CAPTURING "capturing pane for $event_kind" none 0
-    pre="$(_watch_fingerprint || true)"
-    if [ -z "$pre" ]; then _watch_finalize stopped STOPPED "target pane disappeared during capture"; break; fi
+    evidence_fingerprint="$(_watch_fingerprint || true)"
+    if [ -z "$evidence_fingerprint" ]; then _watch_finalize stopped STOPPED "target pane disappeared during capture"; break; fi
 
-    WATCH_RETRY=0
+    WATCH_RETRY=0; retry_cancelled=0
     while :; do
       if [ "$WATCH_CALLS" -ge "$WATCH_MAX_CALLS" ]; then
         _watch_phase PAUSED_ERROR "max_calls reached before model launch" none 0
@@ -1216,9 +1387,8 @@ cmd_watch_loop() {
       WATCH_LAST_DECISION="$(now)"
       valid=1; failure=""
       if [ "$BRAIN_LAST_RC" -ne 0 ]; then valid=0; failure="backend rc=$BRAIN_LAST_RC${BRAIN_STOP_REASON:+ ($BRAIN_STOP_REASON)}"
-      elif ! printf '%s' "$DECISION_JSON" | jq -e 'type == "object"' >/dev/null 2>&1; then valid=0; failure="empty or malformed model JSON"
+      elif [ "$DECISION_SCHEMA_VALID" -ne 1 ]; then valid=0; failure="${DECISION_SCHEMA_ERROR:-decision schema/type validation failed}"
       else
-        case "$DECISION_ACTION" in send|wait|done|escalate|suggest) : ;; *) valid=0; failure="unknown action: ${DECISION_ACTION:-empty}" ;; esac
         if [ "$valid" -eq 1 ] && [ "$DECISION_ACTION" = "done" ]; then
           case "$event_kind" in turn_complete|screen_idle|idle|manual_reassess) : ;;
             *) valid=0; failure="done is invalid for event kind: $event_kind" ;;
@@ -1237,13 +1407,21 @@ cmd_watch_loop() {
       fi
       WATCH_RETRY=$((WATCH_RETRY + 1))
       _watch_phase DECIDING "$failure; retry $WATCH_RETRY scheduled" retry 0
-      if ! _watch_retry_delay "$WATCH_RETRY"; then
-        _watch_finalize stopped STOPPED "target pane disappeared during retry delay"
-        break 2
-      fi
+      set +e; _watch_retry_delay "$WATCH_RETRY" "$event_kind"; retry_rc=$?; set -e
+      case "$retry_rc" in
+        0) : ;;
+        10) retry_cancelled=1; break ;;
+        2) _watch_finalize stopped STOPPED "target pane disappeared during retry delay"; break 2 ;;
+        *) _watch_finalize paused_error PAUSED_ERROR "retry wait failed"; break 2 ;;
+      esac
     done
 
-    set +e; _watch_post_decision_guard "$pre" "$event_kind"; guard_rc=$?; set -e
+    if [ "$retry_cancelled" -eq 1 ]; then
+      WATCH_EVENT_ID=""; WATCH_RETRY=0
+      continue
+    fi
+
+    set +e; _watch_post_decision_guard "$evidence_fingerprint" "$event_kind"; guard_rc=$?; set -e
     case "$guard_rc" in
       0) : ;;
       2) _watch_finalize stopped STOPPED "target pane disappeared after decision"; break ;;
@@ -1288,17 +1466,48 @@ cmd_watch_loop() {
         fi
         ;;
     esac
-    _watch_phase EXECUTING "sending one safe decision" none 0
-    pre="$(_watch_fingerprint || true)"
-    [ -n "$pre" ] || { _watch_finalize stopped STOPPED "target pane disappeared before send"; break; }
-    _send "$pane" "$DECISION_TEXT" ${DECISION_KEYS[@]+"${DECISION_KEYS[@]}"}
-    radar_event_append sent watcher "${DECISION_REASON:-safe action sent}" "$(jq -cn --arg event_id "$WATCH_EVENT_ID" \
-      --arg pre "$pre" '{record:"execution",event_id:$event_id,sent:true,pre_send_fingerprint:$pre}')"
-    _clearmark "$pane"
-    if ! _watch_verify_send "$pre"; then
-      _watch_finalize stopped STOPPED "target pane disappeared during verification"
+    _watch_phase EXECUTING "final delivery guard" none 0
+    set +e; _watch_pre_send_test_seam; guard_rc=$?; set -e
+    if [ "$guard_rc" -eq 2 ]; then
+      _watch_finalize stopped STOPPED "target pane disappeared at delivery boundary"
       break
     fi
+    set +e; _watch_post_decision_guard "$evidence_fingerprint" "$event_kind"; guard_rc=$?; set -e
+    case "$guard_rc" in
+      0) : ;;
+      2) _watch_finalize stopped STOPPED "target pane disappeared at final delivery guard"; break ;;
+      10|12) WATCH_EVENT_ID=""; WATCH_RETRY=0; continue ;;
+      *) _watch_finalize paused_error PAUSED_ERROR "final delivery guard failed"; break ;;
+    esac
+    delivery_fingerprint="$(_watch_fingerprint || true)"
+    [ -n "$delivery_fingerprint" ] || { _watch_finalize stopped STOPPED "target pane disappeared before send"; break; }
+    if [ "$delivery_fingerprint" != "$evidence_fingerprint" ]; then
+      _watch_supersede_current evidence_changed "$event_kind"
+      WATCH_EVENT_ID=""; WATCH_RETRY=0
+      continue
+    fi
+    if ! _send "$pane" "$DECISION_TEXT" ${DECISION_KEYS[@]+"${DECISION_KEYS[@]}"}; then
+      radar_event_append delivery_failed watcher "tmux send-keys failed" "$(jq -cn \
+        --arg event_id "$WATCH_EVENT_ID" --arg pre "$delivery_fingerprint" \
+        '{record:"delivery_error",event_id:$event_id,sent:false,pre_send_fingerprint:$pre}')"
+      _escalate "$pane" "AI 监控发送按键失败，已暂停"
+      _watch_finalize delivery_error PAUSED_ERROR "tmux send-keys delivery failed"
+      break
+    fi
+    radar_event_append sent watcher "${DECISION_REASON:-safe action sent}" "$(jq -cn --arg event_id "$WATCH_EVENT_ID" \
+      --arg pre "$delivery_fingerprint" '{record:"execution",event_id:$event_id,sent:true,pre_send_fingerprint:$pre}')"
+    _clearmark "$pane"
+    set +e; _watch_verify_send "$delivery_fingerprint"; verify_rc=$?; set -e
+    case "$verify_rc" in
+      0) : ;;
+      2) _watch_finalize stopped STOPPED "target pane disappeared during verification"; break ;;
+      3)
+        _escalate "$pane" "AI 监控发送后未观察到变化，已暂停"
+        _watch_finalize verification_timeout PAUSED_ERROR "verification timeout: no observable send effect"
+        break
+        ;;
+      *) _watch_finalize paused_error PAUSED_ERROR "verification failed"; break ;;
+    esac
     WATCH_EVENT_ID=""; WATCH_RETRY=0
   done
   rm -f "$batch"
@@ -1745,7 +1954,7 @@ _emit_event_usage() {
 
 cmd_emit_event() {
   local pane="${1:-}" kind="${2:-}" source="${3:-}" label="${4-}"
-  local sanitized expected_run_id="${TMUX_RADAR_EXPECT_RUN_ID:-}" event_id extra
+  local sanitized expected_run_id="${TMUX_RADAR_EXPECT_RUN_ID:-}" event_id event_order extra
   if [ -z "$pane" ] || [ -z "$kind" ] || [ -z "$source" ] || [ "${4+x}" != x ]; then
     _emit_event_usage
     return 2
@@ -1767,7 +1976,12 @@ cmd_emit_event() {
   if [ -z "$event_id" ]; then
     event_id="event-${RADAR_RUN_ID}-$(date '+%s')-$$-${RANDOM:-0}"
   fi
-  extra="$(jq -cn --arg event_id "$event_id" '{event_id:$event_id}')"
+  event_order="$(_watch_next_event_order)" || {
+    echo "emit-event: failed to allocate event order" >&2
+    return 1
+  }
+  extra="$(jq -cn --arg event_id "$event_id" --argjson event_order "$event_order" \
+    '{event_id:$event_id,event_order:$event_order}')"
   if ! radar_inbox_append "$kind" "$source" "$sanitized" "$extra"; then
     echo "emit-event: failed to append event" >&2
     return 1

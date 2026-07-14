@@ -80,6 +80,10 @@ case "$cmd" in
     cat "$TEST_SCREEN"
     ;;
   send-keys)
+    count=1
+    [ -s "$TEST_SEND_COUNT" ] && count=$(( $(cat "$TEST_SEND_COUNT") + 1 ))
+    printf '%s\n' "$count" > "$TEST_SEND_COUNT"
+    [ "${TEST_SEND_FAIL_AT:-0}" = "$count" ] && exit 1
     printf '%s\n' "$*" >> "$TEST_SENDS"
     ;;
   wait-for)
@@ -148,6 +152,7 @@ reset_case() {
   export BASH_ENV="$TMP/bashenv"
   export TEST_SCREEN="$CASE/screen"
   export TEST_SENDS="$CASE/sends"
+  export TEST_SEND_COUNT="$CASE/send-count"
   export TEST_SIGNALS="$CASE/signals"
   export TEST_MODEL_CALLS="$CASE/model.calls"
   export TEST_CALL_COUNT="$CASE/call-count"
@@ -163,8 +168,11 @@ reset_case() {
   export TEST_AI_TIMEOUT=5
   export TEST_MAX_CALLS=40
   export TEST_BACKEND_NOTIFY=0
+  export TEST_SEND_FAIL_AT=0
+  export TMUX_RADAR_TEST_PRE_SEND_BLOCK=""
   : > "$TMUX_RADAR_NEEDINPUT_FILE"
   : > "$TEST_SENDS"
+  : > "$TEST_SEND_COUNT"
   : > "$TEST_MODEL_CALLS"
   : > "$TEST_CALL_COUNT"
   : > "$TEST_INTERNAL_LOG"
@@ -376,7 +384,100 @@ assert_eq 1 "$(jq -s '[.[] | select(.kind == "superseded" and .supersedes_event_
 stop_watch
 printf 'PASS: user resume retains non-stale batch events\n'
 
-# 12. Ctrl-C/TERM tears down waiter, timer, backend group, and live pointer.
+# 12. The final delivery-boundary guard catches takeover after policy gating.
+reset_case final-send-guard
+write_response 1 '{"action":"send","text":"","keys":["Enter"],"safe":true,"reason":"must be cancelled"}'
+export TMUX_RADAR_TEST_PRE_SEND_BLOCK="$CASE/pre-send-block"
+touch "$TMUX_RADAR_TEST_PRE_SEND_BLOCK"
+start_watch 30
+emit_event final-race-approval approval approval
+wait_until 'final pre-send seam' "[ -s '$TMUX_RADAR_TEST_PRE_SEND_BLOCK.ready' ]" 600
+printf 'evidence changed at delivery boundary\n' > "$TEST_SCREEN"
+emit_event final-race-user user_resumed resumed
+rm -f "$TMUX_RADAR_TEST_PRE_SEND_BLOCK"
+wait_until 'final guard supersedes stale decision' "jq -e 'select(.kind == \"superseded\" and .supersedes_event_id == \"final-race-approval\")' '$RUN_DIR/events.jsonl' >/dev/null"
+sleep 0.1
+assert_eq 0 "$(wc -l < "$TEST_SENDS" | tr -d ' ')" 'final pre-send guard prevents stale delivery'
+stop_watch
+printf 'PASS: final pre-send guard closes stale delivery window\n'
+
+# 13. Burst selection chooses the newest event at the winning priority.
+reset_case newest-burst
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"newest approval"}'
+write_response 2 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"retained turn"}'
+start_watch 30
+kill -STOP "$WATCH_PID"
+emit_event burst-old-approval approval old
+emit_event burst-turn turn_complete turn
+emit_event burst-new-approval approval new
+kill -CONT "$WATCH_PID"
+wait_until 'burst winner model call' "jq -e 'select(.kind == \"model_started\")' '$RUN_DIR/events.jsonl' >/dev/null"
+assert_eq burst-new-approval "$(jq -r 'select(.kind == "model_started") | .event_id' "$RUN_DIR/events.jsonl" | head -n 1)" 'newest approval wins burst'
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "coalesced" and .event_id == "burst-old-approval" and .coalesced_into_event_id == "burst-new-approval")] | length' "$RUN_DIR/events.jsonl")" 'older approval explicitly coalesced'
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "requeued" and .event_id == "burst-turn")] | length' "$RUN_DIR/events.jsonl")" 'independent turn explicitly requeued'
+stop_watch
+printf 'PASS: burst coalescing selects newest actionable event\n'
+
+# 14. Required decision fields retain their exact JSON types.
+reset_case schema-types
+write_response 1 '{"action":"send","text":"","keys":["Enter"],"reason":"missing safe"}'
+write_response 2 '{"action":"send","text":"","keys":["Enter"],"safe":null,"reason":"null safe"}'
+write_response 3 '{"action":"send","text":"","keys":["Enter"],"safe":"true","reason":"string safe"}'
+write_response 4 '{"action":"send","text":"","keys":["Enter",1],"safe":true,"reason":"bad keys"}'
+start_watch 30
+emit_event schema-event approval schema
+wait_until 'schema validation exhaustion' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 3' '$RUN_DIR/state.json' >/dev/null 2>&1" 600
+assert_eq 0 "$(wc -l < "$TEST_SENDS" | tr -d ' ')" 'malformed decision types send no keys'
+assert_eq 4 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'malformed decision types retry same event'
+wait "$WATCH_PID" 2>/dev/null || true
+WATCH_PID=""
+printf 'PASS: decision schema types are validated locally\n'
+
+# 15. tmux delivery failure is visible and never journaled as sent.
+reset_case send-failure
+write_response 1 '{"action":"send","text":"","keys":["Enter"],"safe":true,"reason":"delivery fails"}'
+export TEST_SEND_FAIL_AT=1
+start_watch 30
+emit_event send-failure-event approval send
+wait_until 'delivery failure final outcome' "[ -s '$RUN_DIR/final.json' ]"
+assert_eq delivery_error "$(jq -r '.outcome' "$RUN_DIR/final.json")" 'delivery failure outcome'
+assert_eq 0 "$(jq -s '[.[] | select(.kind == "sent" and .sent == true)] | length' "$RUN_DIR/events.jsonl")" 'no false sent journal'
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "delivery_failed")] | length' "$RUN_DIR/events.jsonl")" 'delivery failure is journaled'
+wait "$WATCH_PID" 2>/dev/null || true
+WATCH_PID=""
+printf 'PASS: send failure pauses without false verification\n'
+
+# 16. Verification timeout is a visible warning, not normal completion.
+reset_case verify-timeout
+write_response 1 '{"action":"send","text":"","keys":["Enter"],"safe":true,"reason":"no visible effect"}'
+export TMUX_RADAR_TEST_VERIFY_TIMEOUT=0.2
+start_watch 30
+emit_event verify-timeout-event approval send
+wait_until 'verification timeout final outcome' "[ -s '$RUN_DIR/final.json' ]" 400
+assert_eq verification_timeout "$(jq -r '.outcome' "$RUN_DIR/final.json")" 'verification timeout outcome'
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "verification_warning" and .result == "timeout")] | length' "$RUN_DIR/events.jsonl")" 'verification timeout warning journal'
+assert_json "$RUN_DIR/state.json" '.phase == "PAUSED_ERROR" and (.status | contains("verification timeout"))'
+wait "$WATCH_PID" 2>/dev/null || true
+WATCH_PID=""
+printf 'PASS: verification timeout remains visibly paused\n'
+
+# 17. user_resumed interrupts retry backoff before another model call.
+reset_case backoff-takeover
+write_response 1 '{"action":"send","text":"","keys":["Enter"],"safe":"true","reason":"invalid"}'
+write_response 2 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"must not run"}'
+export TMUX_RADAR_TEST_RETRY_DELAYS=1,1,1
+start_watch 30
+emit_event backoff-approval approval retry
+wait_until 'retry waiter armed' "jq -e '.phase == \"DECIDING\" and .retry == 1 and .waiter_pid > 0' '$RUN_DIR/state.json' >/dev/null 2>&1" 400
+emit_event backoff-user user_resumed resumed
+wait_until 'retry cancelled by takeover' "jq -e 'select(.kind == \"retry_cancelled\" and .event_id == \"backoff-approval\")' '$RUN_DIR/events.jsonl' >/dev/null" 400
+sleep 0.2
+assert_eq 1 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'takeover prevents extra retry call'
+assert_eq 0 "$(wc -l < "$TEST_SENDS" | tr -d ' ')" 'takeover during backoff sends no keys'
+stop_watch
+printf 'PASS: retry backoff is interruptible by takeover\n'
+
+# 18. Ctrl-C/TERM tears down waiter, timer, backend group, and live pointer.
 reset_case cleanup
 write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"blocked"}'
 touch "$TEST_BLOCK_BACKEND"

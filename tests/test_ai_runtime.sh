@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091,SC2329
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -6,12 +7,10 @@ source "$ROOT/tests/test_helpers.sh"
 
 TMP="$(test_tmpdir runtime)"
 CLEANUP_PIDS=""
-TEST_EXIT_CODE=0
-trap 'TEST_EXIT_CODE=$?' ERR
 SYSTEM_MKTEMP="$(command -v mktemp)"
 
 cleanup() {
-  local rc="${TEST_EXIT_CODE:-$?}"
+  local rc="$?"
   for pid in $CLEANUP_PIDS; do
     kill -KILL "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -43,7 +42,7 @@ trap cleanup EXIT
 config='{"goal":"监控到测试全绿","values":{"timeout":{"value":"60","source":"custom"}}}'
 radar_run_create %39 "$config"
 assert_file "$RADAR_RUN_DIR/config.json"
-assert_json "$RADAR_RUN_DIR/config.json" '.goal == "监控到测试全绿"'
+assert_json "$RADAR_RUN_DIR/config.json" '.schema_version == 1 and .goal == "监控到测试全绿"'
 assert_eq "600" "$(stat -f '%Lp' "$RADAR_RUN_DIR/config.json")" "config.json mode"
 assert_file "$(radar_watch_file %39)"
 
@@ -67,10 +66,10 @@ assert_contains "$watch_contents" "monitor_overview_pane=" "watch overview pane 
 assert_contains "$watch_contents" "monitor_detail_pane=" "watch detail pane key"
 
 radar_state_set ARMED "waiting for hook" none 0
-assert_json "$RADAR_RUN_DIR/state.json" '.phase == "ARMED" and .status == "waiting for hook" and .next.kind == "none" and .next.at == 0 and .run_id == "'"$RADAR_RUN_ID"'"'
+assert_json "$RADAR_RUN_DIR/state.json" '.schema_version == 1 and .phase == "ARMED" and .status == "waiting for hook" and .next.kind == "none" and .next.at == 0 and .run_id == "'"$RADAR_RUN_ID"'"'
 
 radar_event_append approval codex "Codex needs approval" '{}'
-assert_json "$RADAR_RUN_DIR/events.jsonl" 'select(.kind == "approval" and .source == "codex" and .label == "Codex needs approval" and .run_id == "'"$RADAR_RUN_ID"'")'
+assert_json "$RADAR_RUN_DIR/events.jsonl" 'select(.schema_version == 1 and .kind == "approval" and .source == "codex" and .label == "Codex needs approval" and .run_id == "'"$RADAR_RUN_ID"'")'
 
 radar_inbox_append user_resumed hook "User resumed flow" '{"pane_title":"测试面板"}'
 if ! drained_once="$(radar_inbox_drain)"; then
@@ -82,13 +81,44 @@ assert_eq "" "$(radar_inbox_drain)" "second inbox drain empty"
 
 radar_run_finalize completed "goal reached"
 assert_json "$RADAR_RUN_DIR/final.json" '
-  .outcome == "completed" and .reason == "goal reached" and
+  .schema_version == 1 and .outcome == "completed" and .reason == "goal reached" and
   .run_id == "'"$RADAR_RUN_ID"'" and .goal == "监控到测试全绿" and
   .duration_seconds >= 0 and .event_count == 1 and .decision_count == 0 and
   .action_count == 0 and .error_count == 0 and
   .log_path == "'"$RADAR_RUN_DIR"'" and .finalized_epoch > 0
 '
 assert_eq "600" "$(stat -f '%Lp' "$RADAR_RUN_DIR/final.json")" "final.json mode"
+
+# Schema-less v0 runs remain readable and can be advanced/finalized by the v1
+# runtime. Missing schema_version is interpreted as version 0.
+v0_run_dir="$RADAR_RUNS_DIR/v0-readable-run"
+mkdir -p "$v0_run_dir/inbox" "$v0_run_dir/decisions"
+printf '%s\n' '{"goal":"legacy goal","run_id":"v0-readable-run","pane":"%55"}' > "$v0_run_dir/config.json"
+printf '%s\n' '{"phase":"ARMED","status":"legacy state","run_id":"v0-readable-run","pane":"%55"}' > "$v0_run_dir/state.json"
+printf '%s\n' '{"kind":"approval","source":"legacy","label":"legacy event","run_id":"v0-readable-run","pane":"%55"}' > "$v0_run_dir/events.jsonl"
+printf '%s\n' '{"call":1,"backend":"legacy codex","schema_valid":true}' > "$v0_run_dir/decisions/0001.meta.json"
+v0_watch="$(radar_watch_file %55)"
+cat > "$v0_watch" <<EOF
+run_id=v0-readable-run
+run_dir=$v0_run_dir
+pid=$$
+pane=%55
+channel=radar-run-55
+monitor_overview_pane=
+monitor_detail_pane=
+EOF
+radar_run_open %55 > "$TMP/v0-opened.txt"
+assert_eq "$v0_run_dir" "$(cat "$TMP/v0-opened.txt")" 'schema-v0 run opens by canonical pointer'
+assert_json "$v0_run_dir/config.json" '(.schema_version // 0) == 0 and .goal == "legacy goal"'
+assert_json "$v0_run_dir/state.json" '(.schema_version // 0) == 0 and .phase == "ARMED"'
+assert_json "$v0_run_dir/events.jsonl" 'select((.schema_version // 0) == 0 and .kind == "approval")'
+assert_json "$v0_run_dir/decisions/0001.meta.json" '(.schema_version // 0) == 0 and .call == 1'
+radar_event_append input_required codex 'v1 event on v0 run' '{}'
+radar_run_finalize completed 'legacy run completed'
+assert_json "$v0_run_dir/final.json" '
+  .schema_version == 1 and .outcome == "completed" and
+  .goal == "legacy goal" and .event_count == 2
+'
 
 stale_dir="$RADAR_RUNS_DIR/19990101-000000-pane-111"
 mkdir -p "$stale_dir"

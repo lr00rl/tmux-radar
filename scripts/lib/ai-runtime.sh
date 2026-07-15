@@ -144,7 +144,7 @@ radar_run_create() {
       --arg pane "$pane" \
       --arg timestamp "$(_radar_now_iso)" \
       --argjson created_epoch "$created_epoch" \
-      '$config + {run_id:$run_id, pane:$pane, created_at:$timestamp, created_epoch:$created_epoch}'
+      '$config + {schema_version:1, run_id:$run_id, pane:$pane, created_at:$timestamp, created_epoch:$created_epoch}'
   )" || return 1
   _radar_write_snapshot "$run_dir/config.json" "$config_payload" || return 1
   : > "$run_dir/events.jsonl"
@@ -184,7 +184,7 @@ radar_state_set() {
       --arg run_id "$RADAR_RUN_ID" \
       --arg pane "$RADAR_RUN_PANE" \
       --arg timestamp "$(_radar_now_iso)" \
-      '{phase:$phase, status:$status, next:{kind:$next_kind, at:$next_at}, run_id:$run_id, pane:$pane, updated_at:$timestamp}'
+      '{schema_version:1, phase:$phase, status:$status, next:{kind:$next_kind, at:$next_at}, run_id:$run_id, pane:$pane, updated_at:$timestamp}'
   )" || return 1
   _radar_write_snapshot "$RADAR_RUN_DIR/state.json" "$payload"
 }
@@ -199,7 +199,7 @@ _radar_current_event_json() {
     --arg pane "$RADAR_RUN_PANE" \
     --arg timestamp "$(_radar_now_iso)" \
     --argjson extra "$extra_json" \
-    '($extra + {kind:$kind, source:$source, label:$label, run_id:$run_id, pane:$pane, timestamp:$timestamp})'
+    '($extra + {schema_version:1, kind:$kind, source:$source, label:$label, run_id:$run_id, pane:$pane, timestamp:$timestamp})'
 }
 
 radar_event_append() {
@@ -297,7 +297,7 @@ radar_run_finalize() {
       --argjson decision_count "${decision_count:-0}" \
       --argjson action_count "${action_count:-0}" \
       --argjson error_count "${error_count:-0}" \
-      '{outcome:$outcome, reason:$reason, run_id:$run_id, pane:$pane,
+      '{schema_version:1, outcome:$outcome, reason:$reason, run_id:$run_id, pane:$pane,
         goal:$goal, goal_status:$goal_status, duration_seconds:$duration_seconds,
         event_count:$event_count, decision_count:$decision_count,
         action_count:$action_count, error_count:$error_count,

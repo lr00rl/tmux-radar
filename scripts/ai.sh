@@ -92,6 +92,7 @@ BRAIN_LAST_TIMEOUT=0
 BRAIN_LAST_PID=""
 BRAIN_LAST_PGID=""
 BRAIN_STOP_REASON=""
+BRAIN_LAST_ERR_FILE=""
 BRAIN_BACKEND_FROZEN=0
 BRAIN_BACKEND_OK=0
 BRAIN_BACKEND_MODE=""
@@ -115,6 +116,7 @@ DECISION_REASON=""
 DECISION_KEYS=()
 DECISION_SCHEMA_VALID=0
 DECISION_SCHEMA_ERROR=""
+DECISION_READY=0
 
 WATCH_WAITER_PID=""
 WATCH_TIMER_PID=""
@@ -128,6 +130,8 @@ WATCH_AUTONOMY="auto-safe"
 WATCH_MAX_CALLS=40
 WATCH_CALLS=0
 WATCH_RETRY=0
+WATCH_TRANSIENT_RETRIES=0
+WATCH_REPAIR_ATTEMPTS=0
 WATCH_RETRY_LIMIT=3
 WATCH_RETRY_BACKOFF=15
 WATCH_EVENT_ID=""
@@ -796,7 +800,7 @@ _persist_decision_call() {
     --argjson timeout_seconds "${BRAIN_LAST_TIMEOUT:-0}" \
     --argjson backend_rc "${BRAIN_LAST_RC:-0}" \
     --argjson schema_valid "$DECISION_SCHEMA_VALID" \
-    '{run_id:$run_id,pane:$pane,event_id:$event_id,call:$call,backend:$backend,
+    '{schema_version:1,run_id:$run_id,pane:$pane,event_id:$event_id,call:$call,backend:$backend,
       model:$model,profile:$profile,effort:$effort,autonomy:$autonomy,policy:$policy,
       started_at:$started_at,elapsed_seconds:$elapsed_seconds,
       timeout_seconds:$timeout_seconds,backend_rc:$backend_rc,
@@ -936,7 +940,7 @@ _watch_state_snapshot() {
     --argjson model_timeout "${BRAIN_LAST_TIMEOUT:-0}" \
     --argjson model_pid "${BRAIN_LAST_PID:-0}" \
     --argjson model_pgid "${BRAIN_LAST_PGID:-0}" \
-    '. + $extra + {
+    '. + $extra + {schema_version:1,
       phase:$phase,status:$status,event_id:$event_id,goal:$goal,policy:$policy,
       autonomy:$autonomy,poll:$poll,calls:$calls,max_calls:$max_calls,retry:$retry,
       next:{kind:$next_kind,at:$next_at},run_id:$run_id,pane:$pane,updated_at:$timestamp,
@@ -1309,7 +1313,92 @@ _brain_label() {
   fi
 }
 
-_escalate() { [ -x "$NOTIFY" ] && "$NOTIFY" mark "$1" ai "$2" >/dev/null 2>&1 || true; }
+_classify_backend_failure() {
+  local rc="$1" stderr_file="$2" schema_valid="$3" stderr_text normalized
+  local class retryable summary detail
+  stderr_text="$(tail -c 16384 "$stderr_file" 2>/dev/null || true)"
+  normalized="$(printf '%s' "$stderr_text" | tr '[:upper:]' '[:lower:]')"
+  class='transient'; retryable=1; summary='backend failed with a retryable error'; detail='see stderr_path for private evidence'
+
+  if [ "$rc" -eq 78 ]; then
+    class='config-permanent'; retryable=0
+    summary='backend preflight failed'
+    detail='backend preflight rejected execution'
+  elif [ "$rc" -ne 0 ]; then
+    case "$rc" in
+      126|127)
+        class='config-permanent'; retryable=0; summary='backend executable could not be launched'
+        ;;
+      *)
+        case "$normalized" in
+          *requires*a*newer*version*|*unsupported*model*|*unknown*model*|*model*not*found*|\
+          *profile*not*found*|*authentication*|*unauthorized*|*invalid*api*key*|\
+          *not*logged*in*|*forbidden*|*permission*denied*)
+            class='config-permanent'; retryable=0
+            summary='backend configuration cannot run the selected model'
+            ;;
+          *rate*limit*|*too*many*requests*|*connection*|*network*|*temporar*|\
+          *timed*out*|*timeout*|*service*unavailable*|*server*error*)
+            class='transient'; retryable=1
+            ;;
+        esac
+        ;;
+    esac
+  elif [ "$schema_valid" -ne 1 ]; then
+    class='output-invalid'; retryable=1
+    summary='model output failed decision validation'
+    detail='decision schema/type validation failed'
+  fi
+
+  jq -cn --arg class "$class" --arg summary "$summary" --arg detail "$detail" \
+    --argjson retryable "$retryable" \
+    '{class:$class,retryable:($retryable == 1),summary:$summary,detail:$detail}'
+}
+
+_classify_outcome() {
+  local kind="$1"
+  shift
+  case "$kind" in
+    backend) _classify_backend_failure "$@" ;;
+    policy-halt)
+      jq -cn --arg summary "${1:-policy requires user action}" \
+        '{class:"policy-halt",retryable:false,summary:$summary,detail:""}'
+      ;;
+    decision-invalid)
+      jq -cn --arg summary "${1:-decision violates the current event contract}" \
+        '{class:"decision-invalid",retryable:true,summary:$summary,
+          detail:"repair must satisfy the event-specific decision contract"}'
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+_watch_record_backend_error() {
+  local classification="$1" stderr_path="$2" call="$3" summary
+  summary="$(printf '%s' "$classification" | jq -r '.summary')"
+  radar_event_append backend_error watcher "$summary" "$(jq -cn \
+    --argjson classification "$classification" \
+    --arg event_id "${WATCH_EVENT_ID:-}" --arg backend_mode "$BRAIN_BACKEND_MODE" \
+    --arg backend_path "$BRAIN_BACKEND_PATH" --arg backend_version "$BRAIN_BACKEND_VERSION" \
+    --arg stderr_path "$stderr_path" --argjson call "$call" '
+    {schema_version:1,record:"error",event_id:$event_id,error_class:$classification.class,
+     retryable:$classification.retryable,summary:$classification.summary,detail:$classification.detail,
+     backend_mode:$backend_mode,backend_path:$backend_path,backend_version:$backend_version,
+     stderr_path:$stderr_path,call:$call}')"
+}
+
+_escalate() {
+  local pane="$1" message="$2"
+  if [ -x "$NOTIFY" ] && "$NOTIFY" mark "$pane" ai "$message" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ -n "${RADAR_RUN_DIR:-}" ]; then
+    radar_event_append notification_failed notifier 'user notification could not be delivered' \
+      '{"record":"notification_error","retryable":false}' || true
+  fi
+  audit "notification-failed\t$pane\t$(_flat "$message")"
+  return 0
+}
 _clearmark() { [ -x "$NOTIFY" ] && "$NOTIFY" clear "$1" >/dev/null 2>&1 || true; }
 
 # Send a decision to a pane: literal text (may contain spaces), then key names.
@@ -1334,9 +1423,11 @@ _send() {  # _send <pane> <text> <key> <key> ...
 # ---------------------------------------------------------------------------
 cmd_decide() {
   need_jq
-  have_brain || { echo "codex 未安装/不可用，无法决策。"; return 3; }
   local pane autonomy policy goal cap cap_tail where json pretty_json action text safe reason extra="" prompt backend
   local excerpt_lines errfile err_tail call_tag="" logging snapshots TMUX_RADAR_AI_ERR="" TMUX_SWITCHER_AI_ERR=""
+  DECISION_READY=0
+  BRAIN_LAST_ERR_FILE=""
+  have_brain || { echo "codex 未安装/不可用，无法决策。"; return 3; }
   pane="$(_resolve_pane "${1:-}")" || { echo "no target pane"; return 5; }
   autonomy="${2:-$(opt @radar-ai-autonomy confirm)}"
   policy="${3:-}"
@@ -1353,6 +1444,9 @@ cmd_decide() {
     extra="$extra"$'\n\nPOLICY: watch-until-done with ALWAYS-ALLOW enabled. When the pending action is SAFE and the prompt offers a "Yes, and don\'t ask again" / "always allow" / "don\'t ask again for … commands" option, PREFER that option so the agent stops interrupting for this command type. Still escalate anything destructive or ambiguous; NEVER pick an always-allow option for an unsafe action.'
   fi
   extra="$extra$(_user_rules)"
+  if [ "${TMUX_RADAR_REPAIR_ATTEMPT:-0}" -gt 0 ] 2>/dev/null; then
+    extra="$extra"$'\n\nREPAIR: the previous decision was invalid: '"${TMUX_RADAR_REPAIR_REASON:-decision schema/type validation failed}"$'. Return exactly one corrected decision object that satisfies both the JSON schema and the event-specific action constraints; do not add prose or markdown.'
+  fi
   where="$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}' 2>/dev/null || echo "$pane")"
   cap="$(tmux capture-pane -p -t "$pane" -S "-$(opt @radar-ai-capture-lines 120)" 2>/dev/null || true)"
   [ -n "$cap" ] || { echo "pane $pane: nothing to read"; return 5; }
@@ -1388,6 +1482,7 @@ cmd_decide() {
   fi
   BRAIN_BOUND_PANE="$pane"
   BRAIN_PID_FILE="$(_wbase "$pane").brain.pid"
+  BRAIN_LAST_ERR_FILE="${errfile:-}"
   _brain "$(_skill_file decide.schema.json)" "$prompt"
   json="$BRAIN_RESULT"
   BRAIN_BOUND_PANE=""
@@ -1434,6 +1529,7 @@ cmd_decide() {
   DECISION_REASON="$reason"
   DECISION_KEYS=()
   for _k in ${keys[@]+"${keys[@]}"}; do DECISION_KEYS+=("$_k"); done
+  DECISION_READY=1
 
   if [ -n "${TMUX_RADAR_AI_DETAIL:-${TMUX_SWITCHER_AI_DETAIL:-}}" ]; then
     err_tail=""
@@ -2194,7 +2290,7 @@ _watch_signal_exit() {
 cmd_watch_loop() {
   local pane goal policy poll auto maxcalls config supplied_config="${6:-}" batch wait_rc coalesce_rc event_kind
   local rc valid failure evidence_fingerprint delivery_fingerprint armed_fingerprint current_fingerprint guard_rc
-  local retry_rc retry_cancelled verify_rc
+  local retry_rc retry_cancelled verify_rc classification error_class retryable summary detail stderr_path failure_kind
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane" >&2; return 1; }
   if [ -n "$supplied_config" ]; then
     config="$supplied_config"
@@ -2238,10 +2334,23 @@ cmd_watch_loop() {
   WATCH_PANE="$pane"; WATCH_WF="$(_wf "$pane")"; WATCH_STARTED="$(now)"
   WATCH_POLL="$poll"; WATCH_GOAL="$goal"; WATCH_POLICY="$policy"
   WATCH_AUTONOMY="$auto"; WATCH_MAX_CALLS="$maxcalls"; WATCH_CALLS=0
-  WATCH_RETRY=0; WATCH_EVENT_ID=""; WATCH_LAST_DECISION=""; WATCH_FINALIZED=0
+  WATCH_RETRY=0; WATCH_TRANSIENT_RETRIES=0; WATCH_REPAIR_ATTEMPTS=0
+  WATCH_EVENT_ID=""; WATCH_LAST_DECISION=""; WATCH_FINALIZED=0
   WATCH_STABLE_COUNT=0
   radar_run_create "$pane" "$config"
   WATCH_WF="$(radar_watch_file "$pane")"
+  if [ "$BRAIN_BACKEND_OK" -ne 1 ]; then
+    classification="$(jq -cn --arg summary "$(printf '%s' "$BRAIN_PREFLIGHT_JSON" | jq -r '.summary')" \
+      --arg detail "$(printf '%s' "$BRAIN_PREFLIGHT_JSON" | jq -r '.detail // ""')" \
+      '{class:"config-permanent",retryable:false,summary:$summary,detail:$detail}')"
+    _watch_phase CREATED "run created" none 0
+    _watch_record_backend_error "$classification" "" 0
+    _watch_phase PAUSED_ERROR "$(printf '%s' "$classification" | jq -r '.summary')" none 0
+    radar_run_finalize paused_error "$(printf '%s' "$classification" | jq -r '.summary')"
+    WATCH_FINALIZED=1
+    rm -f "$WATCH_WF"
+    return 3
+  fi
   if [ -n "${TMUX_RADAR_TEST_RUNTIME_FILE:-}" ] && [ -n "$supplied_config" ]; then
     _watch_runtime_json > "$TMUX_RADAR_TEST_RUNTIME_FILE"
   fi
@@ -2330,7 +2439,7 @@ cmd_watch_loop() {
     evidence_fingerprint="$(_watch_fingerprint || true)"
     if [ -z "$evidence_fingerprint" ]; then _watch_finalize stopped STOPPED "target pane disappeared during capture"; break; fi
 
-    WATCH_RETRY=0; retry_cancelled=0
+    WATCH_RETRY=0; WATCH_TRANSIENT_RETRIES=0; WATCH_REPAIR_ATTEMPTS=0; retry_cancelled=0
     while :; do
       if [ "$WATCH_CALLS" -ge "$WATCH_MAX_CALLS" ]; then
         _watch_phase PAUSED_ERROR "max_calls reached before model launch" none 0
@@ -2342,33 +2451,97 @@ cmd_watch_loop() {
       WATCH_CALLS=$((WATCH_CALLS + 1))
       _watch_phase DECIDING "model call $WATCH_CALLS/$WATCH_MAX_CALLS for $event_kind" none 0
       DECISION_ACTION=""; DECISION_JSON=""; DECISION_TEXT=""; DECISION_SAFE=0; DECISION_REASON=""; DECISION_KEYS=()
+      DECISION_READY=0; DECISION_SCHEMA_VALID=0; DECISION_SCHEMA_ERROR='decision was not produced'
+      BRAIN_LAST_RC=0; BRAIN_STOP_REASON=""; BRAIN_LAST_ERR_FILE=""
       set +e
-      TMUX_RADAR_AI_DETAIL=1 TMUX_RADAR_DECIDE_PARSE_ONLY=1 cmd_decide "$pane" "$auto" "$policy" "$goal"
+      TMUX_RADAR_REPAIR_ATTEMPT="$WATCH_REPAIR_ATTEMPTS" \
+        TMUX_RADAR_REPAIR_REASON="${failure:-}" \
+        TMUX_RADAR_AI_DETAIL=1 TMUX_RADAR_DECIDE_PARSE_ONLY=1 \
+        cmd_decide "$pane" "$auto" "$policy" "$goal"
       rc=$?
       set -e
       WATCH_LAST_DECISION="$(now)"
-      valid=1; failure=""
-      if [ "$BRAIN_LAST_RC" -ne 0 ]; then valid=0; failure="backend rc=$BRAIN_LAST_RC${BRAIN_STOP_REASON:+ ($BRAIN_STOP_REASON)}"
-      elif [ "$DECISION_SCHEMA_VALID" -ne 1 ]; then valid=0; failure="${DECISION_SCHEMA_ERROR:-decision schema/type validation failed}"
+      valid=1; failure=""; failure_kind=""
+      if [ "$DECISION_READY" -ne 1 ]; then
+        valid=0; failure="decision was not produced (cmd rc=$rc)"; failure_kind='decision-invalid'
+      elif [ "$BRAIN_LAST_RC" -ne 0 ]; then
+        valid=0; failure="backend rc=$BRAIN_LAST_RC${BRAIN_STOP_REASON:+ ($BRAIN_STOP_REASON)}"; failure_kind='backend'
+      elif [ "$DECISION_SCHEMA_VALID" -ne 1 ]; then
+        valid=0; failure="${DECISION_SCHEMA_ERROR:-decision schema/type validation failed}"; failure_kind='output-invalid'
       else
         if [ "$valid" -eq 1 ] && [ "$DECISION_ACTION" = "done" ]; then
           case "$event_kind" in turn_complete|screen_idle|idle|manual_reassess) : ;;
-            *) valid=0; failure="done is invalid for event kind: $event_kind" ;;
+            *) valid=0; failure="done is invalid for event kind: $event_kind"; failure_kind='decision-invalid' ;;
           esac
         fi
       fi
       [ "$valid" -eq 1 ] && break
-      radar_event_append decision_failed watcher "$failure" "$(jq -cn --arg event_id "$WATCH_EVENT_ID" \
-        --arg reason "$failure" --argjson retry "$WATCH_RETRY" '{record:"decision_error",event_id:$event_id,reason:$reason,retry:$retry}')"
-      if [ "$WATCH_RETRY" -ge "$WATCH_RETRY_LIMIT" ]; then
-        _watch_phase PAUSED_ERROR "$failure; retry exhausted" none 0
-        _escalate "$pane" "AI 监控连续决策失败，已暂停: $failure"
-        radar_run_finalize paused_error "$failure"
+
+      case "$failure_kind" in
+        decision-invalid) classification="$(_classify_outcome decision-invalid "$failure")" ;;
+        *) classification="$(_classify_outcome backend "$BRAIN_LAST_RC" "${BRAIN_LAST_ERR_FILE:-}" "$DECISION_SCHEMA_VALID")" ;;
+      esac
+      error_class="$(printf '%s' "$classification" | jq -r '.class')"
+      retryable="$(printf '%s' "$classification" | jq -r '.retryable')"
+      if { [ "$error_class" = output-invalid ] || [ "$error_class" = decision-invalid ]; } && [ -n "$failure" ]; then
+        classification="$(printf '%s' "$classification" | jq -c --arg summary "$failure" '.summary=$summary')"
+      fi
+      summary="$(printf '%s' "$classification" | jq -r '.summary')"
+      detail="$(printf '%s' "$classification" | jq -r '.detail')"
+      stderr_path="${BRAIN_LAST_ERR_FILE:-}"
+      if [ "$error_class" = decision-invalid ]; then
+        radar_event_append decision_invalid watcher "$summary" "$(jq -cn \
+          --arg event_id "$WATCH_EVENT_ID" --arg detail "$detail" --argjson call "$WATCH_CALLS" \
+          '{record:"decision_error",event_id:$event_id,error_class:"decision-invalid",
+            retryable:true,detail:$detail,call:$call}')"
+      else
+        _watch_record_backend_error "$classification" "$stderr_path" "$WATCH_CALLS"
+      fi
+
+      if [ "$retryable" != true ]; then
+        _watch_phase PAUSED_ERROR "$summary" none 0
+        _escalate "$pane" "AI 监控配置错误，已暂停: $summary"
+        radar_run_finalize paused_error "$summary"
         WATCH_FINALIZED=1; rm -f "$WATCH_WF"
         break 2
       fi
-      WATCH_RETRY=$((WATCH_RETRY + 1))
-      _watch_phase DECIDING "$failure; retry $WATCH_RETRY scheduled" retry 0
+
+      if [ "$error_class" = output-invalid ] || [ "$error_class" = decision-invalid ]; then
+        if [ "$WATCH_REPAIR_ATTEMPTS" -ge 1 ]; then
+          _watch_phase PAUSED_ERROR "$summary; repair attempt failed" none 0
+          _escalate "$pane" "AI 监控输出修复失败，已暂停: $summary"
+          radar_run_finalize paused_error "$summary"
+          WATCH_FINALIZED=1; rm -f "$WATCH_WF"
+          break 2
+        fi
+        WATCH_REPAIR_ATTEMPTS=1
+        WATCH_RETRY="$WATCH_REPAIR_ATTEMPTS"
+        radar_event_append decision_repair watcher "$summary" "$(jq -cn \
+          --arg event_id "$WATCH_EVENT_ID" --arg detail "$detail" \
+          --arg error_class "$error_class" \
+          '{record:"repair",event_id:$event_id,error_class:$error_class,repair_attempt:1,detail:$detail}')"
+        _watch_phase DECIDING "$summary; repair attempt 1 scheduled" repair 0
+        continue
+      fi
+
+      if [ "$error_class" = transient ] && [ "$WATCH_REPAIR_ATTEMPTS" -ge 1 ]; then
+        _watch_phase PAUSED_ERROR "$summary; repair call transport failed" none 0
+        _escalate "$pane" "AI 监控输出修复调用失败，已暂停: $summary"
+        radar_run_finalize paused_error "$summary"
+        WATCH_FINALIZED=1; rm -f "$WATCH_WF"
+        break 2
+      fi
+
+      if [ "$WATCH_TRANSIENT_RETRIES" -ge "$WATCH_RETRY_LIMIT" ]; then
+        _watch_phase PAUSED_ERROR "$summary; retry exhausted" none 0
+        _escalate "$pane" "AI 监控连续决策失败，已暂停: $summary"
+        radar_run_finalize paused_error "$summary"
+        WATCH_FINALIZED=1; rm -f "$WATCH_WF"
+        break 2
+      fi
+      WATCH_TRANSIENT_RETRIES=$((WATCH_TRANSIENT_RETRIES + 1))
+      WATCH_RETRY="$WATCH_TRANSIENT_RETRIES"
+      _watch_phase DECIDING "$summary; retry $WATCH_RETRY scheduled" retry 0
       set +e; _watch_retry_delay "$WATCH_RETRY" "$event_kind"; retry_rc=$?; set -e
       case "$retry_rc" in
         0) : ;;
@@ -2412,17 +2585,27 @@ cmd_watch_loop() {
         continue
         ;;
       escalate)
-        _watch_phase PAUSED_ERROR "model escalated: ${DECISION_REASON:-unspecified}" none 0
+        classification="$(_classify_outcome policy-halt "${DECISION_REASON:-model requested human judgment}")"
+        radar_event_append policy_halt policy "${DECISION_REASON:-model requested human judgment}" "$(jq -cn \
+          --arg event_id "$WATCH_EVENT_ID" --argjson classification "$classification" \
+          '{record:"policy_halt",event_id:$event_id,sent:false,outcome_class:$classification.class,
+            retryable:$classification.retryable}')"
+        _watch_phase PAUSED_POLICY "model escalated: ${DECISION_REASON:-unspecified}" none 0
         _escalate "$pane" "AI 拿不准: ${DECISION_REASON:-需要人工处理}"
-        radar_run_finalize paused "${DECISION_REASON:-model escalated}"
+        radar_run_finalize policy_halt "${DECISION_REASON:-model escalated}"
         WATCH_FINALIZED=1; rm -f "$WATCH_WF"
         break
         ;;
       send)
         if [ "$DECISION_SAFE" != 1 ] || [ "$auto" = suggest ] || [ "$auto" = confirm ]; then
-          _watch_phase PAUSED_ERROR "policy requires user: ${DECISION_REASON:-unsafe or non-auto action}" none 0
+          classification="$(_classify_outcome policy-halt "${DECISION_REASON:-unsafe or non-auto action}")"
+          radar_event_append policy_halt policy "${DECISION_REASON:-unsafe or non-auto action}" "$(jq -cn \
+            --arg event_id "$WATCH_EVENT_ID" --argjson classification "$classification" \
+            '{record:"policy_halt",event_id:$event_id,sent:false,outcome_class:$classification.class,
+              retryable:$classification.retryable}')"
+          _watch_phase PAUSED_POLICY "policy requires user: ${DECISION_REASON:-unsafe or non-auto action}" none 0
           _escalate "$pane" "AI 需要你确认: ${DECISION_REASON:-操作未自动执行}"
-          radar_run_finalize paused "policy gate"
+          radar_run_finalize policy_halt "policy gate"
           WATCH_FINALIZED=1; rm -f "$WATCH_WF"
           break
         fi

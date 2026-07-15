@@ -124,17 +124,23 @@ call=1
 [ -s "$TEST_CALL_COUNT" ] && call=$(( $(cat "$TEST_CALL_COUNT") + 1 ))
 printf '%s\n' "$call" > "$TEST_CALL_COUNT"
 printf '%s\n' "$call" >> "$TEST_MODEL_CALLS"
-printf '%s %s\n' "$$" "$(ps -o pgid= -p $$ | tr -d ' ')" >> "$TEST_BACKEND_PIDS"
+pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)"
+[ -n "$pgid" ] || pgid="$$"
+printf '%s %s\n' "$$" "$pgid" >> "$TEST_BACKEND_PIDS"
 if [ "${TEST_BACKEND_NOTIFY:-0}" = 1 ]; then
   TMUX_PANE=%1 bash "$TEST_ROOT/scripts/needinput-notify.sh" codex-hook <<<'{"hook_event_name":"PermissionRequest"}'
 fi
 while [ -e "$TEST_BLOCK_BACKEND" ]; do sleep 0.01; done
-if [ -n "${TEST_BACKEND_STDERR:-}" ]; then
-  printf '%s\n' "$TEST_BACKEND_STDERR" >&2
+backend_stderr="${TEST_BACKEND_STDERR:-}"
+[ -f "$TEST_RESPONSES/$call.stderr" ] && backend_stderr="$(cat "$TEST_RESPONSES/$call.stderr")"
+if [ -n "$backend_stderr" ]; then
+  printf '%s\n' "$backend_stderr" >&2
 fi
-if [ "${TEST_BACKEND_RC:-0}" -ne 0 ]; then
+backend_rc="${TEST_BACKEND_RC:-0}"
+[ -f "$TEST_RESPONSES/$call.rc" ] && backend_rc="$(cat "$TEST_RESPONSES/$call.rc")"
+if [ "$backend_rc" -ne 0 ]; then
   rm -rf "$TEST_ACTIVE_LOCK"
-  exit "$TEST_BACKEND_RC"
+  exit "$backend_rc"
 fi
 response="$TEST_RESPONSES/$call.json"
 if [ -f "$response" ]; then cat "$response"; fi
@@ -308,21 +314,23 @@ assert_eq 1 "$(wc -l < "$TEST_SENDS" | tr -d ' ')" 'safe action sent exactly onc
 stop_watch
 printf 'PASS: safe send remains VERIFYING until evidence changes\n'
 
-# 5. Malformed/empty output retries the same event and pauses after retry 3.
+# 5. Malformed output receives one explicit repair attempt, then pauses.
 reset_case retry
 write_response 1 ''
 write_response 2 '{bad json'
-write_response 3 ''
-write_response 4 '{"action":"mystery","reason":"unknown"}'
 start_watch 30
 emit_event retry-event approval retry
-wait_until 'PAUSED_ERROR retry exhaustion' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 3' '$RUN_DIR/state.json' >/dev/null" 600
-assert_eq 4 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'initial call plus three bounded retries'
+wait_until 'PAUSED_ERROR after repair attempt' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 1' '$RUN_DIR/state.json' >/dev/null" 600
+assert_eq 2 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'initial call plus one repair attempt'
 assert_eq 0 "$(wc -l < "$TEST_SENDS" | tr -d ' ')" 'retry exhaustion sends no keys'
+if ! jq -e 'select(.kind == "decision_repair" and .repair_attempt == 1)' \
+  "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
+  _fail_assert 'invalid output repair attempt is not explicit' 'events' "$(cat "$RUN_DIR/events.jsonl")"
+fi
 wait_until 'watch exits after retry exhaustion' "! kill -0 '$WATCH_PID' 2>/dev/null" 400
 wait "$WATCH_PID" 2>/dev/null || true
 WATCH_PID=""
-printf 'PASS: malformed decisions pause after bounded retries\n'
+printf 'PASS: malformed decisions receive one bounded repair attempt\n'
 
 # 6. Every custom backend is internal, preventing hook/notifier recursion.
 reset_case internal
@@ -390,13 +398,19 @@ printf 'PASS: post-decision user evidence cancels stale sends\n'
 reset_case done-gate
 write_response 1 '{"action":"done","text":"","keys":[],"safe":true,"reason":"wrong event"}'
 write_response 2 '{"action":"done","text":"","keys":[],"safe":true,"reason":"still wrong"}'
-write_response 3 '{"action":"done","text":"","keys":[],"safe":true,"reason":"still wrong"}'
-write_response 4 '{"action":"done","text":"","keys":[],"safe":true,"reason":"still wrong"}'
 start_watch 30
 emit_event approval-cannot-complete approval approval
-wait_until 'invalid done rejection' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 3' '$RUN_DIR/state.json' >/dev/null 2>&1" 600
+wait_until 'invalid done rejection' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 1' '$RUN_DIR/state.json' >/dev/null 2>&1" 600
 wait_until 'invalid done final outcome' "[ -s '$RUN_DIR/final.json' ]"
 assert_eq paused_error "$(jq -r '.outcome' "$RUN_DIR/final.json")" 'approval event cannot complete run'
+assert_eq 2 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'invalid done receives one repair attempt'
+if ! jq -e 'select(.kind == "decision_invalid" and .error_class == "decision-invalid")' \
+  "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
+  _fail_assert 'event-invalid done is not classified as a decision error' \
+    'events' "$(cat "$RUN_DIR/events.jsonl")"
+fi
+assert_contains "$(cat "$TEST_PROMPT_FILE")" 'done is invalid for event kind: approval' \
+  'semantic repair prompt names the violated event constraint'
 assert_eq 0 "$(wc -l < "$TEST_SENDS" | tr -d ' ')" 'invalid done sends no keys'
 wait "$WATCH_PID" 2>/dev/null || true
 WATCH_PID=""
@@ -493,13 +507,11 @@ printf 'PASS: burst coalescing selects newest actionable event\n'
 reset_case schema-types
 write_response 1 '{"action":"send","text":"","keys":["Enter"],"reason":"missing safe"}'
 write_response 2 '{"action":"send","text":"","keys":["Enter"],"safe":null,"reason":"null safe"}'
-write_response 3 '{"action":"send","text":"","keys":["Enter"],"safe":"true","reason":"string safe"}'
-write_response 4 '{"action":"send","text":"","keys":["Enter",1],"safe":true,"reason":"bad keys"}'
 start_watch 30
 emit_event schema-event approval schema
-wait_until 'schema validation exhaustion' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 3' '$RUN_DIR/state.json' >/dev/null 2>&1" 600
+wait_until 'schema validation exhaustion' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 1' '$RUN_DIR/state.json' >/dev/null 2>&1" 600
 assert_eq 0 "$(wc -l < "$TEST_SENDS" | tr -d ' ')" 'malformed decision types send no keys'
-assert_eq 4 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'malformed decision types retry same event'
+assert_eq 2 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'malformed decision types receive one repair attempt'
 wait "$WATCH_PID" 2>/dev/null || true
 WATCH_PID=""
 printf 'PASS: decision schema types are validated locally\n'
@@ -534,9 +546,11 @@ printf 'PASS: verification timeout remains visibly paused\n'
 
 # 17. user_resumed interrupts retry backoff before another model call.
 reset_case backoff-takeover
-write_response 1 '{"action":"send","text":"","keys":["Enter"],"safe":"true","reason":"invalid"}'
-write_response 2 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"must not run"}'
-export TMUX_RADAR_TEST_RETRY_DELAYS=1,1,1
+export TEST_BACKEND_RC=1
+export TEST_BACKEND_STDERR='temporary connection reset by peer'
+# Keep the timer far beyond any loaded-CI scheduling jitter. The user-resumed
+# event must wake the waiter immediately, so this does not lengthen the case.
+export TMUX_RADAR_TEST_RETRY_DELAYS=30,30,30
 start_watch 30
 emit_event backoff-approval approval retry
 wait_until 'retry waiter armed' "jq -e '.phase == \"DECIDING\" and .retry == 1 and .waiter_pid > 0' '$RUN_DIR/state.json' >/dev/null 2>&1" 400
@@ -640,7 +654,7 @@ start_watch_config 30 1 on 'monitor until tests pass' 'logging=decision,screen_s
 emit_event decision-log manual_reassess inspect
 wait_until 'structured decision log' "[ -s '$RUN_DIR/decisions/0001.json' ] && [ -s '$RUN_DIR/decisions/0001.meta.json' ] && [ -e '$RUN_DIR/backend/0001.stderr' ]"
 assert_json "$RUN_DIR/decisions/0001.json" '.action == "wait" and .pane_state == "working" and .goal_status == "working" and .risk == "low" and .evidence == ["test command remains active"]'
-assert_json "$RUN_DIR/decisions/0001.meta.json" '.call == 1 and .event_id == "decision-log" and .schema_valid == true and .backend_rc == 0 and .elapsed_seconds >= 0 and .timeout_seconds > 0'
+assert_json "$RUN_DIR/decisions/0001.meta.json" '.schema_version == 1 and .call == 1 and .event_id == "decision-log" and .schema_valid == true and .backend_rc == 0 and .elapsed_seconds >= 0 and .timeout_seconds > 0'
 assert_eq 600 "$(stat -f '%Lp' "$RUN_DIR/decisions/0001.json")" 'decision log mode'
 assert_eq 600 "$(stat -f '%Lp' "$RUN_DIR/decisions/0001.meta.json")" 'decision metadata mode'
 assert_eq 600 "$(stat -f '%Lp' "$RUN_DIR/backend/0001.stderr")" 'backend stderr mode'
@@ -700,7 +714,42 @@ assert_json "$RUN_DIR/state.json" '.phase == "COMPLETED" and .next.kind == "manu
 stop_watch
 printf 'PASS: completion keep requires explicit close\n'
 
-# 26. A selected Codex that cannot run the configured model is a permanent
+# 26. Transport retries and output repair have independent budgets.
+reset_case mixed-recovery
+printf '%s\n' 'temporary connection reset by peer' > "$TEST_RESPONSES/1.stderr"
+printf '%s\n' 1 > "$TEST_RESPONSES/1.rc"
+write_response 2 '{bad json'
+write_response 3 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"recovered after repair"}'
+start_watch 30
+emit_event mixed-recovery-event manual_reassess inspect
+wait_until 'mixed transient and repair recovery' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 3 ] && jq -e '.phase == \"ARMED\"' '$RUN_DIR/state.json' >/dev/null 2>&1" 600
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "decision_repair")] | length' "$RUN_DIR/events.jsonl")" \
+  'mixed recovery uses exactly one repair attempt'
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "backend_error" and .error_class == "transient")] | length' "$RUN_DIR/events.jsonl")" \
+  'mixed recovery preserves one transient failure'
+stop_watch
+printf 'PASS: transient retries and output repair use independent budgets\n'
+
+# 27. A transient transport failure retains bounded retry/backoff behavior.
+reset_case transient-backend
+export TEST_BACKEND_RC=1
+export TEST_BACKEND_STDERR='connection reset by peer'
+start_watch_config 30 1 on 'retry recoverable transport errors' 'retry_limit=3'
+emit_event transient-backend-event manual_reassess inspect
+wait_until 'transient backend retry exhaustion' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 3' '$RUN_DIR/state.json' >/dev/null 2>&1" 600
+assert_eq 4 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'transient backend uses bounded retry budget'
+if ! jq -e 'select(
+  .record == "error" and .kind == "backend_error" and
+  .error_class == "transient" and .retryable == true and .call == 1
+)' "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
+  _fail_assert 'transient backend error lacks retryable classification' \
+    'events' "$(cat "$RUN_DIR/events.jsonl")"
+fi
+wait "$WATCH_PID" 2>/dev/null || true
+WATCH_PID=""
+printf 'PASS: transient backend failures retain bounded retries\n'
+
+# 28. A selected Codex that cannot run the configured model is a permanent
 # configuration failure. It must spend one attempt, preserve the exact stderr
 # evidence path, and never schedule a retry that cannot heal the configuration.
 reset_case permanent-backend
@@ -726,9 +775,50 @@ if ! jq -e --arg path "$RUN_DIR/backend/0001.stderr" '
   _fail_assert 'permanent backend error lacks structured evidence' \
     'events' "$(cat "$RUN_DIR/events.jsonl")"
 fi
+if jq -e 'select(.kind == "backend_error") | .detail | contains("requires a newer version")' \
+  "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
+  _fail_assert 'backend event duplicated private stderr instead of referencing its evidence path'
+fi
 wait_until 'permanent watcher exits' "! kill -0 '$WATCH_PID' 2>/dev/null" 400
 wait "$WATCH_PID" 2>/dev/null || true
 WATCH_PID=""
 printf 'PASS: permanent backend incompatibility spends no retry budget\n'
+
+# 29. Authoritative launch failure status outranks transient-looking stderr.
+reset_case launch-permanent
+export TEST_BACKEND_RC=127
+export TEST_BACKEND_STDERR='connection timeout while launching missing executable'
+start_watch 30
+emit_event launch-permanent-event manual_reassess inspect
+wait_until 'launch failure permanent pause' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 0' '$RUN_DIR/state.json' >/dev/null 2>&1" 400
+assert_eq 1 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'launch failure does not retry transient-looking text'
+if ! jq -e 'select(.kind == "backend_error" and .error_class == "config-permanent" and .retryable == false)' \
+  "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
+  _fail_assert 'launch exit status did not outrank stderr wording' 'events' "$(cat "$RUN_DIR/events.jsonl")"
+fi
+wait "$WATCH_PID" 2>/dev/null || true
+WATCH_PID=""
+printf 'PASS: launch exit status outranks fuzzy stderr classification\n'
+
+# 30. Unsafe or non-auto delivery is a policy halt, not a backend failure.
+reset_case policy-halt
+write_response 1 '{"action":"send","text":"2","keys":["Enter"],"safe":false,"reason":"requires human approval"}'
+start_watch 30
+emit_event policy-halt-event approval inspect
+wait_until 'policy halt final outcome' "[ -s '$RUN_DIR/final.json' ]" 400
+assert_json "$RUN_DIR/state.json" '.phase == "PAUSED_POLICY" and .retry == 0'
+assert_json "$RUN_DIR/final.json" '.outcome == "policy_halt"'
+if ! jq -e 'select(.kind == "policy_halt" and .record == "policy_halt")' \
+  "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
+  _fail_assert 'policy halt lacks canonical event' 'events' "$(cat "$RUN_DIR/events.jsonl")"
+fi
+assert_eq policy-halt "$(jq -r 'select(.kind == "policy_halt") | .outcome_class' "$RUN_DIR/events.jsonl")" \
+  'policy halt uses the stable outcome classifier'
+assert_eq 0 "$(jq -s '[.[] | select(.kind == "backend_error")] | length' "$RUN_DIR/events.jsonl")" \
+  'policy halt is not a backend error'
+assert_eq 0 "$(wc -l < "$TEST_SENDS" | tr -d ' ')" 'policy halt sends no keys'
+wait "$WATCH_PID" 2>/dev/null || true
+WATCH_PID=""
+printf 'PASS: policy refusal remains distinct from backend failure\n'
 
 printf 'PASS: serialized event-driven supervision suite\n'

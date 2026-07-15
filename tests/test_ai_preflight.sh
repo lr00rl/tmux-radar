@@ -262,6 +262,22 @@ test_version_probe_is_bounded_and_rejects_prereleases() {
   '
 }
 
+test_incompatible_setup_starts_no_model_process() {
+  local rc run_dir
+  set +e
+  TEST_CASE_NAME=setup-permanent TEST_CODEX_PATH="$TMP/old-bin/codex" \
+    run_ai _watch_loop %1 'do not launch an incompatible backend' safe-auto 30 auto-safe
+  rc=$?
+  set -e
+  assert_eq 3 "$rc" 'incompatible setup returns permanent-config status'
+  run_dir="$(find "$TMP/state-setup-permanent/ai-runs" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+  [ -n "$run_dir" ] || _fail_assert 'incompatible setup did not preserve a diagnostic run'
+  assert_json "$run_dir/state.json" '.phase == "PAUSED_ERROR" and .retry == 0 and .calls == 0'
+  assert_json "$run_dir/final.json" '.outcome == "paused_error" and .decision_count == 0'
+  assert_eq 0 "$(wc -l < "$TMP/setup-permanent.exec.log" | tr -d ' ')" \
+    'incompatible setup launches no model process'
+}
+
 write_fakes
 run_test 'built-in supervision defaults are Luna/high' test_builtin_defaults_are_luna_high
 run_test 'inherited PATH order selects the user Codex' test_inherited_path_order_is_preserved
@@ -270,6 +286,7 @@ run_test 'custom command bypasses Codex preflight' test_custom_command_bypasses_
 run_test 'custom command keeps precedence over profile with a warning' test_custom_command_precedes_profile_with_warning
 run_test 'profile execution uses the frozen explicit Codex' test_profile_executes_the_frozen_explicit_codex
 run_test 'version probes are bounded and prereleases fail closed' test_version_probe_is_bounded_and_rejects_prereleases
+run_test 'incompatible setup launches no model process' test_incompatible_setup_starts_no_model_process
 
 if [ "$FAILURES" -ne 0 ]; then
   printf 'FAIL: %s preflight regression(s)\n' "$FAILURES" >&2

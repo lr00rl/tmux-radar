@@ -129,6 +129,13 @@ if [ "${TEST_BACKEND_NOTIFY:-0}" = 1 ]; then
   TMUX_PANE=%1 bash "$TEST_ROOT/scripts/needinput-notify.sh" codex-hook <<<'{"hook_event_name":"PermissionRequest"}'
 fi
 while [ -e "$TEST_BLOCK_BACKEND" ]; do sleep 0.01; done
+if [ -n "${TEST_BACKEND_STDERR:-}" ]; then
+  printf '%s\n' "$TEST_BACKEND_STDERR" >&2
+fi
+if [ "${TEST_BACKEND_RC:-0}" -ne 0 ]; then
+  rm -rf "$TEST_ACTIVE_LOCK"
+  exit "$TEST_BACKEND_RC"
+fi
 response="$TEST_RESPONSES/$call.json"
 if [ -f "$response" ]; then cat "$response"; fi
 rm -rf "$TEST_ACTIVE_LOCK"
@@ -173,6 +180,8 @@ reset_case() {
   export TEST_AI_TIMEOUT=5
   export TEST_MAX_CALLS=40
   export TEST_BACKEND_NOTIFY=0
+  export TEST_BACKEND_RC=0
+  export TEST_BACKEND_STDERR=""
   export TEST_SEND_FAIL_AT=0
   export TMUX_RADAR_TEST_PRE_SEND_BLOCK=""
   export TMUX_RADAR_TEST_GATE_ATTEMPTS=""
@@ -690,5 +699,36 @@ assert_file "$CASE/state/ai-watch/_1.watch"
 assert_json "$RUN_DIR/state.json" '.phase == "COMPLETED" and .next.kind == "manual_close" and .next.at == 0'
 stop_watch
 printf 'PASS: completion keep requires explicit close\n'
+
+# 26. A selected Codex that cannot run the configured model is a permanent
+# configuration failure. It must spend one attempt, preserve the exact stderr
+# evidence path, and never schedule a retry that cannot heal the configuration.
+reset_case permanent-backend
+export TEST_BACKEND_RC=1
+export TEST_BACKEND_STDERR="The 'gpt-5.6-luna' model requires a newer version of Codex."
+start_watch_config 30 1 on 'finish without wasting model calls' 'retry_limit=3'
+emit_event permanent-backend-event manual_reassess inspect
+wait_until 'permanent backend pause' "jq -e '.phase == \"PAUSED_ERROR\"' '$RUN_DIR/state.json' >/dev/null 2>&1" 400
+assert_eq 1 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'permanent backend launches once'
+assert_json "$RUN_DIR/state.json" '.phase == "PAUSED_ERROR" and .retry == 0'
+assert_eq "$TEST_BACKEND_STDERR" "$(cat "$RUN_DIR/backend/0001.stderr")" \
+  'permanent backend keeps exact stderr'
+if ! jq -e --arg path "$RUN_DIR/backend/0001.stderr" '
+  select(
+    .record == "error" and
+    .kind == "backend_error" and
+    .error_class == "config-permanent" and
+    .retryable == false and
+    .stderr_path == $path and
+    .call == 1
+  )
+' "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
+  _fail_assert 'permanent backend error lacks structured evidence' \
+    'events' "$(cat "$RUN_DIR/events.jsonl")"
+fi
+wait_until 'permanent watcher exits' "! kill -0 '$WATCH_PID' 2>/dev/null" 400
+wait "$WATCH_PID" 2>/dev/null || true
+WATCH_PID=""
+printf 'PASS: permanent backend incompatibility spends no retry budget\n'
 
 printf 'PASS: serialized event-driven supervision suite\n'

@@ -26,8 +26,9 @@
 # Config (tmux options, all optional):
 #   @radar-ai-key            A                     menu key (prefix + A)
 #   @radar-ai-model          gpt-5.6-luna          Codex model slug (fast tier)
-#   @radar-ai-effort         low                   minimal|low|medium|high|xhigh
+#   @radar-ai-effort         high                  minimal|low|medium|high|xhigh
 #   @radar-ai-profile        (none)                codex config profile (-p); overrides model/effort
+#   @radar-ai-codex-path     (PATH)                absolute Codex executable override
 #   @radar-ai-cmd            (none)                replace Codex entirely: shell cmd,
 #                                                     prompt on stdin -> decision JSON on stdout
 #   @radar-ai-autonomy       confirm               ask: suggest|confirm|auto
@@ -54,7 +55,7 @@
 # (@radar-ai-cmd is the user-facing version of the same seam.)
 set -euo pipefail
 
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 # Interactive prompts use `read -e` (readline): canonical-mode reads erase CJK
 # input by the BYTE (deleting one Chinese char took two+ presses and mangled
 # the line). readline edits by character — but only under a UTF-8 locale.
@@ -91,6 +92,20 @@ BRAIN_LAST_TIMEOUT=0
 BRAIN_LAST_PID=""
 BRAIN_LAST_PGID=""
 BRAIN_STOP_REASON=""
+BRAIN_BACKEND_FROZEN=0
+BRAIN_BACKEND_OK=0
+BRAIN_BACKEND_MODE=""
+BRAIN_BACKEND_PATH=""
+BRAIN_BACKEND_VERSION=""
+BRAIN_BACKEND_IDENTITY=""
+BRAIN_BACKEND_SOURCE=""
+BRAIN_BACKEND_COMMAND=""
+BRAIN_BACKEND_PROFILE=""
+BRAIN_BACKEND_MODEL="gpt-5.6-luna"
+BRAIN_BACKEND_EFFORT="high"
+BRAIN_BACKEND_WARNING=""
+BRAIN_BACKEND_JSON='{}'
+BRAIN_PREFLIGHT_JSON='{}'
 
 DECISION_JSON=""
 DECISION_ACTION=""
@@ -343,7 +358,7 @@ cmd_build_watch_config() {
       command:{value:"",source:"default"},
       profile:{value:"",source:"default"},
       model:{value:"gpt-5.6-luna",source:"default"},
-      effort:{value:"low",source:"default"},
+      effort:{value:"high",source:"default"},
       timeout:{value:120,source:"default"},
       max_decisions:{value:40,source:"default"},
       retry_limit:{value:3,source:"default"},
@@ -446,6 +461,7 @@ _apply_watch_config() {
 }
 
 _watch_runtime_json() {
+  _ensure_backend_frozen
   jq -cn \
     --arg goal "$TMUX_RADAR_RUN_GOAL" --arg autonomy "$TMUX_RADAR_RUN_AUTONOMY" \
     --arg approval_policy "$TMUX_RADAR_RUN_APPROVAL_POLICY" --arg always_allow "$TMUX_RADAR_RUN_ALWAYS_ALLOW" \
@@ -459,6 +475,7 @@ _watch_runtime_json() {
     --argjson capture_lines "$TMUX_RADAR_RUN_CAPTURE_LINES" --argjson monitor_excerpt_lines "$TMUX_RADAR_RUN_MONITOR_EXCERPT_LINES" \
     --argjson monitor_width "$TMUX_RADAR_RUN_MONITOR_WIDTH" --argjson overview_ratio "$TMUX_RADAR_RUN_OVERVIEW_RATIO" \
     --argjson completion_close_delay "$TMUX_RADAR_RUN_COMPLETION_CLOSE_DELAY" --argjson retention_days "$TMUX_RADAR_RUN_RETENTION_DAYS" \
+    --argjson backend "$BRAIN_BACKEND_JSON" \
     '{goal:$goal,autonomy:$autonomy,approval_policy:$approval_policy,always_allow:$always_allow,
       hooks_first:$hooks_first,poll:$poll,stable_screen_threshold:$stable_screen_threshold,
       command:$command,profile:$profile,model:$model,effort:$effort,timeout:$timeout,
@@ -466,11 +483,222 @@ _watch_runtime_json() {
       capture_lines:$capture_lines,monitor_excerpt_lines:$monitor_excerpt_lines,
       monitor_position:$monitor_position,monitor_width:$monitor_width,overview_ratio:$overview_ratio,
       completion_close_delay:$completion_close_delay,logging:$logging,
-      screen_snapshots:$screen_snapshots,retention_days:$retention_days}'
+      screen_snapshots:$screen_snapshots,retention_days:$retention_days,backend:$backend}'
 }
+
+_codex_version() {
+  local executable="$1" raw tmp pid started timeout=3 had_job_control=0
+  [ -x "$executable" ] || return 1
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tmux-radar-version.XXXXXX")" || return 1
+  case "$-" in *m*) had_job_control=1 ;; esac
+  set -m
+  ("$executable" --version 2>/dev/null | head -c 4096 > "$tmp") &
+  pid=$!
+  [ "$had_job_control" -eq 1 ] || set +m
+  started="$(date '+%s')"
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$(( $(date '+%s') - started ))" -ge "$timeout" ]; then
+      _terminate_process_tree "$pid" "$pid"
+      break
+    fi
+    sleep 0.05
+  done
+  wait "$pid" 2>/dev/null || true
+  raw="$(cat "$tmp" 2>/dev/null || true)"
+  rm -f "$tmp"
+  printf '%s\n' "$raw" |
+    awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+[.][0-9]+[.][0-9]+$/) { print $i; exit } }'
+}
+
+_backend_file_identity() {
+  local executable="$1" identity
+  # This guard detects package upgrades/path drift between preflight and a
+  # model call. It is not a same-user security sandbox: a process that can
+  # replace the user's Codex can also rewrite this plugin, tmux options, and
+  # run state. Copying Codex into a private artifact would hide upgrades and
+  # execute a different path than the one shown during launch review.
+  identity="$(stat -f '%d:%i:%m:%z' "$executable" 2>/dev/null || true)"
+  [ -n "$identity" ] || identity="$(stat -c '%d:%i:%Y:%s' "$executable" 2>/dev/null || true)"
+  printf '%s' "$identity"
+}
+
+_version_ge() {
+  local actual="$1" required="$2"
+  awk -v actual="$actual" -v required="$required" 'BEGIN {
+    split(actual, a, "."); split(required, r, ".")
+    for (i = 1; i <= 3; i++) {
+      av = a[i] + 0; rv = r[i] + 0
+      if (av > rv) exit 0
+      if (av < rv) exit 1
+    }
+    exit 0
+  }'
+}
+
+_model_min_codex() {
+  case "$1" in
+    gpt-5.6-luna) printf '%s' '0.144.0' ;;
+    *) printf '%s' '0.0.0' ;;
+  esac
+}
+
+_absolute_executable() {
+  local requested="$1" found dir
+  [ -n "$requested" ] || return 1
+  case "$requested" in
+    */*)
+      [ -x "$requested" ] || return 1
+      case "$requested" in
+        /*) printf '%s' "$requested" ;;
+        *)
+          dir="$(cd "$(dirname "$requested")" 2>/dev/null && pwd -P)" || return 1
+          printf '%s/%s' "$dir" "$(basename "$requested")"
+          ;;
+      esac
+      ;;
+    *)
+      found="$(command -v "$requested" 2>/dev/null || true)"
+      [ -n "$found" ] && [ -x "$found" ] || return 1
+      case "$found" in
+        /*) printf '%s' "$found" ;;
+        *)
+          dir="$(cd "$(dirname "$found")" 2>/dev/null && pwd -P)" || return 1
+          printf '%s/%s' "$dir" "$(basename "$found")"
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_codex_candidates_json() {
+  local selected="$1" model="$2" candidates='[]' paths candidate absolute version minimum compatible item seen=''
+  minimum="$(_model_min_codex "$model")"
+  paths="$(type -a -p codex 2>/dev/null || true)"
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    absolute="$(_absolute_executable "$candidate" 2>/dev/null || true)"
+    [ -n "$absolute" ] || continue
+    [ "$absolute" = "$selected" ] && continue
+    case "$seen" in *$'\n'"$absolute"$'\n'*) continue ;; esac
+    seen="$seen"$'\n'"$absolute"$'\n'
+    version="$(_codex_version "$absolute" || true)"
+    compatible=0
+    [ -n "$version" ] && _version_ge "$version" "$minimum" && compatible=1
+    item="$(jq -cn --arg path "$absolute" --arg version "$version" \
+      --arg source path --arg required_version "$minimum" --argjson compatible "$compatible" \
+      '{path:$path,version:$version,source:$source,required_version:$required_version,
+        compatible:($compatible == 1)}')"
+    candidates="$(jq -cn --argjson items "$candidates" --argjson item "$item" '$items + [$item]')"
+  done <<< "$paths"
+  printf '%s' "$candidates"
+}
+
+_freeze_backend() {
+  local diagnostics="${1:-0}" custom explicit selected version minimum compatible=0
+  local source='path' profile model effort warning='' candidates='[]' class='' summary='' detail=''
+  BRAIN_BACKEND_FROZEN=1
+  BRAIN_BACKEND_OK=0
+  BRAIN_BACKEND_MODE=''
+  BRAIN_BACKEND_PATH=''
+  BRAIN_BACKEND_VERSION=''
+  BRAIN_BACKEND_IDENTITY=''
+  BRAIN_BACKEND_SOURCE=''
+  BRAIN_BACKEND_COMMAND=''
+  BRAIN_BACKEND_PROFILE=''
+  BRAIN_BACKEND_WARNING=''
+
+  model="$(opt @radar-ai-model gpt-5.6-luna)"
+  effort="$(opt @radar-ai-effort high)"
+  profile="$(opt @radar-ai-profile '')"
+  custom="${TMUX_RADAR_AI_CMD:-${TMUX_SWITCHER_AI_CMD:-}}"
+  if [ -n "$custom" ]; then
+    source='env'
+  else
+    custom="$(opt @radar-ai-cmd '')"
+    [ -n "$custom" ] && source='config'
+  fi
+
+  BRAIN_BACKEND_MODEL="$model"
+  BRAIN_BACKEND_EFFORT="$effort"
+  BRAIN_BACKEND_PROFILE="$profile"
+  if [ -n "$custom" ]; then
+    [ -n "$profile" ] && warning='custom command takes precedence over the configured Codex profile'
+    BRAIN_BACKEND_OK=1
+    BRAIN_BACKEND_MODE='custom-command'
+    BRAIN_BACKEND_COMMAND="$custom"
+    BRAIN_BACKEND_SOURCE="$source"
+    BRAIN_BACKEND_WARNING="$warning"
+    BRAIN_BACKEND_JSON="$(jq -cn --arg mode "$BRAIN_BACKEND_MODE" --arg command "$custom" \
+      --arg source "$source" --arg profile "$profile" --arg warning "$warning" \
+      '{mode:$mode,command:$command,source:$source,profile:$profile,warning:$warning}')"
+    BRAIN_PREFLIGHT_JSON="$(jq -cn --argjson backend "$BRAIN_BACKEND_JSON" \
+      --arg model "$model" --arg effort "$effort" --argjson candidates "$candidates" \
+      '{ok:true,backend:$backend,model:$model,effort:$effort,candidates:$candidates}')"
+    [ -z "$warning" ] || printf 'tmux-radar: %s\n' "$warning" >&2
+    return 0
+  fi
+
+  explicit="$(_explicit_opt @radar-ai-codex-path)"
+  [ -n "$explicit" ] && source='tmux'
+  if [ -n "$explicit" ]; then
+    selected="$(_absolute_executable "$explicit" 2>/dev/null || true)"
+  else
+    selected="$(_absolute_executable codex 2>/dev/null || true)"
+    source='path'
+  fi
+
+  minimum="$(_model_min_codex "$model")"
+  if [ -z "$selected" ]; then
+    class='config-permanent'
+    summary='Codex executable is missing or not executable'
+    detail="requested=${explicit:-codex}"
+  else
+    version="$(_codex_version "$selected" || true)"
+    if [ -z "$version" ]; then
+      class='config-permanent'
+      summary='Codex version could not be determined'
+      detail="path=$selected"
+    elif _version_ge "$version" "$minimum"; then
+      compatible=1
+      BRAIN_BACKEND_OK=1
+    else
+      class='config-permanent'
+      summary="Codex $version is too old for $model"
+      detail="requires Codex >= $minimum"
+    fi
+  fi
+  [ "$diagnostics" = 1 ] && candidates="$(_codex_candidates_json "$selected" "$model")"
+
+  BRAIN_BACKEND_MODE='codex'
+  BRAIN_BACKEND_PATH="$selected"
+  BRAIN_BACKEND_VERSION="$version"
+  BRAIN_BACKEND_IDENTITY="$(_backend_file_identity "$selected")"
+  BRAIN_BACKEND_SOURCE="$source"
+  BRAIN_BACKEND_JSON="$(jq -cn --arg mode "$BRAIN_BACKEND_MODE" --arg path "$selected" \
+    --arg version "$version" --arg identity "$BRAIN_BACKEND_IDENTITY" --arg source "$source" --arg profile "$profile" \
+    --arg required_version "$minimum" --argjson compatible "$compatible" \
+    '{mode:$mode,path:$path,version:$version,identity:$identity,source:$source,profile:$profile,
+      required_version:$required_version,compatible:($compatible == 1)}')"
+  BRAIN_PREFLIGHT_JSON="$(jq -cn --argjson ok "$BRAIN_BACKEND_OK" \
+    --argjson backend "$BRAIN_BACKEND_JSON" --arg model "$model" --arg effort "$effort" \
+    --argjson candidates "$candidates" --arg class "$class" --arg summary "$summary" --arg detail "$detail" '
+    {ok:($ok == 1),backend:$backend,model:$model,effort:$effort,candidates:$candidates}
+    + (if $class == "" then {} else {class:$class,summary:$summary,detail:$detail} end)')"
+}
+
+_ensure_backend_frozen() {
+  [ "$BRAIN_BACKEND_FROZEN" -eq 1 ] || _freeze_backend 0
+}
+
+cmd_doctor_json() {
+  need_jq
+  _freeze_backend 1
+  printf '%s\n' "$BRAIN_PREFLIGHT_JSON"
+}
+
 have_tmux() { command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2>&1; }
 need_jq()  { command -v jq >/dev/null 2>&1 || { echo "tmux-radar AI needs 'jq'." >&2; exit 3; }; }
-have_brain() { [ -n "${TMUX_RADAR_AI_CMD:-${TMUX_SWITCHER_AI_CMD:-}}" ] || [ -n "$(opt @radar-ai-cmd '')" ] || command -v codex >/dev/null 2>&1; }
+have_brain() { _ensure_backend_frozen; [ "$BRAIN_BACKEND_OK" -eq 1 ]; }
 now()  { date '+%s'; }
 audit() { printf '%s\t%s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true; }
 
@@ -553,9 +781,10 @@ _persist_decision_call() {
       '{valid:false,raw:$raw,error:$error}')"
     _radar_write_snapshot "$decision_file" "$payload"
   fi
-  model="$(opt @radar-ai-model gpt-5.6-luna)"
-  profile="$(opt @radar-ai-profile '')"
-  effort="$(opt @radar-ai-effort low)"
+  _ensure_backend_frozen
+  model="$BRAIN_BACKEND_MODEL"
+  profile="$BRAIN_BACKEND_PROFILE"
+  effort="$BRAIN_BACKEND_EFFORT"
   payload="$(jq -cn \
     --arg run_id "$RADAR_RUN_ID" --arg pane "$RADAR_RUN_PANE" \
     --arg event_id "${WATCH_EVENT_ID:-}" --arg backend "$backend" \
@@ -963,7 +1192,8 @@ _resolve_pane() {
 # Codex is read-only + ephemeral; only its --output-schema'd last message is used.
 # ---------------------------------------------------------------------------
 _brain() {
-  local schema="$1" prompt="$2" out custom profile err pid rc=0 started timeout stop_reason="" had_job_control=0
+  local schema="$1" prompt="$2" out err pid pid_tmp rc=0 started timeout stop_reason="" had_job_control=0
+  _ensure_backend_frozen
   BRAIN_RESULT=""
   BRAIN_LAST_RC=0
   BRAIN_LAST_STARTED=0
@@ -972,28 +1202,35 @@ _brain() {
   BRAIN_LAST_PID=""
   BRAIN_LAST_PGID=""
   BRAIN_STOP_REASON=""
+  if [ "$BRAIN_BACKEND_OK" -ne 1 ]; then
+    BRAIN_LAST_RC=78
+    BRAIN_STOP_REASON="$(printf '%s' "$BRAIN_PREFLIGHT_JSON" | jq -r '.summary // "backend preflight failed"')"
+    return 0
+  fi
+  if [ "$BRAIN_BACKEND_MODE" = codex ] && \
+     [ "$(_backend_file_identity "$BRAIN_BACKEND_PATH")" != "$BRAIN_BACKEND_IDENTITY" ]; then
+    BRAIN_LAST_RC=78
+    BRAIN_STOP_REASON='selected Codex executable changed after preflight'
+    return 0
+  fi
   out="$(mktemp "${TMPDIR:-/tmp}/tmuxai.XXXXXX")"
   BRAIN_OUT_FILE="$out"
   err="${TMUX_RADAR_AI_ERR:-${TMUX_SWITCHER_AI_ERR:-/dev/null}}"
   [ "$err" = "/dev/null" ] || : > "$err" 2>/dev/null || true
-  # env seam (tests) wins over the user-facing option; both replace codex with
-  # any command that reads the prompt on stdin and prints decision JSON.
-  custom="${TMUX_RADAR_AI_CMD:-${TMUX_SWITCHER_AI_CMD:-$(opt @radar-ai-cmd '')}}"
   case "$-" in *m*) had_job_control=1 ;; esac
   set -m
-  if [ -n "$custom" ]; then
-    (export TMUX_RADAR_INTERNAL=1; printf '%s' "$prompt" | eval "$custom" > "$out" 2>"$err") &
-  elif [ -n "$(opt @radar-ai-profile '')" ]; then
+  if [ "$BRAIN_BACKEND_MODE" = custom-command ]; then
+    (export TMUX_RADAR_INTERNAL=1; printf '%s' "$prompt" | eval "$BRAIN_BACKEND_COMMAND" > "$out" 2>"$err") &
+  elif [ -n "$BRAIN_BACKEND_PROFILE" ]; then
     # a codex profile bundles model/effort/etc in ~/.codex/config.toml; the
     # safety flags (read-only, ephemeral) stay ours and are not overridable
-    profile="$(opt @radar-ai-profile '')"
-    TMUX_RADAR_INTERNAL=1 codex exec -p "$profile" \
+    TMUX_RADAR_INTERNAL=1 "$BRAIN_BACKEND_PATH" exec -p "$BRAIN_BACKEND_PROFILE" \
       -s read-only --ephemeral --skip-git-repo-check \
       --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" &
   else
-    TMUX_RADAR_INTERNAL=1 codex exec \
-      -m "$(opt @radar-ai-model gpt-5.6-luna)" \
-      -c model_reasoning_effort="$(opt @radar-ai-effort low)" \
+    TMUX_RADAR_INTERNAL=1 "$BRAIN_BACKEND_PATH" exec \
+      -m "$BRAIN_BACKEND_MODEL" \
+      -c model_reasoning_effort="$BRAIN_BACKEND_EFFORT" \
       -s read-only --ephemeral --skip-git-repo-check \
       --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" &
   fi
@@ -1010,10 +1247,15 @@ _brain() {
   BRAIN_LAST_PID="$pid"
   BRAIN_LAST_PGID="$BRAIN_PGID"
   if [ -n "${BRAIN_PID_FILE:-}" ]; then
+    pid_tmp="$(mktemp "${BRAIN_PID_FILE}.tmp.XXXXXX")" || pid_tmp=''
+  fi
+  if [ -n "${pid_tmp:-}" ]; then
     {
       printf 'pid=%s\npgid=%s\nwatch_pid=%s\npane=%s\nstarted=%s\noutput=%s\n' \
         "$pid" "$BRAIN_PGID" "$$" "${BRAIN_BOUND_PANE:-}" "$started" "$out"
-    } > "$BRAIN_PID_FILE"
+    } > "$pid_tmp"
+    chmod 600 "$pid_tmp" 2>/dev/null || true
+    mv "$pid_tmp" "$BRAIN_PID_FILE"
   fi
   if [ -n "${RADAR_RUN_DIR:-}" ] && [ -n "${WATCH_EVENT_ID:-}" ]; then
     _watch_model_started "$started" "$pid" "$BRAIN_PGID" "$timeout"
@@ -1055,16 +1297,15 @@ _brain() {
 }
 
 _brain_label() {
-  local custom profile
-  custom="${TMUX_RADAR_AI_CMD:-${TMUX_SWITCHER_AI_CMD:-$(opt @radar-ai-cmd '')}}"
-  if [ -n "$custom" ]; then
-    printf 'custom command: %s' "$(_flat "$custom")"
-  elif [ -n "$(opt @radar-ai-profile '')" ]; then
-    profile="$(opt @radar-ai-profile '')"
-    printf 'codex profile: %s (read-only, ephemeral)' "$profile"
+  _ensure_backend_frozen
+  if [ "$BRAIN_BACKEND_MODE" = custom-command ]; then
+    printf 'custom command: %s' "$(_flat "$BRAIN_BACKEND_COMMAND")"
+  elif [ -n "$BRAIN_BACKEND_PROFILE" ]; then
+    printf 'codex %s profile: %s (read-only, ephemeral)' \
+      "$BRAIN_BACKEND_VERSION" "$BRAIN_BACKEND_PROFILE"
   else
-    printf 'codex exec: model=%s effort=%s (read-only, ephemeral)' \
-      "$(opt @radar-ai-model gpt-5.6-luna)" "$(opt @radar-ai-effort low)"
+    printf 'codex %s: model=%s effort=%s (read-only, ephemeral)' \
+      "$BRAIN_BACKEND_VERSION" "$BRAIN_BACKEND_MODEL" "$BRAIN_BACKEND_EFFORT"
   fi
 }
 
@@ -1990,6 +2231,10 @@ cmd_watch_loop() {
     ')"
   fi
 
+  _freeze_backend 0
+  config="$(printf '%s' "$config" | jq -c --argjson backend "$BRAIN_BACKEND_JSON" \
+    '. + {backend:$backend}')"
+
   WATCH_PANE="$pane"; WATCH_WF="$(_wf "$pane")"; WATCH_STARTED="$(now)"
   WATCH_POLL="$poll"; WATCH_GOAL="$goal"; WATCH_POLICY="$policy"
   WATCH_AUTONOMY="$auto"; WATCH_MAX_CALLS="$maxcalls"; WATCH_CALLS=0
@@ -2864,6 +3109,7 @@ case "${1:-}" in
   _decode-goal) shift; cmd_decode_goal "${1-}" || rc=$? ;;
   _build-watch-config) shift; cmd_build_watch_config "${1:-}" "${2-}" || rc=$? ;;
   _render-watch-config) shift; cmd_render_watch_config "${1:-}" || rc=$? ;;
+  doctor-json)   shift; cmd_doctor_json "$@" || rc=$? ;;
   ask)          shift; cmd_ask "$@" || rc=$? ;;
   decide)       shift; cmd_decide "${1:-}" "${2:-}" "${3:-}" "${4:-}" || rc=$? ;;
   watch)        shift; cmd_watch "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" || rc=$? ;;
@@ -2883,7 +3129,7 @@ case "${1:-}" in
   list)         cmd_list || rc=$? ;;
   cleanup)      cmd_cleanup || rc=$? ;;
   menu)         cmd_menu || rc=$? ;;
-  *) echo "usage: ai.sh {ask [req]|decide [pane] [autonomy] [policy]|watch <pane> [goal] [policy] [poll] [autonomy]|emit-event <pane> <kind> <source> <label>|watch-setup [pane]|pause <pane>|resume <pane>|keep <pane>|report [run-id|latest]|monitor <pane>|monitor-timeline <pane>|monitor-detail <pane>|stop <pane|all>|status|list|cleanup|menu}" >&2; exit 2 ;;
+  *) echo "usage: ai.sh {doctor-json|ask [req]|decide [pane] [autonomy] [policy]|watch <pane> [goal] [policy] [poll] [autonomy]|emit-event <pane> <kind> <source> <label>|watch-setup [pane]|pause <pane>|resume <pane>|keep <pane>|report [run-id|latest]|monitor <pane>|monitor-timeline <pane>|monitor-detail <pane>|stop <pane|all>|status|list|cleanup|menu}" >&2; exit 2 ;;
 esac
 # menu-launched popups set this so the result stays on screen until a keypress
 if [ -n "${TMUX_RADAR_AI_PAUSE:-${TMUX_SWITCHER_AI_PAUSE:-}}" ] && [ -t 0 ]; then

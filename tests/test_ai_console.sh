@@ -190,6 +190,7 @@ test_build_watch_config_contains_all_settings_and_provenance() {
     (.values.goal == {value:"允许到测试全绿", source:"custom"}) and
     (.values.poll == {value:17, source:"tmux"}) and
     (.values.model == {value:"gpt-5.6-luna", source:"default"}) and
+    (.values.effort == {value:"high", source:"default"}) and
     (.values.completion_close_delay == {value:12, source:"default"}) and
     (.values.timeout == {value:45, source:"custom"}) and
     (.values.logging == {value:"full", source:"custom"}) and

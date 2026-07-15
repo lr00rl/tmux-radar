@@ -228,7 +228,14 @@ test_custom_command_precedes_profile_with_warning() {
 }
 
 test_profile_executes_the_frozen_explicit_codex() {
-  local invocation
+  local invocation result="$TMP/profile-doctor.json"
+  TEST_CASE_NAME=profile TEST_PROFILE=locked TEST_CODEX_PATH="$TMP/new-bin/codex" \
+    run_ai doctor-json > "$result"
+  assert_json "$result" '
+    .backend.profile == "locked" and
+    .backend.model == "" and .backend.model_source == "profile-managed" and
+    .backend.effort == "" and .backend.effort_source == "profile-managed"
+  '
   TEST_CASE_NAME=profile TEST_PROFILE=locked TEST_CODEX_PATH="$TMP/new-bin/codex" \
     run_ai decide %1 auto-safe safe-auto 'complete fixture'
   invocation="$(cat "$TMP/profile.exec.log")"

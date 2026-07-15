@@ -380,7 +380,12 @@ cmd_build_watch_config() {
   _config_apply_tmux
   _config_apply_overrides "${TMUX_RADAR_SETUP_OVERRIDES:-}" custom
   _config_apply_overrides "${TMUX_RADAR_RUNTIME_OVERRIDES:-}" runtime
-  CONFIG_JSON="$(printf '%s' "$CONFIG_JSON" | jq -c '.goal=.values.goal.value')"
+  CONFIG_JSON="$(printf '%s' "$CONFIG_JSON" | jq -c '
+    if .values.profile.value != "" then
+      (if .values.model.source == "default" then .values.model={value:"",source:"profile-managed"} else . end) |
+      (if .values.effort.source == "default" then .values.effort={value:"",source:"profile-managed"} else . end)
+    else . end |
+    .goal=.values.goal.value')"
   printf '%s\n' "$CONFIG_JSON"
 }
 
@@ -440,6 +445,8 @@ _apply_watch_config() {
   _config_assign "$config" profile TMUX_RADAR_RUN_PROFILE
   _config_assign "$config" model TMUX_RADAR_RUN_MODEL
   _config_assign "$config" effort TMUX_RADAR_RUN_EFFORT
+  TMUX_RADAR_RUN_MODEL_SOURCE="$(printf '%s' "$config" | jq -r '.values.model.source')"
+  TMUX_RADAR_RUN_EFFORT_SOURCE="$(printf '%s' "$config" | jq -r '.values.effort.source')"
   _config_assign "$config" timeout TMUX_RADAR_RUN_TIMEOUT
   _config_assign "$config" max_decisions TMUX_RADAR_RUN_MAX_DECISIONS
   _config_assign "$config" retry_limit TMUX_RADAR_RUN_RETRY_LIMIT
@@ -456,7 +463,8 @@ _apply_watch_config() {
   export TMUX_RADAR_RUN_GOAL TMUX_RADAR_RUN_AUTONOMY TMUX_RADAR_RUN_APPROVAL_POLICY
   export TMUX_RADAR_RUN_ALWAYS_ALLOW TMUX_RADAR_RUN_HOOKS_FIRST TMUX_RADAR_RUN_POLL
   export TMUX_RADAR_RUN_STABLE_SCREEN_THRESHOLD TMUX_RADAR_RUN_COMMAND TMUX_RADAR_RUN_PROFILE
-  export TMUX_RADAR_RUN_MODEL TMUX_RADAR_RUN_EFFORT TMUX_RADAR_RUN_TIMEOUT
+  export TMUX_RADAR_RUN_MODEL TMUX_RADAR_RUN_EFFORT TMUX_RADAR_RUN_MODEL_SOURCE TMUX_RADAR_RUN_EFFORT_SOURCE
+  export TMUX_RADAR_RUN_TIMEOUT
   export TMUX_RADAR_RUN_MAX_DECISIONS TMUX_RADAR_RUN_RETRY_LIMIT TMUX_RADAR_RUN_RETRY_BACKOFF
   export TMUX_RADAR_RUN_CAPTURE_LINES TMUX_RADAR_RUN_MONITOR_EXCERPT_LINES
   export TMUX_RADAR_RUN_MONITOR_POSITION TMUX_RADAR_RUN_MONITOR_WIDTH TMUX_RADAR_RUN_OVERVIEW_RATIO
@@ -599,7 +607,7 @@ _codex_candidates_json() {
 
 _freeze_backend() {
   local diagnostics="${1:-0}" custom explicit selected version minimum compatible=0
-  local source='path' profile model effort warning='' candidates='[]' class='' summary='' detail=''
+  local source='path' profile model effort model_source effort_source warning='' candidates='[]' class='' summary='' detail=''
   BRAIN_BACKEND_FROZEN=1
   BRAIN_BACKEND_OK=0
   BRAIN_BACKEND_MODE=''
@@ -614,6 +622,20 @@ _freeze_backend() {
   model="$(opt @radar-ai-model gpt-5.6-luna)"
   effort="$(opt @radar-ai-effort high)"
   profile="$(opt @radar-ai-profile '')"
+  model_source="${TMUX_RADAR_RUN_MODEL_SOURCE:-}"
+  effort_source="${TMUX_RADAR_RUN_EFFORT_SOURCE:-}"
+  if [ -z "$model_source" ]; then
+    if [ -n "$profile" ] && [ -z "$(_explicit_opt @radar-ai-model)" ]; then
+      model=''; model_source='profile-managed'
+    elif [ -n "$(_explicit_opt @radar-ai-model)" ]; then model_source='tmux'
+    else model_source='default'; fi
+  fi
+  if [ -z "$effort_source" ]; then
+    if [ -n "$profile" ] && [ -z "$(_explicit_opt @radar-ai-effort)" ]; then
+      effort=''; effort_source='profile-managed'
+    elif [ -n "$(_explicit_opt @radar-ai-effort)" ]; then effort_source='tmux'
+    else effort_source='default'; fi
+  fi
   custom="${TMUX_RADAR_AI_CMD:-${TMUX_SWITCHER_AI_CMD:-}}"
   if [ -n "$custom" ]; then
     source='env'
@@ -634,7 +656,9 @@ _freeze_backend() {
     BRAIN_BACKEND_WARNING="$warning"
     BRAIN_BACKEND_JSON="$(jq -cn --arg mode "$BRAIN_BACKEND_MODE" --arg command "$custom" \
       --arg source "$source" --arg profile "$profile" --arg warning "$warning" \
-      '{mode:$mode,command:$command,source:$source,profile:$profile,warning:$warning}')"
+      --arg model "$model" --arg effort "$effort" --arg model_source "$model_source" --arg effort_source "$effort_source" \
+      '{mode:$mode,command:$command,source:$source,profile:$profile,warning:$warning,
+        model:$model,effort:$effort,model_source:$model_source,effort_source:$effort_source}')"
     BRAIN_PREFLIGHT_JSON="$(jq -cn --argjson backend "$BRAIN_BACKEND_JSON" \
       --arg model "$model" --arg effort "$effort" --argjson candidates "$candidates" \
       '{ok:true,backend:$backend,model:$model,effort:$effort,candidates:$candidates}')"
@@ -680,8 +704,10 @@ _freeze_backend() {
   BRAIN_BACKEND_SOURCE="$source"
   BRAIN_BACKEND_JSON="$(jq -cn --arg mode "$BRAIN_BACKEND_MODE" --arg path "$selected" \
     --arg version "$version" --arg identity "$BRAIN_BACKEND_IDENTITY" --arg source "$source" --arg profile "$profile" \
+    --arg model "$model" --arg effort "$effort" --arg model_source "$model_source" --arg effort_source "$effort_source" \
     --arg required_version "$minimum" --argjson compatible "$compatible" \
     '{mode:$mode,path:$path,version:$version,identity:$identity,source:$source,profile:$profile,
+      model:$model,effort:$effort,model_source:$model_source,effort_source:$effort_source,
       required_version:$required_version,compatible:($compatible == 1)}')"
   BRAIN_PREFLIGHT_JSON="$(jq -cn --argjson ok "$BRAIN_BACKEND_OK" \
     --argjson backend "$BRAIN_BACKEND_JSON" --arg model "$model" --arg effort "$effort" \
@@ -1315,44 +1341,45 @@ _brain_label() {
 
 _classify_backend_failure() {
   local rc="$1" stderr_file="$2" schema_valid="$3" stderr_text normalized
-  local class retryable summary detail
+  local class code retryable summary detail
   stderr_text="$(tail -c 16384 "$stderr_file" 2>/dev/null || true)"
   normalized="$(printf '%s' "$stderr_text" | tr '[:upper:]' '[:lower:]')"
-  class='transient'; retryable=1; summary='backend failed with a retryable error'; detail='see stderr_path for private evidence'
+  class='transient'; code='backend-failed'; retryable=1; summary='backend failed with a retryable error'; detail='see stderr_path for private evidence'
 
   if [ "$rc" -eq 78 ]; then
-    class='config-permanent'; retryable=0
+    class='config-permanent'; code='backend-preflight'; retryable=0
     summary='backend preflight failed'
     detail='backend preflight rejected execution'
   elif [ "$rc" -ne 0 ]; then
     case "$rc" in
       126|127)
         class='config-permanent'; retryable=0; summary='backend executable could not be launched'
+        if [ "$rc" -eq 126 ]; then code='backend-not-executable'; else code='backend-command-missing'; fi
         ;;
       *)
         case "$normalized" in
           *requires*a*newer*version*|*unsupported*model*|*unknown*model*|*model*not*found*|\
           *profile*not*found*|*authentication*|*unauthorized*|*invalid*api*key*|\
           *not*logged*in*|*forbidden*|*permission*denied*)
-            class='config-permanent'; retryable=0
+            class='config-permanent'; code='backend-config-invalid'; retryable=0
             summary='backend configuration cannot run the selected model'
             ;;
           *rate*limit*|*too*many*requests*|*connection*|*network*|*temporar*|\
           *timed*out*|*timeout*|*service*unavailable*|*server*error*)
-            class='transient'; retryable=1
+            class='transient'; code='backend-transport'; retryable=1
             ;;
         esac
         ;;
     esac
   elif [ "$schema_valid" -ne 1 ]; then
-    class='output-invalid'; retryable=1
+    class='output-invalid'; code='decision-output-invalid'; retryable=1
     summary='model output failed decision validation'
     detail='decision schema/type validation failed'
   fi
 
-  jq -cn --arg class "$class" --arg summary "$summary" --arg detail "$detail" \
+  jq -cn --arg class "$class" --arg code "$code" --arg summary "$summary" --arg detail "$detail" \
     --argjson retryable "$retryable" \
-    '{class:$class,retryable:($retryable == 1),summary:$summary,detail:$detail}'
+    '{class:$class,code:$code,retryable:($retryable == 1),summary:$summary,detail:$detail}'
 }
 
 _classify_outcome() {
@@ -1362,11 +1389,11 @@ _classify_outcome() {
     backend) _classify_backend_failure "$@" ;;
     policy-halt)
       jq -cn --arg summary "${1:-policy requires user action}" \
-        '{class:"policy-halt",retryable:false,summary:$summary,detail:""}'
+        '{class:"policy-halt",code:"policy-requires-user",retryable:false,summary:$summary,detail:""}'
       ;;
     decision-invalid)
       jq -cn --arg summary "${1:-decision violates the current event contract}" \
-        '{class:"decision-invalid",retryable:true,summary:$summary,
+        '{class:"decision-invalid",code:"decision-contract-invalid",retryable:true,summary:$summary,
           detail:"repair must satisfy the event-specific decision contract"}'
       ;;
     *) return 2 ;;
@@ -1374,17 +1401,21 @@ _classify_outcome() {
 }
 
 _watch_record_backend_error() {
-  local classification="$1" stderr_path="$2" call="$3" summary
+  local classification="$1" stderr_path="$2" call="$3" summary error_event_id timestamp
   summary="$(printf '%s' "$classification" | jq -r '.summary')"
+  error_event_id="${WATCH_EVENT_ID:-$RADAR_RUN_ID}:backend:$call"
+  timestamp="$(_radar_now_iso)"
   radar_event_append backend_error watcher "$summary" "$(jq -cn \
     --argjson classification "$classification" \
-    --arg event_id "${WATCH_EVENT_ID:-}" --arg backend_mode "$BRAIN_BACKEND_MODE" \
+    --arg event_id "$error_event_id" --arg trigger_event_id "${WATCH_EVENT_ID:-}" --arg backend_mode "$BRAIN_BACKEND_MODE" \
     --arg backend_path "$BRAIN_BACKEND_PATH" --arg backend_version "$BRAIN_BACKEND_VERSION" \
-    --arg stderr_path "$stderr_path" --argjson call "$call" '
-    {schema_version:1,record:"error",event_id:$event_id,error_class:$classification.class,
-     retryable:$classification.retryable,summary:$classification.summary,detail:$classification.detail,
-     backend_mode:$backend_mode,backend_path:$backend_path,backend_version:$backend_version,
-     stderr_path:$stderr_path,call:$call}')"
+    --arg stderr_path "$stderr_path" --arg timestamp "$timestamp" --argjson call "$call" '
+    {schema_version:1,record:"error",event_id:$event_id,trigger_event_id:$trigger_event_id,
+     error:{class:$classification.class,code:$classification.code,retryable:$classification.retryable,
+       summary:$classification.summary,detail:$classification.detail,backend_mode:$backend_mode,
+       backend_path:$backend_path,backend_version:$backend_version,stderr_path:$stderr_path,
+       call:$call,timestamp:$timestamp}}')"
+  _watch_state_snapshot "$(jq -cn --arg event_id "$error_event_id" '{latest_error_event_id:$event_id}')"
 }
 
 _escalate() {
@@ -2342,7 +2373,7 @@ cmd_watch_loop() {
   if [ "$BRAIN_BACKEND_OK" -ne 1 ]; then
     classification="$(jq -cn --arg summary "$(printf '%s' "$BRAIN_PREFLIGHT_JSON" | jq -r '.summary')" \
       --arg detail "$(printf '%s' "$BRAIN_PREFLIGHT_JSON" | jq -r '.detail // ""')" \
-      '{class:"config-permanent",retryable:false,summary:$summary,detail:$detail}')"
+      '{class:"config-permanent",code:"backend-preflight",retryable:false,summary:$summary,detail:$detail}')"
     _watch_phase CREATED "run created" none 0
     _watch_record_backend_error "$classification" "" 0
     _watch_phase PAUSED_ERROR "$(printf '%s' "$classification" | jq -r '.summary')" none 0

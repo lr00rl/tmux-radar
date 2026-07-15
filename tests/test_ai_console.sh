@@ -200,6 +200,17 @@ test_build_watch_config_contains_all_settings_and_provenance() {
   '
 }
 
+test_profile_managed_brain_does_not_claim_defaults() {
+  local config_file="$TMP/profile-managed.json"
+  TMUX_RADAR_SETUP_OVERRIDES='profile=locked' \
+    run_ai _build-watch-config %39 'profile goal' > "$config_file"
+  assert_json "$config_file" '
+    .values.profile == {value:"locked",source:"custom"} and
+    .values.model == {value:"",source:"profile-managed"} and
+    .values.effort == {value:"",source:"profile-managed"}
+  '
+}
+
 test_invalid_numeric_overrides_retain_effective_values() {
   local config_file="$TMP/rejected-config.json" errors="$TMP/rejected.err"
   TMUX_RADAR_SETUP_OVERRIDES='poll=abc,timeout=0,retry_limit=-1' \
@@ -523,6 +534,7 @@ mkdir -p "$TMP/state"
 run_test '_decode-goal preserves CJK and whitespace' test_decode_goal_preserves_cjk_and_whitespace
 run_test '_decode-goal detects advanced sentinel' test_decode_goal_detects_advanced_sentinel
 run_test '_build-watch-config represents every setting and provenance' test_build_watch_config_contains_all_settings_and_provenance
+run_test 'profile-managed brain does not claim Luna/high defaults' test_profile_managed_brain_does_not_claim_defaults
 run_test 'invalid numeric overrides retain previous effective values' test_invalid_numeric_overrides_retain_effective_values
 run_test 'invalid numeric overrides surface rejection details' test_invalid_numeric_overrides_surface_rejections
 run_test 'menu routes w to quick setup' test_menu_routes_w_to_quick_setup

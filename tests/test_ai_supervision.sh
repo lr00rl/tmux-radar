@@ -725,7 +725,7 @@ emit_event mixed-recovery-event manual_reassess inspect
 wait_until 'mixed transient and repair recovery' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 3 ] && jq -e '.phase == \"ARMED\"' '$RUN_DIR/state.json' >/dev/null 2>&1" 600
 assert_eq 1 "$(jq -s '[.[] | select(.kind == "decision_repair")] | length' "$RUN_DIR/events.jsonl")" \
   'mixed recovery uses exactly one repair attempt'
-assert_eq 1 "$(jq -s '[.[] | select(.kind == "backend_error" and .error_class == "transient")] | length' "$RUN_DIR/events.jsonl")" \
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "backend_error" and .error.class == "transient")] | length' "$RUN_DIR/events.jsonl")" \
   'mixed recovery preserves one transient failure'
 stop_watch
 printf 'PASS: transient retries and output repair use independent budgets\n'
@@ -740,7 +740,7 @@ wait_until 'transient backend retry exhaustion' "jq -e '.phase == \"PAUSED_ERROR
 assert_eq 4 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'transient backend uses bounded retry budget'
 if ! jq -e 'select(
   .record == "error" and .kind == "backend_error" and
-  .error_class == "transient" and .retryable == true and .call == 1
+  .error.class == "transient" and .error.retryable == true and .error.call == 1
 )' "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
   _fail_assert 'transient backend error lacks retryable classification' \
     'events' "$(cat "$RUN_DIR/events.jsonl")"
@@ -766,18 +766,23 @@ if ! jq -e --arg path "$RUN_DIR/backend/0001.stderr" '
   select(
     .record == "error" and
     .kind == "backend_error" and
-    .error_class == "config-permanent" and
-    .retryable == false and
-    .stderr_path == $path and
-    .call == 1
+    .error.class == "config-permanent" and
+    .error.retryable == false and
+    .error.stderr_path == $path and
+    .error.call == 1 and
+    (.error.code | length) > 0 and
+    (.error.timestamp | length) > 0
   )
 ' "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
   _fail_assert 'permanent backend error lacks structured evidence' \
     'events' "$(cat "$RUN_DIR/events.jsonl")"
 fi
-if jq -e 'select(.kind == "backend_error") | .detail | contains("requires a newer version")' \
+if jq -e 'select(.kind == "backend_error") | .error.detail | contains("requires a newer version")' \
   "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
   _fail_assert 'backend event duplicated private stderr instead of referencing its evidence path'
+fi
+if jq -e 'select(.kind == "backend_error" and has("error_class"))' "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
+  _fail_assert 'backend event used legacy flat error fields instead of the canonical error object'
 fi
 wait_until 'permanent watcher exits' "! kill -0 '$WATCH_PID' 2>/dev/null" 400
 wait "$WATCH_PID" 2>/dev/null || true
@@ -792,7 +797,7 @@ start_watch 30
 emit_event launch-permanent-event manual_reassess inspect
 wait_until 'launch failure permanent pause' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 0' '$RUN_DIR/state.json' >/dev/null 2>&1" 400
 assert_eq 1 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'launch failure does not retry transient-looking text'
-if ! jq -e 'select(.kind == "backend_error" and .error_class == "config-permanent" and .retryable == false)' \
+if ! jq -e 'select(.kind == "backend_error" and .error.class == "config-permanent" and .error.retryable == false)' \
   "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
   _fail_assert 'launch exit status did not outrank stderr wording' 'events' "$(cat "$RUN_DIR/events.jsonl")"
 fi

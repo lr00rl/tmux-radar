@@ -1,7 +1,7 @@
 # tmux-radar Native Supervisor TUI Design
 
 Date: 2026-07-14
-Status: Architecture approved; written specification pending final review
+Status: Approved for Phase 0-1 implementation; boundary contracts revised after adversarial plan review
 Scope: `prefix + A -> w/W/v`, supervisor setup, backend preflight, live console, control bridge, binary distribution, compatibility, and staged engine migration
 Supersedes: the setup and presentation-layer sections of `2026-07-13-supervision-console-design.md`
 Preserves: the existing hook, event journal, safety gate, delivery verification, one-model-call, and process-tree lifecycle contracts
@@ -63,8 +63,11 @@ tmux continues to own layout and pane lifecycle. The Go binary owns all interact
 
 ```text
 tmux-radar.tmux
-  creates/reuses the monitor surface
-  passes target pane, monitor pane, state dir, and engine script
+  routes every entry through scripts/native-launcher.sh
+            |
+scripts/native-launcher.sh
+  duplicate lookup, legacy routing, binary bootstrap, geometry, surface creation
+  passes target pane, nullable monitor pane, surface, state dir, and engine script
             |
             v
 bin/tmux-radar
@@ -77,7 +80,7 @@ bin/tmux-radar
             +-- internal/preflight
             |     backend resolution, version, auth/config and hook checks
             +-- internal/enginebridge
-            |     start Bash engine through JSON stdin; parse start result
+            |     atomic versioned start through JSON stdin; run-scoped controls
             +-- internal/control
                   invoke existing pause/resume/reassess/keep/stop commands
             |
@@ -88,21 +91,22 @@ scripts/ai.sh + scripts/lib/ai-runtime.sh
 
 ### tmux Plugin Ownership
 
-The plugin creates the UI surface because it already owns tmux compatibility, options, initial focus, duplicate-run selection, and cleanup.
+The plugin delegates one shell launcher to create the UI surface because shell remains available when the native binary is missing, corrupt, or built for the wrong architecture. Both `tmux-radar.tmux` and the `ai.sh menu` fallback call this launcher; neither duplicates routing or geometry logic.
 
-- At 120 or more client columns and at least 24 rows, create a full-height right pane and select it so Goal input is immediately active.
-- Use approximately 38% of the client width, clamped to 56-96 columns, while leaving at least 64 columns for the target.
+- Use the actual target-pane width as the hard geometry input; client width is diagnostic only.
+- At 121 or more target-pane columns and at least 24 rows, create a full-height right pane and select it so Goal input is immediately active.
+- Use approximately 38% of the target width, clamped to 56-96 columns, while leaving at least 64 target columns plus the tmux divider.
 - Below that threshold, run the same binary in a 90% by 85% popup instead of crushing the target pane.
 - Keep focus in the TUI after launch so the user sees preflight and the first live state. `Enter` explicitly returns focus to the target pane.
 - Cancelling setup closes the newly created monitor surface and starts no watcher.
-- A duplicate launch selects the existing monitor and shows the existing run ID.
+- The launcher checks for an existing live run before creating a surface. A sequential duplicate selects the existing split monitor or opens a read-only attach view for a detached run. The engine's atomic reservation remains the concurrency backstop.
 
-The binary never creates, resizes, or kills tmux panes. It may focus the supplied target pane in response to `Enter`. It receives `--target-pane`, `--monitor-pane`, `--surface split|popup`, and `--engine-script` from the plugin.
+The binary never creates, resizes, or kills tmux panes. It may focus the supplied target pane in response to `Enter`. It receives `--target-pane`, optional `--monitor-pane`, `--surface split|popup`, and `--engine-script` from the launcher. Resize reflows content inside the existing surface; a running split never transforms into a popup and a popup never transforms into a split.
 
 ### Binary Commands
 
 ```text
-tmux-radar supervisor setup  --target-pane %N --monitor-pane %M --surface split
+tmux-radar supervisor setup  --target-pane %N [--monitor-pane %M] --surface split|popup
 tmux-radar supervisor attach --run <run-id>
 tmux-radar supervisor doctor [--json]
 tmux-radar version
@@ -112,21 +116,24 @@ tmux-radar version
 
 ### Engine Start Protocol
 
-Phase 1 adds one internal Bash command:
+Phase 1 adds two versioned internal Bash commands:
 
 ```text
-ai.sh engine-start <target-pane> <monitor-pane>
+ai.sh engine-start
+ai.sh control <run-id> <target-pane> <action> <request-id>
 ```
 
-It reads one immutable configuration object from stdin, validates every field with the existing constraints, creates the run, starts the watcher, records the existing monitor owner, and prints exactly one JSON result:
+`engine-start` reads one strict request from stdin. The request contains `protocol_version:1`, `config_schema_version:1`, authoritative target pane, expected state root, immutable config, and an owner descriptor. Split and popup owners contain a random 128-bit token, Go PID, heartbeat path, and optional pane ID. Detached and viewer descriptors contain no active owner lease. Request target and config target must match after canonical pane resolution.
+
+The parent acquires an atomic per-pane launch lock before checking/replacing the live pointer. It validates the complete request, creates the run and owner metadata, writes a starting pointer, starts a watcher that opens the pre-created run without config in argv, and waits for a ready record proving traps and first state are installed. Only then does it print exactly one JSON result:
 
 ```json
-{"ok":true,"run_id":"...","run_dir":"...","watcher_pid":1234}
+{"protocol_version":1,"ok":true,"status":"started","run_id":"...","run_dir":"...","watcher_pid":1234}
 ```
 
-Failure output is also JSON and contains a stable error class, user-facing summary, detail, retryability, and evidence path. Configuration JSON is never placed in argv, a tmux option, or a world-readable temporary file.
+An active duplicate returns `status:"already-active"` and the existing run/owner without creating a process. Failure output is one JSON line and contains protocol version, stable error class/code, summary, detail, retryability, and evidence path. Diagnostics go to stderr. Invalid requests, dead identities, protocol mismatch, readiness timeout, or child failure leave no live pointer or hidden process; an incomplete run is finalized as `startup-failed`. Configuration JSON is never placed in argv, a tmux option, or a world-readable temporary file.
 
-After launch, the Go process reads canonical files and invokes existing public control commands. No Unix socket is required in Phase 1.
+After launch, the Go process reads canonical files and invokes the run-scoped `control` command. No Unix socket is required in Phase 1.
 
 ## Canonical Run Contract
 
@@ -146,9 +153,11 @@ ai-runs/<run-id>/
   final.json
 ```
 
-Newly written JSON includes `schema_version: 1`. Readers treat a missing version as legacy version 0. Version 1 changes are additive. Existing field meanings are not repurposed.
+New `config.json`, `state.json`, `final.json`, every `events.jsonl` record, every decision metadata record, every control request/acknowledgement, owner descriptor, and start request/result include `schema_version:1` or `protocol_version:1` as appropriate. Raw `decisions/NNNN.json` remains the model's existing strict output and is not wrapped or versioned. Readers treat missing artifact versions as legacy version 0, ignore additive unknown fields, and reject unsupported major/protocol versions before control or launch.
 
-The TUI does not rewrite engine state. It writes configuration only before launch. After launch, controls go through `ai.sh`; acknowledgement is proved by a matching canonical event/state transition, not by process exit code alone.
+The TUI does not rewrite engine state. It writes configuration only in the stdin start request. After launch, controls use run ID, target pane, action, and a UUID request ID. The engine atomically verifies that the current pointer still names that run and pane before any sentinel, event, or signal. A stale viewer receives `stale-run` and cannot affect the replacement run.
+
+Every control writes one idempotent request record. Repeating the same request ID returns the stored result and causes no second transition. Engine acknowledgements carry the same request ID. Pause succeeds only at `PAUSED_USER`; resume succeeds on `resumed`; reassess succeeds when its manual event is accepted; keep succeeds on a persisted keep acknowledgement; stop succeeds only when that run's `final.json` is terminal. UI acknowledgement timeout is five seconds, except stop is ten seconds. Timeout does not resend or claim success; the request remains inspectable and a later acknowledgement updates the UI.
 
 The UI checks file size/modification metadata every 250 milliseconds. It reparses only changed files and emits a Bubble Tea message only when the derived model changes. Timeline reads continue from the last byte offset and handle truncation or inode replacement defensively. A one-second tick updates elapsed time and countdowns without reconstructing timeline content.
 
@@ -202,18 +211,22 @@ The final review is part of the same screen, not a second shell prompt. It highl
 
 ## Backend Resolution And Preflight
 
-The engine must stop prepending `/opt/homebrew/bin` ahead of the user's environment. Backend resolution order is:
+The engine must stop prepending `/opt/homebrew/bin` ahead of the user's environment. Backend modes are explicit:
 
-1. Explicit per-run `command` or profile
-2. Explicit `@radar-ai-codex-path`
-3. The first executable from the inherited user/tmux `PATH`
+- `codex`: a resolved and pinned absolute Codex executable, optionally with a profile
+- `custom-command`: the existing arbitrary command backend, exempt from Codex path/version/auth/model checks
 
-The resolved absolute path, version, source, and model/effort are frozen in `config.json`. The preflight scans other PATH candidates only to produce diagnostics; it never silently substitutes one after launch review.
+When custom command and profile coexist, existing command precedence remains for compatibility and preflight emits a warning that the profile is ignored. Codex backend resolution order is:
+
+1. Explicit `@radar-ai-codex-path`
+2. The first executable from the inherited user/tmux `PATH`
+
+The resolved absolute path, version, source, profile, and model/effort are frozen as one backend object in `config.json`. `_brain`, metadata, labels, preflight, and logs use that object and never rerun `command -v`. A profile uses the pinned executable; when profile-managed model/effort are not passed explicitly, the UI labels them `profile-managed` instead of claiming Luna/high. The preflight scans other PATH candidates only to produce diagnostics; it never silently substitutes one after launch review.
 
 Preflight checks:
 
 - executable exists and can run `--version`
-- configured profile and command are not mutually ambiguous
+- custom-command/profile coexistence warning and command precedence
 - known minimum CLI compatibility for the built-in default model
 - Codex authentication/config health through `codex login status` when that subcommand is supported; otherwise show `not checked by this CLI version` without claiming success
 - native hook installation status, reported as native, legacy, fallback, or missing
@@ -241,7 +254,7 @@ effort = high
 | `policy-halt` | destructive, irreversible, ambiguous, production or secret-bearing action | never automatic | pause for user with evidence and target jump |
 | `lifecycle-stop` | target/owner disappeared or user stopped | never | terminal STOPPED state and cleanup evidence |
 
-Error records include class, code, retryable flag, summary, detail, backend path/version, stderr file, call number, and timestamp. Known permanent stderr such as `requires a newer version of Codex` consumes no retry budget.
+Canonical error evidence is an `events.jsonl` record with `record:"error"`, `kind:"backend_error"`, and an `error` object containing class, code, retryable flag, summary, detail, frozen backend path/version, stderr reference, call number, and timestamp. `state.json` references the latest error event ID; decision metadata retains call-local evidence. Known permanent stderr such as `requires a newer version of Codex` consumes no retry budget. A setup-detected permanent error starts zero backend processes and leaves calls/retry at zero. A runtime-discovered permanent error records one failed backend attempt and schedules zero retries. Output-invalid performs one explicitly labeled repair attempt that counts against the decision budget, then halts if invalid. Transient retries use the configured retry limit and backoff.
 
 ## Live Console
 
@@ -302,7 +315,18 @@ At narrow widths, footer labels shorten before keys disappear. The minimum foote
 
 ## Lifecycle And Control Semantics
 
-Phase 1 preserves the current watcher state machine and ownership checks. The existing monitor pane is recorded before watcher pointer snapshots can overwrite monitor IDs.
+Phase 1 preserves the watcher state machine but adds an engine-enforced owner lease; current shell EXIT traps alone are insufficient for a native owner.
+
+Owner descriptors are canonical version-1 JSON:
+
+- `split`: monitor pane ID, owner PID, random 128-bit token, heartbeat path
+- `popup`: no pane ID, owner PID, token, heartbeat path
+- `detached`: no active UI owner; target-pane liveness owns the run
+- `viewer`: read-only and never owns or controls the run
+
+The Go owner atomically refreshes a token-bearing heartbeat once per second. The Bash watcher checks token and heartbeat age during idle waits, retry delays, capture, delivery, verification, and backend-call polling; split owners also require the pane to remain live. A three-second stale lease stops the watcher and complete backend tree. The random token prevents an unrelated reused PID from satisfying the lease. Owner metadata is persisted before the first `CREATED`/`ARMED` state and survives every pointer rewrite.
+
+Popup `Enter` first submits a run-scoped `detach` control and waits for its acknowledgement changing the descriptor to `detached`; only then may the process exit while the run continues. Popup crash/SIGKILL without that transition stops the run. An attached viewer is read-only. A detached active run may transfer ownership only through a separate atomic `takeover-owner` control that verifies the run is still detached.
 
 Control commands are asynchronous from the TUI's perspective:
 
@@ -314,7 +338,7 @@ Control commands are asynchronous from the TUI's perspective:
 
 The TUI never reports success solely because a shell command exited zero.
 
-If the TUI process exits unexpectedly in a split owner, the pane closes and existing owner-GC stops the watcher and backend tree. In popup mode, explicit detach is recorded before the popup exits; an unmarked popup crash stops the watcher. Target-pane disappearance always stops the run.
+If the TUI process exits unexpectedly, the lease expires and engine-side owner-GC stops the watcher and backend tree even if tmux leaves the pane process state unusual. Target-pane disappearance always stops the run. `scripts/ai-monitor.sh` is not deleted until native split death, forced process death, popup crash, explicit popup detach, and detached target death all pass the process-tree suite.
 
 ## Distribution And Installation
 
@@ -327,7 +351,7 @@ Release artifacts are built for:
 
 Each release includes SHA-256 checksums. The source repository does not commit platform binaries.
 
-`@radar-supervisor-binary` may point to a user-managed binary. Otherwise the plugin uses `bin/tmux-radar` in its install directory. When absent, the first explicit supervisor launch offers to install the matching checksummed release asset; it does not perform hidden network work from hooks or plugin startup. If Go is installed, source build is an explicit alternative. Declining installation keeps the workspace navigator functional and offers the legacy Bash supervisor during the migration window.
+`scripts/native-launcher.sh` exists independently of the binary and handles bootstrap. `@radar-supervisor-binary` may point to a user-managed binary. Otherwise the launcher uses `bin/tmux-radar` in the plugin directory. When absent, corrupt, wrong-architecture, or protocol-incompatible, the shell launcher offers matching checksummed release install, explicit source build when Go exists, or legacy UI. It does not perform hidden network work from hooks or plugin startup. Declining/failing installation keeps the navigator and AI-status functional and starts no watcher.
 
 The binary and Bash engine exchange a protocol version at launch. A mismatch blocks supervision with an update instruction; it never attempts a partially compatible run.
 
@@ -346,12 +370,12 @@ Acceptance: the supplied failure configuration names `/opt/homebrew/bin/codex 0.
 
 - add Go module and `tmux-radar supervisor` commands
 - implement setup, review, preflight, live views, help, and controls
-- add stdin engine-start protocol and external monitor ownership
+- add atomic stdin engine-start transaction, run-scoped controls, and owner leases
 - keep `TMUX_RADAR_LEGACY_UI=1` rollback
 
-Acceptance: all current events, lifecycle, serialized-supervision, runtime, and ownership tests pass with the Go monitor owner; TUI-specific unit and real tmux tests pass.
+Acceptance: all intentionally preserved events, lifecycle, serialized-supervision, runtime, and ownership behavior passes with the Go monitor owner; tests whose retry/schema semantics intentionally change are updated with explicit replacement assertions. Concurrent starts produce one run. Stale viewers cannot control replacement runs. Config never appears in process argv. Every owner-death/detach case passes against a backend with a child process.
 
-After one release with successful rollback telemetry/manual evidence, delete `scripts/ai-monitor.sh` and the readline/advanced field-name setup loop.
+After one release where automated legacy routing passes and manual release acceptance proves native/legacy switching in both menu entrypoints, the readline/advanced field-name setup loop may be deleted. `scripts/ai-monitor.sh` is deleted only after the native owner lease matrix passes; elapsed release time alone is not a deletion gate.
 
 ### Phase 2: Engine Parity Harness
 
@@ -376,23 +400,27 @@ Go becomes default only after one dual-engine release. Bash watcher code is dele
 
 - reducer/state transitions for every setup and live message
 - config validation and provenance
-- schema v0/v1 parsing and additive unknown fields
+- explicit schema v0/v1 fixtures for config, state, events, final, decision metadata, controls, owner and start records; additive unknown fields and unsupported-major rejection
 - incremental JSONL tailing, replacement, truncation, partial final line
 - permanent/transient/output-invalid/policy/lifecycle classification
 - footer degradation and width-safe rendering
 - CJK grapheme editing and exact JSON round-trip
-- control acknowledgement and timeout behavior
+- run-scoped control idempotency, stale-run refusal, correlated acknowledgement, and timeout behavior
+- atomic per-pane start reservation, readiness failure cleanup, and argv privacy
 
 ### Automated tmux
 
 - `80x24`: popup setup/live console, minimum controls visible
-- `120x30`: minimum right pane, target remains at least 64 columns
+- `120x30`: popup because the 121-column split invariant is not met
+- `121x30`: minimum right pane, 56-column monitor, divider, and 64-column target
 - `150x40`: compact right console
 - `284x54`: full setup form and live views
-- resize across thresholds without losing form values/view/scroll position
-- close monitor, close target, `q`, and `Ctrl-C` process-tree cleanup
-- Enter target behavior and popup detach ownership
-- duplicate launch selects existing monitor
+- resize content inside its existing split/popup without losing form values/view/scroll position; no implicit surface migration
+- close split monitor, SIGKILL native owner, crash popup, close detached target, `q`, and `Ctrl-C` process-tree cleanup
+- popup Enter detach acknowledgement before run continuation
+- sequential duplicate selects existing monitor; concurrent duplicate creates exactly one run
+- stale run A controls cannot change replacement run B on the same pane
+- missing/corrupt/wrong-architecture binary, checksum failure, and protocol mismatch start zero watchers and preserve legacy routing
 - active backend call remains singular while hook events burst
 
 ### Manual Release Acceptance
@@ -430,8 +458,10 @@ Go becomes default only after one dual-engine release. Bash watcher code is dele
 - Migration: UI-first staged migration
 - Phase 1 engine: existing Bash watcher
 - State transport: canonical run directory
-- Phase 1 control transport: existing `ai.sh` commands plus journal acknowledgement
-- tmux layout ownership: plugin shell
+- Phase 1 start transport: protocol-v1 JSON stdin, atomic per-pane reservation, child-ready handshake
+- Phase 1 control transport: run-scoped idempotent `ai.sh control` plus correlated journal acknowledgement
+- Native owner liveness: token-bearing one-second heartbeat, engine-enforced three-second lease
+- tmux layout/bootstrap ownership: one plugin shell launcher shared by both menu entrypoints
 - Default model/effort: `gpt-5.6-luna` / `high`
 - Narrow layout: same binary in popup
 - Browser/web UI: none

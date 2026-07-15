@@ -63,6 +63,7 @@ case "$cmd" in
     case "$key" in
       @radar-ai-timeout|@switcher-ai-timeout) printf '%s\n' "${TEST_AI_TIMEOUT:-5}" ;;
       @radar-ai-max-calls|@switcher-ai-max-calls) printf '%s\n' "${TEST_MAX_CALLS:-40}" ;;
+      @radar-ai-codex-path|@switcher-ai-codex-path) [ -z "${TEST_CODEX_PATH:-}" ] || printf '%s\n' "$TEST_CODEX_PATH" ;;
       @radar-ai-capture-lines|@switcher-ai-capture-lines) printf '%s\n' 120 ;;
       @radar-ai-monitor-excerpt-lines|@switcher-ai-monitor-excerpt-lines) printf '%s\n' 16 ;;
       *) exit 0 ;;
@@ -147,6 +148,24 @@ if [ -f "$response" ]; then cat "$response"; fi
 rm -rf "$TEST_ACTIVE_LOCK"
 BACKENDEOF
   chmod +x "$TMP/bin/fake-backend"
+
+  cat > "$TMP/bin/fake-notify" <<'NOTIFYEOF'
+#!/usr/bin/env bash
+exit "${TEST_NOTIFY_RC:-0}"
+NOTIFYEOF
+  chmod +x "$TMP/bin/fake-notify"
+
+  cat > "$TMP/bin/frozen-codex" <<'CODEXEOF'
+#!/usr/bin/env bash
+set -eu
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' 'codex-cli 0.144.4'
+  exit 0
+fi
+printf '%s\n' "$*" >> "$TEST_CODEX_EXEC_LOG"
+exit 1
+CODEXEOF
+  chmod +x "$TMP/bin/frozen-codex"
 }
 
 reset_case() {
@@ -188,6 +207,13 @@ reset_case() {
   export TEST_BACKEND_NOTIFY=0
   export TEST_BACKEND_RC=0
   export TEST_BACKEND_STDERR=""
+  export TEST_NOTIFY_RC=0
+  export TMUX_RADAR_NOTIFY_CMD="$TMP/bin/fake-notify"
+  export TMUX_RADAR_AI_LOG="$CASE/audit.log"
+  export TEST_CODEX_PATH=""
+  export TEST_CODEX_EXEC_LOG="$CASE/codex-exec.log"
+  export TMUX_RADAR_TEST_BEFORE_DECIDE_BLOCK="$CASE/before-decide"
+  export TMUX_RADAR_TEST_BEFORE_BRAIN_BLOCK=""
   export TEST_SEND_FAIL_AT=0
   export TMUX_RADAR_TEST_PRE_SEND_BLOCK=""
   export TMUX_RADAR_TEST_GATE_ATTEMPTS=""
@@ -202,6 +228,7 @@ reset_case() {
   : > "$TEST_CONCURRENT"
   : > "$TEST_BACKEND_PIDS"
   : > "$TEST_WAITER_PIDS"
+  : > "$TEST_CODEX_EXEC_LOG"
   printf 'screen-0\n' > "$TEST_SCREEN"
   touch "$TEST_PANE_ALIVE"
   RUN_DIR=""
@@ -730,7 +757,44 @@ assert_eq 1 "$(jq -s '[.[] | select(.kind == "backend_error" and .error.class ==
 stop_watch
 printf 'PASS: transient retries and output repair use independent budgets\n'
 
-# 27. A transient transport failure retains bounded retry/backoff behavior.
+# 27. A transport failure during the one logical repair keeps the repair prompt
+# and uses the independent transient retry budget.
+reset_case repair-transport-recovery
+write_response 1 '{bad json'
+printf '%s\n' 'temporary connection reset by peer' > "$TEST_RESPONSES/2.stderr"
+printf '%s\n' 1 > "$TEST_RESPONSES/2.rc"
+write_response 3 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"repair recovered after transport"}'
+start_watch 30
+emit_event repair-transport-event manual_reassess inspect
+wait_until 'repair transport recovery' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 3 ] && jq -e '.phase == \"ARMED\"' '$RUN_DIR/state.json' >/dev/null 2>&1" 600
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "decision_repair")] | length' "$RUN_DIR/events.jsonl")" \
+  'repair transport recovery keeps one logical repair attempt'
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "backend_error" and .error.class == "transient")] | length' "$RUN_DIR/events.jsonl")" \
+  'repair transport recovery records the transient failure'
+assert_contains "$(cat "$TEST_PROMPT_FILE")" 'previous decision was invalid' \
+  'transport retry preserves repair context'
+stop_watch
+printf 'PASS: repair transport failure uses the transient retry budget\n'
+
+# 28. Repeated transport failures during repair remain bounded.
+reset_case repair-transport-exhausted
+write_response 1 '{bad json'
+for call in 2 3 4; do
+  printf '%s\n' 'temporary connection reset by peer' > "$TEST_RESPONSES/$call.stderr"
+  printf '%s\n' 1 > "$TEST_RESPONSES/$call.rc"
+done
+start_watch_config 30 1 on 'bound repair transport retries' 'retry_limit=2'
+emit_event repair-transport-exhausted-event manual_reassess inspect
+wait_until 'repair transport retry exhaustion' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 2' '$RUN_DIR/state.json' >/dev/null 2>&1" 700
+assert_eq 4 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" \
+  'initial invalid output plus three bounded repair transport calls'
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "decision_repair")] | length' "$RUN_DIR/events.jsonl")" \
+  'transport exhaustion does not spend a second repair attempt'
+wait "$WATCH_PID" 2>/dev/null || true
+WATCH_PID=""
+printf 'PASS: repair transport retries remain bounded\n'
+
+# 29. A transient transport failure retains bounded retry/backoff behavior.
 reset_case transient-backend
 export TEST_BACKEND_RC=1
 export TEST_BACKEND_STDERR='connection reset by peer'
@@ -749,7 +813,7 @@ wait "$WATCH_PID" 2>/dev/null || true
 WATCH_PID=""
 printf 'PASS: transient backend failures retain bounded retries\n'
 
-# 28. A selected Codex that cannot run the configured model is a permanent
+# 30. A selected Codex that cannot run the configured model is a permanent
 # configuration failure. It must spend one attempt, preserve the exact stderr
 # evidence path, and never schedule a retry that cannot heal the configuration.
 reset_case permanent-backend
@@ -757,7 +821,7 @@ export TEST_BACKEND_RC=1
 export TEST_BACKEND_STDERR="The 'gpt-5.6-luna' model requires a newer version of Codex."
 start_watch_config 30 1 on 'finish without wasting model calls' 'retry_limit=3'
 emit_event permanent-backend-event manual_reassess inspect
-wait_until 'permanent backend pause' "jq -e '.phase == \"PAUSED_ERROR\"' '$RUN_DIR/state.json' >/dev/null 2>&1" 400
+wait_until 'permanent backend pause' "jq -e '.phase == \"PAUSED_ERROR\"' '$RUN_DIR/state.json' >/dev/null 2>&1" 1200
 assert_eq 1 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'permanent backend launches once'
 assert_json "$RUN_DIR/state.json" '.phase == "PAUSED_ERROR" and .retry == 0'
 assert_eq "$TEST_BACKEND_STDERR" "$(cat "$RUN_DIR/backend/0001.stderr")" \
@@ -789,7 +853,7 @@ wait "$WATCH_PID" 2>/dev/null || true
 WATCH_PID=""
 printf 'PASS: permanent backend incompatibility spends no retry budget\n'
 
-# 29. Authoritative launch failure status outranks transient-looking stderr.
+# 31. Authoritative launch failure status outranks transient-looking stderr.
 reset_case launch-permanent
 export TEST_BACKEND_RC=127
 export TEST_BACKEND_STDERR='connection timeout while launching missing executable'
@@ -805,8 +869,79 @@ wait "$WATCH_PID" 2>/dev/null || true
 WATCH_PID=""
 printf 'PASS: launch exit status outranks fuzzy stderr classification\n'
 
-# 30. Unsafe or non-auto delivery is a policy halt, not a backend failure.
+# 32. Ordered classifier rules keep permanent evidence ahead of transport words
+# and leave unknown nonzero failures retryable.
+reset_case classifier-matrix
+classifier_stderr="$CASE/classifier.stderr"
+printf '%s\n' 'connection timeout followed by unsupported model' > "$classifier_stderr"
+PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" _classify-backend-failure 1 "$classifier_stderr" 0 > "$CASE/mixed.json"
+assert_json "$CASE/mixed.json" '.class == "config-permanent" and .retryable == false'
+printf '%s\n' 'profile not found' > "$classifier_stderr"
+PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" _classify-backend-failure 1 "$classifier_stderr" 0 > "$CASE/profile.json"
+assert_json "$CASE/profile.json" '.class == "config-permanent"'
+printf '%s\n' 'authentication failed: unauthorized' > "$classifier_stderr"
+PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" _classify-backend-failure 1 "$classifier_stderr" 0 > "$CASE/auth.json"
+assert_json "$CASE/auth.json" '.class == "config-permanent"'
+printf '%s\n' 'unrecognized backend failure' > "$classifier_stderr"
+PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" _classify-backend-failure 1 "$classifier_stderr" 0 > "$CASE/unknown.json"
+assert_json "$CASE/unknown.json" '.class == "transient" and .retryable == true and .code == "backend-failed"'
+printf 'PASS: classifier ordering covers permanent, mixed, and unknown failures\n'
+
+# 33. Pane loss before cmd_decide starts a model is a lifecycle stop. It does
+# not reuse the previous decision, spend budget, or schedule output repair.
+reset_case pre-decision-pane-loss
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"first decision"}'
+start_watch 30
+emit_event pane-loss-first manual_reassess first
+wait_until 'first decision before pane loss' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 1 ] && jq -e '.phase == \"ARMED\"' '$RUN_DIR/state.json' >/dev/null 2>&1"
+rm -f "${TMUX_RADAR_TEST_BEFORE_DECIDE_BLOCK}.ready"
+touch "$TMUX_RADAR_TEST_BEFORE_DECIDE_BLOCK"
+emit_event pane-loss-second manual_reassess second
+wait_until 'pre-decision block armed' "[ -e '${TMUX_RADAR_TEST_BEFORE_DECIDE_BLOCK}.ready' ]"
+rm -f "$TEST_PANE_ALIVE" "$TMUX_RADAR_TEST_BEFORE_DECIDE_BLOCK"
+wait_until 'pane loss lifecycle final' "[ -s '$RUN_DIR/final.json' ]" 400
+assert_json "$RUN_DIR/final.json" '.outcome == "stopped" and (.reason | contains("target pane disappeared"))'
+assert_json "$RUN_DIR/state.json" '.phase == "STOPPED" and .calls == 1'
+assert_eq 1 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'pane loss starts no second backend'
+assert_eq 0 "$(jq -s '[.[] | select(.kind == "decision_repair")] | length' "$RUN_DIR/events.jsonl")" \
+  'pane loss schedules no model-output repair'
+wait "$WATCH_PID" 2>/dev/null || true
+WATCH_PID=""
+printf 'PASS: pre-decision pane loss is a zero-call lifecycle stop\n'
+
+# 34. Codex identity drift after freeze is a permanent zero-launch failure with
+# exact protected evidence rather than a dangling stderr reference.
+reset_case backend-identity-drift
+unset TMUX_RADAR_AI_CMD
+cp "$TMP/bin/frozen-codex" "$CASE/frozen-codex"
+chmod +x "$CASE/frozen-codex"
+export TEST_CODEX_PATH="$CASE/frozen-codex"
+export TMUX_RADAR_TEST_BEFORE_BRAIN_BLOCK="$CASE/before-brain"
+touch "$TMUX_RADAR_TEST_BEFORE_BRAIN_BLOCK"
+start_watch 30
+emit_event identity-drift-event manual_reassess inspect
+wait_until 'identity drift block armed' "[ -e '${TMUX_RADAR_TEST_BEFORE_BRAIN_BLOCK}.ready' ]"
+printf '%s\n' '# identity drift' >> "$TEST_CODEX_PATH"
+rm -f "$TMUX_RADAR_TEST_BEFORE_BRAIN_BLOCK"
+wait_until 'identity drift permanent pause' "jq -e '.phase == \"PAUSED_ERROR\" and .calls == 0 and .retry == 0' '$RUN_DIR/state.json' >/dev/null 2>&1" 500
+assert_eq 0 "$(wc -l < "$TEST_CODEX_EXEC_LOG" | tr -d ' ')" 'identity drift launches no Codex exec'
+identity_stderr="$(jq -r 'select(.kind == "backend_error") | .error.stderr_path' "$RUN_DIR/events.jsonl")"
+assert_file "$identity_stderr"
+assert_eq 'selected Codex executable changed after preflight' "$(cat "$identity_stderr")" \
+  'identity drift keeps exact evidence'
+assert_eq 600 "$(stat -f '%Lp' "$identity_stderr")" 'identity drift evidence mode'
+if ! jq -e 'select(.kind == "backend_error" and .error.code == "backend-identity-changed" and
+  (.error.summary | contains("changed after preflight")) and .error.call == 0)' \
+  "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
+  _fail_assert 'identity drift lacks exact canonical evidence' 'events' "$(cat "$RUN_DIR/events.jsonl")"
+fi
+wait "$WATCH_PID" 2>/dev/null || true
+WATCH_PID=""
+printf 'PASS: backend identity drift fails before launch with exact evidence\n'
+
+# 35. Unsafe or non-auto delivery is a policy halt, not a backend failure.
 reset_case policy-halt
+export TEST_NOTIFY_RC=1
 write_response 1 '{"action":"send","text":"2","keys":["Enter"],"safe":false,"reason":"requires human approval"}'
 start_watch 30
 emit_event policy-halt-event approval inspect
@@ -822,6 +957,11 @@ assert_eq policy-halt "$(jq -r 'select(.kind == "policy_halt") | .outcome_class'
 assert_eq 0 "$(jq -s '[.[] | select(.kind == "backend_error")] | length' "$RUN_DIR/events.jsonl")" \
   'policy halt is not a backend error'
 assert_eq 0 "$(wc -l < "$TEST_SENDS" | tr -d ' ')" 'policy halt sends no keys'
+if ! jq -e 'select(.kind == "notification_failed" and .record == "notification_error")' \
+  "$RUN_DIR/events.jsonl" >/dev/null 2>&1; then
+  _fail_assert 'notifier failure lacks durable journal evidence' 'events' "$(cat "$RUN_DIR/events.jsonl")"
+fi
+assert_contains "$(cat "$TMUX_RADAR_AI_LOG")" 'notification-failed' 'notifier failure reaches audit log'
 wait "$WATCH_PID" 2>/dev/null || true
 WATCH_PID=""
 printf 'PASS: policy refusal remains distinct from backend failure\n'

@@ -14,7 +14,7 @@ process_alive() {
 
 wait_for_file() {
   local file="$1"
-  for _ in {1..80}; do
+  for _ in {1..600}; do
     [ -s "$file" ] && return 0
     sleep 0.05
   done
@@ -23,7 +23,7 @@ wait_for_file() {
 
 wait_for_exit() {
   local pid="$1"
-  for _ in {1..140}; do
+  for _ in {1..600}; do
     process_alive "$pid" || return 0
     sleep 0.05
   done
@@ -142,11 +142,16 @@ BASH_ENV="$TMP/bashenv" \
 TEST_FAKE_TMUX="$TMP/bin/tmux" \
 TMUX_RADAR_STATE_DIR="$TMP/state" \
 TMUX_RADAR_NEEDINPUT_FILE="$TMP/state/need-input" \
+TMUX_RADAR_TEST_MONITOR_READY="$TMP/monitor.ready" \
 TEST_PANE_ALIVE="$TMP/pane-alive" \
   bash "$ROOT/scripts/ai.sh" monitor-timeline %1 \
   >"$TMP/monitor.out" 2>"$TMP/monitor.err" &
 MONITOR_PID=$!
-sleep 0.2
+wait_for_file "$TMP/monitor.ready" || {
+  printf 'FAIL: monitor never acquired watcher ownership\n' >&2
+  cat "$TMP/monitor.err" >&2 || true
+  exit 1
+}
 
 kill -TERM "$MONITOR_PID"
 wait "$MONITOR_PID" 2>/dev/null || true

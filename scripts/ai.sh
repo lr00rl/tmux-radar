@@ -64,7 +64,7 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 SCRIPT_DIR="$(dirname "$SELF")"
 PROMPT_DIR="$SCRIPT_DIR/prompts"
 AI_RUNTIME_LIB="$SCRIPT_DIR/lib/ai-runtime.sh"
-NOTIFY="$SCRIPT_DIR/needinput-notify.sh"
+NOTIFY="${TMUX_RADAR_NOTIFY_CMD:-$SCRIPT_DIR/needinput-notify.sh}"
 AI_MONITOR="$SCRIPT_DIR/ai-monitor.sh"
 [ -r "$AI_RUNTIME_LIB" ] || { echo "tmux-radar AI needs $AI_RUNTIME_LIB" >&2; exit 1; }
 # shellcheck source=scripts/lib/ai-runtime.sh
@@ -117,6 +117,9 @@ DECISION_KEYS=()
 DECISION_SCHEMA_VALID=0
 DECISION_SCHEMA_ERROR=""
 DECISION_READY=0
+DECISION_FAILURE_KIND=""
+DECISION_FAILURE_DETAIL=""
+DECISION_MODEL_LAUNCHED=0
 
 WATCH_WAITER_PID=""
 WATCH_TIMER_PID=""
@@ -1232,21 +1235,28 @@ _brain() {
   BRAIN_LAST_PID=""
   BRAIN_LAST_PGID=""
   BRAIN_STOP_REASON=""
+  DECISION_MODEL_LAUNCHED=0
+  err="${TMUX_RADAR_AI_ERR:-${TMUX_SWITCHER_AI_ERR:-/dev/null}}"
+  [ "$err" = "/dev/null" ] || : > "$err" 2>/dev/null || true
   if [ "$BRAIN_BACKEND_OK" -ne 1 ]; then
     BRAIN_LAST_RC=78
     BRAIN_STOP_REASON="$(printf '%s' "$BRAIN_PREFLIGHT_JSON" | jq -r '.summary // "backend preflight failed"')"
+    [ "$err" = "/dev/null" ] || printf '%s\n' "$BRAIN_STOP_REASON" > "$err"
     return 0
+  fi
+  if [ -n "${TMUX_RADAR_TEST_BEFORE_BRAIN_BLOCK:-}" ]; then
+    : > "${TMUX_RADAR_TEST_BEFORE_BRAIN_BLOCK}.ready"
+    while [ -e "$TMUX_RADAR_TEST_BEFORE_BRAIN_BLOCK" ]; do sleep 0.01; done
   fi
   if [ "$BRAIN_BACKEND_MODE" = codex ] && \
      [ "$(_backend_file_identity "$BRAIN_BACKEND_PATH")" != "$BRAIN_BACKEND_IDENTITY" ]; then
     BRAIN_LAST_RC=78
     BRAIN_STOP_REASON='selected Codex executable changed after preflight'
+    [ "$err" = "/dev/null" ] || printf '%s\n' "$BRAIN_STOP_REASON" > "$err"
     return 0
   fi
   out="$(mktemp "${TMPDIR:-/tmp}/tmuxai.XXXXXX")"
   BRAIN_OUT_FILE="$out"
-  err="${TMUX_RADAR_AI_ERR:-${TMUX_SWITCHER_AI_ERR:-/dev/null}}"
-  [ "$err" = "/dev/null" ] || : > "$err" 2>/dev/null || true
   case "$-" in *m*) had_job_control=1 ;; esac
   set -m
   if [ "$BRAIN_BACKEND_MODE" = custom-command ]; then
@@ -1265,6 +1275,7 @@ _brain() {
       --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" &
   fi
   BRAIN_PID=$!
+  DECISION_MODEL_LAUNCHED=1
   BRAIN_PGID="$BRAIN_PID"
   [ "$had_job_control" -eq 1 ] || set +m
   pid="$BRAIN_PID"
@@ -1340,7 +1351,7 @@ _brain_label() {
 }
 
 _classify_backend_failure() {
-  local rc="$1" stderr_file="$2" schema_valid="$3" stderr_text normalized
+  local rc="$1" stderr_file="$2" schema_valid="$3" stop_reason="${4:-}" stderr_text normalized
   local class code retryable summary detail
   stderr_text="$(tail -c 16384 "$stderr_file" 2>/dev/null || true)"
   normalized="$(printf '%s' "$stderr_text" | tr '[:upper:]' '[:lower:]')"
@@ -1348,8 +1359,9 @@ _classify_backend_failure() {
 
   if [ "$rc" -eq 78 ]; then
     class='config-permanent'; code='backend-preflight'; retryable=0
-    summary='backend preflight failed'
-    detail='backend preflight rejected execution'
+    summary="${stop_reason:-backend preflight failed}"
+    detail='backend rejected before model launch'
+    case "$stop_reason" in *changed*after*preflight*) code='backend-identity-changed' ;; esac
   elif [ "$rc" -ne 0 ]; then
     case "$rc" in
       126|127)
@@ -1457,9 +1469,22 @@ cmd_decide() {
   local pane autonomy policy goal cap cap_tail where json pretty_json action text safe reason extra="" prompt backend
   local excerpt_lines errfile err_tail call_tag="" logging snapshots TMUX_RADAR_AI_ERR="" TMUX_SWITCHER_AI_ERR=""
   DECISION_READY=0
+  DECISION_FAILURE_KIND=""
+  DECISION_FAILURE_DETAIL=""
+  DECISION_MODEL_LAUNCHED=0
   BRAIN_LAST_ERR_FILE=""
-  have_brain || { echo "codex 未安装/不可用，无法决策。"; return 3; }
-  pane="$(_resolve_pane "${1:-}")" || { echo "no target pane"; return 5; }
+  if ! have_brain; then
+    DECISION_FAILURE_KIND='config-permanent'
+    DECISION_FAILURE_DETAIL="$(printf '%s' "$BRAIN_PREFLIGHT_JSON" | jq -r '.summary // "backend unavailable"')"
+    echo "codex 未安装/不可用，无法决策。"
+    return 3
+  fi
+  if ! pane="$(_resolve_pane "${1:-}")"; then
+    DECISION_FAILURE_KIND='lifecycle-stop'
+    DECISION_FAILURE_DETAIL='target pane disappeared before decision capture'
+    echo "no target pane"
+    return 5
+  fi
   autonomy="${2:-$(opt @radar-ai-autonomy confirm)}"
   policy="${3:-}"
   goal="${4:-}"
@@ -1480,7 +1505,17 @@ cmd_decide() {
   fi
   where="$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}' 2>/dev/null || echo "$pane")"
   cap="$(tmux capture-pane -p -t "$pane" -S "-$(opt @radar-ai-capture-lines 120)" 2>/dev/null || true)"
-  [ -n "$cap" ] || { echo "pane $pane: nothing to read"; return 5; }
+  if [ -z "$cap" ]; then
+    if tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
+      DECISION_FAILURE_KIND='capture-error'
+      DECISION_FAILURE_DETAIL='target pane capture returned no readable content'
+    else
+      DECISION_FAILURE_KIND='lifecycle-stop'
+      DECISION_FAILURE_DETAIL='target pane disappeared during decision capture'
+    fi
+    echo "pane $pane: nothing to read"
+    return 5
+  fi
   excerpt_lines="$(_monitor_excerpt_lines)"
   cap_tail="$(printf '%s\n' "$cap" | tail -n "$excerpt_lines")"
 
@@ -1545,7 +1580,9 @@ cmd_decide() {
   else
     action="unknown"; text=""; safe=0; reason="$DECISION_SCHEMA_ERROR"
   fi
-  [ -z "$call_tag" ] || _persist_decision_call "$call_tag" "$json" "$backend" "$autonomy" "$policy"
+  if [ -n "$call_tag" ] && [ "$DECISION_MODEL_LAUNCHED" -eq 1 ]; then
+    _persist_decision_call "$call_tag" "$json" "$backend" "$autonomy" "$policy"
+  fi
   local keys=() _k                     # bash 3.2 (macOS) has no mapfile
   if [ "$DECISION_SCHEMA_VALID" -eq 1 ]; then
     while IFS= read -r _k; do [ -n "$_k" ] && keys+=("$_k"); done \
@@ -2321,7 +2358,7 @@ _watch_signal_exit() {
 cmd_watch_loop() {
   local pane goal policy poll auto maxcalls config supplied_config="${6:-}" batch wait_rc coalesce_rc event_kind
   local rc valid failure evidence_fingerprint delivery_fingerprint armed_fingerprint current_fingerprint guard_rc
-  local retry_rc retry_cancelled verify_rc classification error_class retryable summary detail stderr_path failure_kind
+  local retry_rc retry_cancelled verify_rc classification error_class retryable summary detail stderr_path failure_kind repair_reason
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane" >&2; return 1; }
   if [ -n "$supplied_config" ]; then
     config="$supplied_config"
@@ -2470,7 +2507,7 @@ cmd_watch_loop() {
     evidence_fingerprint="$(_watch_fingerprint || true)"
     if [ -z "$evidence_fingerprint" ]; then _watch_finalize stopped STOPPED "target pane disappeared during capture"; break; fi
 
-    WATCH_RETRY=0; WATCH_TRANSIENT_RETRIES=0; WATCH_REPAIR_ATTEMPTS=0; retry_cancelled=0
+    WATCH_RETRY=0; WATCH_TRANSIENT_RETRIES=0; WATCH_REPAIR_ATTEMPTS=0; retry_cancelled=0; repair_reason=""
     while :; do
       if [ "$WATCH_CALLS" -ge "$WATCH_MAX_CALLS" ]; then
         _watch_phase PAUSED_ERROR "max_calls reached before model launch" none 0
@@ -2483,18 +2520,28 @@ cmd_watch_loop() {
       _watch_phase DECIDING "model call $WATCH_CALLS/$WATCH_MAX_CALLS for $event_kind" none 0
       DECISION_ACTION=""; DECISION_JSON=""; DECISION_TEXT=""; DECISION_SAFE=0; DECISION_REASON=""; DECISION_KEYS=()
       DECISION_READY=0; DECISION_SCHEMA_VALID=0; DECISION_SCHEMA_ERROR='decision was not produced'
+      DECISION_FAILURE_KIND=""; DECISION_FAILURE_DETAIL=""; DECISION_MODEL_LAUNCHED=0
       BRAIN_LAST_RC=0; BRAIN_STOP_REASON=""; BRAIN_LAST_ERR_FILE=""
+      if [ -n "${TMUX_RADAR_TEST_BEFORE_DECIDE_BLOCK:-}" ]; then
+        : > "${TMUX_RADAR_TEST_BEFORE_DECIDE_BLOCK}.ready"
+        while [ -e "$TMUX_RADAR_TEST_BEFORE_DECIDE_BLOCK" ]; do sleep 0.01; done
+      fi
       set +e
       TMUX_RADAR_REPAIR_ATTEMPT="$WATCH_REPAIR_ATTEMPTS" \
-        TMUX_RADAR_REPAIR_REASON="${failure:-}" \
+        TMUX_RADAR_REPAIR_REASON="${repair_reason:-}" \
         TMUX_RADAR_AI_DETAIL=1 TMUX_RADAR_DECIDE_PARSE_ONLY=1 \
         cmd_decide "$pane" "$auto" "$policy" "$goal"
       rc=$?
       set -e
+      if [ "$DECISION_MODEL_LAUNCHED" -ne 1 ]; then
+        WATCH_CALLS=$((WATCH_CALLS - 1))
+      fi
       WATCH_LAST_DECISION="$(now)"
       valid=1; failure=""; failure_kind=""
       if [ "$DECISION_READY" -ne 1 ]; then
-        valid=0; failure="decision was not produced (cmd rc=$rc)"; failure_kind='decision-invalid'
+        valid=0
+        failure="${DECISION_FAILURE_DETAIL:-decision was not produced (cmd rc=$rc)}"
+        failure_kind="${DECISION_FAILURE_KIND:-decision-invalid}"
       elif [ "$BRAIN_LAST_RC" -ne 0 ]; then
         valid=0; failure="backend rc=$BRAIN_LAST_RC${BRAIN_STOP_REASON:+ ($BRAIN_STOP_REASON)}"; failure_kind='backend'
       elif [ "$DECISION_SCHEMA_VALID" -ne 1 ]; then
@@ -2508,9 +2555,22 @@ cmd_watch_loop() {
       fi
       [ "$valid" -eq 1 ] && break
 
+      if [ "$failure_kind" = lifecycle-stop ]; then
+        _watch_finalize stopped STOPPED "$failure"
+        break 2
+      fi
+
       case "$failure_kind" in
         decision-invalid) classification="$(_classify_outcome decision-invalid "$failure")" ;;
-        *) classification="$(_classify_outcome backend "$BRAIN_LAST_RC" "${BRAIN_LAST_ERR_FILE:-}" "$DECISION_SCHEMA_VALID")" ;;
+        config-permanent)
+          classification="$(jq -cn --arg summary "$failure" \
+            '{class:"config-permanent",code:"backend-preflight",retryable:false,summary:$summary,detail:"backend rejected before model launch"}')"
+          ;;
+        capture-error)
+          classification="$(jq -cn --arg summary "$failure" \
+            '{class:"transient",code:"pane-capture-failed",retryable:true,summary:$summary,detail:"target remained live but capture produced no content"}')"
+          ;;
+        *) classification="$(_classify_outcome backend "$BRAIN_LAST_RC" "${BRAIN_LAST_ERR_FILE:-}" "$DECISION_SCHEMA_VALID" "$BRAIN_STOP_REASON")" ;;
       esac
       error_class="$(printf '%s' "$classification" | jq -r '.class')"
       retryable="$(printf '%s' "$classification" | jq -r '.retryable')"
@@ -2546,6 +2606,7 @@ cmd_watch_loop() {
           break 2
         fi
         WATCH_REPAIR_ATTEMPTS=1
+        repair_reason="$failure"
         WATCH_RETRY="$WATCH_REPAIR_ATTEMPTS"
         radar_event_append decision_repair watcher "$summary" "$(jq -cn \
           --arg event_id "$WATCH_EVENT_ID" --arg detail "$detail" \
@@ -2553,14 +2614,6 @@ cmd_watch_loop() {
           '{record:"repair",event_id:$event_id,error_class:$error_class,repair_attempt:1,detail:$detail}')"
         _watch_phase DECIDING "$summary; repair attempt 1 scheduled" repair 0
         continue
-      fi
-
-      if [ "$error_class" = transient ] && [ "$WATCH_REPAIR_ATTEMPTS" -ge 1 ]; then
-        _watch_phase PAUSED_ERROR "$summary; repair call transport failed" none 0
-        _escalate "$pane" "AI 监控输出修复调用失败，已暂停: $summary"
-        radar_run_finalize paused_error "$summary"
-        WATCH_FINALIZED=1; rm -f "$WATCH_WF"
-        break 2
       fi
 
       if [ "$WATCH_TRANSIENT_RETRIES" -ge "$WATCH_RETRY_LIMIT" ]; then
@@ -3050,6 +3103,9 @@ _monitor_loop() {  # _monitor_loop <timeline|detail|combined> <pane>
   # or pressing Ctrl-C must stop the watcher instead of leaving a hidden brain
   # call running after its visible control surface is gone.
   trap 'printf "\033[r\033[?25h"; "$SELF" stop "$pane" >/dev/null 2>&1 || true; exit 0' TERM INT HUP
+  if [ -n "${TMUX_RADAR_TEST_MONITOR_READY:-}" ]; then
+    printf 'ready\n' > "$TMUX_RADAR_TEST_MONITOR_READY"
+  fi
   while [ -f "$wf" ]; do
     cols="$(tput cols 2>/dev/null || echo 100)"
     rows="$(tput lines 2>/dev/null || echo 24)"
@@ -3323,6 +3379,7 @@ case "${1:-}" in
   _decode-goal) shift; cmd_decode_goal "${1-}" || rc=$? ;;
   _build-watch-config) shift; cmd_build_watch_config "${1:-}" "${2-}" || rc=$? ;;
   _render-watch-config) shift; cmd_render_watch_config "${1:-}" || rc=$? ;;
+  _classify-backend-failure) shift; _classify_backend_failure "${1:-0}" "${2:-/dev/null}" "${3:-0}" "${4:-}" || rc=$? ;;
   doctor-json)   shift; cmd_doctor_json "$@" || rc=$? ;;
   ask)          shift; cmd_ask "$@" || rc=$? ;;
   decide)       shift; cmd_decide "${1:-}" "${2:-}" "${3:-}" "${4:-}" || rc=$? ;;

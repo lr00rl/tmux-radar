@@ -802,6 +802,9 @@ start_watch_config 30 1 on 'retry recoverable transport errors' 'retry_limit=3'
 emit_event transient-backend-event manual_reassess inspect
 wait_until 'transient backend retry exhaustion' "jq -e '.phase == \"PAUSED_ERROR\" and .retry == 3' '$RUN_DIR/state.json' >/dev/null 2>&1" 600
 assert_eq 4 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'transient backend uses bounded retry budget'
+transient_error_event_id="$(jq -r 'select(.kind == "backend_error") | .event_id' "$RUN_DIR/events.jsonl" | tail -n 1)"
+assert_eq "$transient_error_event_id" "$(jq -r '.latest_error_event_id' "$RUN_DIR/state.json")" \
+  'paused transient state links to its latest backend error event'
 if ! jq -e 'select(
   .record == "error" and .kind == "backend_error" and
   .error.class == "transient" and .error.retryable == true and .error.call == 1
@@ -824,6 +827,9 @@ emit_event permanent-backend-event manual_reassess inspect
 wait_until 'permanent backend pause' "jq -e '.phase == \"PAUSED_ERROR\"' '$RUN_DIR/state.json' >/dev/null 2>&1" 1200
 assert_eq 1 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" 'permanent backend launches once'
 assert_json "$RUN_DIR/state.json" '.phase == "PAUSED_ERROR" and .retry == 0'
+permanent_error_event_id="$(jq -r 'select(.kind == "backend_error") | .event_id' "$RUN_DIR/events.jsonl" | tail -n 1)"
+assert_eq "$permanent_error_event_id" "$(jq -r '.latest_error_event_id' "$RUN_DIR/state.json")" \
+  'paused permanent state links to its backend error event'
 assert_eq "$TEST_BACKEND_STDERR" "$(cat "$RUN_DIR/backend/0001.stderr")" \
   'permanent backend keeps exact stderr'
 if ! jq -e --arg path "$RUN_DIR/backend/0001.stderr" '

@@ -125,17 +125,15 @@ func applyLegacyFlatConfig(config *Config, policy, autonomy string, poll *float6
 }
 
 func legacySource(value string) Source {
-	switch {
-	case strings.Contains(value, "_or_"):
-		return SourceLegacy
-	case strings.Contains(value, "tmux"):
+	switch value {
+	case "tmux":
 		return SourceTMUX
-	case strings.Contains(value, "argument"):
+	case "argument":
 		return SourceCustom
-	case strings.Contains(value, "default"):
+	case "default":
 		return SourceDefault
 	default:
-		return SourceRuntime
+		return SourceLegacy
 	}
 }
 
@@ -193,7 +191,16 @@ func (backend BackendIdentity) Validate(config Config) error {
 		if backend.Command == "" {
 			return errors.New("backend.command: custom-command mode requires a command")
 		}
+		if backend.Command != config.Values.Command.Value {
+			return errors.New("backend.command: must match the reviewed effective custom command")
+		}
+		if !oneOf(backend.Source, "env", "config") {
+			return fmt.Errorf("backend.source: unsupported custom-command source %q", backend.Source)
+		}
 		return nil
+	}
+	if config.Values.Command.Value != "" || backend.Command != "" {
+		return errors.New("backend.command: codex mode cannot include an effective custom command")
 	}
 	if !strings.HasPrefix(backend.Path, "/") {
 		return errors.New("backend.path: codex mode requires an absolute executable path")

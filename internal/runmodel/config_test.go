@@ -113,6 +113,21 @@ func TestDecodeConfigReadsLegacyV0AndIgnoresAdditiveFields(t *testing.T) {
 	}
 }
 
+func TestDecodeConfigUsesLegacySourceWhenProvenanceIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	for _, provenance := range []string{"", "runtime-ish", "not_tmux_but_contains_tmux"} {
+		payload := []byte(`{"pane":"%55","goal":"legacy","poll":10,"provenance":{"poll":"` + provenance + `"}}`)
+		config, err := DecodeConfig(payload)
+		if err != nil {
+			t.Fatalf("DecodeConfig(%q): %v", provenance, err)
+		}
+		if config.Values.Poll.Source != SourceLegacy {
+			t.Fatalf("provenance %q mapped to %q, want legacy", provenance, config.Values.Poll.Source)
+		}
+	}
+}
+
 func validCodexBackend() *BackendIdentity {
 	return &BackendIdentity{
 		Mode:            "codex",
@@ -158,6 +173,56 @@ func TestDecodeConfigStrictRequiresFrozenBackend(t *testing.T) {
 	if _, err = DecodeConfigStrict(payload); err == nil || !strings.Contains(err.Error(), "backend.mode") {
 		t.Fatalf("invalid backend mode error = %v", err)
 	}
+}
+
+func TestDecodeConfigStrictBindsReviewedCustomCommand(t *testing.T) {
+	t.Parallel()
+
+	config := DefaultConfig("%8", "strict custom")
+	config.Values.Command = Value[string]{Value: "claude --print", Source: SourceCustom}
+	config.Backend = &BackendIdentity{
+		Mode:         "custom-command",
+		Command:      "claude --print",
+		Source:       "env",
+		Model:        config.Values.Model.Value,
+		Effort:       config.Values.Effort.Value,
+		ModelSource:  config.Values.Model.Source,
+		EffortSource: config.Values.Effort.Source,
+	}
+
+	assertStrict := func(t *testing.T, candidate Config, field string) {
+		t.Helper()
+		payload, err := json.Marshal(candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = DecodeConfigStrict(payload)
+		if field == "" && err != nil {
+			t.Fatalf("valid custom command rejected: %v", err)
+		}
+		if field != "" && (err == nil || !strings.Contains(err.Error(), field)) {
+			t.Fatalf("strict validation error = %v, want field %q", err, field)
+		}
+	}
+
+	assertStrict(t, config, "")
+	mismatch := config
+	mismatch.Backend = cloneBackend(config.Backend)
+	mismatch.Backend.Command = "different --command"
+	assertStrict(t, mismatch, "backend.command")
+	invalidSource := config
+	invalidSource.Backend = cloneBackend(config.Backend)
+	invalidSource.Backend.Source = "unreviewed"
+	assertStrict(t, invalidSource, "backend.source")
+
+	codexContradiction := config
+	codexContradiction.Backend = validCodexBackend()
+	assertStrict(t, codexContradiction, "backend.command")
+}
+
+func cloneBackend(backend *BackendIdentity) *BackendIdentity {
+	copy := *backend
+	return &copy
 }
 
 func TestProfileManagedModelAndEffortDoNotClaimDefaults(t *testing.T) {
@@ -318,5 +383,17 @@ func TestBackendErrorUsesCanonicalNestedEvidenceAndNormalizesLegacy(t *testing.T
 	}
 	if legacy.Error == nil || legacy.Error.Class != "transient" || !legacy.Error.Retryable || legacy.Error.Call != 2 {
 		t.Fatalf("legacy error was not normalized: %#v", legacy)
+	}
+}
+
+func TestEventUnmarshalPreservesCallOnNonErrorEvents(t *testing.T) {
+	t.Parallel()
+
+	var event Event
+	if err := json.Unmarshal([]byte(`{"kind":"model_started","call":7}`), &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Call != 7 {
+		t.Fatalf("event call = %d, want 7", event.Call)
 	}
 }

@@ -168,7 +168,6 @@ func (event *Event) UnmarshalJSON(payload []byte) error {
 		LegacyBackendPath    string `json:"backend_path"`
 		LegacyBackendVersion string `json:"backend_version"`
 		LegacyStderrPath     string `json:"stderr_path"`
-		LegacyCall           int    `json:"call"`
 	}
 	if err := json.Unmarshal(payload, &wire); err != nil {
 		return err
@@ -188,7 +187,7 @@ func (event *Event) UnmarshalJSON(payload []byte) error {
 			BackendPath:    wire.LegacyBackendPath,
 			BackendVersion: wire.LegacyBackendVersion,
 			StderrPath:     wire.LegacyStderrPath,
-			Call:           wire.LegacyCall,
+			Call:           event.Call,
 		}
 	}
 	return nil

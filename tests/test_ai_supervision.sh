@@ -12,15 +12,93 @@ OLD_PATH="$PATH"
 
 cleanup() {
   local rc="${1:-$?}"
-  if [ -n "$WATCH_PID" ]; then
-    kill -TERM "$WATCH_PID" 2>/dev/null || true
-    wait "$WATCH_PID" 2>/dev/null || true
-  fi
+  trap - EXIT TERM INT HUP
+  [ -z "${TEST_WAITER_LIVENESS:-}" ] || rm -f "$TEST_WAITER_LIVENESS"
+  [ -z "${TEST_PROCESS_LIVENESS:-}" ] || rm -f "$TEST_PROCESS_LIVENESS"
+  stop_watch || rc=1
+  stop_recorded_waiters || rc=1
   PATH="$OLD_PATH"
-  rm -rf "$TMP"
+  if [ "$rc" -eq 0 ] && recorded_waiters_gone; then
+    rm -rf "$TMP"
+  else
+    if ! recorded_waiters_gone; then
+      printf 'FAIL: test cleanup retained live supervision waiters\n' >&2
+      rc=1
+    fi
+    printf 'INFO: failed supervision artifacts kept at %s\n' "$TMP" >&2
+  fi
   exit "$rc"
 }
 trap 'cleanup $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+process_tree_pids() {
+  local root="$1"
+  ps -axo pid=,ppid= 2>/dev/null | awk -v root="$root" '
+    { n++; pid[n]=$1; ppid[n]=$2 }
+    END {
+      keep[root]=1
+      for (pass=1; pass<=n; pass++)
+        for (i=1; i<=n; i++)
+          if (keep[ppid[i]]) keep[pid[i]]=1
+      for (i=n; i>=1; i--)
+        if (pid[i] != root && keep[pid[i]]) print pid[i]
+      print root
+    }'
+}
+
+stop_process_tree() {
+  local root="$1" tree pid alive attempt=0
+  case "$root" in ''|0|*[!0-9]*) return 0 ;; esac
+  tree="$(process_tree_pids "$root" || true)"
+  [ -n "$tree" ] || tree="$root"
+  for pid in $tree; do kill -TERM "$pid" 2>/dev/null || true; done
+  while [ "$attempt" -lt 80 ]; do
+    alive=0
+    for pid in $tree; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    [ "$alive" -eq 1 ] || break
+    sleep 0.05
+    attempt=$((attempt + 1))
+  done
+  for pid in $tree; do
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  done
+  wait "$root" 2>/dev/null || true
+}
+
+waiter_pid_belongs_to_test() {
+  local pid="$1" command
+  command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  case "$command" in *"$TMP/bin/tmux"*) return 0 ;; *) return 1 ;; esac
+}
+
+stop_recorded_waiters() {
+  local file pid
+  for file in "$TMP"/*/waiter.pids; do
+    [ -r "$file" ] || continue
+    while IFS= read -r pid; do
+      case "$pid" in ''|0|*[!0-9]*) continue ;; esac
+      if kill -0 "$pid" 2>/dev/null && waiter_pid_belongs_to_test "$pid"; then
+        stop_process_tree "$pid"
+      fi
+    done < "$file"
+  done
+}
+
+recorded_waiters_gone() {
+  local file pid
+  for file in "$TMP"/*/waiter.pids; do
+    [ -r "$file" ] || continue
+    while IFS= read -r pid; do
+      case "$pid" in ''|0|*[!0-9]*) continue ;; esac
+      if kill -0 "$pid" 2>/dev/null && waiter_pid_belongs_to_test "$pid"; then
+        return 1
+      fi
+    done < "$file"
+  done
+  return 0
+}
 
 wait_until() {
   local description="$1" command="$2" attempts="${3:-400}" i=0
@@ -50,63 +128,37 @@ assert_process_group_gone() {
 
 write_fakes() {
   mkdir -p "$TMP/bin"
-  cat > "$TMP/bin/tmux" <<'TMUXEOF'
-#!/usr/bin/env bash
-set -eu
-cmd="${1:-}"
-shift || true
-case "$cmd" in
-  list-sessions) exit 0 ;;
-  show-option)
-    key=""
-    for arg in "$@"; do key="$arg"; done
-    case "$key" in
-      @radar-ai-timeout|@switcher-ai-timeout) printf '%s\n' "${TEST_AI_TIMEOUT:-5}" ;;
-      @radar-ai-max-calls|@switcher-ai-max-calls) printf '%s\n' "${TEST_MAX_CALLS:-40}" ;;
-      @radar-ai-codex-path|@switcher-ai-codex-path) [ -z "${TEST_CODEX_PATH:-}" ] || printf '%s\n' "$TEST_CODEX_PATH" ;;
-      @radar-ai-capture-lines|@switcher-ai-capture-lines) printf '%s\n' 120 ;;
-      @radar-ai-monitor-excerpt-lines|@switcher-ai-monitor-excerpt-lines) printf '%s\n' 16 ;;
-      *) exit 0 ;;
-    esac
-    ;;
-  display-message)
-    [ -f "$TEST_PANE_ALIVE" ] || exit 1
-    case "$*" in
-      *pane_id*) printf '%s\n' '%1' ;;
-      *) printf '%s\n' 'test:0.0 codex' ;;
-    esac
-    ;;
-  capture-pane)
-    [ -f "$TEST_PANE_ALIVE" ] || exit 1
-    cat "$TEST_SCREEN"
-    ;;
-  send-keys)
-    count=1
-    [ -s "$TEST_SEND_COUNT" ] && count=$(( $(cat "$TEST_SEND_COUNT") + 1 ))
-    printf '%s\n' "$count" > "$TEST_SEND_COUNT"
-    [ "${TEST_SEND_FAIL_AT:-0}" = "$count" ] && exit 1
-    printf '%s\n' "$*" >> "$TEST_SENDS"
-    ;;
-  wait-for)
-    if [ "${1:-}" = -S ]; then
-      shift
-      : > "$TEST_SIGNALS/${1}.signal"
-      exit 0
-    fi
-    channel="${1:-}"
-    printf '%s\n' "$$" >> "$TEST_WAITER_PIDS"
-    while [ ! -e "$TEST_SIGNALS/$channel.signal" ]; do sleep 0.01; done
-    rm -f "$TEST_SIGNALS/$channel.signal"
-    ;;
-  *) exit 0 ;;
-esac
-TMUXEOF
+  cp "$ROOT/tests/fixtures/fake-tmux-supervision" "$TMP/bin/tmux"
   chmod +x "$TMP/bin/tmux"
   printf '%s\n' 'tmux() { "$TEST_FAKE_TMUX" "$@"; }' > "$TMP/bashenv"
 
   cat > "$TMP/bin/fake-backend" <<'BACKENDEOF'
 #!/usr/bin/env bash
 set -eu
+backend_owner_pid="$PPID"
+backend_liveness="${TEST_PROCESS_LIVENESS:-}"
+backend_max_seconds="${TEST_PROCESS_MAX_SECONDS:-300}"
+case "$backend_max_seconds" in ''|*[!0-9]*) backend_max_seconds=300 ;; esac
+backend_deadline=$((SECONDS + backend_max_seconds))
+backend_wait_fifo="$TEST_SIGNALS/.backend-wait.$$"
+mkfifo "$backend_wait_fifo"
+exec 8<>"$backend_wait_fifo"
+rm -f "$backend_wait_fifo"
+backend_wait() { IFS= read -r -t 1 _ <&8 || true; }
+backend_live() {
+  [ -z "$backend_liveness" ] || [ -e "$backend_liveness" ] || return 1
+  kill -0 "$backend_owner_pid" 2>/dev/null || return 1
+  [ "$SECONDS" -lt "$backend_deadline" ]
+}
+backend_cleanup() {
+  rc="$?"
+  trap - EXIT TERM INT HUP
+  rm -rf "$TEST_ACTIVE_LOCK"
+  exit "$rc"
+}
+trap 'backend_cleanup' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 if [ -n "${TEST_PROMPT_FILE:-}" ]; then
   cat > "$TEST_PROMPT_FILE"
 else
@@ -115,7 +167,10 @@ fi
 printf '%s\n' "${TMUX_RADAR_INTERNAL:-}" >> "$TEST_INTERNAL_LOG"
 mkdir "$TEST_ACTIVE_LOCK" 2>/dev/null || {
   printf 'concurrent\n' >> "$TEST_CONCURRENT"
-  while ! mkdir "$TEST_ACTIVE_LOCK" 2>/dev/null; do sleep 0.01; done
+  while ! mkdir "$TEST_ACTIVE_LOCK" 2>/dev/null; do
+    backend_live || exit 0
+    backend_wait
+  done
 }
 active=1
 [ -s "$TEST_MAX_ACTIVE" ] && active="$(cat "$TEST_MAX_ACTIVE")"
@@ -131,7 +186,10 @@ printf '%s %s\n' "$$" "$pgid" >> "$TEST_BACKEND_PIDS"
 if [ "${TEST_BACKEND_NOTIFY:-0}" = 1 ]; then
   TMUX_PANE=%1 bash "$TEST_ROOT/scripts/needinput-notify.sh" codex-hook <<<'{"hook_event_name":"PermissionRequest"}'
 fi
-while [ -e "$TEST_BLOCK_BACKEND" ]; do sleep 0.01; done
+while [ -e "$TEST_BLOCK_BACKEND" ]; do
+  backend_live || exit 0
+  backend_wait
+done
 backend_stderr="${TEST_BACKEND_STDERR:-}"
 [ -f "$TEST_RESPONSES/$call.stderr" ] && backend_stderr="$(cat "$TEST_RESPONSES/$call.stderr")"
 if [ -n "$backend_stderr" ]; then
@@ -140,12 +198,10 @@ fi
 backend_rc="${TEST_BACKEND_RC:-0}"
 [ -f "$TEST_RESPONSES/$call.rc" ] && backend_rc="$(cat "$TEST_RESPONSES/$call.rc")"
 if [ "$backend_rc" -ne 0 ]; then
-  rm -rf "$TEST_ACTIVE_LOCK"
   exit "$backend_rc"
 fi
 response="$TEST_RESPONSES/$call.json"
 if [ -f "$response" ]; then cat "$response"; fi
-rm -rf "$TEST_ACTIVE_LOCK"
 BACKENDEOF
   chmod +x "$TMP/bin/fake-backend"
 
@@ -171,9 +227,7 @@ CODEXEOF
 reset_case() {
   local name="$1"
   if [ -n "$WATCH_PID" ]; then
-    kill -TERM "$WATCH_PID" 2>/dev/null || true
-    wait "$WATCH_PID" 2>/dev/null || true
-    WATCH_PID=""
+    stop_watch
   fi
   CASE="$TMP/$name"
   mkdir -p "$CASE/state" "$CASE/signals" "$CASE/responses"
@@ -198,6 +252,10 @@ reset_case() {
   export TEST_CONCURRENT="$CASE/concurrent"
   export TEST_BACKEND_PIDS="$CASE/backend.pids"
   export TEST_WAITER_PIDS="$CASE/waiter.pids"
+  export TEST_WAITER_LIVENESS="$CASE/waiter.live"
+  export TEST_WAITER_MAX_SECONDS=300
+  export TEST_PROCESS_LIVENESS="$CASE/process.live"
+  export TEST_PROCESS_MAX_SECONDS=300
   export TEST_BLOCK_BACKEND="$CASE/block-backend"
   export TEST_RESPONSES="$CASE/responses"
   export TEST_PROMPT_FILE="$CASE/prompt.txt"
@@ -231,6 +289,8 @@ reset_case() {
   : > "$TEST_CODEX_EXEC_LOG"
   printf 'screen-0\n' > "$TEST_SCREEN"
   touch "$TEST_PANE_ALIVE"
+  touch "$TEST_WAITER_LIVENESS"
+  touch "$TEST_PROCESS_LIVENESS"
   RUN_DIR=""
 }
 
@@ -264,10 +324,14 @@ start_watch_config() {
 
 stop_watch() {
   local pid="$WATCH_PID"
-  [ -n "$pid" ] || return 0
-  kill -TERM "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  [ -z "${TEST_WAITER_LIVENESS:-}" ] || rm -f "$TEST_WAITER_LIVENESS"
+  [ -z "${TEST_PROCESS_LIVENESS:-}" ] || rm -f "$TEST_PROCESS_LIVENESS"
+  if [ -n "$pid" ]; then
+    stop_process_tree "$pid"
+  fi
   WATCH_PID=""
+  stop_recorded_waiters
+  recorded_waiters_gone
 }
 
 emit_event() {

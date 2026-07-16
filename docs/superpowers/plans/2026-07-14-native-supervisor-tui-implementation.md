@@ -10,6 +10,35 @@
 
 ---
 
+## Incident Gate: Process And Performance Safety
+
+Development is blocked on this gate after an interrupted supervision test left 34
+orphan fake `tmux wait-for` processes polling a deleted temporary directory every
+10 ms. The resulting external `sleep` fork loop created roughly 1,500 processes
+per second and exhausted an 8-core host for three days. Two stale legacy monitor
+processes also redrew once per second for about 47 hours.
+
+- [x] A fake waiter exits when its owner PID or liveness file disappears and has
+  an absolute maximum lifetime.
+- [x] No waiter, timer, backend, monitor, or watcher survives normal stop, failed
+  assertion, `TERM`, `INT`, or `HUP` cleanup paths.
+- [x] Test cleanup proves zero owned PIDs remain before deleting temporary state.
+- [x] No supervision test fixture uses an unbounded 5-10 ms external-process
+  polling loop.
+- [x] A legacy monitor validates watcher/run ownership on every wake and exits
+  when the pointer is stale instead of trusting file existence alone.
+- [x] Idle lifecycle and monitor checks have explicit bounded-work regression
+  evidence; a passing functional suite is insufficient without a post-test
+  process-table audit.
+- [ ] The native TUI replaces the legacy multi-process redraw path before live
+  deployment; the Bash monitor remains a bounded fallback, not the primary UI.
+
+Do not resume feature tasks below until the focused process-safety suite passes,
+the full supervision suite exits with zero residual processes, and fresh CPU/load
+sampling shows no fork churn.
+
+---
+
 ## Delivery Boundary
 
 This plan implements Phase 0 and Phase 1 from `docs/superpowers/specs/2026-07-14-native-supervisor-tui-design.md`. It deliberately does not port the watcher into Go. After this plan passes real tmux acceptance, write a separate Phase 2-3 plan for the engine-neutral replay harness and opt-in Go engine.

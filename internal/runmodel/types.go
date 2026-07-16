@@ -229,8 +229,12 @@ func validateCanonicalBackendError(raw map[string]json.RawMessage, backendError 
 		"class", "code", "retryable", "summary", "detail", "backend_mode",
 		"backend_path", "backend_version", "stderr_path", "call", "timestamp",
 	} {
-		if _, exists := fields[field]; !exists {
+		value, exists := fields[field]
+		if !exists {
 			return fmt.Errorf("backend_error.error.%s: required field is missing", field)
+		}
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("backend_error.error.%s: required field must not be null", field)
 		}
 	}
 	if backendError.Class == "" {

@@ -2,7 +2,7 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AI="$SCRIPT_DIR/ai.sh"
+AI="${TMUX_RADAR_AI_SCRIPT:-$SCRIPT_DIR/ai.sh}"
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
 WATCH_DIR="$STATE_DIR/ai-watch"
 
@@ -19,7 +19,16 @@ PANE=""
 WATCH_FILE=""
 RUN_DIR=""
 RUN_ID=""
+WATCH_PID=""
+WATCH_GENERATION=""
 STOP_ON_EXIT=1
+OVERVIEW_PREVIOUS=""
+OVERVIEW_CURRENT=""
+COMPACT_PREVIOUS=""
+COMPACT_CURRENT=""
+COMPACT_PREVIOUS_CONTROLS=""
+COMPACT_CONTROLS=""
+COMPACT_BODY=""
 
 watch_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'; }
 field() { awk -F= -v key="$2" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$1" 2>/dev/null || true; }
@@ -46,7 +55,51 @@ open_run() {
   [ -r "$WATCH_FILE" ] || return 1
   RUN_DIR="$(field "$WATCH_FILE" run_dir)"
   RUN_ID="$(field "$WATCH_FILE" run_id)"
-  [ -d "$RUN_DIR" ]
+  WATCH_PID="$(field "$WATCH_FILE" pid)"
+  WATCH_GENERATION="$(field "$WATCH_FILE" generation)"
+  monitor_run_live
+}
+
+monitor_run_live() {
+  local current_run current_dir current_pid current_generation start_generation start_pid
+  [ -r "$WATCH_FILE" ] && [ -d "$RUN_DIR" ] || return 1
+  current_run="$(field "$WATCH_FILE" run_id)"
+  current_dir="$(field "$WATCH_FILE" run_dir)"
+  current_pid="$(field "$WATCH_FILE" pid)"
+  current_generation="$(field "$WATCH_FILE" generation)"
+  [ "$current_run" = "$RUN_ID" ] && [ "$current_dir" = "$RUN_DIR" ] || return 1
+  [ "$current_pid" = "$WATCH_PID" ] && [ "$current_generation" = "$WATCH_GENERATION" ] || return 1
+  case "$WATCH_PID" in ''|0|*[!0-9]*) return 1 ;; esac
+  kill -0 "$WATCH_PID" 2>/dev/null || return 1
+  if [ -n "$WATCH_GENERATION" ] && [ -r "$RUN_DIR/start.json" ]; then
+    start_generation="$(jq -r '.generation // empty' "$RUN_DIR/start.json" 2>/dev/null || true)"
+    start_pid="$(jq -r '.watcher_pid // 0' "$RUN_DIR/start.json" 2>/dev/null || true)"
+    [ "$start_generation" = "$WATCH_GENERATION" ] || return 1
+    case "$start_pid" in 0|'') : ;; *) [ "$start_pid" = "$WATCH_PID" ] || return 1 ;; esac
+  fi
+}
+
+owned_control() {
+  local action="$1" request_id
+  monitor_run_live || return 1
+  if [ -n "$WATCH_GENERATION" ]; then
+    request_id="monitor.$$.$(date '+%s').$action"
+    "$AI" control "$RUN_ID" "$PANE" "$action" "$request_id" >/dev/null 2>&1
+  else
+    "$AI" "$action" "$PANE" >/dev/null 2>&1
+  fi
+}
+
+monitor_cleanup() {
+  local rc="${1:-$?}"
+  trap - EXIT TERM INT HUP
+  rm -f "${OVERVIEW_PREVIOUS:-}" "${OVERVIEW_CURRENT:-}" \
+    "${COMPACT_PREVIOUS:-}" "${COMPACT_CURRENT:-}" \
+    "${COMPACT_PREVIOUS_CONTROLS:-}" "${COMPACT_CONTROLS:-}" \
+    "${COMPACT_BODY:-}"
+  printf '\033[r\033[?25h'
+  [ "$STOP_ON_EXIT" -eq 0 ] || owned_control stop || true
+  exit "$rc"
 }
 
 phase_color() {
@@ -146,17 +199,16 @@ draw_rows_at() {
 draw_fixed_rows() { draw_rows_at "$1" "$2" "$3" 1; }
 
 overview_loop() {
-  local once="$1" previous current cols last_cols=0
-  previous="$(mktemp "${TMPDIR:-/tmp}/radar-overview.prev.XXXXXX")" || exit 1
-  current="$(mktemp "${TMPDIR:-/tmp}/radar-overview.cur.XXXXXX")" || exit 1
-  : > "$previous"
-  trap 'rm -f "${previous:-}" "${current:-}"; printf "\033[?25h"; [ "$STOP_ON_EXIT" -eq 0 ] || "$AI" stop "$PANE" >/dev/null 2>&1 || true' EXIT TERM INT HUP
+  local once="$1" cols last_cols=0
+  OVERVIEW_PREVIOUS="$(mktemp "${TMPDIR:-/tmp}/radar-overview.prev.XXXXXX")" || exit 1
+  OVERVIEW_CURRENT="$(mktemp "${TMPDIR:-/tmp}/radar-overview.cur.XXXXXX")" || exit 1
+  : > "$OVERVIEW_PREVIOUS"
   printf '\033[?25l'
-  while [ -r "$WATCH_FILE" ]; do
+  while monitor_run_live; do
     cols="$(tput cols 2>/dev/null || printf 100)"; case "$cols" in ''|*[!0-9]*) cols=100 ;; esac
-    if [ "$cols" -ne "$last_cols" ]; then printf '\033[H\033[2J'; : > "$previous"; last_cols="$cols"; fi
-    overview_rows > "$current" || break
-    draw_fixed_rows "$previous" "$current" "$cols"
+    if [ "$cols" -ne "$last_cols" ]; then printf '\033[H\033[2J'; : > "$OVERVIEW_PREVIOUS"; last_cols="$cols"; fi
+    overview_rows > "$OVERVIEW_CURRENT" || break
+    draw_fixed_rows "$OVERVIEW_PREVIOUS" "$OVERVIEW_CURRENT" "$cols"
     [ "$once" -eq 1 ] && { STOP_ON_EXIT=0; break; }
     sleep 1
   done
@@ -265,14 +317,17 @@ handle_key() {
     4|c) DETAIL_VIEW=Config; DETAIL_REDRAW=1 ;;
     5) DETAIL_VIEW=Logs; DETAIL_REDRAW=1 ;;
     p)
-      if [ -e "$RUN_DIR/paused" ]; then "$AI" resume "$PANE" >/dev/null 2>&1
-      else "$AI" pause "$PANE" >/dev/null 2>&1; fi
+      if [ -e "$RUN_DIR/paused" ]; then owned_control resume
+      else owned_control pause; fi
       ;;
-    r) "$AI" emit-event "$PANE" manual_reassess monitor 'manual reassessment' >/dev/null 2>&1 ;;
-    k) "$AI" keep "$PANE" >/dev/null 2>&1 || true ;;
+    r)
+      if [ -n "$WATCH_GENERATION" ]; then owned_control reassess
+      elif monitor_run_live; then "$AI" emit-event "$PANE" manual_reassess monitor 'manual reassessment' >/dev/null 2>&1; fi
+      ;;
+    k) owned_control keep || true ;;
     q)
+      owned_control stop || true
       STOP_ON_EXIT=0
-      "$AI" stop "$PANE" >/dev/null 2>&1 || true
       return 10
       ;;
     '')
@@ -289,9 +344,8 @@ handle_key() {
 detail_loop() {
   local once="$1" key count last_count=0
   DETAIL_VIEW="${2:-Timeline}"; DETAIL_REDRAW=1
-  trap 'printf "\033[?25h"; [ "$STOP_ON_EXIT" -eq 0 ] || "$AI" stop "$PANE" >/dev/null 2>&1 || true' EXIT TERM INT HUP
   printf '\033[?25l'
-  while [ -r "$WATCH_FILE" ]; do
+  while monitor_run_live; do
     if [ "$DETAIL_REDRAW" -eq 1 ]; then
       printf '\033[H\033[2J'
       detail_header "$DETAIL_VIEW"
@@ -420,9 +474,8 @@ compact_loop() {
   DETAIL_VIEW="$initial_view"; DETAIL_REDRAW=1; COMPACT_OFFSET=0; COMPACT_FOLLOW=0; COMPACT_POPUP=0
   compact_is_popup && COMPACT_POPUP=1
   [ "$DETAIL_VIEW" != Timeline ] || COMPACT_FOLLOW=1
-  trap 'rm -f "${COMPACT_PREVIOUS:-}" "${COMPACT_CURRENT:-}" "${COMPACT_PREVIOUS_CONTROLS:-}" "${COMPACT_CONTROLS:-}" "${COMPACT_BODY:-}"; printf "\033[r\033[?25h"; [ "$STOP_ON_EXIT" -eq 0 ] || "$AI" stop "$PANE" >/dev/null 2>&1 || true' EXIT TERM INT HUP
   printf '\033[?25l'
-  while [ -r "$WATCH_FILE" ]; do
+  while monitor_run_live; do
     cols="${TMUX_RADAR_MONITOR_COLS:-$(tput cols 2>/dev/null || printf 80)}"
     rows="${TMUX_RADAR_MONITOR_ROWS:-$(tput lines 2>/dev/null || printf 30)}"
     case "$cols" in ''|*[!0-9]*) cols=80 ;; esac; case "$rows" in ''|*[!0-9]*) rows=30 ;; esac
@@ -470,7 +523,10 @@ usage() { printf 'usage: ai-monitor.sh {overview|detail|compact} <pane> [view] [
 mode="${1:-}"; shift || true
 pane="${1:-}"; shift || true
 [ -n "$mode" ] && [ -n "$pane" ] || usage
-open_run "$pane" || { printf 'tmux-radar: no active run for %s\n' "$pane" >&2; exit 1; }
+open_run "$pane" || { printf 'tmux-radar: no live run for %s\n' "$pane" >&2; exit 1; }
+trap 'monitor_cleanup $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 once=0; view=Timeline
 for arg in "$@"; do case "$arg" in --once) once=1 ;; Timeline|Decision|Screen|Config|Logs) view="$arg" ;; esac; done
 case "$mode" in

@@ -896,11 +896,28 @@ _watch_state_write() {  # pane started poll goal policy auto maxcalls calls quie
 }
 
 _watch_pointer_write() {
-  local wf="$WATCH_WF" tmp run_id run_dir channel overview detail monitors_file
+  local wf="$WATCH_WF" tmp current_run run_id run_dir channel generation owner_file overview detail monitors_file rc locked=0
   [ -n "$wf" ] || return 0
-  run_id="$(_state_get "$wf" run_id)"; [ -n "$run_id" ] || run_id="${RADAR_RUN_ID:-}"
-  run_dir="$(_state_get "$wf" run_dir)"; [ -n "$run_dir" ] || run_dir="${RADAR_RUN_DIR:-}"
-  channel="$(_state_get "$wf" channel)"; [ -n "$channel" ] || channel="${RADAR_RUN_CHANNEL:-}"
+  if [ -n "${RADAR_RUN_GENERATION:-}" ] && [ ! -s "${RADAR_RUN_DIR:-}/ready.json" ]; then
+    return 0
+  fi
+  if [ -n "${RADAR_RUN_GENERATION:-}" ]; then
+    if ! radar_launch_lock_acquire "$WATCH_PANE" "${TMUX_RADAR_POINTER_LOCK_ATTEMPTS:-1000}" \
+      "${TMUX_RADAR_POINTER_LOCK_DELAY:-0.005}"; then
+      return 1
+    fi
+    locked=1
+  fi
+  current_run="$(_state_get "$wf" run_id)"
+  if [ -n "$current_run" ] && [ -n "${RADAR_RUN_ID:-}" ] && [ "$current_run" != "$RADAR_RUN_ID" ]; then
+    [ "$locked" -eq 0 ] || radar_launch_lock_release >/dev/null 2>&1 || true
+    return 0
+  fi
+  run_id="${RADAR_RUN_ID:-$current_run}"
+  run_dir="${RADAR_RUN_DIR:-$(_state_get "$wf" run_dir)}"
+  channel="${RADAR_RUN_CHANNEL:-$(_state_get "$wf" channel)}"
+  generation="${RADAR_RUN_GENERATION:-$(_state_get "$wf" generation)}"
+  owner_file="$(_state_get "$wf" owner_file)"
   monitors_file="$run_dir/monitors"
   if [ -r "$monitors_file" ]; then
     overview="$(_state_get "$monitors_file" monitor_overview_pane)"
@@ -909,9 +926,13 @@ _watch_pointer_write() {
     overview="$(_state_get "$wf" monitor_overview_pane)"
     detail="$(_state_get "$wf" monitor_detail_pane)"
   fi
-  tmp="$(mktemp "${wf}.XXXXXX")" || return 1
+  tmp="$(mktemp "${wf}.XXXXXX")" || {
+    [ "$locked" -eq 0 ] || radar_launch_lock_release >/dev/null 2>&1 || true
+    return 1
+  }
   {
-    printf 'run_id=%s\nrun_dir=%s\nchannel=%s\n' "$run_id" "$run_dir" "$channel"
+    printf 'run_id=%s\nrun_dir=%s\ngeneration=%s\nchannel=%s\nowner_file=%s\n' \
+      "$run_id" "$run_dir" "$generation" "$channel" "$owner_file"
     printf 'monitor_overview_pane=%s\nmonitor_detail_pane=%s\n' "$overview" "$detail"
     printf 'pid=%s\npane=%s\nstarted=%s\ngoal=%s\npoll=%s\n' \
       "$$" "$WATCH_PANE" "$WATCH_STARTED" "$(_flat "$WATCH_GOAL")" "$WATCH_POLL"
@@ -922,7 +943,9 @@ _watch_pointer_write() {
       "${WATCH_NEXT_AT:-0}" "${WATCH_LAST_DECISION:-}" "$(now)"
     printf 'quiet=0\nmarked=0\n'
   } > "$tmp"
-  mv "$tmp" "$wf"
+  if mv "$tmp" "$wf"; then rc=0; else rc=$?; fi
+  [ "$locked" -eq 0 ] || radar_launch_lock_release >/dev/null 2>&1 || true
+  return "$rc"
 }
 
 _watch_pointer_set_monitors() {
@@ -1698,6 +1721,26 @@ _watch_start_timer() {
   WATCH_TIMER_PID=$!
 }
 
+_watch_pause() {
+  local requested="${1:-1}" fifo
+  if [ -n "${TMUX_RADAR_TEST_WAIT_TICK+x}" ]; then
+    sleep "$requested"
+    return 0
+  fi
+  if [ "${WATCH_PAUSE_FD_READY:-0}" -ne 1 ]; then
+    fifo="$RADAR_RUN_DIR/.pause.$$"
+    if mkfifo "$fifo" 2>/dev/null; then
+      exec 9<>"$fifo"
+      rm -f "$fifo"
+      WATCH_PAUSE_FD_READY=1
+    else
+      sleep 1
+      return 0
+    fi
+  fi
+  IFS= read -r -t 1 _ <&9 || true
+}
+
 _watch_wait_delay() {
   local delay="$1" tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.05}"
   _watch_start_timer "$delay"
@@ -2031,7 +2074,17 @@ _watch_wait_for_batch() {
         return 0
       fi
     fi
-    sleep "$tick"
+    # The journal is authoritative. A wake signal is only an optimization and
+    # may race with waiter replacement, so observe durable events directly on
+    # each built-in pause without spawning another polling process.
+    if radar_inbox_pending; then
+      radar_inbox_drain > "$batch"
+      if [ -s "$batch" ]; then
+        _watch_kill_waiters
+        return 0
+      fi
+    fi
+    _watch_pause "$tick"
   done
 }
 
@@ -2320,6 +2373,14 @@ _watch_completion_hold() {
   done
 }
 
+_watch_remove_owned_pointer() {
+  local current_run
+  [ -n "${WATCH_WF:-}" ] && [ -r "$WATCH_WF" ] || return 0
+  current_run="$(_state_get "$WATCH_WF" run_id)"
+  [ "$current_run" = "${RADAR_RUN_ID:-}" ] || return 0
+  rm -f "$WATCH_WF"
+}
+
 _watch_finalize() {
   local outcome="$1" phase="$2" reason="$3" delay deadline
   _delivery_cleanup
@@ -2338,8 +2399,9 @@ _watch_finalize() {
     radar_run_finalize "$outcome" "$reason"
     WATCH_FINALIZED=1
   fi
-  rm -f "$WATCH_WF" "$BRAIN_PID_FILE" "$BRAIN_OUT_FILE" \
-    "$RADAR_RUN_DIR/paused" "$RADAR_RUN_DIR/keep-open"
+  _watch_remove_owned_pointer
+  rm -f "$BRAIN_PID_FILE" "$BRAIN_OUT_FILE" \
+    "$RADAR_RUN_DIR/paused" "$RADAR_RUN_DIR/resume-request" "$RADAR_RUN_DIR/keep-open"
 }
 
 _watch_signal_exit() {
@@ -2351,14 +2413,16 @@ _watch_signal_exit() {
   else
     _watch_kill_waiters
     _terminate_current_brain
-    [ -n "$WATCH_WF" ] && rm -f "$WATCH_WF"
-    [ -n "${RADAR_RUN_DIR:-}" ] && rm -f "$RADAR_RUN_DIR/paused" "$RADAR_RUN_DIR/keep-open"
+    _watch_remove_owned_pointer
+    [ -n "${RADAR_RUN_DIR:-}" ] && rm -f \
+      "$RADAR_RUN_DIR/paused" "$RADAR_RUN_DIR/resume-request" "$RADAR_RUN_DIR/keep-open"
   fi
   exit "$rc"
 }
 
 cmd_watch_loop() {
-  local pane goal policy poll auto maxcalls config supplied_config="${6:-}" batch wait_rc coalesce_rc event_kind
+  local pane goal policy poll auto maxcalls config supplied_config="${6:-}" precreated_run="${7:-}"
+  local batch wait_rc coalesce_rc event_kind requested_backend frozen_backend run_id generation channel resume_request_id
   local rc valid failure evidence_fingerprint delivery_fingerprint armed_fingerprint current_fingerprint guard_rc
   local retry_rc retry_cancelled verify_rc classification error_class retryable summary detail stderr_path failure_kind repair_reason
   local requested_policy requested_poll requested_auto always_allow_source
@@ -2413,6 +2477,27 @@ cmd_watch_loop() {
   fi
 
   _freeze_backend 0
+  if [ -n "$precreated_run" ]; then
+    requested_backend="$(printf '%s' "$config" | jq -S -c '.backend // {}')"
+    frozen_backend="$(printf '%s' "$BRAIN_BACKEND_JSON" | jq -S -c '.')"
+    if ! jq -en --argjson requested "$requested_backend" --argjson frozen "$frozen_backend" '
+      def normalized: {
+        mode:(.mode // ""), path:(.path // ""), version:(.version // ""),
+        identity:(.identity // ""), source:(.source // ""), profile:(.profile // ""),
+        command:(.command // ""), warning:(.warning // ""), model:(.model // ""),
+        effort:(.effort // ""), model_source:(.model_source // ""),
+        effort_source:(.effort_source // ""), required_version:(.required_version // ""),
+        compatible:(.compatible // false)
+      };
+      ($requested | normalized) == ($frozen | normalized)
+    ' >/dev/null; then
+      BRAIN_BACKEND_OK=0
+      BRAIN_PREFLIGHT_JSON="$(jq -cn \
+        --arg summary 'Frozen backend identity changed before watcher launch' \
+        --arg detail "requested=$requested_backend current=$frozen_backend" \
+        '{ok:false,class:"config-permanent",summary:$summary,detail:$detail}')"
+    fi
+  fi
   config="$(printf '%s' "$config" | jq -c --argjson backend "$BRAIN_BACKEND_JSON" \
     '. + {backend:$backend}')"
 
@@ -2422,7 +2507,14 @@ cmd_watch_loop() {
   WATCH_RETRY=0; WATCH_TRANSIENT_RETRIES=0; WATCH_REPAIR_ATTEMPTS=0
   WATCH_EVENT_ID=""; WATCH_LAST_DECISION=""; WATCH_FINALIZED=0
   WATCH_STABLE_COUNT=0
-  radar_run_create "$pane" "$config"
+  if [ -n "$precreated_run" ]; then
+    run_id="$(printf '%s' "$config" | jq -r '.run_id // empty')"
+    generation="$(jq -r '.generation // empty' "$precreated_run/start.json" 2>/dev/null || true)"
+    channel="$(_radar_watch_channel "$pane")"
+    _radar_use_run "$pane" "$run_id" "$precreated_run" "$channel" "$generation"
+  else
+    radar_run_create "$pane" "$config"
+  fi
   WATCH_WF="$(radar_watch_file "$pane")"
   if [ "$BRAIN_BACKEND_OK" -ne 1 ]; then
     classification="$(jq -cn --arg summary "$(printf '%s' "$BRAIN_PREFLIGHT_JSON" | jq -r '.summary')" \
@@ -2431,9 +2523,13 @@ cmd_watch_loop() {
     _watch_phase CREATED "run created" none 0
     _watch_record_backend_error "$classification" "" 0
     _watch_phase PAUSED_ERROR "$(printf '%s' "$classification" | jq -r '.summary')" none 0
-    radar_run_finalize paused_error "$(printf '%s' "$classification" | jq -r '.summary')"
+    if [ -n "$precreated_run" ]; then
+      radar_run_finalize startup-failed "$(printf '%s' "$classification" | jq -r '.summary')"
+    else
+      radar_run_finalize paused_error "$(printf '%s' "$classification" | jq -r '.summary')"
+    fi
     WATCH_FINALIZED=1
-    rm -f "$WATCH_WF"
+    _watch_remove_owned_pointer
     return 3
   fi
   if [ -n "${TMUX_RADAR_TEST_RUNTIME_FILE:-}" ] && [ -n "$supplied_config" ]; then
@@ -2450,6 +2546,12 @@ cmd_watch_loop() {
   trap '_watch_signal_exit HUP 129' HUP
   _watch_phase CREATED "run created" none 0
   _watch_phase ARMED "waiting for native event or idle fallback" idle 0
+  if [ -z "${TMUX_RADAR_TEST_NATIVE_SKIP_READY:-}" ]; then
+    _radar_write_snapshot "$RADAR_RUN_DIR/ready.json" "$(jq -cn \
+      --arg run_id "$RADAR_RUN_ID" --arg pane "$WATCH_PANE" --arg phase "$WATCH_PHASE" \
+      --arg generation "$RADAR_RUN_GENERATION" --arg timestamp "$(_radar_now_iso)" \
+      '{schema_version:1,run_id:$run_id,pane:$pane,phase:$phase,generation:$generation,ready_at:$timestamp}')"
+  fi
   audit "watch-start\t$pane\t$goal\t${policy:-safe}\tpoll=$poll\trun=$RADAR_RUN_ID"
   _watch_timeline "$pane" start "$(_pane_label "$pane") · event-driven · poll=${poll}s · goal=${goal:-<none>}"
   printf '%s▶ 开始监控%s %s%s\n' "$CG" "$CR" "$(_pane_label "$pane")" "${goal:+  ${CD}· ${goal}${CR}}"
@@ -2471,7 +2573,11 @@ cmd_watch_loop() {
           }
           sleep "${TMUX_RADAR_TEST_WAIT_TICK:-0.1}"
         done
-        radar_event_append resumed monitor "supervision resumed" '{"record":"control"}'
+        resume_request_id="$(cat "$RADAR_RUN_DIR/resume-request" 2>/dev/null || true)"
+        radar_event_append resumed monitor "supervision resumed" "$(jq -cn \
+          --arg request_id "$resume_request_id" \
+          '{record:"control",request_id:$request_id}')"
+        rm -f "$RADAR_RUN_DIR/resume-request"
         WATCH_STABLE_COUNT=0
         continue
         ;;
@@ -2974,6 +3080,403 @@ cmd_watch_setup() {
   sleep "${TMUX_RADAR_SETUP_LAUNCH_PAUSE:-1.2}"
 }
 
+_native_generation() {
+  LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'
+}
+
+_native_backends_equal() {
+  jq -en --argjson requested "$1" --argjson frozen "$2" '
+    def normalized: {
+      mode:(.mode // ""), path:(.path // ""), version:(.version // ""),
+      identity:(.identity // ""), source:(.source // ""), profile:(.profile // ""),
+      command:(.command // ""), warning:(.warning // ""), model:(.model // ""),
+      effort:(.effort // ""), model_source:(.model_source // ""),
+      effort_source:(.effort_source // ""), required_version:(.required_version // ""),
+      compatible:(.compatible // false)
+    };
+    ($requested | normalized) == ($frozen | normalized)
+  ' >/dev/null
+}
+
+_native_request_valid() {
+  printf '%s' "$1" | jq -e '
+    def exact($expected): (keys | sort) == ($expected | sort);
+    def subset($allowed): ((keys - $allowed) | length) == 0;
+    exact(["protocol_version","config_schema_version","state_root","target_pane","config","owner"]) and
+    .protocol_version == 1 and .config_schema_version == 1 and
+    (.state_root | type == "string" and startswith("/")) and
+    (.target_pane | type == "string" and test("^%[0-9]+$")) and
+    (.config | exact(["schema_version","pane","goal","values","backend"])) and
+    .config.schema_version == 1 and .config.pane == .target_pane and
+    .config.goal == .config.values.goal.value and
+    (.config.values | exact([
+      "goal","autonomy","approval_policy","always_allow","hooks_first","poll",
+      "stable_screen_threshold","command","profile","model","effort","timeout",
+      "max_decisions","retry_limit","retry_backoff","capture_lines",
+      "monitor_excerpt_lines","monitor_position","monitor_width","overview_ratio",
+      "completion_close_delay","logging","screen_snapshots","retention_days"
+    ])) and
+    ([.config.values[] |
+      exact(["source","value"]) and
+      (.source | IN("default","tmux","custom","runtime","preset","legacy","profile-managed"))
+    ] | all) and
+    (.config.backend | subset([
+      "mode","path","version","identity","source","profile","command","warning",
+      "model","effort","model_source","effort_source","required_version","compatible"
+    ])) and
+    (.config.backend.mode | IN("codex","custom-command")) and
+    (.config.backend | has("source") and has("model_source") and has("effort_source")) and
+    ((.owner == null) or
+      (.owner | subset(["schema_version","kind","pane","pid","token","heartbeat_path"])) and
+      .owner.schema_version == 1 and
+      (.owner.kind | IN("split","popup","detached","viewer")) and
+      (if (.owner.kind | IN("detached","viewer")) then
+         (.owner | exact(["schema_version","kind"]))
+       elif .owner.kind == "popup" then
+         (.owner | exact(["schema_version","kind","pid","token","heartbeat_path"])) and
+         (.owner.pid > 0) and (.owner.token | test("^[0-9a-fA-F]{32}$")) and
+         (.owner.heartbeat_path | startswith("/"))
+       else
+         (.owner | exact(["schema_version","kind","pane","pid","token","heartbeat_path"])) and
+         (.owner.pane | test("^%[0-9]+$")) and (.owner.pid > 0) and
+         (.owner.token | test("^[0-9a-fA-F]{32}$")) and
+         (.owner.heartbeat_path | startswith("/"))
+       end))
+  ' >/dev/null 2>&1
+}
+
+_native_start_error() {
+  local status="$1" code="$2" summary="$3" detail="${4:-}" evidence="${5:-}"
+  jq -cn --arg status "$status" --arg code "$code" --arg summary "$summary" \
+    --arg detail "$detail" --arg evidence "$evidence" --arg timestamp "$(_radar_now_iso)" '
+    {protocol_version:1,ok:false,status:$status,code:$code,error:{
+      class:"config-permanent",code:$code,retryable:false,summary:$summary,
+      detail:$detail,evidence_path:$evidence,call:0,timestamp:$timestamp
+    }}'
+}
+
+_native_release_lock() {
+  radar_launch_lock_release >/dev/null 2>&1 || true
+  trap - EXIT
+}
+
+cmd_watch_run() {
+  local run_id="${1:-}" run_dir config pane config_run_id
+  case "$run_id" in ''|*/*|*..*) echo "_watch_run: invalid run id" >&2; return 2 ;; esac
+  run_dir="$RADAR_RUNS_DIR/$run_id"
+  [ -d "$run_dir" ] && [ -r "$run_dir/config.json" ] || {
+    echo "_watch_run: run not found: $run_id" >&2
+    return 1
+  }
+  config="$(cat "$run_dir/config.json")"
+  config_run_id="$(printf '%s' "$config" | jq -r '.run_id // empty')"
+  pane="$(printf '%s' "$config" | jq -r '.pane // empty')"
+  [ "$config_run_id" = "$run_id" ] || { echo "_watch_run: config identity mismatch" >&2; return 1; }
+  cmd_watch_loop "$pane" "" "" "" "" "$config" "$run_dir"
+}
+
+cmd_engine_start() {
+  local raw request state_root pane canonical config requested_backend generation owner owner_file=""
+  local watch_file existing_pid existing_run existing_dir existing_owner watcher_pid run_id run_dir
+  local ready attempts delay attempt=0 start_payload result
+  need_jq
+  raw="$(cat)"
+  if ! request="$(printf '%s' "$raw" | jq -c -s 'if length == 1 then .[0] else error("expected one JSON value") end' 2>/dev/null)"; then
+    _native_start_error rejected invalid-request 'engine-start requires exactly one JSON request'
+    return 2
+  fi
+  if ! _native_request_valid "$request"; then
+    _native_start_error rejected invalid-request 'engine-start request failed strict protocol-v1 validation'
+    return 2
+  fi
+
+  state_root="$(printf '%s' "$request" | jq -r '.state_root')"
+  pane="$(printf '%s' "$request" | jq -r '.target_pane')"
+  config="$(printf '%s' "$request" | jq -c '.config')"
+  if [ "$state_root" != "$RADAR_STATE_DIR" ]; then
+    _native_start_error rejected state-root-mismatch 'request state_root does not match the engine state root' \
+      "requested=$state_root engine=$RADAR_STATE_DIR"
+    return 2
+  fi
+  canonical="$(_resolve_pane "$pane" 2>/dev/null || true)"
+  if [ "$canonical" != "$pane" ]; then
+    _native_start_error rejected target-unavailable 'target pane is missing or did not resolve canonically' "$pane"
+    return 2
+  fi
+
+  _apply_watch_config "$config"
+  _freeze_backend 0
+  requested_backend="$(printf '%s' "$config" | jq -S -c '.backend')"
+  if [ "$BRAIN_BACKEND_OK" -ne 1 ] || ! _native_backends_equal "$requested_backend" "$BRAIN_BACKEND_JSON"; then
+    _native_start_error rejected backend-drift 'reviewed backend no longer matches the executable environment' \
+      "$(printf '%s' "$BRAIN_PREFLIGHT_JSON" | jq -c '.')"
+    return 3
+  fi
+
+  if ! radar_launch_lock_acquire "$pane" "${TMUX_RADAR_NATIVE_LOCK_ATTEMPTS:-500}" \
+    "${TMUX_RADAR_NATIVE_LOCK_DELAY:-0.01}"; then
+    _native_start_error busy launch-busy 'another launch or control owns the target pane lock'
+    return 4
+  fi
+  trap '_native_release_lock' EXIT
+  watch_file="$(radar_watch_file "$pane")"
+  if [ -r "$watch_file" ]; then
+    existing_pid="$(_state_get "$watch_file" pid)"
+    existing_run="$(_state_get "$watch_file" run_id)"
+    existing_dir="$(_state_get "$watch_file" run_dir)"
+    if [ -n "$existing_run" ] && [ -d "$existing_dir" ] && [ ! -e "$existing_dir/final.json" ] &&
+      [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+      existing_owner="$(_state_get "$watch_file" owner_file)"
+      owner='null'
+      [ -n "$existing_owner" ] && [ -r "$existing_owner" ] && owner="$(cat "$existing_owner")"
+      result="$(jq -cn --arg run_id "$existing_run" --arg run_dir "$existing_dir" \
+        --argjson watcher_pid "$existing_pid" --argjson owner "$owner" \
+        '{protocol_version:1,ok:true,status:"already-active",run_id:$run_id,
+          run_dir:$run_dir,watcher_pid:$watcher_pid,owner:$owner}')"
+      _native_release_lock
+      printf '%s\n' "$result"
+      return 0
+    fi
+    rm -f "$watch_file"
+  fi
+
+  generation="$(_native_generation)"
+  [ "${#generation}" -eq 32 ] || {
+    _native_release_lock
+    _native_start_error startup-failed generation-failed 'could not allocate a 128-bit pointer generation'
+    return 1
+  }
+  radar_run_allocate "$pane" "$config" "$generation"
+  run_id="$RADAR_RUN_ID"
+  run_dir="$RADAR_RUN_DIR"
+  _radar_write_snapshot "$run_dir/start-request.json" "$request"
+  owner="$(printf '%s' "$request" | jq -c '.owner')"
+  if [ "$owner" != null ]; then
+    owner_file="$run_dir/owner.json"
+    _radar_write_snapshot "$owner_file" "$owner"
+  fi
+  start_payload="$(jq -cn --arg run_id "$run_id" --arg pane "$pane" --arg generation "$generation" \
+    --arg timestamp "$(_radar_now_iso)" \
+    '{schema_version:1,protocol_version:1,status:"starting",run_id:$run_id,pane:$pane,
+      generation:$generation,watcher_pid:0,started_at:$timestamp}')"
+  _radar_write_snapshot "$run_dir/start.json" "$start_payload"
+  radar_run_publish_pointer 0 "$owner_file"
+
+  nohup bash "$SELF" _watch_run "$run_id" </dev/null \
+    >>"$run_dir/engine.stdout" 2>>"$run_dir/engine.stderr" &
+  watcher_pid=$!
+  radar_run_publish_pointer "$watcher_pid" "$owner_file"
+  start_payload="$(printf '%s' "$start_payload" | jq -c --argjson pid "$watcher_pid" \
+    '.watcher_pid=$pid')"
+  _radar_write_snapshot "$run_dir/start.json" "$start_payload"
+
+  attempts="${TMUX_RADAR_NATIVE_START_ATTEMPTS:-500}"
+  delay="${TMUX_RADAR_NATIVE_START_DELAY:-0.01}"
+  case "$attempts" in ''|*[!0-9]*) attempts=500 ;; esac
+  while [ "$attempt" -lt "$attempts" ]; do
+    ready="$run_dir/ready.json"
+    if [ -s "$ready" ] && jq -e --arg run_id "$run_id" --arg generation "$generation" \
+      '.schema_version == 1 and .phase == "ARMED" and .run_id == $run_id and .generation == $generation' \
+      "$ready" >/dev/null 2>&1; then
+      start_payload="$(printf '%s' "$start_payload" | jq -c --arg timestamp "$(_radar_now_iso)" \
+        '.status="ready" | .ready_at=$timestamp')"
+      _radar_write_snapshot "$run_dir/start.json" "$start_payload"
+      result="$(jq -cn --arg run_id "$run_id" --arg run_dir "$run_dir" \
+        --argjson watcher_pid "$watcher_pid" --argjson owner "$owner" \
+        '{protocol_version:1,ok:true,status:"started",run_id:$run_id,run_dir:$run_dir,
+          watcher_pid:$watcher_pid,owner:$owner}')"
+      _native_release_lock
+      printf '%s\n' "$result"
+      return 0
+    fi
+    kill -0 "$watcher_pid" 2>/dev/null || break
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+
+  kill -TERM "$watcher_pid" 2>/dev/null || true
+  sleep 0.05
+  _terminate_process_tree "$watcher_pid" ""
+  wait "$watcher_pid" 2>/dev/null || true
+  [ -s "$run_dir/final.json" ] || radar_run_finalize startup-failed 'watcher did not publish a ready acknowledgement'
+  [ "$(_state_get "$watch_file" run_id)" != "$run_id" ] || rm -f "$watch_file"
+  start_payload="$(printf '%s' "$start_payload" | jq -c --arg timestamp "$(_radar_now_iso)" \
+    '.status="startup-failed" | .failed_at=$timestamp')"
+  _radar_write_snapshot "$run_dir/start.json" "$start_payload"
+  _native_release_lock
+  _native_start_error startup-failed readiness-timeout 'watcher did not publish a ready acknowledgement' \
+    "run_id=$run_id" "$run_dir/engine.stderr"
+  return 1
+}
+
+_control_result() {
+  local ok="$1" status="$2" run_id="$3" pane="$4" action="$5" request_id="$6"
+  local evidence="${7:-}" code="${8:-}" summary="${9:-}" error='null'
+  if [ "$ok" != true ]; then
+    error="$(jq -cn --arg code "$code" --arg summary "$summary" --arg evidence "$evidence" \
+      --arg timestamp "$(_radar_now_iso)" '
+      {class:"runtime-permanent",code:$code,retryable:false,summary:$summary,
+       evidence_path:$evidence,call:0,timestamp:$timestamp}')"
+  fi
+  jq -cn --argjson ok "$ok" --arg status "$status" --arg run_id "$run_id" --arg pane "$pane" \
+    --arg action "$action" --arg request_id "$request_id" --arg evidence "$evidence" \
+    --argjson error "$error" '
+    {protocol_version:1,schema_version:1,ok:$ok,status:$status,run_id:$run_id,pane:$pane,
+     action:$action,request_id:$request_id,evidence_path:$evidence,error:$error}'
+}
+
+_control_wait_state() {
+  local run_dir="$1" phase="$2" attempts="${3:-250}" attempt=0
+  while [ "$attempt" -lt "$attempts" ]; do
+    jq -e --arg phase "$phase" '.phase == $phase' "$run_dir/state.json" >/dev/null 2>&1 && return 0
+    sleep "${TMUX_RADAR_CONTROL_DELAY:-0.02}"
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+_control_wait_event() {
+  local run_dir="$1" kind="$2" request_id="$3" attempts="${4:-250}" attempt=0
+  while [ "$attempt" -lt "$attempts" ]; do
+    jq -s -e --arg kind "$kind" --arg request_id "$request_id" \
+      'any(.[]; .kind == $kind and .request_id == $request_id)' \
+      "$run_dir/events.jsonl" >/dev/null 2>&1 && return 0
+    sleep "${TMUX_RADAR_CONTROL_DELAY:-0.02}"
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+cmd_control() {
+  local run_id="${1:-}" pane="${2:-}" action="${3:-}" request_id="${4:-}"
+  local run_dir watch_file pointer_run pointer_pane pointer_generation expected_generation channel pid
+  local controls request_file ack_file request result attempts attempt=0
+  need_jq
+  case "$run_id" in ''|*/*|*..*) _control_result false rejected "$run_id" "$pane" "$action" "$request_id" "" invalid-request 'invalid run ID'; return 2 ;; esac
+  case "$pane" in ''|%|[^%]*|%*[!0-9]*) _control_result false rejected "$run_id" "$pane" "$action" "$request_id" "" invalid-request 'invalid pane ID'; return 2 ;; esac
+  case "$request_id" in ''|*[!A-Za-z0-9._-]*) _control_result false rejected "$run_id" "$pane" "$action" "$request_id" "" invalid-request 'invalid request ID'; return 2 ;; esac
+  case "$action" in pause|resume|reassess|keep|stop) : ;; *) _control_result false rejected "$run_id" "$pane" "$action" "$request_id" "" invalid-request 'unsupported control action'; return 2 ;; esac
+
+  run_dir="$RADAR_RUNS_DIR/$run_id"
+  controls="$run_dir/controls"
+  request_file="$controls/$request_id.request.json"
+  ack_file="$controls/$request_id.ack.json"
+  [ -d "$run_dir" ] || { _control_result false missing-run "$run_id" "$pane" "$action" "$request_id" "" missing-run 'requested run does not exist'; return 1; }
+  mkdir -p "$controls"
+  if [ -s "$ack_file" ]; then
+    cat "$ack_file"
+    jq -e '.ok == true' "$ack_file" >/dev/null 2>&1
+    return $?
+  fi
+  if ! radar_launch_lock_acquire "$pane" "${TMUX_RADAR_CONTROL_LOCK_ATTEMPTS:-500}" \
+    "${TMUX_RADAR_CONTROL_LOCK_DELAY:-0.01}"; then
+    _control_result false busy "$run_id" "$pane" "$action" "$request_id" "" control-busy 'target pane control lock is busy'
+    return 1
+  fi
+  trap '_native_release_lock' EXIT
+  if [ -s "$ack_file" ]; then
+    result="$(cat "$ack_file")"
+    _native_release_lock
+    printf '%s\n' "$result"
+    printf '%s' "$result" | jq -e '.ok == true' >/dev/null 2>&1
+    return $?
+  fi
+
+  watch_file="$(radar_watch_file "$pane")"
+  pointer_run="$(_state_get "$watch_file" run_id)"
+  pointer_pane="$(_state_get "$watch_file" pane)"
+  pointer_generation="$(_state_get "$watch_file" generation)"
+  expected_generation="$(jq -r '.generation // empty' "$run_dir/start.json" 2>/dev/null || true)"
+  request="$(jq -cn --arg run_id "$run_id" --arg pane "$pane" --arg action "$action" \
+    --arg request_id "$request_id" --arg generation "$expected_generation" \
+    --arg timestamp "$(_radar_now_iso)" '
+    {schema_version:1,run_id:$run_id,pane:$pane,action:$action,request_id:$request_id,
+     generation:$generation,requested_at:$timestamp}')"
+  _radar_write_snapshot "$request_file" "$request"
+  if [ "$pointer_run" != "$run_id" ] || [ "$pointer_pane" != "$pane" ] ||
+    [ -z "$expected_generation" ] || [ "$pointer_generation" != "$expected_generation" ]; then
+    result="$(_control_result false stale-run "$run_id" "$pane" "$action" "$request_id" \
+      "$watch_file" stale-run 'live pointer no longer identifies the requested run generation')"
+    _radar_write_snapshot "$ack_file" "$result"
+    _native_release_lock
+    printf '%s\n' "$result"
+    return 1
+  fi
+
+  channel="$(_state_get "$watch_file" channel)"
+  pid="$(_state_get "$watch_file" pid)"
+  _radar_use_run "$pane" "$run_id" "$run_dir" "$channel" "$expected_generation"
+
+  case "$action" in
+    pause)
+      printf '%s\n' "$request_id" > "$run_dir/paused"
+      radar_event_append paused monitor 'paused by user' "$(jq -cn --arg request_id "$request_id" \
+        '{record:"control",request_id:$request_id}')"
+      [ -z "$channel" ] || tmux wait-for -S "$channel" >/dev/null 2>&1 || true
+      _native_release_lock
+      _control_wait_state "$run_dir" PAUSED_USER "${TMUX_RADAR_CONTROL_ATTEMPTS:-250}" || action='timeout'
+      ;;
+    resume)
+      printf '%s\n' "$request_id" > "$run_dir/resume-request"
+      rm -f "$run_dir/paused"
+      radar_event_append resume_requested monitor 'resume requested' "$(jq -cn --arg request_id "$request_id" \
+        '{record:"control",request_id:$request_id}')"
+      [ -z "$channel" ] || tmux wait-for -S "$channel" >/dev/null 2>&1 || true
+      _native_release_lock
+      _control_wait_event "$run_dir" resumed "$request_id" "${TMUX_RADAR_CONTROL_ATTEMPTS:-250}" || action='timeout'
+      ;;
+    reassess)
+      radar_inbox_append manual_reassess monitor 'manual reassessment requested' "$(jq -cn \
+        --arg request_id "$request_id" '{record:"control",request_id:$request_id}')"
+      [ -z "$channel" ] || tmux wait-for -S "$channel" >/dev/null 2>&1 || true
+      _native_release_lock
+      _control_wait_event "$run_dir" manual_reassess "$request_id" "${TMUX_RADAR_CONTROL_ATTEMPTS:-250}" || action='timeout'
+      ;;
+    keep)
+      if ! jq -e '.phase == "COMPLETED"' "$run_dir/state.json" >/dev/null 2>&1; then
+        action='invalid-state'
+      else
+        : > "$run_dir/keep-open"
+        radar_event_append keep_acknowledged monitor 'completion console kept open' "$(jq -cn \
+          --arg request_id "$request_id" '{record:"control",request_id:$request_id}')"
+      fi
+      _native_release_lock
+      ;;
+    stop)
+      [ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || true
+      _native_release_lock
+      attempts="${TMUX_RADAR_STOP_ATTEMPTS:-500}"
+      while [ "$attempt" -lt "$attempts" ] && [ ! -s "$run_dir/final.json" ]; do
+        sleep "${TMUX_RADAR_CONTROL_DELAY:-0.02}"
+        attempt=$((attempt + 1))
+      done
+      if [ ! -s "$run_dir/final.json" ]; then
+        _terminate_process_tree "$pid" ""
+        radar_run_finalize stopped 'forced stop after watcher acknowledgement timeout'
+      fi
+      [ -s "$run_dir/final.json" ] || action='timeout'
+      ;;
+  esac
+
+  case "$action" in
+    timeout)
+      result="$(_control_result false timeout "$run_id" "$pane" "$(printf '%s' "$request" | jq -r '.action')" \
+        "$request_id" "$request_file" acknowledgement-timeout 'control transition did not publish its acknowledgement in time')"
+      ;;
+    invalid-state)
+      result="$(_control_result false invalid-state "$run_id" "$pane" "$(printf '%s' "$request" | jq -r '.action')" \
+        "$request_id" "$request_file" invalid-state 'control is not valid in the current run state')"
+      ;;
+    *)
+      result="$(_control_result true acknowledged "$run_id" "$pane" "$action" "$request_id" "$request_file")"
+      ;;
+  esac
+  _radar_write_snapshot "$ack_file" "$result"
+  _native_release_lock
+  printf '%s\n' "$result"
+  printf '%s' "$result" | jq -e '.ok == true' >/dev/null 2>&1
+}
+
 cmd_pause() {
   local pane run_dir
   pane="$(_resolve_pane "${1:-}" 2>/dev/null || echo "${1:-}")"
@@ -3398,12 +3901,15 @@ case "${1:-}" in
   _render-watch-config) shift; cmd_render_watch_config "${1:-}" || rc=$? ;;
   _classify-backend-failure) shift; _classify_backend_failure "${1:-0}" "${2:-/dev/null}" "${3:-0}" "${4:-}" || rc=$? ;;
   doctor-json)   shift; cmd_doctor_json "$@" || rc=$? ;;
+  engine-start)  shift; cmd_engine_start || rc=$? ;;
+  control)       shift; cmd_control "${1:-}" "${2:-}" "${3:-}" "${4:-}" || rc=$? ;;
   ask)          shift; cmd_ask "$@" || rc=$? ;;
   decide)       shift; cmd_decide "${1:-}" "${2:-}" "${3:-}" "${4:-}" || rc=$? ;;
   watch)        shift; cmd_watch "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" || rc=$? ;;
   emit-event)   shift; cmd_emit_event "$@" || rc=$? ;;
   watch-setup)  shift; cmd_watch_setup "${1:-}" "${2:-quick}" "${3:-}" || rc=$? ;;
   _watch_loop)  shift; cmd_watch_loop "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" || rc=$? ;;
+  _watch_run)   shift; cmd_watch_run "${1:-}" || rc=$? ;;
   _launch-monitor) shift; _launch_monitor "${1:-}" "${2:-$(_wf "${1:-}")}" || rc=$? ;;
   pause)        shift; cmd_pause "${1:-}" || rc=$? ;;
   resume)       shift; cmd_resume "${1:-}" || rc=$? ;;
@@ -3417,7 +3923,7 @@ case "${1:-}" in
   list)         cmd_list || rc=$? ;;
   cleanup)      cmd_cleanup || rc=$? ;;
   menu)         cmd_menu || rc=$? ;;
-  *) echo "usage: ai.sh {doctor-json|ask [req]|decide [pane] [autonomy] [policy]|watch <pane> [goal] [policy] [poll] [autonomy]|emit-event <pane> <kind> <source> <label>|watch-setup [pane]|pause <pane>|resume <pane>|keep <pane>|report [run-id|latest]|monitor <pane>|monitor-timeline <pane>|monitor-detail <pane>|stop <pane|all>|status|list|cleanup|menu}" >&2; exit 2 ;;
+  *) echo "usage: ai.sh {doctor-json|engine-start|control <run-id> <pane> <action> <request-id>|ask [req]|decide [pane] [autonomy] [policy]|watch <pane> [goal] [policy] [poll] [autonomy]|emit-event <pane> <kind> <source> <label>|watch-setup [pane]|pause <pane>|resume <pane>|keep <pane>|report [run-id|latest]|monitor <pane>|monitor-timeline <pane>|monitor-detail <pane>|stop <pane|all>|status|list|cleanup|menu}" >&2; exit 2 ;;
 esac
 # menu-launched popups set this so the result stays on screen until a keypress
 if [ -n "${TMUX_RADAR_AI_PAUSE:-${TMUX_SWITCHER_AI_PAUSE:-}}" ] && [ -t 0 ]; then

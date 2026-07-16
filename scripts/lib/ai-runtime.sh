@@ -12,6 +12,8 @@ RADAR_RUN_ID="${RADAR_RUN_ID:-}"
 RADAR_RUN_DIR="${RADAR_RUN_DIR:-}"
 RADAR_RUN_PANE="${RADAR_RUN_PANE:-}"
 RADAR_RUN_CHANNEL="${RADAR_RUN_CHANNEL:-}"
+RADAR_RUN_GENERATION="${RADAR_RUN_GENERATION:-}"
+RADAR_LAUNCH_LOCK_DIR="${RADAR_LAUNCH_LOCK_DIR:-}"
 
 _radar_require_jq() {
   command -v jq >/dev/null 2>&1 || {
@@ -96,13 +98,15 @@ _radar_inbox_publish_ready() {
 
 _radar_watch_write() {
   local watch_file="$1" pane="$2" run_id="$3" run_dir="$4" pid="$5" channel="$6"
-  local overview="${7:-}" detail="${8:-}"
+  local overview="${7:-}" detail="${8:-}" generation="${9:-}" owner_file="${10:-}"
   _radar_write_snapshot "$watch_file" "$(cat <<EOF
 run_id=$run_id
 run_dir=$run_dir
+generation=$generation
 pid=$pid
 pane=$pane
 channel=$channel
+owner_file=$owner_file
 monitor_overview_pane=$overview
 monitor_detail_pane=$detail
 EOF
@@ -114,6 +118,7 @@ _radar_use_run() {
   RADAR_RUN_ID="$2"
   RADAR_RUN_DIR="$3"
   RADAR_RUN_CHANNEL="$4"
+  RADAR_RUN_GENERATION="${5:-}"
 }
 
 radar_watch_key() {
@@ -124,16 +129,68 @@ radar_watch_file() {
   printf '%s/%s.watch' "$RADAR_WATCH_DIR" "$(radar_watch_key "$1")"
 }
 
-radar_run_create() {
-  local pane="$1" config_json="$2"
-  local pane_token stamp run_id run_dir watch_file channel config_payload created_epoch
+radar_launch_lock_acquire() {
+  local pane="$1" attempts="${2:-500}" delay="${3:-0.01}" lock owner stale attempt=0
+  lock="$RADAR_WATCH_DIR/.launch-$(radar_watch_key "$pane").lock"
+  mkdir -p "$RADAR_WATCH_DIR"
+  # Preserve a roughly five-second contention window without hundreds of
+  # short-lived sleep processes when the lock owner stays live.
+  case "$attempts" in ''|*[!0-9]*) attempts=11 ;; esac
+  [ "$attempts" -le 11 ] || attempts=11
+  while [ "$attempt" -lt "$attempts" ]; do
+    if mkdir "$lock" 2>/dev/null; then
+      printf '%s\n' "$$" > "$lock/owner"
+      RADAR_LAUNCH_LOCK_DIR="$lock"
+      return 0
+    fi
+    owner="$(_radar_watch_field "$lock/owner" owner)"
+    [ -n "$owner" ] || owner="$(cat "$lock/owner" 2>/dev/null || true)"
+    case "$owner" in
+      ''|*[!0-9]*) : ;;
+      *)
+        if ! kill -0 "$owner" 2>/dev/null; then
+          stale="${lock}.stale.$$.$RANDOM"
+          if mv "$lock" "$stale" 2>/dev/null; then
+            rm -rf "$stale"
+            continue
+          fi
+        fi
+        ;;
+    esac
+    sleep "$delay"
+    case "$delay" in
+      0.005) delay=0.01 ;;
+      0.01)  delay=0.02 ;;
+      0.02)  delay=0.05 ;;
+      0.05)  delay=0.1 ;;
+      0.1)   delay=0.25 ;;
+      0.25)  delay=0.5 ;;
+      *)     delay=1 ;;
+    esac
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+radar_launch_lock_release() {
+  local lock="${RADAR_LAUNCH_LOCK_DIR:-}" owner
+  [ -n "$lock" ] && [ -d "$lock" ] || return 0
+  owner="$(cat "$lock/owner" 2>/dev/null || true)"
+  [ "$owner" = "$$" ] || return 1
+  rm -f "$lock/owner"
+  rmdir "$lock" 2>/dev/null || return 1
+  RADAR_LAUNCH_LOCK_DIR=""
+}
+
+radar_run_allocate() {
+  local pane="$1" config_json="$2" generation="${3:-}"
+  local pane_token stamp run_id run_dir channel config_payload created_epoch
   _radar_require_jq || return 1
   mkdir -p "$RADAR_WATCH_DIR" "$RADAR_RUNS_DIR"
   pane_token="$(_radar_pane_token "$pane")"
   stamp="$(_radar_run_stamp)"
   run_id="${stamp}-${pane_token}-$$-${RANDOM:-0}"
   run_dir="$RADAR_RUNS_DIR/$run_id"
-  watch_file="$(radar_watch_file "$pane")"
   channel="$(_radar_watch_channel "$pane")"
   created_epoch="$(date '+%s')"
   mkdir -p "$run_dir"
@@ -148,13 +205,26 @@ radar_run_create() {
   )" || return 1
   _radar_write_snapshot "$run_dir/config.json" "$config_payload" || return 1
   : > "$run_dir/events.jsonl"
-  mkdir -p "$run_dir/inbox"
-  _radar_watch_write "$watch_file" "$pane" "$run_id" "$run_dir" "$$" "$channel" "" "" || return 1
-  _radar_use_run "$pane" "$run_id" "$run_dir" "$channel"
+  mkdir -p "$run_dir/inbox" "$run_dir/controls"
+  _radar_use_run "$pane" "$run_id" "$run_dir" "$channel" "$generation"
+}
+
+radar_run_publish_pointer() {
+  local pid="$1" owner_file="${2:-}" watch_file
+  [ -n "$RADAR_RUN_PANE" ] && [ -n "$RADAR_RUN_ID" ] && [ -n "$RADAR_RUN_DIR" ] || return 1
+  watch_file="$(radar_watch_file "$RADAR_RUN_PANE")"
+  _radar_watch_write "$watch_file" "$RADAR_RUN_PANE" "$RADAR_RUN_ID" "$RADAR_RUN_DIR" \
+    "$pid" "$RADAR_RUN_CHANNEL" "" "" "$RADAR_RUN_GENERATION" "$owner_file"
+}
+
+radar_run_create() {
+  local pane="$1" config_json="$2"
+  radar_run_allocate "$pane" "$config_json" "" || return 1
+  radar_run_publish_pointer "$$" "" || return 1
 }
 
 radar_run_open() {
-  local target="$1" watch_file run_dir run_id pane channel
+  local target="$1" watch_file run_dir run_id pane channel generation
   if [ -f "$target" ]; then
     watch_file="$target"
   else
@@ -165,8 +235,9 @@ radar_run_open() {
   run_id="$(_radar_watch_field "$watch_file" run_id)"
   pane="$(_radar_watch_field "$watch_file" pane)"
   channel="$(_radar_watch_field "$watch_file" channel)"
+  generation="$(_radar_watch_field "$watch_file" generation)"
   [ -n "$run_dir" ] || return 1
-  _radar_use_run "$pane" "$run_id" "$run_dir" "$channel"
+  _radar_use_run "$pane" "$run_id" "$run_dir" "$channel" "$generation"
   printf '%s\n' "$run_dir"
 }
 
@@ -225,6 +296,15 @@ radar_inbox_append() {
   if ! _radar_inbox_publish_ready "$tmp_path" "$inbox_dir"; then
     return 1
   fi
+}
+
+radar_inbox_pending() {
+  local ready_path
+  [ -n "$RADAR_RUN_DIR" ] || return 1
+  for ready_path in "$RADAR_RUN_DIR/inbox/"*.ready; do
+    [ -e "$ready_path" ] && return 0
+  done
+  return 1
 }
 
 radar_inbox_drain() {

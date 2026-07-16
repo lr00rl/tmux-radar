@@ -442,6 +442,27 @@ func TestBackendErrorCanonicalV1RequiresCompleteNestedEvidence(t *testing.T) {
 			t.Fatalf("canonical error missing %q was accepted: %s", field, fixture)
 		}
 	}
+	for _, field := range []string{
+		"class", "code", "retryable", "summary", "detail", "backend_mode",
+		"backend_path", "backend_version", "stderr_path", "call", "timestamp",
+	} {
+		fixture, err := json.Marshal(canonical)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var nullValue map[string]any
+		if err := json.Unmarshal(fixture, &nullValue); err != nil {
+			t.Fatal(err)
+		}
+		nullValue["error"].(map[string]any)[field] = nil
+		fixture, err = json.Marshal(nullValue)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(fixture, &decoded); err == nil {
+			t.Fatalf("canonical error with null %q was accepted: %s", field, fixture)
+		}
+	}
 	contradictoryCall := bytes.Replace(payload, []byte(`"kind":"backend_error"`),
 		[]byte(`"kind":"backend_error","call":99`), 1)
 	if err := json.Unmarshal(contradictoryCall, &decoded); err == nil {

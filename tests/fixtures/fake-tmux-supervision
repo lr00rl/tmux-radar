@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -eu
+
+wait_channel_init() {
+  local fifo="${TEST_SIGNALS:?}/.wait-slice.$$"
+  mkfifo "$fifo"
+  exec 9<>"$fifo"
+  rm -f "$fifo"
+}
+
+wait_channel() {
+  IFS= read -r -t 1 _ <&9 || true
+}
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  list-sessions) exit 0 ;;
+  show-option)
+    key=""
+    for arg in "$@"; do key="$arg"; done
+    case "$key" in
+      @radar-ai-timeout|@switcher-ai-timeout) printf '%s\n' "${TEST_AI_TIMEOUT:-5}" ;;
+      @radar-ai-max-calls|@switcher-ai-max-calls) printf '%s\n' "${TEST_MAX_CALLS:-40}" ;;
+      @radar-ai-codex-path|@switcher-ai-codex-path) [ -z "${TEST_CODEX_PATH:-}" ] || printf '%s\n' "$TEST_CODEX_PATH" ;;
+      @radar-ai-capture-lines|@switcher-ai-capture-lines) printf '%s\n' 120 ;;
+      @radar-ai-monitor-excerpt-lines|@switcher-ai-monitor-excerpt-lines) printf '%s\n' 16 ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  display-message)
+    [ -f "$TEST_PANE_ALIVE" ] || exit 1
+    case "$*" in
+      *pane_id*) printf '%s\n' '%1' ;;
+      *) printf '%s\n' 'test:0.0 codex' ;;
+    esac
+    ;;
+  capture-pane)
+    [ -f "$TEST_PANE_ALIVE" ] || exit 1
+    cat "$TEST_SCREEN"
+    ;;
+  send-keys)
+    count=1
+    [ -s "$TEST_SEND_COUNT" ] && count=$(( $(cat "$TEST_SEND_COUNT") + 1 ))
+    printf '%s\n' "$count" > "$TEST_SEND_COUNT"
+    [ "${TEST_SEND_FAIL_AT:-0}" = "$count" ] && exit 1
+    printf '%s\n' "$*" >> "$TEST_SENDS"
+    ;;
+  wait-for)
+    if [ "${1:-}" = -S ]; then
+      shift
+      channel="${1:-}"
+      : > "$TEST_SIGNALS/$channel.signal"
+      exit 0
+    fi
+    channel="${1:-}"
+    owner_pid="$PPID"
+    liveness="${TEST_WAITER_LIVENESS:-}"
+    max_seconds="${TEST_WAITER_MAX_SECONDS:-300}"
+    case "$max_seconds" in ''|*[!0-9]*) max_seconds=300 ;; esac
+    deadline=$((SECONDS + max_seconds))
+    printf '%s\n' "$$" >> "$TEST_WAITER_PIDS"
+    trap 'exit 0' TERM INT HUP
+    wait_channel_init
+    while [ ! -e "$TEST_SIGNALS/$channel.signal" ]; do
+      [ -z "$liveness" ] || [ -e "$liveness" ] || exit 0
+      kill -0 "$owner_pid" 2>/dev/null || exit 0
+      [ "$SECONDS" -lt "$deadline" ] || exit 0
+      wait_channel
+    done
+    rm -f "$TEST_SIGNALS/$channel.signal"
+    ;;
+  *) exit 0 ;;
+esac

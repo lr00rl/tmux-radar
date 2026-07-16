@@ -12,6 +12,11 @@ import (
 	"sync"
 )
 
+const (
+	maxEventPollBytes        = 1 << 20
+	eventTailFingerprintSize = 4 << 10
+)
+
 type Snapshot struct {
 	Config Config
 	State  *State
@@ -19,7 +24,8 @@ type Snapshot struct {
 }
 
 type Reader struct {
-	mu sync.Mutex
+	snapshotMu sync.Mutex
+	eventsMu   sync.Mutex
 
 	runDir string
 
@@ -28,8 +34,9 @@ type Reader struct {
 	stateInfo     os.FileInfo
 	finalInfo     os.FileInfo
 
-	eventsInfo   os.FileInfo
-	eventsOffset int64
+	eventsOffset     int64
+	eventsTailOffset int64
+	eventsTail       []byte
 }
 
 func Open(runDir string) (*Reader, error) {
@@ -57,8 +64,8 @@ func Open(runDir string) (*Reader, error) {
 }
 
 func (reader *Reader) Snapshot() (Snapshot, bool, error) {
-	reader.mu.Lock()
-	defer reader.mu.Unlock()
+	reader.snapshotMu.Lock()
+	defer reader.snapshotMu.Unlock()
 
 	candidate := reader.snapshot
 	stateInfo := reader.stateInfo
@@ -91,7 +98,28 @@ func (reader *Reader) Snapshot() (Snapshot, bool, error) {
 	reader.snapshotReady = true
 	reader.stateInfo = stateInfo
 	reader.finalInfo = finalInfo
-	return candidate, changed, nil
+	return cloneSnapshot(candidate), changed, nil
+}
+
+func cloneSnapshot(snapshot Snapshot) Snapshot {
+	cloned := snapshot
+	if snapshot.Config.Backend != nil {
+		backend := *snapshot.Config.Backend
+		cloned.Config.Backend = &backend
+	}
+	if snapshot.State != nil {
+		state := *snapshot.State
+		if snapshot.State.Verification != nil {
+			verification := *snapshot.State.Verification
+			state.Verification = &verification
+		}
+		cloned.State = &state
+	}
+	if snapshot.Final != nil {
+		final := *snapshot.Final
+		cloned.Final = &final
+	}
+	return cloned
 }
 
 func readOptionalJSON[T any](path string, previousInfo os.FileInfo) (*T, os.FileInfo, bool, error) {
@@ -135,14 +163,12 @@ func sameArtifact(previous, current os.FileInfo) bool {
 }
 
 func (reader *Reader) PollEvents() ([]Event, error) {
-	reader.mu.Lock()
-	defer reader.mu.Unlock()
+	reader.eventsMu.Lock()
+	defer reader.eventsMu.Unlock()
 
 	path := filepath.Join(reader.runDir, "events.jsonl")
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		reader.eventsInfo = nil
-		reader.eventsOffset = 0
 		return nil, nil
 	}
 	if err != nil {
@@ -155,34 +181,36 @@ func (reader *Reader) PollEvents() ([]Event, error) {
 		return nil, fmt.Errorf("stat events.jsonl: %w", err)
 	}
 	start := reader.eventsOffset
-	if reader.eventsInfo != nil {
-		if !os.SameFile(reader.eventsInfo, info) || info.Size() < start ||
-			(info.Size() == reader.eventsInfo.Size() && !info.ModTime().Equal(reader.eventsInfo.ModTime())) {
-			start = 0
-		}
+	prefixMatches, err := committedEventTailMatches(
+		file, info.Size(), reader.eventsOffset, reader.eventsTailOffset, reader.eventsTail,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("verify events.jsonl cursor: %w", err)
+	}
+	if !prefixMatches {
+		start = 0
 	}
 	if _, err := file.Seek(start, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("seek events.jsonl: %w", err)
 	}
-	payload, err := io.ReadAll(file)
+	payload, err := io.ReadAll(io.LimitReader(file, maxEventPollBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read events.jsonl: %w", err)
 	}
-	finalInfo, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("restat events.jsonl: %w", err)
+	batch := payload
+	if len(batch) > maxEventPollBytes {
+		batch = batch[:maxEventPollBytes]
 	}
 
-	lastNewline := bytes.LastIndexByte(payload, '\n')
+	lastNewline := bytes.LastIndexByte(batch, '\n')
 	if lastNewline < 0 {
-		reader.eventsInfo = finalInfo
-		if start == 0 {
-			reader.eventsOffset = 0
+		if len(payload) > maxEventPollBytes {
+			return nil, fmt.Errorf("events.jsonl line exceeds %d bytes at offset %d", maxEventPollBytes, start)
 		}
 		return nil, nil
 	}
 
-	complete := payload[:lastNewline+1]
+	complete := batch[:lastNewline+1]
 	lines := bytes.Split(complete, []byte{'\n'})
 	events := make([]Event, 0, len(lines)-1)
 	for lineNumber, line := range lines {
@@ -200,7 +228,42 @@ func (reader *Reader) PollEvents() ([]Event, error) {
 		events = append(events, event)
 	}
 
-	reader.eventsInfo = finalInfo
-	reader.eventsOffset = start + int64(lastNewline+1)
+	nextOffset := start + int64(lastNewline+1)
+	tailOffset, tail, err := readCommittedEventTail(file, nextOffset)
+	if err != nil {
+		return nil, fmt.Errorf("read events.jsonl cursor fingerprint: %w", err)
+	}
+	reader.eventsOffset = nextOffset
+	reader.eventsTailOffset = tailOffset
+	reader.eventsTail = tail
 	return events, nil
+}
+
+func committedEventTailMatches(file *os.File, size, offset, tailOffset int64, tail []byte) (bool, error) {
+	if offset == 0 {
+		return true, nil
+	}
+	if size < offset || len(tail) == 0 {
+		return false, nil
+	}
+	current := make([]byte, len(tail))
+	if _, err := file.ReadAt(current, tailOffset); err != nil {
+		return false, err
+	}
+	return bytes.Equal(current, tail), nil
+}
+
+func readCommittedEventTail(file *os.File, offset int64) (int64, []byte, error) {
+	tailOffset := offset - eventTailFingerprintSize
+	if tailOffset < 0 {
+		tailOffset = 0
+	}
+	tail := make([]byte, offset-tailOffset)
+	if len(tail) == 0 {
+		return tailOffset, nil, nil
+	}
+	if _, err := file.ReadAt(tail, tailOffset); err != nil {
+		return 0, nil, err
+	}
+	return tailOffset, tail, nil
 }

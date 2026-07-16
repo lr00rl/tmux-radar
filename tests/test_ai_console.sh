@@ -156,7 +156,8 @@ test_build_watch_config_contains_all_settings_and_provenance() {
     run_ai _build-watch-config %39 '允许到测试全绿' > "$config_file"
 
   assert_json "$config_file" '
-    (keys == ["goal", "pane", "values"]) and
+    (keys == ["goal", "pane", "schema_version", "values"]) and
+    (.schema_version == 1) and
     (.goal == "允许到测试全绿") and
     (.pane == "%39") and
     (.values | keys == [

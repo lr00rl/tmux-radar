@@ -261,6 +261,15 @@ func TestDecodeConfigRejectsUnsupportedSchema(t *testing.T) {
 	}
 }
 
+func TestDecodeConfigRejectsIncompleteCanonicalV1(t *testing.T) {
+	t.Parallel()
+
+	_, err := DecodeConfig([]byte(`{"schema_version":1,"pane":"%1","goal":"must not invent defaults"}`))
+	if err == nil {
+		t.Fatal("incomplete schema-v1 config was filled with invented defaults")
+	}
+}
+
 func TestDecodeConfigStrictRejectsUnknownLaunchFields(t *testing.T) {
 	t.Parallel()
 
@@ -383,6 +392,43 @@ func TestBackendErrorUsesCanonicalNestedEvidenceAndNormalizesLegacy(t *testing.T
 	}
 	if legacy.Error == nil || legacy.Error.Class != "transient" || !legacy.Error.Retryable || legacy.Error.Call != 2 {
 		t.Fatalf("legacy error was not normalized: %#v", legacy)
+	}
+}
+
+func TestBackendErrorCanonicalV1RequiresCompleteNestedEvidence(t *testing.T) {
+	t.Parallel()
+
+	valid := Event{
+		SchemaVersion: 1,
+		Kind:          "backend_error",
+		Error: &BackendError{
+			Class: "config-permanent", Code: "backend-preflight", Retryable: false,
+			Summary: "backend unavailable", Call: 0, Timestamp: "2026-07-15T00:00:00Z",
+		},
+	}
+	payload, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(payload, []byte(`"call":0`)) {
+		t.Fatalf("canonical call zero disappeared: %s", payload)
+	}
+	var decoded Event
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("valid canonical error rejected: %v", err)
+	}
+
+	invalid := []string{
+		`{"schema_version":1,"kind":"backend_error"}`,
+		`{"schema_version":1,"kind":"backend_error","error":null}`,
+		`{"schema_version":1,"kind":"backend_error","error":{"class":"transient","code":"backend-failed","retryable":true,"summary":"temporary","timestamp":"2026-07-15T00:00:00Z"}}`,
+		`{"schema_version":1,"kind":"backend_error","error_class":"transient","error":{"class":"transient","code":"backend-failed","retryable":true,"summary":"temporary","call":1,"timestamp":"2026-07-15T00:00:00Z"}}`,
+		`{"schema_version":2,"kind":"backend_error","error":{"class":"transient","code":"backend-failed","retryable":true,"summary":"temporary","call":1,"timestamp":"2026-07-15T00:00:00Z"}}`,
+	}
+	for _, input := range invalid {
+		if err := json.Unmarshal([]byte(input), &decoded); err == nil {
+			t.Fatalf("invalid canonical error was accepted: %s", input)
+		}
 	}
 }
 

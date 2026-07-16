@@ -197,7 +197,7 @@ test_old_explicit_backend_reports_newer_candidate_without_exec() {
 }
 
 test_custom_command_bypasses_codex_preflight() {
-  local result="$TMP/custom-doctor.json"
+  local result="$TMP/custom-doctor.json" config="$TMP/custom-config.json"
   TEST_CASE_NAME=custom TEST_CODEX_PATH="$TMP/old-bin/codex" \
     TMUX_RADAR_AI_CMD='printf custom' run_ai doctor-json > "$result"
   assert_json "$result" '
@@ -209,6 +209,9 @@ test_custom_command_bypasses_codex_preflight() {
   '
   assert_eq 0 "$(wc -l < "$TMP/custom.version.log" | tr -d ' ')" \
     'custom command bypasses Codex version checks'
+  TEST_CASE_NAME=custom TMUX_RADAR_AI_CMD='printf custom' \
+    run_ai _build-watch-config %1 'custom command goal' > "$config"
+  assert_json "$config" '.values.command == {value:"printf custom",source:"runtime"}'
 }
 
 test_custom_command_precedes_profile_with_warning() {
@@ -281,6 +284,14 @@ test_incompatible_setup_starts_no_model_process() {
   [ -n "$run_dir" ] || _fail_assert 'incompatible setup did not preserve a diagnostic run'
   assert_json "$run_dir/state.json" '.phase == "PAUSED_ERROR" and .retry == 0 and .calls == 0'
   assert_json "$run_dir/final.json" '.outcome == "paused_error" and .decision_count == 0'
+  assert_json "$run_dir/config.json" '
+    .schema_version == 1 and .goal == "do not launch an incompatible backend" and
+    .values.goal == {value:"do not launch an incompatible backend",source:"custom"} and
+    .values.approval_policy == {value:"safe-auto",source:"custom"} and
+    .values.autonomy == {value:"auto-safe",source:"custom"} and
+    .values.poll == {value:30,source:"custom"} and
+    .values.max_decisions == {value:40,source:"default"}
+  '
   assert_eq 0 "$(wc -l < "$TMP/setup-permanent.exec.log" | tr -d ' ')" \
     'incompatible setup launches no model process'
 }

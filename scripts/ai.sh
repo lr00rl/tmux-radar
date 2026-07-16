@@ -348,13 +348,13 @@ EOF
 }
 
 cmd_build_watch_config() {
-  local pane="$1" raw_goal="${2-}" goal goal_source
+  local pane="$1" raw_goal="${2-}" goal goal_source env_command
   need_jq
   if [ -n "$raw_goal" ]; then goal="$raw_goal"; goal_source=custom
   else goal='推进当前任务直到完成'; goal_source=default
   fi
   CONFIG_JSON="$(jq -cn --arg pane "$pane" --arg goal "$goal" --arg goal_source "$goal_source" '
-    {pane:$pane,goal:$goal,values:{
+    {schema_version:1,pane:$pane,goal:$goal,values:{
       goal:{value:$goal,source:$goal_source},
       autonomy:{value:"auto-safe",source:"default"},
       approval_policy:{value:"safe-auto",source:"default"},
@@ -383,6 +383,8 @@ cmd_build_watch_config() {
   _config_apply_tmux
   _config_apply_overrides "${TMUX_RADAR_SETUP_OVERRIDES:-}" custom
   _config_apply_overrides "${TMUX_RADAR_RUNTIME_OVERRIDES:-}" runtime
+  env_command="${TMUX_RADAR_AI_CMD:-${TMUX_SWITCHER_AI_CMD:-}}"
+  [ -z "$env_command" ] || _config_set command "$env_command" runtime 0
   CONFIG_JSON="$(printf '%s' "$CONFIG_JSON" | jq -c '
     if .values.profile.value != "" then
       (if .values.model.source == "default" then .values.model={value:"",source:"profile-managed"} else . end) |
@@ -2359,6 +2361,7 @@ cmd_watch_loop() {
   local pane goal policy poll auto maxcalls config supplied_config="${6:-}" batch wait_rc coalesce_rc event_kind
   local rc valid failure evidence_fingerprint delivery_fingerprint armed_fingerprint current_fingerprint guard_rc
   local retry_rc retry_cancelled verify_rc classification error_class retryable summary detail stderr_path failure_kind repair_reason
+  local requested_policy requested_poll requested_auto always_allow_source
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane" >&2; return 1; }
   if [ -n "$supplied_config" ]; then
     config="$supplied_config"
@@ -2376,23 +2379,37 @@ cmd_watch_loop() {
     WATCH_STABLE_THRESHOLD="$TMUX_RADAR_RUN_STABLE_SCREEN_THRESHOLD"
   else
     goal="${2:-}"
-    policy="${3:-}"
-    [ -z "$policy" ] && [ "$(opt @radar-ai-watch-always-allow off)" = on ] && policy="always-allow"
-    poll="${4:-}"; case "$poll" in ''|*[!0-9.]*) poll="$(opt @radar-ai-poll 5)" ;; esac
-    auto="${5:-}"; [ -n "$auto" ] || auto="$(opt @radar-ai-watch-autonomy auto-safe)"
-    maxcalls="$(opt @radar-ai-max-calls 40)"; case "$maxcalls" in ''|*[!0-9]*) maxcalls=40 ;; esac
-    WATCH_HOOKS_FIRST="$(opt @radar-ai-hooks-first on)"
-    case "$WATCH_HOOKS_FIRST" in on|off) : ;; *) WATCH_HOOKS_FIRST=on ;; esac
-    WATCH_STABLE_THRESHOLD="$(opt @radar-ai-stable-screen-threshold 1)"
-    case "$WATCH_STABLE_THRESHOLD" in ''|*[!0-9]*) WATCH_STABLE_THRESHOLD=1 ;; esac
-    [ "$WATCH_STABLE_THRESHOLD" -ge 1 ] 2>/dev/null || WATCH_STABLE_THRESHOLD=1
-    config="$(jq -cn --arg goal "$goal" --arg policy "${policy:-safe-auto}" --arg autonomy "$auto" \
-      --argjson poll "$(awk -v p="$poll" 'BEGIN { printf "%.6f", p+0 }')" --argjson max_calls "$maxcalls" '
-      {goal:$goal,policy:$policy,autonomy:$autonomy,poll:$poll,max_calls:$max_calls,
-       source:{kind:"watch_cli",provenance:"legacy-compatible"},
-       provenance:{goal:"argument",policy:"argument_or_tmux",autonomy:"argument_or_tmux",
-                   poll:"argument_or_tmux",max_calls:"tmux_or_default"}}
-    ')"
+    requested_policy="${3:-}"
+    requested_poll="${4:-}"
+    requested_auto="${5:-}"
+    config="$(cmd_build_watch_config "$pane" "$goal")"
+    CONFIG_JSON="$config"
+    if [ -n "$requested_policy" ]; then
+      _config_set approval_policy "$requested_policy" custom 0 || true
+      if [ "$requested_policy" = always-allow ]; then
+        _config_set always_allow on custom 0 || true
+      else
+        _config_set always_allow off custom 0 || true
+      fi
+    elif [ "$(printf '%s' "$CONFIG_JSON" | jq -r '.values.always_allow.value')" = on ]; then
+      always_allow_source="$(printf '%s' "$CONFIG_JSON" | jq -r '.values.always_allow.source')"
+      _config_set approval_policy always-allow "$always_allow_source" 0 || true
+    fi
+    [ -z "$requested_poll" ] || _config_set poll "$requested_poll" custom 0 || true
+    [ -z "$requested_auto" ] || _config_set autonomy "$requested_auto" custom 0 || true
+    CONFIG_JSON="$(printf '%s' "$CONFIG_JSON" | jq -c '.goal=.values.goal.value')"
+    config="$CONFIG_JSON"
+    _apply_watch_config "$config"
+    goal="$TMUX_RADAR_RUN_GOAL"
+    policy="$TMUX_RADAR_RUN_APPROVAL_POLICY"
+    [ "$TMUX_RADAR_RUN_ALWAYS_ALLOW" = on ] && policy=always-allow
+    poll="$TMUX_RADAR_RUN_POLL"
+    auto="$TMUX_RADAR_RUN_AUTONOMY"
+    maxcalls="$TMUX_RADAR_RUN_MAX_DECISIONS"
+    WATCH_RETRY_LIMIT="$TMUX_RADAR_RUN_RETRY_LIMIT"
+    WATCH_RETRY_BACKOFF="$TMUX_RADAR_RUN_RETRY_BACKOFF"
+    WATCH_HOOKS_FIRST="$TMUX_RADAR_RUN_HOOKS_FIRST"
+    WATCH_STABLE_THRESHOLD="$TMUX_RADAR_RUN_STABLE_SCREEN_THRESHOLD"
   fi
 
   _freeze_backend 0

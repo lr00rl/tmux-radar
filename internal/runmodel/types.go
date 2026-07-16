@@ -1,6 +1,7 @@
 package runmodel
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 )
@@ -158,6 +159,10 @@ type Event struct {
 // the canonical nested representation.
 func (event *Event) UnmarshalJSON(payload []byte) error {
 	type eventAlias Event
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return err
+	}
 	var wire struct {
 		eventAlias
 		LegacyClass          string `json:"error_class"`
@@ -173,7 +178,10 @@ func (event *Event) UnmarshalJSON(payload []byte) error {
 		return err
 	}
 	*event = Event(wire.eventAlias)
-	if event.Error == nil && (wire.LegacyClass != "" || event.Kind == "backend_error") {
+	if err := ValidateSchemaVersion(event.SchemaVersion); err != nil {
+		return err
+	}
+	if event.SchemaVersion == LegacySchemaVersion && event.Error == nil && wire.LegacyClass != "" {
 		retryable := false
 		if wire.LegacyRetryable != nil {
 			retryable = *wire.LegacyRetryable
@@ -189,6 +197,53 @@ func (event *Event) UnmarshalJSON(payload []byte) error {
 			StderrPath:     wire.LegacyStderrPath,
 			Call:           event.Call,
 		}
+	}
+	if event.SchemaVersion == CurrentSchemaVersion && event.Kind == "backend_error" {
+		if err := validateCanonicalBackendError(raw, event.Error); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateCanonicalBackendError(raw map[string]json.RawMessage, backendError *BackendError) error {
+	legacyFields := []string{
+		"error_class", "retryable", "summary", "detail", "backend_mode",
+		"backend_path", "backend_version", "stderr_path",
+	}
+	for _, field := range legacyFields {
+		if _, exists := raw[field]; exists {
+			return fmt.Errorf("backend_error: canonical schema v1 cannot include legacy field %q", field)
+		}
+	}
+
+	errorPayload, exists := raw["error"]
+	if !exists || bytes.Equal(bytes.TrimSpace(errorPayload), []byte("null")) || backendError == nil {
+		return fmt.Errorf("backend_error.error: canonical nested evidence is required")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(errorPayload, &fields); err != nil {
+		return fmt.Errorf("backend_error.error: %w", err)
+	}
+	for _, field := range []string{"class", "code", "retryable", "summary", "call", "timestamp"} {
+		if _, exists := fields[field]; !exists {
+			return fmt.Errorf("backend_error.error.%s: required field is missing", field)
+		}
+	}
+	if backendError.Class == "" {
+		return fmt.Errorf("backend_error.error.class: must not be empty")
+	}
+	if backendError.Code == "" {
+		return fmt.Errorf("backend_error.error.code: must not be empty")
+	}
+	if backendError.Summary == "" {
+		return fmt.Errorf("backend_error.error.summary: must not be empty")
+	}
+	if backendError.Call < 0 {
+		return fmt.Errorf("backend_error.error.call: must be non-negative")
+	}
+	if backendError.Timestamp == "" {
+		return fmt.Errorf("backend_error.error.timestamp: must not be empty")
 	}
 	return nil
 }
@@ -274,7 +329,7 @@ type BackendError struct {
 	BackendVersion string `json:"backend_version,omitempty"`
 	StderrPath     string `json:"stderr_path,omitempty"`
 	EvidencePath   string `json:"evidence_path,omitempty"`
-	Call           int    `json:"call,omitempty"`
+	Call           int    `json:"call"`
 	Timestamp      string `json:"timestamp,omitempty"`
 }
 

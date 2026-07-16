@@ -91,14 +91,23 @@ func DecodeConfig(payload []byte) (Config, error) {
 		return Config{}, err
 	}
 
+	if version == CurrentSchemaVersion {
+		var config Config
+		if err := json.Unmarshal(payload, &config); err != nil {
+			return Config{}, fmt.Errorf("config JSON: %w", err)
+		}
+		if err := config.Validate(); err != nil {
+			return Config{}, fmt.Errorf("config schema v%d: %w", version, err)
+		}
+		return config, nil
+	}
+
 	config := DefaultConfig(probe.Pane, probe.Goal)
 	if err := json.Unmarshal(payload, &config); err != nil {
 		return Config{}, fmt.Errorf("config JSON: %w", err)
 	}
-	config.SchemaVersion = version
-	if version == LegacySchemaVersion {
-		applyLegacyFlatConfig(&config, probe.Policy, probe.Autonomy, probe.Poll, probe.MaxCalls, probe.Provenance)
-	}
+	config.SchemaVersion = LegacySchemaVersion
+	applyLegacyFlatConfig(&config, probe.Policy, probe.Autonomy, probe.Poll, probe.MaxCalls, probe.Provenance)
 	if config.Goal != config.Values.Goal.Value && config.Values.Goal.Source == SourceDefault {
 		config.Values.Goal = Value[string]{Value: config.Goal, Source: SourceDefault}
 	}

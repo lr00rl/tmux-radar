@@ -417,6 +417,36 @@ func TestBackendErrorCanonicalV1RequiresCompleteNestedEvidence(t *testing.T) {
 	if err := json.Unmarshal(payload, &decoded); err != nil {
 		t.Fatalf("valid canonical error rejected: %v", err)
 	}
+	var canonical map[string]any
+	if err := json.Unmarshal(payload, &canonical); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{
+		"class", "code", "retryable", "summary", "detail", "backend_mode",
+		"backend_path", "backend_version", "stderr_path", "call", "timestamp",
+	} {
+		fixture, err := json.Marshal(canonical)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var missing map[string]any
+		if err := json.Unmarshal(fixture, &missing); err != nil {
+			t.Fatal(err)
+		}
+		delete(missing["error"].(map[string]any), field)
+		fixture, err = json.Marshal(missing)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(fixture, &decoded); err == nil {
+			t.Fatalf("canonical error missing %q was accepted: %s", field, fixture)
+		}
+	}
+	contradictoryCall := bytes.Replace(payload, []byte(`"kind":"backend_error"`),
+		[]byte(`"kind":"backend_error","call":99`), 1)
+	if err := json.Unmarshal(contradictoryCall, &decoded); err == nil {
+		t.Fatalf("flat and nested call contradiction was accepted: %s", contradictoryCall)
+	}
 
 	invalid := []string{
 		`{"schema_version":1,"kind":"backend_error"}`,

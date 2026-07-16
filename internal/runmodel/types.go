@@ -209,7 +209,7 @@ func (event *Event) UnmarshalJSON(payload []byte) error {
 func validateCanonicalBackendError(raw map[string]json.RawMessage, backendError *BackendError) error {
 	legacyFields := []string{
 		"error_class", "retryable", "summary", "detail", "backend_mode",
-		"backend_path", "backend_version", "stderr_path",
+		"backend_path", "backend_version", "stderr_path", "call",
 	}
 	for _, field := range legacyFields {
 		if _, exists := raw[field]; exists {
@@ -225,7 +225,10 @@ func validateCanonicalBackendError(raw map[string]json.RawMessage, backendError 
 	if err := json.Unmarshal(errorPayload, &fields); err != nil {
 		return fmt.Errorf("backend_error.error: %w", err)
 	}
-	for _, field := range []string{"class", "code", "retryable", "summary", "call", "timestamp"} {
+	for _, field := range []string{
+		"class", "code", "retryable", "summary", "detail", "backend_mode",
+		"backend_path", "backend_version", "stderr_path", "call", "timestamp",
+	} {
 		if _, exists := fields[field]; !exists {
 			return fmt.Errorf("backend_error.error.%s: required field is missing", field)
 		}
@@ -323,14 +326,14 @@ type BackendError struct {
 	Code           string `json:"code"`
 	Retryable      bool   `json:"retryable"`
 	Summary        string `json:"summary"`
-	Detail         string `json:"detail,omitempty"`
-	BackendMode    string `json:"backend_mode,omitempty"`
-	BackendPath    string `json:"backend_path,omitempty"`
-	BackendVersion string `json:"backend_version,omitempty"`
-	StderrPath     string `json:"stderr_path,omitempty"`
+	Detail         string `json:"detail"`
+	BackendMode    string `json:"backend_mode"`
+	BackendPath    string `json:"backend_path"`
+	BackendVersion string `json:"backend_version"`
+	StderrPath     string `json:"stderr_path"`
 	EvidencePath   string `json:"evidence_path,omitempty"`
 	Call           int    `json:"call"`
-	Timestamp      string `json:"timestamp,omitempty"`
+	Timestamp      string `json:"timestamp"`
 }
 
 type OwnerKind string

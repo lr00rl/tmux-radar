@@ -239,8 +239,7 @@ test_menu_routes_w_to_quick_setup() {
   local action
   run_ai menu
   action="$(menu_action_for_key w)"
-  assert_contains "$action" 'watch-setup' 'w uses shared setup flow'
-  assert_contains "$action" 'display-popup -E -w 90% -h 85%' 'w reserves a full supervision setup console'
+  assert_contains "$action" 'native-launcher.sh' 'w uses the native surface launcher'
   assert_contains "$action" "'#{pane_id}' quick" 'w selects quick mode'
   case "$action" in
     *always-allow*) _fail_assert 'w must not preset always-allow' 'actual' "$action" ;;
@@ -251,32 +250,27 @@ test_menu_routes_W_to_quick_setup_with_always_allow() {
   local action
   run_ai menu
   action="$(menu_action_for_key W)"
-  assert_contains "$action" 'watch-setup' 'W uses shared setup flow'
-  assert_contains "$action" 'display-popup -E -w 90% -h 85%' 'W reserves a full supervision setup console'
-  assert_contains "$action" "'#{pane_id}' quick always-allow" \
-    'W selects quick mode with always-allow preset'
+  assert_contains "$action" 'native-launcher.sh' 'W uses the native surface launcher'
+  assert_contains "$action" "'#{pane_id}' always-allow" 'W selects the always-allow preset'
 }
 
 test_menu_routes_v_to_advanced_setup() {
   local action
   run_ai menu
   action="$(menu_action_for_key v)"
-  assert_contains "$action" 'watch-setup' 'v uses shared setup flow'
-  assert_contains "$action" 'display-popup -E -w 90% -h 85%' 'v reserves a full advanced setup console'
+  assert_contains "$action" 'native-launcher.sh' 'v uses the native surface launcher'
   assert_contains "$action" "'#{pane_id}' advanced" 'v selects advanced mode'
 }
 
 test_native_tpm_menu_matches_goal_first_setup_routes() {
   local entrypoint
   entrypoint="$(cat "$ROOT/tmux-radar.tmux")"
-  assert_contains "$entrypoint" 'MONITOR_POP="display-popup -E -w 90% -h 85%"' \
-    'native prefix+A menu reserves the supervision popup'
-  assert_contains "$entrypoint" "watch-setup '#{pane_id}' quick" \
-    'native w binding uses quick goal-first setup'
-  assert_contains "$entrypoint" "watch-setup '#{pane_id}' quick always-allow" \
-    'native W binding uses quick goal-first setup with always-allow'
-  assert_contains "$entrypoint" "watch-setup '#{pane_id}' advanced" \
-    'native v binding uses advanced goal-first setup'
+  assert_contains "$entrypoint" "native-launcher.sh '#{pane_id}' quick" \
+    'native w binding uses quick setup'
+  assert_contains "$entrypoint" "native-launcher.sh '#{pane_id}' always-allow" \
+    'native W binding uses always-allow setup'
+  assert_contains "$entrypoint" "native-launcher.sh '#{pane_id}' advanced" \
+    'native v binding uses advanced setup'
   case "$entrypoint" in
     *'run-shell \"$SCRIPTS/ai.sh watch'*) _fail_assert 'native menu bypasses goal entry with direct watch' ;;
   esac

@@ -40,14 +40,13 @@ tmux bind-key "$KEY" display-popup -E -w "$POPUP_W" -h "$POPUP_H" "$SCRIPTS/swit
 if [ "$(opt @radar-ai off)" = "on" ]; then
   AI_KEY="$(opt @radar-ai-key A)"
   POP="display-popup -E -w 80% -h 70%"
-  MONITOR_POP="display-popup -E -w 90% -h 85%"
   tmux bind-key "$AI_KEY" display-menu -T "#[align=centre] tmux AI 主管 " -x C -y C \
     "指挥 tmux（自然语言）"            a "$POP \"TMUX_RADAR_AI_PAUSE=1 $SCRIPTS/ai.sh ask\"" \
     "让当前 pane 继续 / 决定一次"       c "$POP \"TMUX_RADAR_AI_PAUSE=1 $SCRIPTS/ai.sh decide '#{pane_id}'\"" \
     "" \
-    "常驻监控当前 pane 直到完成"        w "$MONITOR_POP \"$SCRIPTS/ai.sh watch-setup '#{pane_id}' quick\"" \
-    "常驻监控 + always-allow（更省心）"  W "$MONITOR_POP \"$SCRIPTS/ai.sh watch-setup '#{pane_id}' quick always-allow\"" \
-    "自定义监控（目标 / 间隔 / 策略）…"  v "$MONITOR_POP \"$SCRIPTS/ai.sh watch-setup '#{pane_id}' advanced\"" \
+    "常驻监控当前 pane 直到完成"        w "run-shell \"$SCRIPTS/native-launcher.sh '#{pane_id}' quick\"" \
+    "常驻监控 + always-allow（更省心）"  W "run-shell \"$SCRIPTS/native-launcher.sh '#{pane_id}' always-allow\"" \
+    "自定义监控（目标 / 间隔 / 策略）…"  v "run-shell \"$SCRIPTS/native-launcher.sh '#{pane_id}' advanced\"" \
     "" \
     "状态 / 最近决策"                  s "$POP \"TMUX_RADAR_AI_PAUSE=1 $SCRIPTS/ai.sh status\"" \
     "停止全部监控"                     S "run-shell \"$SCRIPTS/ai.sh stop all\"" \

@@ -66,6 +66,7 @@ PROMPT_DIR="$SCRIPT_DIR/prompts"
 AI_RUNTIME_LIB="$SCRIPT_DIR/lib/ai-runtime.sh"
 NOTIFY="${TMUX_RADAR_NOTIFY_CMD:-$SCRIPT_DIR/needinput-notify.sh}"
 AI_MONITOR="$SCRIPT_DIR/ai-monitor.sh"
+NATIVE_LAUNCHER="$SCRIPT_DIR/native-launcher.sh"
 [ -r "$AI_RUNTIME_LIB" ] || { echo "tmux-radar AI needs $AI_RUNTIME_LIB" >&2; exit 1; }
 # shellcheck source=scripts/lib/ai-runtime.sh
 . "$AI_RUNTIME_LIB"
@@ -4014,16 +4015,15 @@ cmd_cleanup() {
 # the plugin binding.
 # ---------------------------------------------------------------------------
 cmd_menu() {
-  local pop monitor_pop
+  local pop
   pop="display-popup -E -w 80% -h 70%"
-  monitor_pop="display-popup -E -w 90% -h 85%"
   tmux display-menu -T "#[align=centre] tmux AI 主管 " -x C -y C \
     "指挥 tmux（自然语言）"             a "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF ask\"" \
     "让当前 pane 继续 / 决定一次"        c "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF decide '#{pane_id}'\"" \
     "" \
-    "常驻监控当前 pane 直到完成"         w "$monitor_pop \"$SELF watch-setup '#{pane_id}' quick\"" \
-    "常驻监控 + always-allow（更省心）"  W "$monitor_pop \"$SELF watch-setup '#{pane_id}' quick always-allow\"" \
-    "自定义监控（目标 / 间隔 / 策略）…"   v "$monitor_pop \"$SELF watch-setup '#{pane_id}' advanced\"" \
+    "常驻监控当前 pane 直到完成"         w "run-shell \"$NATIVE_LAUNCHER '#{pane_id}' quick\"" \
+    "常驻监控 + always-allow（更省心）"  W "run-shell \"$NATIVE_LAUNCHER '#{pane_id}' always-allow\"" \
+    "自定义监控（目标 / 间隔 / 策略）…"   v "run-shell \"$NATIVE_LAUNCHER '#{pane_id}' advanced\"" \
     "" \
     "状态 / 最近决策"                   s "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF status\"" \
     "停止全部监控"                      S "run-shell \"$SELF stop all\"" \

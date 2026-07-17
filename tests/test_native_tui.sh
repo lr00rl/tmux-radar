@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,6 +30,60 @@ exit 9
 SH
 chmod +x "$TMP/bin/ai.sh"
 
+cat > "$TMP/bin/native-stub" <<'SH'
+#!/usr/bin/env bash
+set -eu
+if [ "${1:-}" = version ]; then
+  printf '%s\n' "tmux-radar dev (protocol ${TEST_NATIVE_PROTOCOL:-1}, schema 1)"
+  exit 0
+fi
+printf '%s\n' "$*" >> "$TEST_NATIVE_CALLS"
+SH
+chmod +x "$TMP/bin/native-stub"
+
+cat > "$TMP/bin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -eu
+command="${1:-}"
+shift || true
+case "$command" in
+  display-message)
+    case "$*" in
+      *pane_width*) printf '%s\n' "${TEST_TARGET_WIDTH:-284}" ;;
+      *pane_height*) printf '%s\n' "${TEST_TARGET_HEIGHT:-40}" ;;
+      *pane_id*) printf '%s\n' '%42' ;;
+      *) printf 'display-message %s\n' "$*" >> "$TEST_TMUX_CALLS" ;;
+    esac
+    ;;
+  show-option)
+    printf '%s\n' "${TEST_MONITOR_WIDTH:-84}"
+    ;;
+  split-window)
+    printf 'split-window %s\n' "$*" >> "$TEST_TMUX_CALLS"
+    printf '%s\n' '%90'
+    ;;
+  display-popup|select-pane|kill-pane)
+    printf '%s %s\n' "$command" "$*" >> "$TEST_TMUX_CALLS"
+    ;;
+  *)
+    printf '%s %s\n' "$command" "$*" >> "$TEST_TMUX_CALLS"
+    ;;
+esac
+SH
+chmod +x "$TMP/bin/tmux"
+
+run_launcher() {
+  local width="$1" height="$2" entry="$3"
+  : > "$TMP/tmux.calls"
+  : > "$TMP/native.calls"
+  PATH="$TMP/bin:$PATH" \
+    TEST_TARGET_WIDTH="$width" TEST_TARGET_HEIGHT="$height" TEST_MONITOR_WIDTH=84 \
+    TEST_TMUX_CALLS="$TMP/tmux.calls" TEST_NATIVE_CALLS="$TMP/native.calls" \
+    TMUX_RADAR_BIN="$TMP/bin/native-stub" TMUX_RADAR_ENGINE_SCRIPT="$TMP/bin/ai.sh" \
+    TMUX_RADAR_STATE_DIR="$TMP/state" \
+    bash "$ROOT/scripts/native-launcher.sh" %42 "$entry"
+}
+
 run_test() {
   local name="$1"
   shift
@@ -42,7 +97,7 @@ run_test() {
 
 test_version_contract() {
   local output
-  output="$($TMP/bin/tmux-radar version)"
+  output="$("$TMP/bin/tmux-radar" version)"
   assert_contains "$output" 'protocol 1' 'version exposes protocol'
   assert_contains "$output" 'schema 1' 'version exposes schema'
 }
@@ -71,10 +126,86 @@ test_missing_attach_is_permanent() {
   assert_eq 3 "$rc" 'missing run exits with permanent status'
 }
 
+test_launcher_uses_popup_at_width_120() {
+  local calls
+  run_launcher 120 30 quick
+  calls="$(cat "$TMP/tmux.calls")"
+  assert_contains "$calls" 'display-popup' '120-column target uses popup'
+  case "$calls" in *split-window*) _fail_assert 'popup path must not split target' 'calls' "$calls" ;; esac
+  assert_contains "$calls" "--entry 'quick'" 'popup receives quick preset'
+}
+
+test_launcher_uses_minimum_split_at_width_121() {
+  local calls
+  run_launcher 121 30 always-allow
+  calls="$(cat "$TMP/tmux.calls")"
+  assert_contains "$calls" 'split-window' '121-column target uses split'
+  assert_contains "$calls" '-l 56' 'minimum split is 56 columns'
+  assert_contains "$calls" "--entry 'always-allow'" 'W preset reaches native setup'
+  assert_contains "$calls" "--monitor-pane \"\$TMUX_PANE\"" 'split owner binds to the created pane'
+  case "$calls" in *display-popup*) _fail_assert 'split path must not open popup' 'calls' "$calls" ;; esac
+}
+
+test_launcher_clamps_wide_monitor_without_using_client_width() {
+  local calls
+  run_launcher 284 54 advanced
+  calls="$(cat "$TMP/tmux.calls")"
+  assert_contains "$calls" '-l 84' 'wide target honors configured monitor width'
+  assert_contains "$calls" "--entry 'advanced'" 'advanced preset reaches native setup'
+}
+
+test_launcher_rejects_duplicate_before_surface_creation() {
+  local calls pointer="$TMP/state/ai-watch/_42.watch" run_dir="$TMP/state/ai-runs/existing"
+  mkdir -p "$(dirname "$pointer")" "$run_dir"
+  printf '%s\n' '{"schema_version":1,"kind":"split","pane":"%77","pid":1,"token":"00000000000000000000000000000000","heartbeat_path":"/tmp/existing"}' > "$run_dir/owner.json"
+  printf 'run_id=existing\nrun_dir=%s\npid=%s\nowner_file=%s\n' "$run_dir" "$$" "$run_dir/owner.json" > "$pointer"
+  run_launcher 284 54 quick
+  calls="$(cat "$TMP/tmux.calls")"
+  assert_contains "$calls" 'select-pane -t %77' 'duplicate focuses existing split owner'
+  case "$calls" in *split-window*|*display-popup*) _fail_assert 'duplicate must not create a surface' 'calls' "$calls" ;; esac
+  rm -f "$pointer"
+  rm -rf "$run_dir"
+}
+
+test_launcher_legacy_rollback_is_explicit() {
+  local calls
+  : > "$TMP/tmux.calls"
+  PATH="$TMP/bin:$PATH" TEST_TARGET_WIDTH=284 TEST_TARGET_HEIGHT=54 \
+    TEST_TMUX_CALLS="$TMP/tmux.calls" TEST_NATIVE_CALLS="$TMP/native.calls" \
+    TMUX_RADAR_LEGACY_UI=1 TMUX_RADAR_ENGINE_SCRIPT="$TMP/bin/ai.sh" TMUX_RADAR_STATE_DIR="$TMP/state" \
+    bash "$ROOT/scripts/native-launcher.sh" %42 advanced
+  calls="$(cat "$TMP/tmux.calls")"
+  assert_contains "$calls" 'display-popup' 'legacy rollback opens legacy popup'
+  assert_contains "$calls" 'watch-setup' 'legacy rollback invokes watch-setup'
+  assert_contains "$calls" 'advanced' 'legacy rollback preserves preset'
+}
+
+test_launcher_protocol_mismatch_creates_no_surface() {
+  local rc calls
+  : > "$TMP/tmux.calls"
+  set +e
+  PATH="$TMP/bin:$PATH" TEST_NATIVE_PROTOCOL=9 TEST_TARGET_WIDTH=284 TEST_TARGET_HEIGHT=54 \
+    TEST_TMUX_CALLS="$TMP/tmux.calls" TEST_NATIVE_CALLS="$TMP/native.calls" \
+    TMUX_RADAR_BIN="$TMP/bin/native-stub" TMUX_RADAR_ENGINE_SCRIPT="$TMP/bin/ai.sh" \
+    TMUX_RADAR_STATE_DIR="$TMP/state" \
+    bash "$ROOT/scripts/native-launcher.sh" %42 quick >/dev/null 2>&1
+  rc=$?
+  set -e
+  calls="$(cat "$TMP/tmux.calls")"
+  [ "$rc" -ne 0 ] || _fail_assert 'protocol mismatch must fail' 'rc' "$rc"
+  case "$calls" in *split-window*|*display-popup*) _fail_assert 'protocol mismatch must not create a surface' 'calls' "$calls" ;; esac
+}
+
 run_test 'native CLI version contract' test_version_contract
 run_test 'native doctor JSON contract' test_doctor_json_contract
 run_test 'native invalid argument exit contract' test_invalid_arguments_exit_two
 run_test 'native missing attach exit contract' test_missing_attach_is_permanent
+run_test 'launcher uses popup at target width 120' test_launcher_uses_popup_at_width_120
+run_test 'launcher uses minimum split at target width 121' test_launcher_uses_minimum_split_at_width_121
+run_test 'launcher clamps wide monitor from target geometry' test_launcher_clamps_wide_monitor_without_using_client_width
+run_test 'launcher rejects duplicate before surface creation' test_launcher_rejects_duplicate_before_surface_creation
+run_test 'launcher explicit legacy rollback' test_launcher_legacy_rollback_is_explicit
+run_test 'launcher protocol mismatch creates no surface' test_launcher_protocol_mismatch_creates_no_surface
 
 if [ "$FAILURES" -ne 0 ]; then
   printf '%d native TUI test(s) failed\n' "$FAILURES" >&2

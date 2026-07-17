@@ -1,0 +1,68 @@
+name: Native release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install shell test tools
+        run: sudo apt-get update && sudo apt-get install -y jq shellcheck tmux
+      - name: Verify Go code
+        run: |
+          go test -race ./...
+          go vet ./...
+      - name: Verify native and engine contracts
+        run: |
+          bash tests/test_native_tui.sh
+          bash tests/test_ai_preflight.sh
+          bash tests/test_ai_console.sh
+          bash tests/test_ai_runtime.sh
+          bash tests/test_ai_supervision.sh
+      - name: Verify shell syntax and lint
+        run: |
+          bash -n tmux-radar.tmux scripts/*.sh scripts/lib/*.sh tests/*.sh
+          shellcheck tmux-radar.tmux scripts/*.sh scripts/lib/*.sh tests/*.sh
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Cross-build release binaries
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -eu
+          mkdir -p dist
+          build_date="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          for target in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            asset="tmux-radar_${VERSION}_${os}_${arch}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.buildVersion=${VERSION} -X main.buildCommit=${COMMIT} -X main.buildDate=${build_date}" \
+              -o "dist/$asset" ./cmd/tmux-radar
+          done
+          cd dist
+          sha256sum tmux-radar_* > checksums.txt
+      - name: Publish immutable tag assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/tmux-radar_* dist/checksums.txt --generate-notes --verify-tag

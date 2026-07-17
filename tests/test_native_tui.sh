@@ -196,6 +196,77 @@ test_launcher_protocol_mismatch_creates_no_surface() {
   case "$calls" in *split-window*|*display-popup*) _fail_assert 'protocol mismatch must not create a surface' 'calls' "$calls" ;; esac
 }
 
+test_ensure_native_maps_release_platforms() {
+  local actual
+  actual="$(TMUX_RADAR_PLATFORM_OS=darwin TMUX_RADAR_PLATFORM_ARCH=arm64 \
+    bash "$ROOT/scripts/ensure-native.sh" platform v0.1.0)"
+  assert_eq 'tmux-radar_v0.1.0_darwin_arm64' "$actual" 'darwin arm64 asset name'
+  actual="$(TMUX_RADAR_PLATFORM_OS=linux TMUX_RADAR_PLATFORM_ARCH=amd64 \
+    bash "$ROOT/scripts/ensure-native.sh" platform v0.1.0)"
+  assert_eq 'tmux-radar_v0.1.0_linux_amd64' "$actual" 'linux amd64 asset name'
+}
+
+test_ensure_native_resolve_is_local_only() {
+  local resolved network_log="$TMP/network.log" no_network_bin="$TMP/no-network-bin"
+  mkdir -p "$no_network_bin"
+  cat > "$no_network_bin/curl" <<'SH'
+#!/usr/bin/env bash
+printf 'curl called\n' >> "$TEST_NETWORK_LOG"
+exit 91
+SH
+  chmod +x "$no_network_bin/curl"
+  resolved="$(PATH="$no_network_bin:$PATH" TEST_NETWORK_LOG="$network_log" \
+    TMUX_RADAR_BIN="$TMP/bin/native-stub" bash "$ROOT/scripts/ensure-native.sh" resolve)"
+  assert_eq "$TMP/bin/native-stub" "$resolved" 'configured native binary wins'
+  [ ! -e "$network_log" ] || _fail_assert 'resolve must not call the network' 'network log' "$(cat "$network_log")"
+}
+
+test_ensure_native_refuses_checksum_mismatch() {
+  local version=v0.1.0 asset release_dir install_dir rc
+  asset="$(TMUX_RADAR_PLATFORM_OS=darwin TMUX_RADAR_PLATFORM_ARCH=arm64 \
+    bash "$ROOT/scripts/ensure-native.sh" platform "$version")"
+  release_dir="$TMP/releases/$version"
+  install_dir="$TMP/install-mismatch"
+  mkdir -p "$release_dir" "$install_dir"
+  cp "$TMP/bin/native-stub" "$release_dir/$asset"
+  printf '%064d  %s\n' 0 "$asset" > "$release_dir/checksums.txt"
+  set +e
+  TMUX_RADAR_PLATFORM_OS=darwin TMUX_RADAR_PLATFORM_ARCH=arm64 \
+    bash "$ROOT/scripts/ensure-native.sh" install "$version" \
+      --base-url "file://$release_dir" --install-dir "$install_dir" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || _fail_assert 'checksum mismatch must fail' 'rc' "$rc"
+  [ ! -e "$install_dir/tmux-radar" ] || _fail_assert 'checksum mismatch installed a binary'
+}
+
+test_ensure_native_installs_verified_asset_atomically() {
+  local version=v0.1.1 asset release_dir install_dir checksum output
+  asset="$(TMUX_RADAR_PLATFORM_OS=darwin TMUX_RADAR_PLATFORM_ARCH=arm64 \
+    bash "$ROOT/scripts/ensure-native.sh" platform "$version")"
+  release_dir="$TMP/releases/$version"
+  install_dir="$TMP/install-ok"
+  mkdir -p "$release_dir" "$install_dir"
+  cp "$TMP/bin/native-stub" "$release_dir/$asset"
+  checksum="$(shasum -a 256 "$release_dir/$asset" | awk '{print $1}')"
+  printf '%s  %s\n' "$checksum" "$asset" > "$release_dir/checksums.txt"
+  output="$(TMUX_RADAR_PLATFORM_OS=darwin TMUX_RADAR_PLATFORM_ARCH=arm64 \
+    bash "$ROOT/scripts/ensure-native.sh" install "$version" \
+      --base-url "file://$release_dir" --install-dir "$install_dir")"
+  assert_eq "$install_dir/tmux-radar" "$output" 'verified installer prints installed path'
+  [ -x "$install_dir/tmux-radar" ] || _fail_assert 'verified binary is not executable'
+  assert_contains "$("$install_dir/tmux-radar" version)" 'protocol 1' 'installed binary passes protocol check'
+  if find "$install_dir" -name '*.tmp.*' -print | grep -q .; then
+    _fail_assert 'installer left a temporary artifact' 'files' "$(find "$install_dir" -maxdepth 1 -type f -print)"
+  fi
+}
+
+test_ensure_native_legacy_selection_is_explicit() {
+  local output
+  output="$(bash "$ROOT/scripts/ensure-native.sh" legacy)"
+  assert_contains "$output" 'TMUX_RADAR_LEGACY_UI=1' 'legacy command prints explicit rollback switch'
+}
+
 run_test 'native CLI version contract' test_version_contract
 run_test 'native doctor JSON contract' test_doctor_json_contract
 run_test 'native invalid argument exit contract' test_invalid_arguments_exit_two
@@ -206,6 +277,11 @@ run_test 'launcher clamps wide monitor from target geometry' test_launcher_clamp
 run_test 'launcher rejects duplicate before surface creation' test_launcher_rejects_duplicate_before_surface_creation
 run_test 'launcher explicit legacy rollback' test_launcher_legacy_rollback_is_explicit
 run_test 'launcher protocol mismatch creates no surface' test_launcher_protocol_mismatch_creates_no_surface
+run_test 'ensure-native maps release platforms' test_ensure_native_maps_release_platforms
+run_test 'ensure-native resolve is local only' test_ensure_native_resolve_is_local_only
+run_test 'ensure-native rejects checksum mismatch' test_ensure_native_refuses_checksum_mismatch
+run_test 'ensure-native installs a verified asset atomically' test_ensure_native_installs_verified_asset_atomically
+run_test 'ensure-native legacy selection is explicit' test_ensure_native_legacy_selection_is_explicit
 
 if [ "$FAILURES" -ne 0 ]; then
   printf '%d native TUI test(s) failed\n' "$FAILURES" >&2

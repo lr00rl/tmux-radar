@@ -55,9 +55,11 @@ chmod +x "$TMP/lock-bin/sleep"
 export TEST_LOCK_SLEEP_LOG="$TMP/lock-sleeps"
 : > "$TEST_LOCK_SLEEP_LOG"
 (
-  export RADAR_WATCH_DIR="$TMP/lock-state/ai-watch"
+  export TMUX_RADAR_STATE_DIR="$TMP/lock-state"
   # shellcheck disable=SC1091
   source "$ROOT/scripts/lib/ai-runtime.sh"
+  assert_eq "$TMP/lock-state/ai-watch" "$RADAR_WATCH_DIR" \
+    'launch-lock test uses only its isolated state root'
   set +e
   PATH="$TMP/lock-bin:$PATH" radar_launch_lock_acquire %1 1000 0.005
   lock_rc=$?

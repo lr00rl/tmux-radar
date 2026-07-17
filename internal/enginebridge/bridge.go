@@ -48,6 +48,9 @@ func (request StartRequest) Validate() error {
 		if err := validateOwner(*request.Owner); err != nil {
 			return err
 		}
+		if request.Owner.Kind == runmodel.OwnerViewer {
+			return errors.New("owner.kind: viewer cannot own a new supervision run")
+		}
 	}
 	return nil
 }
@@ -146,9 +149,30 @@ func (bridge Bridge) Control(ctx context.Context, runID, pane, action, requestID
 	if runID == "" || pane == "" || requestID == "" {
 		return ControlResult{}, errors.New("control: run ID, pane, and request ID are required")
 	}
-	if !oneOf(action, "pause", "resume", "reassess", "keep", "stop") {
+	if !oneOf(action, "pause", "resume", "reassess", "keep", "stop", "detach") {
 		return ControlResult{}, fmt.Errorf("control: unsupported action %q", action)
 	}
+	return bridge.control(ctx, runID, pane, action, requestID, nil)
+}
+
+func (bridge Bridge) TakeoverOwner(ctx context.Context, runID, pane, requestID string, owner runmodel.OwnerDescriptor) (ControlResult, error) {
+	if runID == "" || pane == "" || requestID == "" {
+		return ControlResult{}, errors.New("takeover owner: run ID, pane, and request ID are required")
+	}
+	if err := validateOwner(owner); err != nil {
+		return ControlResult{}, err
+	}
+	if owner.Kind != runmodel.OwnerSplit && owner.Kind != runmodel.OwnerPopup {
+		return ControlResult{}, errors.New("takeover owner: requires a split or popup owner lease")
+	}
+	payload, err := json.Marshal(owner)
+	if err != nil {
+		return ControlResult{}, fmt.Errorf("encode takeover owner: %w", err)
+	}
+	return bridge.control(ctx, runID, pane, "takeover-owner", requestID, append(payload, '\n'))
+}
+
+func (bridge Bridge) control(ctx context.Context, runID, pane, action, requestID string, stdin []byte) (ControlResult, error) {
 	timeout := bridge.ControlTimeout
 	if action == "stop" {
 		timeout = bridge.StopTimeout
@@ -158,7 +182,7 @@ func (bridge Bridge) Control(ctx context.Context, runID, pane, action, requestID
 	} else if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	stdout, commandErr, err := bridge.invoke(ctx, timeout, nil, "control", runID, pane, action, requestID)
+	stdout, commandErr, err := bridge.invoke(ctx, timeout, stdin, "control", runID, pane, action, requestID)
 	if err != nil {
 		return ControlResult{}, err
 	}

@@ -92,6 +92,7 @@ BRAIN_LAST_TIMEOUT=0
 BRAIN_LAST_PID=""
 BRAIN_LAST_PGID=""
 BRAIN_STOP_REASON=""
+BRAIN_STOP_KIND=""
 BRAIN_LAST_ERR_FILE=""
 BRAIN_BACKEND_FROZEN=0
 BRAIN_BACKEND_OK=0
@@ -144,6 +145,15 @@ WATCH_NEXT_KIND="none"
 WATCH_NEXT_AT=0
 WATCH_FINALIZED=0
 WATCH_DELIVERY_FINGERPRINT=""
+WATCH_LIFECYCLE_REASON=""
+WATCH_OWNER_KIND=""
+WATCH_OWNER_PANE=""
+WATCH_OWNER_PID=""
+WATCH_OWNER_TOKEN=""
+WATCH_OWNER_HEARTBEAT=""
+WATCH_OWNER_LAST_CHECK_SECOND=-1
+WATCH_OWNER_LAST_OK=1
+WATCH_OWNER_REASON=""
 
 DELIVERY_GATE_HELD=0
 DELIVERY_GATE_TOKEN=""
@@ -1038,6 +1048,68 @@ _state_get() {  # _state_get <watch-file> <key>
   awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$1" 2>/dev/null || true
 }
 
+_watch_owner_load() {
+  local owner_file="$RADAR_RUN_DIR/owner.json"
+  WATCH_OWNER_KIND=""
+  WATCH_OWNER_PANE=""
+  WATCH_OWNER_PID=""
+  WATCH_OWNER_TOKEN=""
+  WATCH_OWNER_HEARTBEAT=""
+  WATCH_OWNER_REASON=""
+  WATCH_OWNER_LAST_CHECK_SECOND=-1
+  WATCH_OWNER_LAST_OK=1
+  rm -f "$RADAR_RUN_DIR/owner.reload"
+  [ -r "$owner_file" ] || return 0
+  if ! jq -e '.schema_version == 1 and (.kind | IN("split","popup","detached"))' \
+    "$owner_file" >/dev/null 2>&1; then
+    WATCH_OWNER_REASON="owner descriptor is malformed or unsupported"
+    WATCH_OWNER_LAST_OK=0
+    return 1
+  fi
+  WATCH_OWNER_KIND="$(jq -r '.kind' "$owner_file")"
+  WATCH_OWNER_PANE="$(jq -r '.pane // empty' "$owner_file")"
+  WATCH_OWNER_PID="$(jq -r '.pid // empty' "$owner_file")"
+  WATCH_OWNER_TOKEN="$(jq -r '.token // empty' "$owner_file")"
+  WATCH_OWNER_HEARTBEAT="$(jq -r '.heartbeat_path // empty' "$owner_file")"
+}
+
+_watch_owner_live() {
+  local force="${1:-0}"
+  if [ -e "$RADAR_RUN_DIR/owner.reload" ]; then
+    _watch_owner_load || return 1
+  fi
+  case "$WATCH_OWNER_KIND" in ''|detached) return 0 ;; esac
+  if [ "$force" -ne 1 ] && [ "$WATCH_OWNER_LAST_CHECK_SECOND" -eq "$SECONDS" ]; then
+    [ "$WATCH_OWNER_LAST_OK" -eq 1 ]
+    return $?
+  fi
+  WATCH_OWNER_LAST_CHECK_SECOND="$SECONDS"
+  if radar_owner_lease_validate "$WATCH_OWNER_KIND" "$WATCH_OWNER_PANE" \
+    "$WATCH_OWNER_PID" "$WATCH_OWNER_TOKEN" "$WATCH_OWNER_HEARTBEAT" \
+    "${TMUX_RADAR_OWNER_LEASE_SECONDS:-3}"; then
+    WATCH_OWNER_LAST_OK=1
+    WATCH_OWNER_REASON=""
+    return 0
+  fi
+  WATCH_OWNER_LAST_OK=0
+  WATCH_OWNER_REASON="${RADAR_OWNER_ERROR:-owner lease is not live}"
+  return 1
+}
+
+_watch_lifecycle_live() {
+  local target="${1:-$WATCH_PANE}" observed
+  observed="$(tmux display-message -p -t "$target" '#{pane_id}' 2>/dev/null || true)"
+  if [ "$observed" != "$target" ]; then
+    WATCH_LIFECYCLE_REASON="target pane $target disappeared"
+    return 1
+  fi
+  if ! _watch_owner_live; then
+    WATCH_LIFECYCLE_REASON="$WATCH_OWNER_REASON"
+    return 1
+  fi
+  WATCH_LIFECYCLE_REASON=""
+}
+
 _process_tree_pids() {  # _process_tree_pids <root-pid>; descendants first
   local root="$1"
   case "$root" in ''|*[!0-9]*) return 0 ;; esac
@@ -1260,6 +1332,7 @@ _brain() {
   BRAIN_LAST_PID=""
   BRAIN_LAST_PGID=""
   BRAIN_STOP_REASON=""
+  BRAIN_STOP_KIND=""
   DECISION_MODEL_LAUNCHED=0
   err="${TMUX_RADAR_AI_ERR:-${TMUX_SWITCHER_AI_ERR:-/dev/null}}"
   [ "$err" = "/dev/null" ] || : > "$err" 2>/dev/null || true
@@ -1331,6 +1404,12 @@ _brain() {
     if [ -n "${BRAIN_BOUND_PANE:-}" ] && \
        ! tmux display-message -p -t "$BRAIN_BOUND_PANE" '#{pane_id}' >/dev/null 2>&1; then
       stop_reason="target pane $BRAIN_BOUND_PANE disappeared"
+      _terminate_process_tree "$pid" "$BRAIN_PGID"
+      break
+    fi
+    if ! _watch_owner_live; then
+      stop_reason="$WATCH_OWNER_REASON"
+      BRAIN_STOP_KIND="lifecycle-stop"
       _terminate_process_tree "$pid" "$BRAIN_PGID"
       break
     fi
@@ -1578,6 +1657,12 @@ cmd_decide() {
   json="$BRAIN_RESULT"
   BRAIN_BOUND_PANE=""
   BRAIN_PID_FILE=""
+  if [ "$BRAIN_STOP_KIND" = lifecycle-stop ]; then
+    DECISION_FAILURE_KIND='lifecycle-stop'
+    DECISION_FAILURE_DETAIL="$BRAIN_STOP_REASON"
+    echo "tmux-radar: $BRAIN_STOP_REASON"
+    return 5
+  fi
   pretty_json="$(_pretty_json "$json")"
   DECISION_SCHEMA_VALID=0
   DECISION_SCHEMA_ERROR="decision schema/type validation failed"
@@ -1746,7 +1831,7 @@ _watch_wait_delay() {
   _watch_start_timer "$delay"
   _watch_state_snapshot
   while [ ! -e "$WATCH_TIMER_DONE" ]; do
-    tmux display-message -p -t "$WATCH_PANE" '#{pane_id}' >/dev/null 2>&1 || {
+    _watch_lifecycle_live || {
       _watch_kill_waiters
       return 1
     }
@@ -2051,7 +2136,7 @@ _watch_wait_for_batch() {
       _watch_kill_waiters
       return 3
     fi
-    tmux display-message -p -t "$WATCH_PANE" '#{pane_id}' >/dev/null 2>&1 || {
+    _watch_lifecycle_live || {
       _watch_kill_waiters
       return 2
     }
@@ -2145,7 +2230,7 @@ _watch_retry_delay() {
         _watch_kill_waiters; rm -f "$batch"; return 10
       fi
     fi
-    tmux display-message -p -t "$WATCH_PANE" '#{pane_id}' >/dev/null 2>&1 || {
+    _watch_lifecycle_live || {
       _watch_kill_waiters; rm -f "$batch"; return 2
     }
     if [ -e "$WATCH_TIMER_DONE" ]; then
@@ -2159,7 +2244,7 @@ _watch_retry_delay() {
       _watch_state_snapshot
       radar_inbox_drain > "$batch"
     fi
-    sleep "$tick"
+    _watch_pause "$tick"
   done
 }
 
@@ -2217,6 +2302,10 @@ _watch_post_decision_guard() {
   fi
   # No takeover event: preserve every event for the next serialized cycle.
   _watch_requeue_file "$batch"
+  if ! _watch_lifecycle_live; then
+    rm -f "$batch" "$retained"
+    return 2
+  fi
   current="$(_watch_fingerprint || true)"
   rm -f "$batch" "$retained"
   if [ -z "$current" ]; then return 2; fi
@@ -2264,7 +2353,7 @@ _watch_verify_send() {
   radar_inbox_drain > "$batch"
   if _watch_verification_batch "$batch" "$deferred"; then reason="user_resumed"; else :; fi
   while [ "$reason" = timeout ]; do
-    tmux display-message -p -t "$WATCH_PANE" '#{pane_id}' >/dev/null 2>&1 || {
+    _watch_lifecycle_live || {
       reason="pane_death"; break
     }
     current="$(_watch_fingerprint || true)"
@@ -2279,7 +2368,7 @@ _watch_verify_send() {
       radar_inbox_drain > "$batch"
       if _watch_verification_batch "$batch" "$deferred"; then reason="user_resumed"; break; fi
     fi
-    sleep "$tick"
+    _watch_pause "$tick"
   done
   _watch_kill_waiters
   _watch_requeue_file "$deferred"
@@ -2305,8 +2394,8 @@ _watch_pre_send_test_seam() {
   [ -n "$block" ] || return 0
   printf 'ready\n' > "$block.ready"
   while [ -e "$block" ]; do
-    tmux display-message -p -t "$WATCH_PANE" '#{pane_id}' >/dev/null 2>&1 || return 2
-    sleep "$tick"
+    _watch_lifecycle_live || return 2
+    _watch_pause "$tick"
   done
   rm -f "$block.ready"
 }
@@ -2317,6 +2406,7 @@ _watch_deliver_under_gate() {
   if ! _delivery_gate_acquire; then return 20; fi
 
   while :; do
+    if ! _watch_lifecycle_live; then _delivery_gate_release; return 2; fi
     set +e; _watch_post_decision_guard "$evidence" "$current_kind"; guard_rc=$?; set -e
     case "$guard_rc" in
       0) : ;;
@@ -2358,6 +2448,7 @@ _watch_deliver_under_gate() {
 _watch_completion_hold() {
   local deadline="$1" tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.1}" kept=0
   while [ -r "$WATCH_WF" ]; do
+    _watch_lifecycle_live || return 0
     if [ -e "$RADAR_RUN_DIR/keep-open" ]; then
       if [ "$kept" -eq 0 ]; then
         WATCH_STATUS="completed; kept open until q"
@@ -2369,7 +2460,7 @@ _watch_completion_hold() {
     elif [ "$(now)" -ge "$deadline" ]; then
       return 0
     fi
-    sleep "$tick"
+    _watch_pause "$tick"
   done
 }
 
@@ -2544,6 +2635,11 @@ cmd_watch_loop() {
   trap '_watch_signal_exit TERM 143' TERM
   trap '_watch_signal_exit INT 130' INT
   trap '_watch_signal_exit HUP 129' HUP
+  if ! _watch_owner_load || ! _watch_owner_live 1; then
+    _watch_phase CREATED "run created" none 0
+    _watch_finalize stopped STOPPED "${WATCH_OWNER_REASON:-owner lease is not live at startup}"
+    return 1
+  fi
   _watch_phase CREATED "run created" none 0
   _watch_phase ARMED "waiting for native event or idle fallback" idle 0
   if [ -z "${TMUX_RADAR_TEST_NATIVE_SKIP_READY:-}" ]; then
@@ -2563,15 +2659,15 @@ cmd_watch_loop() {
     [ -n "$armed_fingerprint" ] || { _watch_finalize stopped STOPPED "target pane disappeared while arming"; break; }
     set +e; _watch_wait_for_batch "$batch"; wait_rc=$?; set -e
     case "$wait_rc" in
-      2) _watch_finalize stopped STOPPED "target pane disappeared"; break ;;
+      2) _watch_finalize stopped STOPPED "${WATCH_LIFECYCLE_REASON:-target pane disappeared}"; break ;;
       3)
         _watch_phase PAUSED_USER "paused by user" resume 0
         while [ -e "$RADAR_RUN_DIR/paused" ]; do
-          tmux display-message -p -t "$WATCH_PANE" '#{pane_id}' >/dev/null 2>&1 || {
-            _watch_finalize stopped STOPPED "target pane disappeared while paused"
+          _watch_lifecycle_live || {
+            _watch_finalize stopped STOPPED "${WATCH_LIFECYCLE_REASON:-target pane disappeared while paused}"
             break 2
           }
-          sleep "${TMUX_RADAR_TEST_WAIT_TICK:-0.1}"
+          _watch_pause "${TMUX_RADAR_TEST_WAIT_TICK:-0.1}"
         done
         resume_request_id="$(cat "$RADAR_RUN_DIR/resume-request" 2>/dev/null || true)"
         radar_event_append resumed monitor "supervision resumed" "$(jq -cn \
@@ -2627,6 +2723,10 @@ cmd_watch_loop() {
     esac
     event_kind="$(printf '%s' "$WATCH_EVENT_JSON" | jq -r '.kind')"
     _watch_phase CAPTURING "capturing pane for $event_kind" none 0
+    if ! _watch_lifecycle_live; then
+      _watch_finalize stopped STOPPED "$WATCH_LIFECYCLE_REASON"
+      break
+    fi
     evidence_fingerprint="$(_watch_fingerprint || true)"
     if [ -z "$evidence_fingerprint" ]; then _watch_finalize stopped STOPPED "target pane disappeared during capture"; break; fi
 
@@ -2753,7 +2853,7 @@ cmd_watch_loop() {
       case "$retry_rc" in
         0) : ;;
         10) retry_cancelled=1; break ;;
-        2) _watch_finalize stopped STOPPED "target pane disappeared during retry delay"; break 2 ;;
+        2) _watch_finalize stopped STOPPED "${WATCH_LIFECYCLE_REASON:-target pane disappeared during retry delay}"; break 2 ;;
         *) _watch_finalize paused_error PAUSED_ERROR "retry wait failed"; break 2 ;;
       esac
     done
@@ -2766,7 +2866,7 @@ cmd_watch_loop() {
     set +e; _watch_post_decision_guard "$evidence_fingerprint" "$event_kind"; guard_rc=$?; set -e
     case "$guard_rc" in
       0) : ;;
-      2) _watch_finalize stopped STOPPED "target pane disappeared after decision"; break ;;
+      2) _watch_finalize stopped STOPPED "${WATCH_LIFECYCLE_REASON:-target pane disappeared after decision}"; break ;;
       10|12)
         WATCH_EVENT_ID=""; WATCH_RETRY=0
         continue
@@ -2822,7 +2922,7 @@ cmd_watch_loop() {
     set +e; _watch_deliver_under_gate "$evidence_fingerprint" "$event_kind"; guard_rc=$?; set -e
     case "$guard_rc" in
       0) : ;;
-      2) _watch_finalize stopped STOPPED "target pane disappeared at final delivery guard"; break ;;
+      2) _watch_finalize stopped STOPPED "${WATCH_LIFECYCLE_REASON:-target pane disappeared at final delivery guard}"; break ;;
       10|12) WATCH_EVENT_ID=""; WATCH_RETRY=0; continue ;;
       21)
         radar_event_append delivery_failed watcher "tmux send-keys failed" "$(jq -cn \
@@ -2842,7 +2942,7 @@ cmd_watch_loop() {
     set +e; _watch_verify_send "$delivery_fingerprint"; verify_rc=$?; set -e
     case "$verify_rc" in
       0) : ;;
-      2) _watch_finalize stopped STOPPED "target pane disappeared during verification"; break ;;
+      2) _watch_finalize stopped STOPPED "${WATCH_LIFECYCLE_REASON:-target pane disappeared during verification}"; break ;;
       3)
         _escalate "$pane" "AI 监控发送后未观察到变化，已暂停"
         _watch_finalize verification_timeout PAUSED_ERROR "verification timeout: no observable send effect"
@@ -3177,6 +3277,7 @@ cmd_watch_run() {
 
 cmd_engine_start() {
   local raw request state_root pane canonical config requested_backend generation owner owner_file=""
+  local owner_kind owner_pane owner_pid owner_token owner_heartbeat
   local watch_file existing_pid existing_run existing_dir existing_owner watcher_pid run_id run_dir
   local ready attempts delay attempt=0 start_payload result
   need_jq
@@ -3193,6 +3294,7 @@ cmd_engine_start() {
   state_root="$(printf '%s' "$request" | jq -r '.state_root')"
   pane="$(printf '%s' "$request" | jq -r '.target_pane')"
   config="$(printf '%s' "$request" | jq -c '.config')"
+  owner="$(printf '%s' "$request" | jq -c '.owner')"
   if [ "$state_root" != "$RADAR_STATE_DIR" ]; then
     _native_start_error rejected state-root-mismatch 'request state_root does not match the engine state root' \
       "requested=$state_root engine=$RADAR_STATE_DIR"
@@ -3202,6 +3304,32 @@ cmd_engine_start() {
   if [ "$canonical" != "$pane" ]; then
     _native_start_error rejected target-unavailable 'target pane is missing or did not resolve canonically' "$pane"
     return 2
+  fi
+
+  if [ "$owner" != null ]; then
+    owner_kind="$(printf '%s' "$owner" | jq -r '.kind')"
+    case "$owner_kind" in
+      viewer)
+        _native_start_error rejected invalid-owner 'viewer descriptors cannot own a new supervision run'
+        return 2
+        ;;
+      split|popup)
+        owner_pane="$(printf '%s' "$owner" | jq -r '.pane // empty')"
+        owner_pid="$(printf '%s' "$owner" | jq -r '.pid // 0')"
+        owner_token="$(printf '%s' "$owner" | jq -r '.token // empty')"
+        owner_heartbeat="$(printf '%s' "$owner" | jq -r '.heartbeat_path // empty')"
+        if ! radar_owner_lease_validate "$owner_kind" "$owner_pane" "$owner_pid" \
+          "$owner_token" "$owner_heartbeat" "${TMUX_RADAR_OWNER_LEASE_SECONDS:-3}"; then
+          _native_start_error rejected owner-unavailable 'active owner lease is not live' "$RADAR_OWNER_ERROR"
+          return 2
+        fi
+        ;;
+      detached) : ;;
+      *)
+        _native_start_error rejected invalid-owner "unsupported owner kind: $owner_kind"
+        return 2
+        ;;
+    esac
   fi
 
   _apply_watch_config "$config"
@@ -3250,7 +3378,6 @@ cmd_engine_start() {
   run_id="$RADAR_RUN_ID"
   run_dir="$RADAR_RUN_DIR"
   _radar_write_snapshot "$run_dir/start-request.json" "$request"
-  owner="$(printf '%s' "$request" | jq -c '.owner')"
   if [ "$owner" != null ]; then
     owner_file="$run_dir/owner.json"
     _radar_write_snapshot "$owner_file" "$owner"
@@ -3347,15 +3474,35 @@ _control_wait_event() {
   return 1
 }
 
+_control_owner_valid() {
+  jq -e '
+    type == "object" and .schema_version == 1 and
+    if .kind == "popup" then
+      ((keys | sort) == ["heartbeat_path","kind","pid","schema_version","token"]) and
+      (.pid | type == "number" and . > 0 and floor == .) and
+      (.token | type == "string" and test("^[0-9a-fA-F]{32}$")) and
+      (.heartbeat_path | type == "string" and startswith("/"))
+    elif .kind == "split" then
+      ((keys | sort) == ["heartbeat_path","kind","pane","pid","schema_version","token"]) and
+      (.pane | type == "string" and test("^%[0-9]+$")) and
+      (.pid | type == "number" and . > 0 and floor == .) and
+      (.token | type == "string" and test("^[0-9a-fA-F]{32}$")) and
+      (.heartbeat_path | type == "string" and startswith("/"))
+    else false end
+  ' >/dev/null 2>&1
+}
+
 cmd_control() {
   local run_id="${1:-}" pane="${2:-}" action="${3:-}" request_id="${4:-}"
   local run_dir watch_file pointer_run pointer_pane pointer_generation expected_generation channel pid
   local controls request_file ack_file request result attempts attempt=0
+  local owner_file owner_kind detached_owner takeover_raw takeover_owner=null
+  local takeover_kind takeover_pane takeover_pid takeover_token takeover_heartbeat
   need_jq
   case "$run_id" in ''|*/*|*..*) _control_result false rejected "$run_id" "$pane" "$action" "$request_id" "" invalid-request 'invalid run ID'; return 2 ;; esac
   case "$pane" in ''|%|[^%]*|%*[!0-9]*) _control_result false rejected "$run_id" "$pane" "$action" "$request_id" "" invalid-request 'invalid pane ID'; return 2 ;; esac
   case "$request_id" in ''|*[!A-Za-z0-9._-]*) _control_result false rejected "$run_id" "$pane" "$action" "$request_id" "" invalid-request 'invalid request ID'; return 2 ;; esac
-  case "$action" in pause|resume|reassess|keep|stop) : ;; *) _control_result false rejected "$run_id" "$pane" "$action" "$request_id" "" invalid-request 'unsupported control action'; return 2 ;; esac
+  case "$action" in pause|resume|reassess|keep|stop|detach|takeover-owner) : ;; *) _control_result false rejected "$run_id" "$pane" "$action" "$request_id" "" invalid-request 'unsupported control action'; return 2 ;; esac
 
   run_dir="$RADAR_RUNS_DIR/$run_id"
   controls="$run_dir/controls"
@@ -3367,6 +3514,21 @@ cmd_control() {
     cat "$ack_file"
     jq -e '.ok == true' "$ack_file" >/dev/null 2>&1
     return $?
+  fi
+  if [ "$action" = takeover-owner ]; then
+    takeover_raw="$(cat)"
+    if ! takeover_owner="$(printf '%s' "$takeover_raw" | jq -c -s \
+      'if length == 1 then .[0] else error("expected one owner descriptor") end' 2>/dev/null)" ||
+      ! printf '%s' "$takeover_owner" | _control_owner_valid; then
+      _control_result false rejected "$run_id" "$pane" "$action" "$request_id" "" \
+        invalid-owner 'takeover-owner requires one strict split or popup owner descriptor on stdin'
+      return 2
+    fi
+    takeover_kind="$(printf '%s' "$takeover_owner" | jq -r '.kind')"
+    takeover_pane="$(printf '%s' "$takeover_owner" | jq -r '.pane // empty')"
+    takeover_pid="$(printf '%s' "$takeover_owner" | jq -r '.pid')"
+    takeover_token="$(printf '%s' "$takeover_owner" | jq -r '.token')"
+    takeover_heartbeat="$(printf '%s' "$takeover_owner" | jq -r '.heartbeat_path')"
   fi
   if ! radar_launch_lock_acquire "$pane" "${TMUX_RADAR_CONTROL_LOCK_ATTEMPTS:-500}" \
     "${TMUX_RADAR_CONTROL_LOCK_DELAY:-0.01}"; then
@@ -3389,9 +3551,10 @@ cmd_control() {
   expected_generation="$(jq -r '.generation // empty' "$run_dir/start.json" 2>/dev/null || true)"
   request="$(jq -cn --arg run_id "$run_id" --arg pane "$pane" --arg action "$action" \
     --arg request_id "$request_id" --arg generation "$expected_generation" \
-    --arg timestamp "$(_radar_now_iso)" '
+    --arg timestamp "$(_radar_now_iso)" --argjson owner "$takeover_owner" '
     {schema_version:1,run_id:$run_id,pane:$pane,action:$action,request_id:$request_id,
-     generation:$generation,requested_at:$timestamp}')"
+     generation:$generation,requested_at:$timestamp} +
+    (if $action == "takeover-owner" then {owner:$owner} else {} end)')"
   _radar_write_snapshot "$request_file" "$request"
   if [ "$pointer_run" != "$run_id" ] || [ "$pointer_pane" != "$pane" ] ||
     [ -z "$expected_generation" ] || [ "$pointer_generation" != "$expected_generation" ]; then
@@ -3442,6 +3605,39 @@ cmd_control() {
       fi
       _native_release_lock
       ;;
+    detach)
+      owner_file="$run_dir/owner.json"
+      owner_kind="$(jq -r '.kind // empty' "$owner_file" 2>/dev/null || true)"
+      if [ "$owner_kind" != popup ]; then
+        action='invalid-state'
+      else
+        detached_owner='{"schema_version":1,"kind":"detached"}'
+        _radar_write_snapshot "$owner_file" "$detached_owner"
+        radar_event_append owner_detached monitor 'popup owner detached' "$(jq -cn \
+          --arg request_id "$request_id" '{record:"control",request_id:$request_id}')"
+        : > "$run_dir/owner.reload"
+        [ -z "$channel" ] || tmux wait-for -S "$channel" >/dev/null 2>&1 || true
+      fi
+      _native_release_lock
+      ;;
+    takeover-owner)
+      owner_file="$run_dir/owner.json"
+      owner_kind="$(jq -r '.kind // empty' "$owner_file" 2>/dev/null || true)"
+      if [ "$owner_kind" != detached ]; then
+        action='invalid-state'
+      elif ! radar_owner_lease_validate "$takeover_kind" "$takeover_pane" "$takeover_pid" \
+        "$takeover_token" "$takeover_heartbeat" "${TMUX_RADAR_OWNER_LEASE_SECONDS:-3}"; then
+        action='owner-unavailable'
+      else
+        _radar_write_snapshot "$owner_file" "$takeover_owner"
+        radar_event_append owner_taken_over monitor 'detached run adopted a live owner lease' "$(jq -cn \
+          --arg request_id "$request_id" --arg owner_kind "$takeover_kind" \
+          '{record:"control",request_id:$request_id,owner_kind:$owner_kind}')"
+        : > "$run_dir/owner.reload"
+        [ -z "$channel" ] || tmux wait-for -S "$channel" >/dev/null 2>&1 || true
+      fi
+      _native_release_lock
+      ;;
     stop)
       [ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || true
       _native_release_lock
@@ -3466,6 +3662,10 @@ cmd_control() {
     invalid-state)
       result="$(_control_result false invalid-state "$run_id" "$pane" "$(printf '%s' "$request" | jq -r '.action')" \
         "$request_id" "$request_file" invalid-state 'control is not valid in the current run state')"
+      ;;
+    owner-unavailable)
+      result="$(_control_result false owner-unavailable "$run_id" "$pane" "$(printf '%s' "$request" | jq -r '.action')" \
+        "$request_id" "$request_file" owner-unavailable "${RADAR_OWNER_ERROR:-owner lease is not live}")"
       ;;
     *)
       result="$(_control_result true acknowledged "$run_id" "$pane" "$action" "$request_id" "$request_file")"

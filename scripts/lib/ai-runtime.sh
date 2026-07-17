@@ -62,6 +62,55 @@ _radar_json_number() {
   esac
 }
 
+radar_owner_heartbeat_read() {
+  local path="$1" key value
+  RADAR_HEARTBEAT_SCHEMA=""
+  RADAR_HEARTBEAT_TOKEN=""
+  RADAR_HEARTBEAT_PID=""
+  RADAR_HEARTBEAT_UPDATED=""
+  [ -r "$path" ] || return 1
+  while IFS='=' read -r key value; do
+    case "$key" in
+      schema_version) RADAR_HEARTBEAT_SCHEMA="$value" ;;
+      token) RADAR_HEARTBEAT_TOKEN="$value" ;;
+      pid) RADAR_HEARTBEAT_PID="$value" ;;
+      updated_epoch) RADAR_HEARTBEAT_UPDATED="$value" ;;
+    esac
+  done < "$path"
+  [ "$RADAR_HEARTBEAT_SCHEMA" = 1 ] || return 1
+  case "$RADAR_HEARTBEAT_PID" in ''|0|*[!0-9]*) return 1 ;; esac
+  case "$RADAR_HEARTBEAT_UPDATED" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$RADAR_HEARTBEAT_TOKEN" ]
+}
+
+# shellcheck disable=SC2034  # RADAR_OWNER_ERROR is consumed by scripts sourcing this library.
+radar_owner_lease_validate() {
+  local kind="$1" pane="$2" pid="$3" token="$4" heartbeat="$5" max_age="${6:-3}"
+  local now_epoch age observed
+  RADAR_OWNER_ERROR=""
+  case "$kind" in split|popup) : ;; *) RADAR_OWNER_ERROR="unsupported active owner kind: $kind"; return 1 ;; esac
+  case "$pid" in ''|0|*[!0-9]*) RADAR_OWNER_ERROR="owner PID is invalid"; return 1 ;; esac
+  [ -n "$token" ] || { RADAR_OWNER_ERROR="owner token is missing"; return 1; }
+  [ -n "$heartbeat" ] || { RADAR_OWNER_ERROR="owner heartbeat path is missing"; return 1; }
+  kill -0 "$pid" 2>/dev/null || { RADAR_OWNER_ERROR="owner PID $pid is not live"; return 1; }
+  if ! radar_owner_heartbeat_read "$heartbeat"; then
+    RADAR_OWNER_ERROR="owner heartbeat is missing or malformed"
+    return 1
+  fi
+  [ "$RADAR_HEARTBEAT_TOKEN" = "$token" ] || { RADAR_OWNER_ERROR="owner heartbeat token mismatch"; return 1; }
+  [ "$RADAR_HEARTBEAT_PID" = "$pid" ] || { RADAR_OWNER_ERROR="owner heartbeat PID mismatch"; return 1; }
+  now_epoch="$(date '+%s')"
+  age=$((now_epoch - RADAR_HEARTBEAT_UPDATED))
+  if [ "$age" -lt 0 ] || [ "$age" -gt "$max_age" ]; then
+    RADAR_OWNER_ERROR="owner heartbeat is stale (${age}s)"
+    return 1
+  fi
+  if [ "$kind" = split ]; then
+    observed="$(tmux display-message -p -t "$pane" '#{pane_id}' 2>/dev/null || true)"
+    [ "$observed" = "$pane" ] || { RADAR_OWNER_ERROR="owner pane $pane is not live"; return 1; }
+  fi
+}
+
 _radar_append_jsonl() {
   local path="$1" payload="$2"
   mkdir -p "$(dirname "$path")"

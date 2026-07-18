@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Install / uninstall the AI-status hooks for Claude Code, Codex and OpenCode so
-# they flag action-required prompts and finished-turn notices in tmux.
+# Install / uninstall the AI-status hooks for Claude Code, Codex, Kimi and
+# OpenCode so they flag action-required prompts and finished-turn notices.
 #
 # Edits, idempotently and with a timestamped backup:
 #   ~/.claude/settings.json   (Claude hooks)
 #   ~/.codex/config.toml      (Codex trust marker + legacy notify fallback)
 #   ~/.codex/hooks.json       (Codex native hooks)
+#   ~/.kimi-code/config.toml  (Kimi native lifecycle hooks)
 #   ~/.config/opencode/plugins/tmux-radar.js (OpenCode lifecycle plugin)
 #
 # Usage: install-hooks.sh [install|uninstall|status]
@@ -17,6 +18,7 @@ CODEX_WRAP="${TMUX_RADAR_CODEX_WRAP:-${TMUX_SWITCHER_CODEX_WRAP:-$SCRIPT_DIR/cod
 CLAUDE_SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 CODEX_CONFIG="${CODEX_CONFIG:-$HOME/.codex/config.toml}"
 CODEX_HOOKS_JSON="${CODEX_HOOKS_JSON:-$HOME/.codex/hooks.json}"
+KIMI_CONFIG="${KIMI_CONFIG:-$HOME/.kimi-code/config.toml}"
 OPENCODE_DIR="${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}"
 OPENCODE_PLUGIN="$OPENCODE_DIR/plugins/tmux-radar.js"
 
@@ -31,6 +33,10 @@ CODEX_HOOK_TIMEOUT=5
 CODEX_HOOK_STATUS="tmux-radar lifecycle bridge"
 CODEX_HOOK_BEGIN="# BEGIN tmux-radar Codex hooks"
 CODEX_HOOK_END="# END tmux-radar Codex hooks"
+KIMI_EVENTS=(PermissionRequest PermissionResult Stop UserPromptSubmit SessionStart SessionEnd Interrupt)
+KIMI_HOOK_TIMEOUT=5
+KIMI_HOOK_BEGIN="# >>> tmux-radar kimi hooks >>>"
+KIMI_HOOK_END="# <<< tmux-radar kimi hooks <<<"
 
 RADAR_TS="$(date +%Y%m%d%H%M%S)"
 
@@ -51,6 +57,17 @@ _esc_rhs() { printf '%s' "${1:-}" | sed 's/[&#\]/\\&/g'; }
 
 toml_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+shell_single_quote() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\\\\\''/g"
+  printf "'"
+}
+
+toml_basic_string() {
+  need_jq
+  jq -Rn --arg value "$1" '$value'
 }
 
 backup_file() {
@@ -464,6 +481,158 @@ claude_status() {
   else echo "Claude settings: (none / jq missing)"; fi
 }
 
+kimi_present() {
+  case "${TMUX_RADAR_TEST_KIMI_PRESENT:-}" in
+    on) return 0 ;;
+    off) return 1 ;;
+  esac
+  [ -e "$KIMI_CONFIG" ] || [ -d "$(dirname "$KIMI_CONFIG")" ] ||
+    command -v kimi >/dev/null 2>&1
+}
+
+kimi_validate_markers() {
+  local path="$1"
+  [ -f "$path" ] || return 0
+  awk -v begin="$KIMI_HOOK_BEGIN" -v end="$KIMI_HOOK_END" '
+    $0 == begin {
+      begins++
+      if (inside) bad=1
+      inside=1
+      next
+    }
+    $0 == end {
+      ends++
+      if (!inside) bad=1
+      inside=0
+      next
+    }
+    END {
+      if (inside || bad || begins > 1 || ends > 1 || begins != ends) exit 1
+    }
+  ' "$path" || die "Kimi managed marker block is malformed in $path"
+}
+
+kimi_strip_block() {
+  local path="$1"
+  awk -v begin="$KIMI_HOOK_BEGIN" -v end="$KIMI_HOOK_END" '
+    $0 == begin {
+      if (outside_pending && pending != "") print pending
+      pending=""
+      outside_pending=0
+      inside=1
+      next
+    }
+    $0 == end { inside=0; next }
+    !inside {
+      if (outside_pending) print pending
+      pending=$0
+      outside_pending=1
+    }
+    END {
+      if (outside_pending) print pending
+    }
+  ' "$path"
+}
+
+kimi_build_block() {
+  local command event encoded
+  command="$(shell_single_quote "$NOTIFY") kimi-hook"
+  encoded="$(toml_basic_string "$command")"
+  printf '%s\n' "$KIMI_HOOK_BEGIN"
+  for event in "${KIMI_EVENTS[@]}"; do
+    printf '[[hooks]]\n'
+    printf 'event = "%s"\n' "$event"
+    printf 'command = %s\n' "$encoded"
+    printf 'timeout = %s\n\n' "$KIMI_HOOK_TIMEOUT"
+  done
+  printf '%s\n' "$KIMI_HOOK_END"
+}
+
+kimi_install() {
+  if ! kimi_present; then
+    info "Kimi not found (no $(dirname "$KIMI_CONFIG"), no 'kimi' on PATH) - skipped"
+    return 0
+  fi
+  local base block tmp
+  mkdir -p "$(dirname "$KIMI_CONFIG")"
+  [ -f "$KIMI_CONFIG" ] || : > "$KIMI_CONFIG"
+  kimi_validate_markers "$KIMI_CONFIG"
+  base="$(mktemp "$(dirname "$KIMI_CONFIG")/.config-base.XXXXXX")" ||
+    die "mktemp failed for $KIMI_CONFIG"
+  block="$(mktemp "$(dirname "$KIMI_CONFIG")/.config-hooks.XXXXXX")" ||
+    die "mktemp failed for $KIMI_CONFIG"
+  tmp="$(mktemp "$(dirname "$KIMI_CONFIG")/.config-final.XXXXXX")" ||
+    die "mktemp failed for $KIMI_CONFIG"
+  kimi_strip_block "$KIMI_CONFIG" > "$base"
+  kimi_build_block > "$block"
+  cat "$base" > "$tmp"
+  [ ! -s "$tmp" ] || printf '\n' >> "$tmp"
+  cat "$block" >> "$tmp"
+  if ! cmp -s "$tmp" "$KIMI_CONFIG"; then
+    backup_file "$KIMI_CONFIG"
+    _replace_file "$tmp" "$KIMI_CONFIG"
+  else
+    rm -f "$tmp"
+  fi
+  rm -f "$base" "$block"
+  for event in "${KIMI_EVENTS[@]}"; do
+    info "Kimi $event -> $NOTIFY kimi-hook"
+  done
+}
+
+kimi_uninstall() {
+  [ -f "$KIMI_CONFIG" ] || {
+    info "no Kimi hook configuration"
+    return 0
+  }
+  local tmp
+  kimi_validate_markers "$KIMI_CONFIG"
+  if ! grep -qF "$KIMI_HOOK_BEGIN" "$KIMI_CONFIG"; then
+    info "no Kimi hooks installed"
+    return 0
+  fi
+  tmp="$(mktemp "$(dirname "$KIMI_CONFIG")/.config-final.XXXXXX")" ||
+    die "mktemp failed for $KIMI_CONFIG"
+  kimi_strip_block "$KIMI_CONFIG" > "$tmp"
+  backup_file "$KIMI_CONFIG"
+  _replace_file "$tmp" "$KIMI_CONFIG"
+  info "removed Kimi AI-status hooks"
+}
+
+kimi_status() {
+  local event count=0 block=""
+  if ! kimi_present; then
+    echo "Kimi: not installed (skipped)"
+    return 0
+  fi
+  if [ ! -f "$KIMI_CONFIG" ]; then
+    echo "Kimi hooks installed: 0/7"
+    return 0
+  fi
+  if ! awk -v begin="$KIMI_HOOK_BEGIN" -v end="$KIMI_HOOK_END" '
+    $0 == begin { begins++; inside=1; next }
+    $0 == end { ends++; inside=0; next }
+    END { exit !(begins <= 1 && ends <= 1 && begins == ends && !inside) }
+  ' "$KIMI_CONFIG"; then
+    echo "Kimi hooks: invalid managed markers ($KIMI_CONFIG)"
+    return 0
+  fi
+  block="$(awk -v begin="$KIMI_HOOK_BEGIN" -v end="$KIMI_HOOK_END" '
+    $0 == begin { inside=1; next }
+    $0 == end { inside=0; next }
+    inside { print }
+  ' "$KIMI_CONFIG")"
+  for event in "${KIMI_EVENTS[@]}"; do
+    if printf '%s\n' "$block" | grep -qF "event = \"$event\""; then
+      echo "Kimi native $event: installed"
+      count=$((count + 1))
+    else
+      echo "Kimi native $event: not installed"
+    fi
+  done
+  echo "Kimi hooks installed: $count/7"
+}
+
 opencode_present() {
   [ -d "$OPENCODE_DIR" ] || command -v opencode >/dev/null 2>&1
 }
@@ -509,17 +678,19 @@ opencode_status() {
 case "${1:-install}" in
   install)
     echo "Installing tmux-radar AI-status hooks:"
-    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$OPENCODE_PLUGIN"
+    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$KIMI_CONFIG" "$OPENCODE_PLUGIN"
     codex_install
+    kimi_install
     claude_install
     opencode_install
     transaction_commit
-    echo "Done. Restart Claude/Codex/OpenCode sessions (or open new ones) to pick up the hooks."
+    echo "Done. Restart Claude/Codex/Kimi/OpenCode sessions (or reload their config) to pick up the hooks."
     ;;
   uninstall)
     echo "Uninstalling tmux-radar AI-status hooks:"
-    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$OPENCODE_PLUGIN"
+    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$KIMI_CONFIG" "$OPENCODE_PLUGIN"
     codex_uninstall
+    kimi_uninstall
     claude_uninstall
     opencode_uninstall
     transaction_commit
@@ -527,6 +698,7 @@ case "${1:-install}" in
   status)
     claude_status
     codex_status
+    kimi_status
     opencode_status
     ;;
   *) die "usage: install-hooks.sh [install|uninstall|status]" ;;

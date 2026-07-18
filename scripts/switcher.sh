@@ -590,7 +590,7 @@ cmd_toggle_expand() {  # fzf transform: flip expand, keep cursor on the window
 
 do_menu() {
   local fzf preview_pos follow preview_win selected target session win
-  local -a start_args sort_args
+  local -a fzf_args
   fzf="$(command -v fzf || true)"
   [ -n "$fzf" ] || { tmux display-message "tmux-radar: fzf not found"; exit 1; }
 
@@ -614,15 +614,15 @@ do_menu() {
   # on initial popup open and when switching back into the recent view.
   # Tree/AI-status view switches and query changes reset to row 1.
   # --sync is required so the list is loaded before 'start' fires.
-  start_args=()
-  [ "$VIEW" = recent ] && start_args=(--sync '--bind=start:pos(2)')
+  fzf_args=(--ansi --delimiter=$'\t' --with-nth=2.. --nth=1 --cycle)
+  [ "$VIEW" = recent ] && fzf_args+=(--sync '--bind=start:pos(2)')
   # sort: relevance when collapsed; preserve window/pane grouping when expanded.
   # AI status is already pane-level and floats hook-marked panes first.
-  sort_args=(); { [ "$EXPAND" = 1 ] || [ "$VIEW" = needinput ]; } && sort_args=(--no-sort)
+  { [ "$EXPAND" = 1 ] || [ "$VIEW" = needinput ]; } && fzf_args+=(--no-sort)
 
   selected="$(
     "$SELF" list | "$fzf" \
-      --ansi --delimiter=$'\t' --with-nth=2.. --nth=1 --cycle "${sort_args[@]}" "${start_args[@]}" \
+      "${fzf_args[@]}" \
       --layout=reverse --prompt="$(_prompt)" \
       --header='C-t tree · C-r recent · C-i AI status · C-e expand/collapse panes · A-p preview · S-↑/↓ PgUp/Dn scroll · Enter switch' \
       --preview="$SELF preview {1}" --preview-window="$preview_win" \

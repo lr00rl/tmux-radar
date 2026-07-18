@@ -183,7 +183,7 @@ _pane_map() {
 _agent_panes() {
   have_tmux || return 0
   local cmds panes ps_rows
-  cmds="${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude opencode')}}"
+  cmds="${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude opencode kimi')}}"
   panes="$(tmux list-panes -a -F '#{pane_id} #{pane_pid} #{pane_tty}' 2>/dev/null)" || return 0
   [ -n "$panes" ] || return 0
   ps_rows="${1:-}"
@@ -631,8 +631,8 @@ cmd_tick() {
     #    (a background session that cannot take input any more). Requires
     #    regok, and only touches agent sources — a `mark - tool ...` from a
     #    user script has no registry row by design and must survive.
-    _drop_rows '( $1 != "-" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 && ag != "" && index(ag, "\001" $1 "\001") == 0 ) ||
-      ( $1 == "-" && regok != "" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 && tolower($5) !~ donere )' \
+    _drop_rows '( $1 != "-" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "kimi" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 && ag != "" && index(ag, "\001" $1 "\001") == 0 ) ||
+      ( $1 == "-" && regok != "" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "kimi" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 && tolower($5) !~ donere )' \
       -v rk="$(printf '\001%s' "$registry_keys")" -v ag="${agents#OK}" \
       -v donere="$DONE_RE" -v regok="$reg_ok"
   else
@@ -934,9 +934,9 @@ _opencode_accept_locked() {  # <key> <generation> <started-ms> <sequence>
   mv "$tmp" "$OC_EVENTS_FILE"
 }
 
-_opencode_mark_locked() {  # <pane|-> <label> <key>
-  local pane="$1" label key="$3" now saved_title="" prev_title=""
-  label="$(_san "$2")"
+_session_mark_locked() {  # <pane|-> <source> <label> <key>
+  local pane="$1" source="$2" label key="$4" now saved_title="" prev_title=""
+  label="$(_san "$3")"
   now="$(date +%s)"
   if [ "$pane" != "-" ] && [ -n "$pane" ] && [ "$(opt @radar-retitle on)" != "off" ]; then
     saved_title="$(_san "$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)")"
@@ -945,11 +945,16 @@ _opencode_mark_locked() {  # <pane|-> <label> <key>
   prev_title="$(awk -F '\t' -v k="$key" -v p="$pane" \
     'NF >= 6 && ($4 == k || $1 == p) && $6 != "" { print $6; exit }' "$STATE_FILE" 2>/dev/null || true)"
   [ -n "$prev_title" ] && saved_title="$prev_title"
-  # OpenCode can host several sessions in one pane. Replace only this session,
-  # unlike the public pane mark API which intentionally keeps one row per pane.
+  # Agent hosts may run several sessions in one pane. Replace only this
+  # session, unlike the public pane mark API which intentionally keeps one row
+  # per pane.
   _rewrite 'if (key == delkey) next' -v delkey="$key"
-  printf '%s\t%s\topencode\t%s\t%s\t%s\n' \
-    "$pane" "$now" "$key" "$label" "$saved_title" >> "$STATE_FILE"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$pane" "$now" "$source" "$key" "$label" "$saved_title" >> "$STATE_FILE"
+}
+
+_opencode_mark_locked() {  # <pane|-> <label> <key>
+  _session_mark_locked "$1" opencode "$2" "$3"
 }
 
 _opencode_event() {  # _opencode_event <one JSON object>
@@ -1045,6 +1050,174 @@ cmd_opencode_stream() {
     sequence="$(_json_field_any sequence "$json")"
     printf 'ok\t%s\t%s\n' "$generation" "$sequence"
   done
+}
+
+_agent_json_object() {  # read exactly one JSON object from stdin
+  local raw
+  command -v jq >/dev/null 2>&1 || {
+    echo "agent event requires jq" >&2
+    return 2
+  }
+  raw="$(cat 2>/dev/null || true)"
+  printf '%s' "$raw" | jq -ce '
+    if type == "object" then . else error("expected one JSON object") end
+  ' 2>/dev/null || {
+    echo "agent event: expected one JSON object" >&2
+    return 2
+  }
+}
+
+_agent_kind_valid() {
+  case "${1:-}" in
+    ''|*[!A-Za-z0-9._-]*|[._-]*) return 1 ;;
+    *) [ "${#1}" -le 64 ] ;;
+  esac
+}
+
+_agent_event_valid() {
+  case "${1:-}" in
+    session_start|approval|approval_resolved|input_required|user_resumed|turn_complete|interrupt|session_end) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_agent_payload_valid() {
+  local json="$1"
+  printf '%s' "$json" | jq -e '
+    def clean_string:
+      type == "string" and (explode | all(. >= 32 and . != 127));
+    (.session_id | clean_string and length > 0 and length <= 200) and
+    ((.cwd // "") | clean_string) and
+    ((.label // "") | clean_string) and
+    ((.process // "") | clean_string and length <= 200) and
+    ((has("pane") | not) or
+      (.pane | type == "string" and (. == "" or test("^%[0-9]+$")))) and
+    ((has("pid") | not) or
+      (.pid | type == "number" and floor == . and . >= 0))
+  ' >/dev/null 2>&1
+}
+
+_agent_display_name() {
+  case "$1" in
+    kimi) printf 'Kimi' ;;
+    codex) printf 'Codex' ;;
+    claude) printf 'Claude' ;;
+    opencode) printf 'OpenCode' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+_agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
+  local kind="$1" event="$2" json="$3" sid key pane pid cwd proc detail
+  local agent display label="" watch_kind="" state=working
+  _agent_kind_valid "$kind" || {
+    echo "agent-event: invalid agent kind" >&2
+    return 2
+  }
+  _agent_event_valid "$event" || {
+    echo "agent-event: unsupported event: $event" >&2
+    return 2
+  }
+  _agent_payload_valid "$json" || {
+    echo "agent-event: invalid payload" >&2
+    return 2
+  }
+
+  sid="$(_json_field session_id "$json")"
+  key="s:${sid}"
+  pane="$(_json_field pane "$json")"
+  [ -n "$pane" ] || pane="${TMUX_PANE:-}"
+  [ -n "$pane" ] || pane="$(_resolve_pane_by_proc || true)"
+  [ -n "$pane" ] || pane="-"
+  pid="$(_json_field_any pid "$json")"
+  proc="$(_json_field process "$json")"
+  if [ -z "$pid" ] || [ "$pid" = 0 ]; then
+    agent="$(_resolve_agent_pid "$kind" || true)"
+    if [ -n "$agent" ]; then
+      pid="${agent%%$'\t'*}"
+      [ -n "$proc" ] || proc="${agent#*$'\t'}"
+    fi
+  fi
+  case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
+  [ -n "$proc" ] || proc="$kind"
+  cwd="$(_json_field cwd "$json")"
+  detail="$(_json_field label "$json")"
+  display="$(_agent_display_name "$kind")"
+
+  lock || return 0
+  case "$event" in
+    session_start)
+      _reg_upsert_locked "$kind" "$key" "$pid" "$pane" working "$cwd" "$proc"
+      _drop_rows '$4 == k && tolower($5) !~ donere' -v k="$key" -v donere="$DONE_RE"
+      ;;
+    approval)
+      _reg_upsert_locked "$kind" "$key" "$pid" "$pane" waiting "$cwd" "$proc"
+      label="$display needs approval${detail:+: $detail}"
+      [ "$(opt @radar-needinput on)" = "on" ] &&
+        _session_mark_locked "$pane" "$kind" "$label" "$key"
+      watch_kind=approval
+      ;;
+    input_required)
+      _reg_upsert_locked "$kind" "$key" "$pid" "$pane" waiting "$cwd" "$proc"
+      label="$display needs your input${detail:+: $detail}"
+      [ "$(opt @radar-needinput on)" = "on" ] &&
+        _session_mark_locked "$pane" "$kind" "$label" "$key"
+      watch_kind=input_required
+      ;;
+    approval_resolved|user_resumed|interrupt)
+      _reg_upsert_locked "$kind" "$key" "$pid" "$pane" working "$cwd" "$proc"
+      _drop_rows '$4 == k' -v k="$key"
+      case "$event" in
+        approval_resolved) label="$display approval resolved" ;;
+        interrupt) label="$display interrupted by user" ;;
+        *) label="$display resumed by user" ;;
+      esac
+      watch_kind=user_resumed
+      ;;
+    turn_complete)
+      _reg_upsert_locked "$kind" "$key" "$pid" "$pane" done "$cwd" "$proc"
+      label="$display finished - your turn${detail:+: $detail}"
+      [ "$(opt @radar-needinput on)" = "on" ] &&
+        _session_mark_locked "$pane" "$kind" "$label" "$key"
+      watch_kind=turn_complete
+      ;;
+    session_end)
+      _reg_remove_locked "$key"
+      _drop_rows '$4 == k && tolower($5) !~ donere' -v k="$key" -v donere="$DONE_RE"
+      ;;
+  esac
+  unlock
+
+  [ -n "$watch_kind" ] && [ "$pane" != "-" ] &&
+    _watch_event "$pane" "$watch_kind" "$kind" "$label"
+  _refresh_titles
+  _sync_bar
+}
+
+cmd_agent_event() {  # agent-event <agent-kind> <normalized-event>
+  local kind="${1:-}" event="${2:-}" json
+  json="$(_agent_json_object)" || return 2
+  _agent_event_apply "$kind" "$event" "$json"
+}
+
+cmd_kimi_hook() {
+  local json event normalized
+  json="$(_agent_json_object)" || return 2
+  event="$(_json_field hook_event_name "$json")"
+  case "$event" in
+    SessionStart) normalized=session_start ;;
+    PermissionRequest) normalized=approval ;;
+    PermissionResult) normalized=approval_resolved ;;
+    UserPromptSubmit) normalized=user_resumed ;;
+    Stop) normalized=turn_complete ;;
+    Interrupt) normalized=interrupt ;;
+    SessionEnd) normalized=session_end ;;
+    *)
+      echo "kimi-hook: unsupported event: ${event:-<missing>}" >&2
+      return 2
+      ;;
+  esac
+  _agent_event_apply kimi "$normalized" "$json"
 }
 
 # Public API for any other agent that wants radar tracking: register with a
@@ -1155,6 +1328,8 @@ case "${1:-}" in
   codex)           shift; cmd_codex "${1:-}" ;;
   opencode-hook)   cmd_opencode_hook ;;
   opencode-stream) cmd_opencode_stream ;;
+  kimi-hook)       cmd_kimi_hook ;;
+  agent-event)     shift; cmd_agent_event "${1:-}" "${2:-}" ;;
   agent-register)  shift; cmd_agent_register "${1:-}" "${2:-}" "${3:-0}" "${4:--}" "${5:-}" ;;
   agent-end)       shift; cmd_agent_end "${1:-}" "${2:-}" ;;
   registry)        cmd_registry ;;                   # debug: registry + liveness verdicts
@@ -1162,5 +1337,5 @@ case "${1:-}" in
   agent-panes)     _agent_panes | tr '\001' '\n' ;;  # debug: which panes host an agent
   resolve-pane)    _resolve_pane_by_proc ;;          # debug: pane of this process tree
   resolve-cwd)     shift; _resolve_pane_by_cwd "${1:-$PWD}" ;;  # debug: pane owning a cwd
-  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|claude-mark|claude-stop|claude-clear|claude-register|claude-end|codex-hook|codex <json>|opencode-hook|opencode-stream|agent-register <kind> <key> <pid> <pane> [cwd]|agent-end <kind> <key>|registry|doctor|agent-panes|resolve-pane|resolve-cwd [cwd]}" >&2; exit 2 ;;
+  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|claude-mark|claude-stop|claude-clear|claude-register|claude-end|codex-hook|codex <json>|opencode-hook|opencode-stream|kimi-hook|agent-event <kind> <event>|agent-register <kind> <key> <pid> <pane> [cwd]|agent-end <kind> <key>|registry|doctor|agent-panes|resolve-pane|resolve-cwd [cwd]}" >&2; exit 2 ;;
 esac

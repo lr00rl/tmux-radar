@@ -103,15 +103,21 @@ func (app *App) Init() tea.Cmd {
 		return app.live.Init()
 	case phaseSetup:
 		if app.checker != nil {
-			return runPreflight(app.context, *app.checker, app.setup.preflightRequestID)
+			config, err := app.setup.reviewedConfig()
+			return runPreflight(app.context, *app.checker, config, err, app.setup.preflightRequestID)
 		}
 	}
 	return nil
 }
 
-func runPreflight(ctx context.Context, checker preflight.Checker, requestID uint64) tea.Cmd {
+func runPreflight(
+	ctx context.Context, checker preflight.Checker, config runmodel.Config, configErr error, requestID uint64,
+) tea.Cmd {
 	return func() tea.Msg {
-		result, err := checker.Check(ctx)
+		if configErr != nil {
+			return PreflightResultMsg{RequestID: requestID, Err: configErr}
+		}
+		result, err := checker.CheckConfig(ctx, config)
 		return PreflightResultMsg{RequestID: requestID, Result: result, Err: err}
 	}
 }
@@ -134,7 +140,11 @@ func (app *App) updateSetup(message tea.Msg) (tea.Model, tea.Cmd) {
 	updated, command := app.setup.Update(message)
 	app.setup = updated
 	if app.checker != nil && app.setup.preflightRequestID != previousRequestID {
-		command = combineCommands(command, runPreflight(app.context, *app.checker, app.setup.preflightRequestID))
+		config, err := app.setup.reviewedConfig()
+		command = combineCommands(
+			command,
+			runPreflight(app.context, *app.checker, config, err, app.setup.preflightRequestID),
+		)
 	}
 	if !app.setup.launchRequested {
 		return app, command

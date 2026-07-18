@@ -213,9 +213,13 @@ test_profile_managed_brain_does_not_claim_defaults() {
 }
 
 test_invalid_numeric_overrides_retain_effective_values() {
-  local config_file="$TMP/rejected-config.json" errors="$TMP/rejected.err"
+  local config_file="$TMP/rejected-config.json" errors="$TMP/rejected.err" rc
+  set +e
   TMUX_RADAR_SETUP_OVERRIDES='poll=abc,timeout=0,retry_limit=-1' \
     run_ai _build-watch-config %39 'keep going' > "$config_file" 2> "$errors"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || _fail_assert 'rejected overrides returned success'
 
   assert_json "$config_file" '
     (.values.poll == {value:17, source:"tmux"}) and
@@ -225,9 +229,13 @@ test_invalid_numeric_overrides_retain_effective_values() {
 }
 
 test_invalid_numeric_overrides_surface_rejections() {
-  local errors="$TMP/rejection-messages.err"
+  local errors="$TMP/rejection-messages.err" rc
+  set +e
   TMUX_RADAR_SETUP_OVERRIDES='poll=abc,timeout=0,retry_limit=-1' \
     run_ai _build-watch-config %39 'keep going' > /dev/null 2> "$errors"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || _fail_assert 'rejected overrides returned success'
 
   assert_contains "$(cat "$errors")" 'rejected' 'numeric rejection is explicit'
   assert_contains "$(cat "$errors")" 'poll=abc' 'poll rejection identifies input'

@@ -37,6 +37,12 @@ case "$cmd" in
       @radar-ai-profile|@switcher-ai-profile)
         [ -n "${TEST_PROFILE:-}" ] && printf '%s\n' "$TEST_PROFILE"
         ;;
+      @radar-ai-model|@switcher-ai-model)
+        [ -n "${TEST_MODEL:-}" ] && printf '%s\n' "$TEST_MODEL"
+        ;;
+      @radar-ai-effort|@switcher-ai-effort)
+        [ -n "${TEST_EFFORT:-}" ] && printf '%s\n' "$TEST_EFFORT"
+        ;;
     esac
     ;;
   display-message)
@@ -131,6 +137,8 @@ run_ai() {
     TEST_VERSION_LOG="$version_log" \
     TEST_CODEX_PATH="${TEST_CODEX_PATH:-}" \
     TEST_PROFILE="${TEST_PROFILE:-}" \
+    TEST_MODEL="${TEST_MODEL:-}" \
+    TEST_EFFORT="${TEST_EFFORT:-}" \
     TMUX_RADAR_STATE_DIR="$TMP/state-$case_name" \
     TMUX_RADAR_NEEDINPUT_FILE="$TMP/state-$case_name/need-input" \
     bash "$ROOT/scripts/ai.sh" "$@"
@@ -212,6 +220,13 @@ test_custom_command_bypasses_codex_preflight() {
   TEST_CASE_NAME=custom TMUX_RADAR_AI_CMD='printf custom' \
     run_ai _build-watch-config %1 'custom command goal' > "$config"
   assert_json "$config" '.values.command == {value:"printf custom",source:"runtime"}'
+  TEST_CASE_NAME=custom-reviewed TMUX_RADAR_AI_CMD='printf custom' \
+    run_ai _doctor-config-json < "$config" > "$result"
+  assert_json "$result" '
+    .backend.mode == "custom-command" and
+    .backend.command == "printf custom" and
+    .backend.source == "env"
+  '
 }
 
 test_custom_command_precedes_profile_with_warning() {
@@ -296,6 +311,40 @@ test_incompatible_setup_starts_no_model_process() {
     'incompatible setup launches no model process'
 }
 
+test_reviewed_config_drives_preflight_backend() {
+  local config="$TMP/reviewed-config.json"
+  local advanced="$TMP/reviewed-advanced.json"
+  local result="$TMP/reviewed-doctor.json"
+
+  TEST_CASE_NAME=reviewed TEST_MODEL=gpt-5.3-codex-spark TEST_EFFORT=high \
+    run_ai _build-watch-config %145 '' > "$config"
+  assert_json "$config" '
+    .values.model == {value:"gpt-5.3-codex-spark",source:"tmux"} and
+    .values.effort == {value:"high",source:"tmux"}
+  '
+  TEST_CASE_NAME=reviewed run_ai _doctor-config-json < "$config" > "$result"
+  assert_json "$result" '
+    .ok == true and
+    .backend.model == "gpt-5.3-codex-spark" and
+    .backend.model_source == "tmux" and
+    .backend.effort == "high" and
+    .backend.effort_source == "tmux"
+  '
+
+  jq '
+    .values.model={value:"gpt-5.6-luna",source:"custom"} |
+    .values.effort={value:"medium",source:"custom"}
+  ' "$config" > "$advanced"
+  TEST_CASE_NAME=reviewed-advanced run_ai _doctor-config-json < "$advanced" > "$result"
+  assert_json "$result" '
+    .ok == true and
+    .backend.model == "gpt-5.6-luna" and
+    .backend.model_source == "custom" and
+    .backend.effort == "medium" and
+    .backend.effort_source == "custom"
+  '
+}
+
 write_fakes
 run_test 'built-in supervision defaults are Luna/high' test_builtin_defaults_are_luna_high
 run_test 'inherited PATH order selects the user Codex' test_inherited_path_order_is_preserved
@@ -305,6 +354,7 @@ run_test 'custom command keeps precedence over profile with a warning' test_cust
 run_test 'profile execution uses the frozen explicit Codex' test_profile_executes_the_frozen_explicit_codex
 run_test 'version probes are bounded and prereleases fail closed' test_version_probe_is_bounded_and_rejects_prereleases
 run_test 'incompatible setup launches no model process' test_incompatible_setup_starts_no_model_process
+run_test 'reviewed config drives preflight backend identity' test_reviewed_config_drives_preflight_backend
 
 if [ "$FAILURES" -ne 0 ]; then
   printf 'FAIL: %s preflight regression(s)\n' "$FAILURES" >&2

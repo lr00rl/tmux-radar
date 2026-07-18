@@ -292,6 +292,7 @@ _config_value_type() {
 _config_set() {  # mutates CONFIG_JSON; preserves old effective value on rejection
   local key="$1" value="$2" source="$3" noisy="${4:-1}" type constraint
   if ! _config_value_valid "$key" "$value"; then
+    CONFIG_REJECTED=1
     constraint="$(_config_constraint "$key")"
     [ "$noisy" -eq 0 ] || printf 'rejected %s=%s; allowed: %s\n' "$key" "$value" "$constraint" >&2
     return 1
@@ -317,6 +318,7 @@ _config_apply_overrides() {
     esac
     key="${item%%=*}"
     if [ "$item" = "$key" ]; then
+      CONFIG_REJECTED=1
       printf 'rejected %s; allowed: key=value\n' "$item" >&2
       continue
     fi
@@ -359,7 +361,7 @@ EOF
 }
 
 cmd_build_watch_config() {
-  local pane="$1" raw_goal="${2-}" goal goal_source env_command
+  local pane="$1" raw_goal="${2-}" goal goal_source env_command CONFIG_REJECTED=0
   need_jq
   if [ -n "$raw_goal" ]; then goal="$raw_goal"; goal_source=custom
   else goal='推进当前任务直到完成'; goal_source=default
@@ -403,6 +405,7 @@ cmd_build_watch_config() {
     else . end |
     .goal=.values.goal.value')"
   printf '%s\n' "$CONFIG_JSON"
+  [ "$CONFIG_REJECTED" -eq 0 ]
 }
 
 cmd_decode_goal() {
@@ -461,6 +464,7 @@ _apply_watch_config() {
   _config_assign "$config" profile TMUX_RADAR_RUN_PROFILE
   _config_assign "$config" model TMUX_RADAR_RUN_MODEL
   _config_assign "$config" effort TMUX_RADAR_RUN_EFFORT
+  TMUX_RADAR_RUN_COMMAND_SOURCE="$(printf '%s' "$config" | jq -r '.values.command.source')"
   TMUX_RADAR_RUN_MODEL_SOURCE="$(printf '%s' "$config" | jq -r '.values.model.source')"
   TMUX_RADAR_RUN_EFFORT_SOURCE="$(printf '%s' "$config" | jq -r '.values.effort.source')"
   _config_assign "$config" timeout TMUX_RADAR_RUN_TIMEOUT
@@ -479,7 +483,8 @@ _apply_watch_config() {
   export TMUX_RADAR_RUN_GOAL TMUX_RADAR_RUN_AUTONOMY TMUX_RADAR_RUN_APPROVAL_POLICY
   export TMUX_RADAR_RUN_ALWAYS_ALLOW TMUX_RADAR_RUN_HOOKS_FIRST TMUX_RADAR_RUN_POLL
   export TMUX_RADAR_RUN_STABLE_SCREEN_THRESHOLD TMUX_RADAR_RUN_COMMAND TMUX_RADAR_RUN_PROFILE
-  export TMUX_RADAR_RUN_MODEL TMUX_RADAR_RUN_EFFORT TMUX_RADAR_RUN_MODEL_SOURCE TMUX_RADAR_RUN_EFFORT_SOURCE
+  export TMUX_RADAR_RUN_MODEL TMUX_RADAR_RUN_EFFORT TMUX_RADAR_RUN_COMMAND_SOURCE
+  export TMUX_RADAR_RUN_MODEL_SOURCE TMUX_RADAR_RUN_EFFORT_SOURCE
   export TMUX_RADAR_RUN_TIMEOUT
   export TMUX_RADAR_RUN_MAX_DECISIONS TMUX_RADAR_RUN_RETRY_LIMIT TMUX_RADAR_RUN_RETRY_BACKOFF
   export TMUX_RADAR_RUN_CAPTURE_LINES TMUX_RADAR_RUN_MONITOR_EXCERPT_LINES
@@ -635,29 +640,47 @@ _freeze_backend() {
   BRAIN_BACKEND_PROFILE=''
   BRAIN_BACKEND_WARNING=''
 
-  model="$(opt @radar-ai-model gpt-5.6-luna)"
-  effort="$(opt @radar-ai-effort high)"
-  profile="$(opt @radar-ai-profile '')"
+  if [ "${TMUX_RADAR_RUN_PROFILE+x}" = x ]; then
+    profile="$TMUX_RADAR_RUN_PROFILE"
+  else
+    profile="$(opt @radar-ai-profile '')"
+  fi
   model_source="${TMUX_RADAR_RUN_MODEL_SOURCE:-}"
   effort_source="${TMUX_RADAR_RUN_EFFORT_SOURCE:-}"
-  if [ -z "$model_source" ]; then
+  if [ -n "$model_source" ]; then
+    model="${TMUX_RADAR_RUN_MODEL:-}"
+  else
+    model="$(opt @radar-ai-model gpt-5.6-luna)"
     if [ -n "$profile" ] && [ -z "$(_explicit_opt @radar-ai-model)" ]; then
       model=''; model_source='profile-managed'
     elif [ -n "$(_explicit_opt @radar-ai-model)" ]; then model_source='tmux'
     else model_source='default'; fi
   fi
-  if [ -z "$effort_source" ]; then
+  if [ -n "$effort_source" ]; then
+    effort="${TMUX_RADAR_RUN_EFFORT:-}"
+  else
+    effort="$(opt @radar-ai-effort high)"
     if [ -n "$profile" ] && [ -z "$(_explicit_opt @radar-ai-effort)" ]; then
       effort=''; effort_source='profile-managed'
     elif [ -n "$(_explicit_opt @radar-ai-effort)" ]; then effort_source='tmux'
     else effort_source='default'; fi
   fi
-  custom="${TMUX_RADAR_AI_CMD:-${TMUX_SWITCHER_AI_CMD:-}}"
-  if [ -n "$custom" ]; then
-    source='env'
+  if [ "${TMUX_RADAR_RUN_COMMAND+x}" = x ]; then
+    custom="$TMUX_RADAR_RUN_COMMAND"
+    if [ -n "$custom" ]; then
+      case "${TMUX_RADAR_RUN_COMMAND_SOURCE:-}" in
+        runtime) source='env' ;;
+        *) source='config' ;;
+      esac
+    fi
   else
-    custom="$(opt @radar-ai-cmd '')"
-    [ -n "$custom" ] && source='config'
+    custom="${TMUX_RADAR_AI_CMD:-${TMUX_SWITCHER_AI_CMD:-}}"
+    if [ -n "$custom" ]; then
+      source='env'
+    else
+      custom="$(opt @radar-ai-cmd '')"
+      [ -n "$custom" ] && source='config'
+    fi
   fi
 
   BRAIN_BACKEND_MODEL="$model"
@@ -738,6 +761,41 @@ _ensure_backend_frozen() {
 
 cmd_doctor_json() {
   need_jq
+  _freeze_backend 1
+  printf '%s\n' "$BRAIN_PREFLIGHT_JSON"
+}
+
+cmd_doctor_config_json() {
+  local raw config
+  need_jq
+  raw="$(cat)"
+  if ! config="$(printf '%s' "$raw" | jq -c -s '
+    def exact($expected): (keys | sort) == ($expected | sort);
+    if length == 1 and
+      (.[0] | exact(["schema_version","pane","goal","values"])) and
+      .[0].schema_version == 1 and
+      (.[0].pane | type == "string" and test("^%[0-9]+$")) and
+      (.[0].goal | type == "string" and length > 0) and
+      .[0].goal == .[0].values.goal.value and
+      (.[0].values | exact([
+        "goal","autonomy","approval_policy","always_allow","hooks_first","poll",
+        "stable_screen_threshold","command","profile","model","effort","timeout",
+        "max_decisions","retry_limit","retry_backoff","capture_lines",
+        "monitor_excerpt_lines","monitor_position","monitor_width","overview_ratio",
+        "completion_close_delay","logging","screen_snapshots","retention_days"
+      ])) and
+      ([.[0].values[] |
+        exact(["source","value"]) and
+        (.source | IN("default","tmux","custom","runtime","preset","legacy","profile-managed"))
+      ] | all)
+    then .[0]
+    else error("expected one reviewed schema-v1 config")
+    end
+  ' 2>/dev/null)"; then
+    echo "_doctor-config-json: invalid reviewed config" >&2
+    return 2
+  fi
+  _apply_watch_config "$config"
   _freeze_backend 1
   printf '%s\n' "$BRAIN_PREFLIGHT_JSON"
 }
@@ -4241,6 +4299,7 @@ case "${1:-}" in
   _render-watch-config) shift; cmd_render_watch_config "${1:-}" || rc=$? ;;
   _classify-backend-failure) shift; _classify_backend_failure "${1:-0}" "${2:-/dev/null}" "${3:-0}" "${4:-}" || rc=$? ;;
   doctor-json)   shift; cmd_doctor_json "$@" || rc=$? ;;
+  _doctor-config-json) shift; cmd_doctor_config_json "$@" || rc=$? ;;
   engine-start)  shift; cmd_engine_start || rc=$? ;;
   control)       shift; cmd_control "${1:-}" "${2:-}" "${3:-}" "${4:-}" || rc=$? ;;
   ask)          shift; cmd_ask "$@" || rc=$? ;;

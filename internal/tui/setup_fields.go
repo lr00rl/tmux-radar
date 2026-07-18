@@ -203,8 +203,28 @@ func (model *SetupModel) setTextField(id, value string) {
 		model.config.Values.Command = custom
 	case fieldProfile:
 		model.config.Values.Profile = custom
+		if value != "" {
+			if model.config.Values.Model.Source == runmodel.SourceDefault {
+				model.config.Values.Model = runmodel.Value[string]{Source: runmodel.SourceProfileManaged}
+			}
+			if model.config.Values.Effort.Source == runmodel.SourceDefault {
+				model.config.Values.Effort = runmodel.Value[string]{Source: runmodel.SourceProfileManaged}
+			}
+		} else {
+			defaults := runmodel.DefaultConfig(model.targetPane, "")
+			if model.config.Values.Model.Source == runmodel.SourceProfileManaged {
+				model.config.Values.Model = defaults.Values.Model
+			}
+			if model.config.Values.Effort.Source == runmodel.SourceProfileManaged {
+				model.config.Values.Effort = defaults.Values.Effort
+			}
+		}
 	case fieldModel:
-		model.config.Values.Model = custom
+		if value == "" && model.config.Values.Profile.Value != "" {
+			model.config.Values.Model = runmodel.Value[string]{Source: runmodel.SourceProfileManaged}
+		} else {
+			model.config.Values.Model = custom
+		}
 	}
 }
 

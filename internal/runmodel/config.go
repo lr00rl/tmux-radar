@@ -146,9 +146,39 @@ func legacySource(value string) Source {
 	}
 }
 
+// DecodeReviewedConfigStrict is the shell-to-setup boundary. It accepts only a
+// complete schema-v1 config and rejects launch state or additive protocol drift.
+func DecodeReviewedConfigStrict(payload []byte) (Config, error) {
+	config, err := decodeCurrentConfigStrict(payload)
+	if err != nil {
+		return Config{}, err
+	}
+	if config.Backend != nil {
+		return Config{}, errors.New("strict reviewed config: backend is launch state and is not allowed")
+	}
+	if config.RunID != "" || config.CreatedAt != "" || config.CreatedEpoch != 0 {
+		return Config{}, errors.New("strict reviewed config: run metadata is not allowed")
+	}
+	if err := config.Validate(); err != nil {
+		return Config{}, err
+	}
+	return config, nil
+}
+
 // DecodeConfigStrict is the launch boundary. Protocol v1 must send a complete
 // v1 config and may not smuggle misspelled or unsupported fields.
 func DecodeConfigStrict(payload []byte) (Config, error) {
+	config, err := decodeCurrentConfigStrict(payload)
+	if err != nil {
+		return Config{}, err
+	}
+	if err := config.ValidateLaunch(); err != nil {
+		return Config{}, err
+	}
+	return config, nil
+}
+
+func decodeCurrentConfigStrict(payload []byte) (Config, error) {
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	var config Config
@@ -160,9 +190,6 @@ func DecodeConfigStrict(payload []byte) (Config, error) {
 	}
 	if config.SchemaVersion != CurrentSchemaVersion {
 		return Config{}, fmt.Errorf("schema_version: launch requires version %d", CurrentSchemaVersion)
-	}
-	if err := config.ValidateLaunch(); err != nil {
-		return Config{}, err
 	}
 	return config, nil
 }

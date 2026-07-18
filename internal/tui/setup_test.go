@@ -207,3 +207,72 @@ func TestSetupProducesExactImmutableConfig(t *testing.T) {
 		t.Fatalf("goal bytes changed: top=%q value=%q", config.Goal, config.Values.Goal.Value)
 	}
 }
+
+func TestSetupReviewsLoadedTmuxModelAndProvenance(t *testing.T) {
+	base := runmodel.DefaultConfig("%145", "")
+	base.Values.Model = runmodel.Value[string]{
+		Value: "gpt-5.3-codex-spark", Source: runmodel.SourceTMUX,
+	}
+	result := compatiblePreflight()
+	result.Model = base.Values.Model.Value
+	result.Backend.Model = base.Values.Model.Value
+	result.Backend.ModelSource = runmodel.SourceTMUX
+
+	model := NewSetup(SetupOptions{
+		TargetPane: "%145", Entry: EntryAlwaysAllow, Config: &base, Preflight: &result,
+	})
+	if !strings.Contains(model.View(), "Brain gpt-5.3-codex-spark/high") {
+		t.Fatalf("setup did not show loaded tmux model:\n%s", model.View())
+	}
+	config, err := model.immutableConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Values.Model.Source != runmodel.SourceTMUX ||
+		config.Backend == nil || config.Backend.ModelSource != runmodel.SourceTMUX {
+		t.Fatalf("reviewed provenance was not preserved: config=%#v", config)
+	}
+}
+
+func TestSetupProfileManagesOnlyImplicitBrainFields(t *testing.T) {
+	model := readySetup(EntryAdvanced)
+	model.setTextField(fieldProfile, "locked")
+	if model.config.Values.Model != (runmodel.Value[string]{Source: runmodel.SourceProfileManaged}) ||
+		model.config.Values.Effort != (runmodel.Value[string]{Source: runmodel.SourceProfileManaged}) {
+		t.Fatalf("profile retained false built-in defaults: model=%#v effort=%#v",
+			model.config.Values.Model, model.config.Values.Effort)
+	}
+	model.setTextField(fieldProfile, "")
+	if model.config.Values.Model != (runmodel.Value[string]{
+		Value: "gpt-5.6-luna", Source: runmodel.SourceDefault,
+	}) || model.config.Values.Effort != (runmodel.Value[string]{
+		Value: "high", Source: runmodel.SourceDefault,
+	}) {
+		t.Fatalf("clearing profile did not restore defaults: model=%#v effort=%#v",
+			model.config.Values.Model, model.config.Values.Effort)
+	}
+
+	base := runmodel.DefaultConfig("%145", "")
+	base.Values.Model = runmodel.Value[string]{
+		Value: "gpt-5.3-codex-spark", Source: runmodel.SourceTMUX,
+	}
+	model = NewSetup(SetupOptions{TargetPane: "%145", Entry: EntryAdvanced, Config: &base})
+	model.setTextField(fieldProfile, "locked")
+	if model.config.Values.Model != base.Values.Model {
+		t.Fatalf("profile replaced explicit tmux model: got=%#v want=%#v",
+			model.config.Values.Model, base.Values.Model)
+	}
+	if model.config.Values.Effort.Source != runmodel.SourceProfileManaged {
+		t.Fatalf("profile falsely retained implicit effort: %#v", model.config.Values.Effort)
+	}
+
+	model.setTextField(fieldModel, "explicit-model")
+	model.setTextField(fieldModel, "")
+	if model.config.Values.Model != (runmodel.Value[string]{Source: runmodel.SourceProfileManaged}) {
+		t.Fatalf("clearing an explicit model did not restore profile management: %#v",
+			model.config.Values.Model)
+	}
+	if _, err := model.reviewedConfig(); err != nil {
+		t.Fatalf("restored profile-managed model is not reviewable: %v", err)
+	}
+}

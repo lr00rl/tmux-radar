@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -51,7 +52,19 @@ case "${1:-}" in
     [ "${2:-}" = -S ] && exit 0
     sleep 0.02
     ;;
-  show-option|list-sessions|list-panes|send-keys|kill-pane) exit 0 ;;
+  show-option)
+    key=""
+    for arg in "$@"; do key="$arg"; done
+    case "$key" in
+      @radar-ai-model|@switcher-ai-model)
+        [ -z "${TEST_MODEL:-}" ] || printf '%s\n' "$TEST_MODEL"
+        ;;
+      @radar-ai-effort|@switcher-ai-effort)
+        [ -z "${TEST_EFFORT:-}" ] || printf '%s\n' "$TEST_EFFORT"
+        ;;
+    esac
+    ;;
+  list-sessions|list-panes|send-keys|kill-pane) exit 0 ;;
   *) exit 0 ;;
 esac
 SH
@@ -71,6 +84,17 @@ fi
 printf '%s\n' '{"action":"wait","text":"","keys":[],"safe":true,"reason":"fixture wait","pane_state":"working","goal_status":"working","risk":"low","evidence":[]}'
 SH
 chmod +x "$TMP/bin/fake-brain"
+
+cat > "$TMP/bin/codex" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' 'codex-cli 0.144.4'
+  exit 0
+fi
+cat >/dev/null
+printf '%s\n' '{"action":"wait","text":"","keys":[],"safe":true,"reason":"fixture wait","pane_state":"working","goal_status":"working","risk":"low","evidence":[]}'
+SH
+chmod +x "$TMP/bin/codex"
 
 cat > "$TMP/bin/owner-heartbeat" <<'SH'
 #!/usr/bin/env bash
@@ -97,6 +121,17 @@ run_ai() {
     bash "$ROOT/scripts/ai.sh" "$@"
 }
 
+run_ai_codex() {
+  PATH="$TMP/bin:$PATH" \
+  TMUX_RADAR_STATE_DIR="$TMP/state" \
+  TMUX_RADAR_NEEDINPUT_FILE="$TMP/state/need-input" \
+  TMUX_RADAR_AI_CMD='' \
+  TMUX_SWITCHER_AI_CMD='' \
+  TMUX_RADAR_RUNTIME_OVERRIDES='poll=30,completion_close_delay=0' \
+  TMUX_RADAR_TEST_WAIT_TICK=0.01 \
+    bash "$ROOT/scripts/ai.sh" "$@"
+}
+
 build_request() {
   local goal="$1" owner config backend
   if [ "$#" -gt 1 ]; then owner="$2"
@@ -113,9 +148,56 @@ build_request() {
 }
 
 goal=$'private goal line 1\nprivate goal line 2'
+
+spark_config="$(TEST_MODEL=gpt-5.3-codex-spark TEST_EFFORT=high \
+  run_ai_codex _build-watch-config %1 'spark provenance chain')"
+spark_preflight="$(printf '%s\n' "$spark_config" | run_ai_codex _doctor-config-json)"
+spark_backend="$(printf '%s' "$spark_preflight" | jq -c '.backend')"
+spark_config="$(printf '%s' "$spark_config" | jq -c --argjson backend "$spark_backend" \
+  '. + {backend:$backend}')"
+spark_request="$(jq -cn \
+  --arg state_root "$TMP/state" \
+  --argjson config "$spark_config" \
+  '{protocol_version:1,config_schema_version:1,state_root:$state_root,
+    target_pane:"%1",config:$config,owner:{schema_version:1,kind:"detached"}}')"
+
+run_count_before="$(find "$TMP/state/ai-runs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+tampered_request="$(printf '%s' "$spark_request" | jq -c '.config.backend.identity="tampered"')"
+set +e
+tampered_result="$(printf '%s\n' "$tampered_request" | run_ai_codex engine-start)"
+tampered_rc=$?
+set -e
+[ "$tampered_rc" -ne 0 ] || _fail_assert 'tampered Spark backend returned success'
+printf '%s' "$tampered_result" | jq -e \
+  '.ok == false and .status == "rejected" and .code == "backend-drift"' >/dev/null ||
+  _fail_assert 'tampered Spark backend did not fail as backend drift' 'actual' "$tampered_result"
+assert_eq "$run_count_before" \
+  "$(find "$TMP/state/ai-runs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')" \
+  'backend drift creates no run directory'
+
+spark_result="$(printf '%s\n' "$spark_request" | run_ai_codex engine-start)"
+printf '%s' "$spark_result" | jq -e '.ok == true and .status == "started"' >/dev/null ||
+  _fail_assert 'reviewed Spark backend did not start' 'actual' "$spark_result"
+WATCHER_PID="$(printf '%s' "$spark_result" | jq -r '.watcher_pid')"
+spark_run_id="$(printf '%s' "$spark_result" | jq -r '.run_id')"
+spark_run_dir="$(printf '%s' "$spark_result" | jq -r '.run_dir')"
+assert_json "$spark_run_dir/config.json" '
+  .values.model == {value:"gpt-5.3-codex-spark",source:"tmux"} and
+  .values.effort == {value:"high",source:"tmux"} and
+  .backend.model == "gpt-5.3-codex-spark" and
+  .backend.model_source == "tmux" and
+  .backend.effort == "high" and
+  .backend.effort_source == "tmux"
+'
+run_ai_codex control "$spark_run_id" %1 stop req-stop-spark >/dev/null
+wait_for_exit "$WATCHER_PID" 200 0.02
+WATCHER_PID=""
+printf 'PASS: reviewed Spark/tmux config survives preflight and engine-start without drift\n'
+
 request="$(build_request "$goal")"
 
 invalid="$(printf '%s' "$request" | jq -c '. + {unknown_field:true}')"
+invalid_before="$(find "$TMP/state/ai-runs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
 set +e
 invalid_result="$(printf '%s\n' "$invalid" | run_ai engine-start)"
 invalid_rc=$?
@@ -125,10 +207,12 @@ printf '%s' "$invalid_result" | jq -e '
   .protocol_version == 1 and .ok == false and .status == "rejected" and
   .error.code == "invalid-request"
 ' >/dev/null || _fail_assert 'invalid request did not return a stable rejection' 'actual' "$invalid_result"
-[ -z "$(find "$TMP/state/ai-runs" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ] ||
-  _fail_assert 'invalid request created a run directory'
+assert_eq "$invalid_before" \
+  "$(find "$TMP/state/ai-runs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')" \
+  'invalid request creates no run directory'
 printf 'PASS: strict engine-start rejects before side effects\n'
 
+runs_before_concurrent="$(find "$TMP/state/ai-runs" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
 printf '%s\n' "$request" | run_ai engine-start > "$TMP/start-1.json" 2> "$TMP/start-1.err" &
 start_one=$!
 printf '%s\n' "$request" | run_ai engine-start > "$TMP/start-2.json" 2> "$TMP/start-2.err" &
@@ -146,7 +230,8 @@ WATCHER_PID="$(jq -r '.watcher_pid' "$started_file")"
 if [ -z "$run_id" ] || [ ! -d "$run_dir" ] || ! kill -0 "$WATCHER_PID" 2>/dev/null; then
   _fail_assert 'started result does not identify one live watcher' 'result' "$(cat "$started_file")"
 fi
-assert_eq 1 "$(find "$TMP/state/ai-runs" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" \
+assert_eq "$((runs_before_concurrent + 1))" \
+  "$(find "$TMP/state/ai-runs" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" \
   'concurrent start run count'
 assert_json "$run_dir/ready.json" '.schema_version == 1 and .phase == "ARMED"'
 assert_json "$run_dir/start.json" ".schema_version == 1 and .generation != \"\" and .watcher_pid == $WATCHER_PID"

@@ -414,6 +414,22 @@ func (model *SetupModel) requestLaunch() {
 }
 
 func (model SetupModel) immutableConfig() (runmodel.Config, error) {
+	config, err := model.reviewedConfig()
+	if err != nil {
+		return runmodel.Config{}, err
+	}
+	if model.preflightStatus != preflightReady || !model.preflightResult.OK {
+		return runmodel.Config{}, errors.New("preflight must pass before launch")
+	}
+	backend := model.preflightResult.Backend
+	config.Backend = &backend
+	if err := config.ValidateLaunch(); err != nil {
+		return runmodel.Config{}, fmt.Errorf("launch configuration: %w", err)
+	}
+	return config, nil
+}
+
+func (model SetupModel) reviewedConfig() (runmodel.Config, error) {
 	config := model.config
 	goal := model.goal.Value()
 	if goal == "" {
@@ -424,13 +440,9 @@ func (model SetupModel) immutableConfig() (runmodel.Config, error) {
 	}
 	config.Goal = goal
 	config.Pane = model.targetPane
-	if model.preflightStatus != preflightReady || !model.preflightResult.OK {
-		return runmodel.Config{}, errors.New("preflight must pass before launch")
-	}
-	backend := model.preflightResult.Backend
-	config.Backend = &backend
-	if err := config.ValidateLaunch(); err != nil {
-		return runmodel.Config{}, fmt.Errorf("launch configuration: %w", err)
+	config.Backend = nil
+	if err := config.Validate(); err != nil {
+		return runmodel.Config{}, fmt.Errorf("reviewed configuration: %w", err)
 	}
 	return config, nil
 }

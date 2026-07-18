@@ -286,6 +286,72 @@ func TestDecodeConfigStrictRejectsUnknownLaunchFields(t *testing.T) {
 	}
 }
 
+func TestDecodeReviewedConfigStrictAcceptsOnlyExactSchemaV1WithoutLaunchState(t *testing.T) {
+	t.Parallel()
+
+	config := DefaultConfig("%145", "review")
+	payload, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeReviewedConfigStrict(payload); err != nil {
+		t.Fatalf("valid reviewed config rejected: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		payload []byte
+		want    string
+	}{
+		{
+			name:    "unknown top-level",
+			payload: bytes.Replace(payload, []byte(`"pane":"%145"`), []byte(`"pane":"%145","future":true`), 1),
+			want:    "unknown field",
+		},
+		{
+			name:    "unknown value field",
+			payload: bytes.Replace(payload, []byte(`"goal":{"value"`), []byte(`"goal":{"future":true,"value"`), 1),
+			want:    "unknown field",
+		},
+		{
+			name:    "legacy schema",
+			payload: bytes.Replace(payload, []byte(`"schema_version":1`), []byte(`"schema_version":0`), 1),
+			want:    "schema_version",
+		},
+		{
+			name:    "multiple values",
+			payload: append(append([]byte{}, payload...), payload...),
+			want:    "trailing JSON",
+		},
+		{
+			name:    "incomplete provenance",
+			payload: bytes.Replace(payload, []byte(`"source":"default"`), []byte(`"source":""`), 1),
+			want:    "source",
+		},
+	}
+
+	withBackend := config
+	withBackend.Backend = validCodexBackend()
+	backendPayload, err := json.Marshal(withBackend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests = append(tests, struct {
+		name    string
+		payload []byte
+		want    string
+	}{name: "launch state", payload: backendPayload, want: "backend"})
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := DecodeReviewedConfigStrict(test.payload)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("DecodeReviewedConfigStrict() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestConfigValidationRejectsInvalidEnumsAndNumbers(t *testing.T) {
 	t.Parallel()
 

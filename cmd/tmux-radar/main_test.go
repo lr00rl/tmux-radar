@@ -107,6 +107,54 @@ func TestRunSetupCancellationIsSuccessAndLeavesNoHeartbeat(t *testing.T) {
 	}
 }
 
+func TestRunSetupLoadsEffectiveConfigBeforeRendering(t *testing.T) {
+	script := writeFakeEngine(t, true)
+	stateRoot := t.TempDir()
+	capture := filepath.Join(t.TempDir(), "reviewed.json")
+	t.Setenv("TMUX_RADAR_TEST_CONFIG_CAPTURE", capture)
+	withProgramRunner(t, func(_ context.Context, app *tui.App, _ io.Reader, _ io.Writer) (tea.Model, error) {
+		view := app.View()
+		if !strings.Contains(view.Content, "Brain gpt-5.3-codex-spark/high") {
+			t.Fatalf("setup rendered stale defaults instead of effective config:\n%s", view.Content)
+		}
+		command := app.Init()
+		if command == nil {
+			t.Fatal("setup did not schedule reviewed-config preflight")
+		}
+		message := command()
+		if _, command = app.Update(message); command != nil {
+			_ = command()
+		}
+		payload, err := os.ReadFile(capture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reviewed, err := runmodel.DecodeReviewedConfigStrict(payload)
+		if err != nil {
+			t.Fatalf("captured reviewed config: %v", err)
+		}
+		if reviewed.Values.Model != (runmodel.Value[string]{
+			Value: "gpt-5.3-codex-spark", Source: runmodel.SourceTMUX,
+		}) {
+			t.Fatalf("preflight received stale config: %#v", reviewed.Values.Model)
+		}
+		message = tea.KeyPressMsg(tea.Key{Code: 'c', Text: "c", Mod: tea.ModCtrl})
+		_, command = app.Update(message)
+		if command != nil {
+			_ = command()
+		}
+		return app, nil
+	})
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{
+		"supervisor", "setup", "--target-pane", "%145", "--monitor-pane", "%99",
+		"--surface", "split", "--entry", "always-allow", "--engine-script", script, "--state-root", stateRoot,
+	}, strings.NewReader(""), &stdout, &stderr)
+	if code != exitOK {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestRunAttachMissingAndFinished(t *testing.T) {
 	stateRoot := t.TempDir()
 	script := writeFakeEngine(t, true)
@@ -142,14 +190,22 @@ func TestRunAttachMissingAndFinished(t *testing.T) {
 func writeFakeEngine(t *testing.T, ready bool) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "ai.sh")
+	effective := runmodel.DefaultConfig("%42", "")
+	effective.Values.Model = runmodel.Value[string]{
+		Value: "gpt-5.3-codex-spark", Source: runmodel.SourceTMUX,
+	}
+	effectivePayload, err := json.Marshal(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
 	result := map[string]any{
 		"ok": ready,
 		"backend": map[string]any{
 			"mode": "codex", "path": "/tmp/codex", "version": "0.144.0", "identity": "test",
-			"source": "test", "model": "gpt-5.6-luna", "effort": "high", "model_source": "default",
+			"source": "test", "model": "gpt-5.3-codex-spark", "effort": "high", "model_source": "tmux",
 			"effort_source": "default", "compatible": ready,
 		},
-		"model": "gpt-5.6-luna", "effort": "high", "candidates": []any{},
+		"model": "gpt-5.3-codex-spark", "effort": "high", "candidates": []any{},
 	}
 	if !ready {
 		result["class"] = "config-permanent"
@@ -160,7 +216,20 @@ func writeFakeEngine(t *testing.T, ready bool) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := "#!/usr/bin/env bash\nset -eu\nif [ \"${1:-}\" = doctor-json ]; then\n  printf '%s\\n' '" + string(payload) + "'\n  exit 0\nfi\nexit 9\n"
+	script := "#!/usr/bin/env bash\nset -eu\ncase \"${1:-}\" in\n" +
+		"  _build-watch-config)\n" +
+		"    pane=\"${2:-%42}\"\n" +
+		"    printf '%s\\n' '" + string(effectivePayload) + "' | sed \"s/%42/$pane/g\"\n" +
+		"    ;;\n" +
+		"  doctor-json|_doctor-config-json)\n" +
+		"    if [ \"${1:-}\" = _doctor-config-json ]; then\n" +
+		"      if [ -n \"${TMUX_RADAR_TEST_CONFIG_CAPTURE:-}\" ]; then cat > \"$TMUX_RADAR_TEST_CONFIG_CAPTURE\"\n" +
+		"      else cat >/dev/null; fi\n" +
+		"    fi\n" +
+		"    printf '%s\\n' '" + string(payload) + "'\n" +
+		"    ;;\n" +
+		"  *) exit 9 ;;\n" +
+		"esac\n"
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}

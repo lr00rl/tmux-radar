@@ -174,8 +174,14 @@ func runSetup(ctx context.Context, args []string, input io.Reader, output, error
 	environment := []string{"TMUX_RADAR_STATE_DIR=" + stateRoot}
 	checker := &preflight.Checker{EngineScript: resolvedEngine, Env: environment}
 	bridge := &enginebridge.Bridge{EngineScript: resolvedEngine, Env: environment}
+	config, err := checker.LoadConfig(ctx, *targetPane)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "supervisor effective config failed: %v\n", err)
+		return classifyError(err, exitPermanent)
+	}
 	app := tui.NewApp(tui.AppOptions{
-		Setup: tui.SetupOptions{TargetPane: *targetPane, Entry: entry}, Checker: checker, Engine: bridge,
+		Setup:   tui.SetupOptions{TargetPane: *targetPane, Entry: entry, Config: &config},
+		Checker: checker, Engine: bridge,
 		StateRoot: stateRoot, MonitorPane: *monitorPane, Surface: surface,
 		FocusTarget: focusTmuxPane(*targetPane),
 	})

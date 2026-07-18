@@ -148,7 +148,7 @@ TMUXEOF
 }
 
 prepare_env() {
-  mkdir -p "$TMP/home/.claude" "$TMP/home/.codex" "$TMP/state"
+  mkdir -p "$TMP/home/.claude" "$TMP/home/.codex" "$TMP/home/.kimi-code" "$TMP/state"
   export HOME="$TMP/home"
   export TEST_FAKE_TMUX="$TMP/bin/tmux"
   export BASH_ENV="$TMP/bashenv"
@@ -158,6 +158,8 @@ prepare_env() {
   export CLAUDE_SETTINGS="$TMP/home/.claude/settings.json"
   export CODEX_CONFIG="$TMP/home/.codex/config.toml"
   export CODEX_HOOKS_JSON="$TMP/home/.codex/hooks.json"
+  export KIMI_CONFIG="$TMP/home/.kimi-code/config.toml"
+  export TMUX_RADAR_TEST_KIMI_PRESENT=on
   export TEST_TMUX_CALLS="$TMP/tmux.calls"
   export TEST_TMUX_TITLES="$TMP/tmux.titles"
   export TEST_PANE_TITLE_FILE="$TMP/pane-title"
@@ -174,6 +176,7 @@ prepare_env() {
   printf '{}\n' > "$CLAUDE_SETTINGS"
   printf 'notify = ["/usr/bin/existing-notify"]\n' > "$CODEX_CONFIG"
   printf '{"hooks":{}}\n' > "$CODEX_HOOKS_JSON"
+  printf 'model = "kimi"\n# keep kimi user config\n' > "$KIMI_CONFIG"
 }
 
 reset_fake_tmux_logs() {
@@ -318,6 +321,7 @@ EOFCONF
   }
 }
 EOFJSON
+  printf 'model = "kimi"\n# keep kimi user config\n' > "$KIMI_CONFIG"
 }
 
 write_fake_tmux
@@ -491,6 +495,8 @@ assert_contains "$status_output" 'PermissionRequest' 'status reports PermissionR
 assert_contains "$status_output" 'Stop' 'status reports Stop'
 assert_contains "$status_output" 'UserPromptSubmit' 'status reports UserPromptSubmit'
 assert_contains "$status_output" 'legacy notify fallback' 'status reports notify fallback'
+assert_contains "$status_output" 'Kimi hooks installed: 7/7' 'status reports complete Kimi coverage'
+assert_eq '7' "$(awk '/# >>> tmux-radar kimi hooks >>>/{inside=1;next}/# <<< tmux-radar kimi hooks <<</{inside=0} inside && /^event = /{n++} END{print n+0}' "$KIMI_CONFIG")" 'Kimi managed block contains seven events'
 assert_not_contains "$install_output_two" 'already integrated already integrated' 'second install remains stable'
 
 for event in PermissionRequest Stop UserPromptSubmit; do
@@ -514,6 +520,8 @@ assert_not_contains "$(cat "$CODEX_CONFIG")" '/old/hooks.json:permission_request
 assert_not_contains "$(cat "$CODEX_CONFIG")" "$CODEX_HOOKS_JSON:permission_request" 'managed radar trust removed'
 assert_contains "$(cat "$CODEX_CONFIG")" 'notify = ["/usr/bin/existing-notify"]' 'uninstall restores the existing notify chain'
 assert_not_contains "$(cat "$CODEX_CONFIG")" "$ROOT/scripts/codex-notify-wrap.sh" 'uninstall removes only the radar wrapper'
+assert_not_contains "$(cat "$KIMI_CONFIG")" '# >>> tmux-radar kimi hooks >>>' 'uninstall removes Kimi managed block'
+assert_contains "$(cat "$KIMI_CONFIG")" '# keep kimi user config' 'uninstall preserves Kimi user config'
 
 isolated_hooks="$TMP/home/.codex/hooks-without-config.json"
 isolated_config="$TMP/home/.codex/config-does-not-exist.toml"
@@ -557,6 +565,7 @@ seed_install_fixtures
 printf '%s\n' '{invalid claude settings' > "$CLAUDE_SETTINGS"
 cp "$CODEX_CONFIG" "$TMP/config.before-transaction-failure"
 cp "$CODEX_HOOKS_JSON" "$TMP/hooks.before-transaction-failure"
+cp "$KIMI_CONFIG" "$TMP/kimi.before-transaction-failure"
 set +e
 bash "$ROOT/scripts/install-hooks.sh" install >"$TMP/transaction-failure.out" 2>"$TMP/transaction-failure.err"
 transaction_failure_rc=$?
@@ -564,6 +573,7 @@ set -e
 [ "$transaction_failure_rc" -ne 0 ] || _fail_assert 'invalid Claude settings must fail the full hook transaction'
 assert_file_same "$CODEX_CONFIG" "$TMP/config.before-transaction-failure" 'Codex config rolled back after downstream Claude failure'
 assert_file_same "$CODEX_HOOKS_JSON" "$TMP/hooks.before-transaction-failure" 'Codex hooks rolled back after downstream Claude failure'
+assert_file_same "$KIMI_CONFIG" "$TMP/kimi.before-transaction-failure" 'Kimi config rolled back after downstream Claude failure'
 
 seed_install_fixtures
 printf '%s\n' '{}' > "$CLAUDE_SETTINGS"
@@ -571,6 +581,7 @@ bash "$ROOT/scripts/install-hooks.sh" install >"$TMP/transaction-uninstall-setup
 printf '%s\n' '{invalid claude settings' > "$CLAUDE_SETTINGS"
 cp "$CODEX_CONFIG" "$TMP/config.before-uninstall-failure"
 cp "$CODEX_HOOKS_JSON" "$TMP/hooks.before-uninstall-failure"
+cp "$KIMI_CONFIG" "$TMP/kimi.before-uninstall-failure"
 set +e
 bash "$ROOT/scripts/install-hooks.sh" uninstall >"$TMP/transaction-uninstall-failure.out" 2>"$TMP/transaction-uninstall-failure.err"
 transaction_uninstall_failure_rc=$?
@@ -578,5 +589,6 @@ set -e
 [ "$transaction_uninstall_failure_rc" -ne 0 ] || _fail_assert 'invalid Claude settings must fail the full uninstall transaction'
 assert_file_same "$CODEX_CONFIG" "$TMP/config.before-uninstall-failure" 'Codex config rolled back after downstream Claude uninstall failure'
 assert_file_same "$CODEX_HOOKS_JSON" "$TMP/hooks.before-uninstall-failure" 'Codex hooks rolled back after downstream Claude uninstall failure'
+assert_file_same "$KIMI_CONFIG" "$TMP/kimi.before-uninstall-failure" 'Kimi config rolled back after downstream Claude uninstall failure'
 
 printf 'PASS: ai hook events and codex hook installation\n'

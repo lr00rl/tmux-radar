@@ -148,7 +148,7 @@ Set these **before** the plugin loads:
 | `@radar-ai-key` | `A` | Prefix key that opens the AI supervisor menu (capital `A` so a stray `prefix + a` can't trigger it). |
 | `@radar-ai-model` | `gpt-5.6-luna` | Codex model slug used by the supervisor's read-only decision calls. |
 | `@radar-ai-effort` | `high` | Reasoning effort per decision (`minimal`/`low`/`medium`/`high`/`xhigh`). |
-| `@radar-ai-profile` | *(none)* | Use a [codex config profile](https://github.com/openai/codex) (`codex exec -p <profile>`) instead of the model/effort options — bundle model, effort, etc. in `~/.codex/config.toml`. Safety flags (read-only, ephemeral) still apply. |
+| `@radar-ai-profile` | *(none)* | Use a [codex config profile](https://github.com/openai/codex) (`codex exec -p <profile>`) instead of the model/effort options. Supervisor isolation still ignores the base interactive config and disables hooks/tools; the explicitly selected profile supplies the brain settings. |
 | `@radar-ai-cmd` | *(none)* | Replace Codex entirely: any shell command that reads the prompt on **stdin** and prints the decision **JSON** on stdout (another CLI, a local model, …). |
 | `@radar-ai-rules` | *(none)* | **Your approval rules**: a file path (contents used) or a literal text block, appended to every decision prompt with top priority — e.g. "auto-approve npm test / file reads; ALWAYS escalate git push, deploys, anything touching prod". Falls back to `~/.config/tmux-radar/rules.md` when that file exists. |
 | `@radar-ai-prompt-dir` | *(none)* | Directory that **shadows** `scripts/prompts/` per file (`decide.md`, `control.md`, `*.schema.json`) — customize the default prompts without editing the plugin. |
@@ -356,14 +356,17 @@ interval begins after the current decision/action/verification finishes. One
 watch owns at most one model process tree, so a slow call cannot create another
 call every five seconds; arrivals are durably queued and coalesced first.
 
-**Codex is a read-only brain; the script is the only actor.** Each call uses
-`codex exec -s read-only --ephemeral` plus a JSON output schema. The script then
-checks local types, policy, safety, current event ID, and the target screen
-fingerprint before sending exact keys. Destructive, irreversible, production,
-credential, remote-write, or ambiguous actions escalate regardless of
-always-allow. Invalid output and backend failures retry with bounded backoff;
-timeouts and all stop paths terminate the complete wrapper/Codex/MCP process
-group.
+**Codex is a decision-only brain; the script is the only actor.** Each call uses
+`codex exec -s read-only --ephemeral` plus a JSON output schema, ignores the
+interactive Codex config and execpolicy rules, omits skill instructions,
+disables hooks and tool-bearing features, and runs from a private empty
+workspace rather than the target project. The script then checks local types,
+policy, safety, current event ID, and the target screen fingerprint before
+sending exact keys. Destructive, irreversible, production, credential,
+remote-write, or ambiguous actions escalate regardless of always-allow. Invalid
+output and backend failures retry with bounded backoff; exact backend failures
+and timeout limits remain visible in `Timeline` and `Logs`, and all stop paths
+terminate the complete wrapper/Codex process group.
 
 Every run is stored under `~/.local/state/tmux/ai-runs/<run-id>/`. Default
 `decision` logging persists config, state, events, structured decisions,

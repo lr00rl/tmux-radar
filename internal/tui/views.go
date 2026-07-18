@@ -284,7 +284,10 @@ func (model LiveModel) liveHeader(width int) []string {
 		}
 		nowLine = fmt.Sprintf("Now   %s %s · %s", severity, backendError.Code,
 			firstNonEmpty(backendError.Summary, backendError.Detail, status))
-		if phase == "PAUSED_ERROR" {
+		if model.snapshot.Final != nil {
+			nextLine = "Next  start supervision again after fixing · 5 Logs · " +
+				firstNonEmpty(backendError.Detail, "fix the backend configuration")
+		} else if phase == "PAUSED_ERROR" {
 			nextLine = "Next  " + firstNonEmpty(backendError.Detail,
 				"fix the backend configuration") + " · r reassess · 5 Logs"
 		} else {
@@ -359,7 +362,16 @@ func (model LiveModel) renderTabs(width int) string {
 
 func (model LiveModel) liveFooter(width int) []string {
 	controls := "1-5 views · j/k scroll · e expand · p pause · r reassess · k keep · Enter target · q stop · ? help"
-	if width < 56 {
+	if model.snapshot.Final != nil {
+		controls = "1-5 views · j/k scroll · e expand · k keep · Enter target · q close · ? help"
+		if width < 56 {
+			controls = "1-5 view · k · Enter · q · ?"
+		} else if width < 72 {
+			controls = "1-5 · k keep · Enter target · q close · ?"
+		} else if width < 110 {
+			controls = "1-5 · j/k · e · k · Enter · q · ?"
+		}
+	} else if width < 56 {
 		controls = "1-5 view · p · r · Enter · q · ?"
 	} else if width < 72 {
 		controls = "1-5 · p pause · r redo · Enter target · q stop · ?"

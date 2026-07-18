@@ -217,8 +217,23 @@ func TestLivePermanentErrorCompletionKeepAndHelp(t *testing.T) {
 		t.Fatalf("permanent error is not explicit\n%s", view)
 	}
 
+	model.snapshot.Final = &runmodel.Final{
+		SchemaVersion: 1, Outcome: "paused_error", Reason: "Codex is too old",
+	}
+	if view := ansi.Strip(model.View()); !strings.Contains(view, "start supervision again") ||
+		strings.Contains(view, "r reassess") {
+		t.Fatalf("terminal error offers an invalid reassess action\n%s", view)
+	}
+	updated, command := model.Update(keyPress('r', "r"))
+	model = updated
+	if command != nil || len(controller.calls) != 0 ||
+		!strings.Contains(model.controlNotice, "start a new supervision run") {
+		t.Fatalf("terminal error accepted reassess command=%#v calls=%#v notice=%q",
+			command, controller.calls, model.controlNotice)
+	}
+
 	model.snapshot.Final = &runmodel.Final{SchemaVersion: 1, Outcome: "completed", Reason: "goal done"}
-	updated, command := model.Update(keyPress('k', "k"))
+	updated, command = model.Update(keyPress('k', "k"))
 	model = updated
 	if command == nil || model.pending == nil || model.pending.Action != "keep" {
 		t.Fatalf("completion keep pending=%#v", model.pending)

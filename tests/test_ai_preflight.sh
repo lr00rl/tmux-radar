@@ -283,6 +283,28 @@ test_spark_disables_reasoning_summaries() {
     'Spark execution disables unavailable reasoning summaries'
 }
 
+test_codex_brain_disables_agent_tooling() {
+  local invocation workspace="$TMP/state-isolated-brain/ai-brain-workspace"
+  TEST_CASE_NAME=isolated-brain TEST_MODEL=gpt-5.3-codex-spark TEST_EFFORT=high \
+    run_ai decide %1 auto-safe safe-auto 'complete fixture'
+  invocation="$(cat "$TMP/isolated-brain.exec.log")"
+  assert_contains "$invocation" '--ignore-user-config' \
+    'supervisor brain ignores the interactive Codex configuration'
+  assert_contains "$invocation" '--ignore-rules' \
+    'supervisor brain ignores interactive execpolicy rules'
+  assert_contains "$invocation" '-c skills.include_instructions=false' \
+    'supervisor brain omits unrelated skill instructions'
+  assert_contains "$invocation" "-C $workspace" \
+    'supervisor brain runs outside the target project'
+  for feature in hooks shell_tool unified_exec apps plugins multi_agent \
+    browser_use computer_use image_generation code_mode_host; do
+    assert_contains "$invocation" "--disable $feature" \
+      "supervisor brain disables $feature"
+  done
+  [ -d "$workspace" ] || _fail_assert \
+    'supervisor brain workspace was not created' 'workspace' "$workspace"
+}
+
 test_version_probe_is_bounded_and_rejects_prereleases() {
   local result="$TMP/slow-doctor.json" started elapsed
   started="$(date '+%s')"
@@ -366,6 +388,7 @@ run_test 'custom command bypasses Codex preflight' test_custom_command_bypasses_
 run_test 'custom command keeps precedence over profile with a warning' test_custom_command_precedes_profile_with_warning
 run_test 'profile execution uses the frozen explicit Codex' test_profile_executes_the_frozen_explicit_codex
 run_test 'Spark execution disables unavailable reasoning summaries' test_spark_disables_reasoning_summaries
+run_test 'Codex supervisor brain disables interactive agent tooling' test_codex_brain_disables_agent_tooling
 run_test 'version probes are bounded and prereleases fail closed' test_version_probe_is_bounded_and_rejects_prereleases
 run_test 'incompatible setup launches no model process' test_incompatible_setup_starts_no_model_process
 run_test 'reviewed config drives preflight backend identity' test_reviewed_config_drives_preflight_backend

@@ -4,11 +4,11 @@
 # running inside your tmux panes (Claude Code / Codex), answers their prompts on
 # your behalf, and arranges your tmux layout from natural language.
 #
-# Design principle: Codex is a READ-ONLY BRAIN. It never touches your system.
-# This script is the only actor: it captures a pane, asks Codex for a structured
-# decision, then — gated by an autonomy setting, a safety denylist, and an audit
-# log — sends the keystrokes itself. Codex runs `-s read-only --ephemeral`, so a
-# confused or adversarial answer can at most propose keys we still get to veto.
+# Design principle: Codex is a DECISION-ONLY BRAIN. It receives no interactive
+# config, hooks, project workspace, or tool-bearing features. This script is the
+# only actor: it captures a pane, asks Codex for a structured decision, then —
+# gated by autonomy, a safety denylist, and an audit log — sends the keystrokes.
+# A confused or adversarial answer can at most propose keys we still get to veto.
 #
 # Subcommands:
 #   ask [<request>]     one-shot: arrange tmux from a natural-language request
@@ -1382,6 +1382,7 @@ _resolve_pane() {
 # ---------------------------------------------------------------------------
 _brain() {
   local schema="$1" prompt="$2" out err pid pid_tmp rc=0 started timeout stop_reason="" had_job_control=0
+  local brain_workdir
   local -a codex_args=()
   _ensure_backend_frozen
   BRAIN_RESULT=""
@@ -1413,26 +1414,48 @@ _brain() {
     [ "$err" = "/dev/null" ] || printf '%s\n' "$BRAIN_STOP_REASON" > "$err"
     return 0
   fi
+  if [ "$BRAIN_BACKEND_MODE" = codex ]; then
+    brain_workdir="$STATE_DIR/ai-brain-workspace"
+    if ! mkdir -p "$brain_workdir" || ! chmod 700 "$brain_workdir"; then
+      BRAIN_LAST_RC=78
+      BRAIN_STOP_REASON="cannot prepare isolated Codex workspace: $brain_workdir"
+      [ "$err" = "/dev/null" ] || printf '%s\n' "$BRAIN_STOP_REASON" > "$err"
+      return 0
+    fi
+  fi
   out="$(mktemp "${TMPDIR:-/tmp}/tmuxai.XXXXXX")"
   BRAIN_OUT_FILE="$out"
   case "$-" in *m*) had_job_control=1 ;; esac
   set -m
   if [ "$BRAIN_BACKEND_MODE" = custom-command ]; then
     (export TMUX_RADAR_INTERNAL=1; printf '%s' "$prompt" | eval "$BRAIN_BACKEND_COMMAND" > "$out" 2>"$err") &
-  elif [ -n "$BRAIN_BACKEND_PROFILE" ]; then
-    # a codex profile bundles model/effort/etc in ~/.codex/config.toml; the
-    # safety flags (read-only, ephemeral) stay ours and are not overridable
-    TMUX_RADAR_INTERNAL=1 "$BRAIN_BACKEND_PATH" exec -p "$BRAIN_BACKEND_PROFILE" \
-      -s read-only --ephemeral --skip-git-repo-check \
-      --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" &
   else
-    codex_args=(exec
-      -m "$BRAIN_BACKEND_MODEL"
-      -c "model_reasoning_effort=$BRAIN_BACKEND_EFFORT")
-    if [ "$BRAIN_BACKEND_MODEL" = gpt-5.3-codex-spark ]; then
-      codex_args+=(-c 'model_reasoning_summary="none"')
+    codex_args=(exec)
+    if [ -n "$BRAIN_BACKEND_PROFILE" ]; then
+      codex_args+=(-p "$BRAIN_BACKEND_PROFILE")
+    else
+      codex_args+=(
+        -m "$BRAIN_BACKEND_MODEL"
+        -c "model_reasoning_effort=$BRAIN_BACKEND_EFFORT")
+      if [ "$BRAIN_BACKEND_MODEL" = gpt-5.3-codex-spark ]; then
+        codex_args+=(-c 'model_reasoning_summary="none"')
+      fi
     fi
     codex_args+=(
+      --ignore-user-config
+      --ignore-rules
+      -c skills.include_instructions=false
+      --disable hooks
+      --disable shell_tool
+      --disable unified_exec
+      --disable apps
+      --disable plugins
+      --disable multi_agent
+      --disable browser_use
+      --disable computer_use
+      --disable image_generation
+      --disable code_mode_host
+      -C "$brain_workdir"
       -s read-only --ephemeral --skip-git-repo-check
       --output-schema "$schema" -o "$out" -- "$prompt")
     TMUX_RADAR_INTERNAL=1 "$BRAIN_BACKEND_PATH" "${codex_args[@]}" >/dev/null 2>"$err" &
@@ -1511,22 +1534,34 @@ _brain_label() {
   if [ "$BRAIN_BACKEND_MODE" = custom-command ]; then
     printf 'custom command: %s' "$(_flat "$BRAIN_BACKEND_COMMAND")"
   elif [ -n "$BRAIN_BACKEND_PROFILE" ]; then
-    printf 'codex %s profile: %s (read-only, ephemeral)' \
+    printf 'codex %s profile: %s (decision-only, no tools, isolated)' \
       "$BRAIN_BACKEND_VERSION" "$BRAIN_BACKEND_PROFILE"
   else
-    printf 'codex %s: model=%s effort=%s (read-only, ephemeral)' \
+    printf 'codex %s: model=%s effort=%s (decision-only, no tools, isolated)' \
       "$BRAIN_BACKEND_VERSION" "$BRAIN_BACKEND_MODEL" "$BRAIN_BACKEND_EFFORT"
   fi
 }
 
 _classify_backend_failure() {
   local rc="$1" stderr_file="$2" schema_valid="$3" stop_reason="${4:-}" stderr_text normalized
-  local class code retryable summary detail
+  local class code retryable summary detail timeout_limit
   stderr_text="$(tail -c 16384 "$stderr_file" 2>/dev/null || true)"
   normalized="$(printf '%s' "$stderr_text" | tr '[:upper:]' '[:lower:]')"
   class='transient'; code='backend-failed'; retryable=1; summary='backend failed with a retryable error'; detail='see stderr_path for private evidence'
 
-  if [ "$rc" -eq 78 ]; then
+  case "$stop_reason" in
+    brain\ call\ exceeded\ *s\ timeout)
+      timeout_limit="${stop_reason#brain call exceeded }"
+      timeout_limit="${timeout_limit% timeout}"
+      class='transient'; code='backend-timeout'; retryable=1
+      summary="$stop_reason"
+      detail="no decision finished within the configured $timeout_limit limit; inspect 5 Logs before increasing Brain timeout"
+      ;;
+  esac
+
+  if [ "$code" = backend-timeout ]; then
+    :
+  elif [ "$rc" -eq 78 ]; then
     class='config-permanent'; code='backend-preflight'; retryable=0
     summary="${stop_reason:-backend preflight failed}"
     detail='backend rejected before model launch'
@@ -1539,6 +1574,15 @@ _classify_backend_failure() {
         ;;
       *)
         case "$normalized" in
+          *unexpected*argument*--ignore-user-config*|\
+          *unrecognized*option*--ignore-user-config*|\
+          *unexpected*argument*--disable*|\
+          *unknown*feature*shell_tool*|*unknown*feature*unified_exec*|\
+          *unknown*feature*hooks*)
+            class='config-permanent'; code='backend-cli-incompatible'; retryable=0
+            summary='selected Codex CLI does not support supervisor isolation'
+            detail='upgrade the selected Codex CLI; the unsupported flag is shown in 5 Logs'
+            ;;
           *invalid_json_schema*|*invalid*schema*response_format*)
             class='config-permanent'; code='decision-schema-invalid'; retryable=0
             summary='decision output schema is incompatible with Codex'

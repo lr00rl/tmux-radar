@@ -335,6 +335,11 @@ func (model LiveModel) handleKey(message tea.KeyPressMsg) (LiveModel, tea.Cmd) {
 		model.setActiveView(LiveView(key[0] - '1'))
 		return model, nil
 	}
+	if model.snapshot.Final != nil && (key == "p" || key == "r") {
+		model.controlNotice = "Run is finished; start a new supervision run to continue"
+		model.controlError = ""
+		return model, nil
+	}
 	switch key {
 	case "?":
 		model.showHelp = true

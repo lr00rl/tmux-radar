@@ -967,6 +967,25 @@ assert_json "$CASE/auth.json" '.class == "config-permanent"'
 printf '%s\n' 'unrecognized backend failure' > "$classifier_stderr"
 PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" _classify-backend-failure 1 "$classifier_stderr" 0 > "$CASE/unknown.json"
 assert_json "$CASE/unknown.json" '.class == "transient" and .retryable == true and .code == "backend-failed"'
+printf '%s\n' 'authentication permission denied text copied from the model prompt' > "$classifier_stderr"
+PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" _classify-backend-failure \
+  143 "$classifier_stderr" 0 'brain call exceeded 60s timeout' > "$CASE/timeout.json"
+assert_json "$CASE/timeout.json" '
+  .class == "transient" and
+  .code == "backend-timeout" and
+  .retryable == true and
+  (.summary | contains("60s timeout")) and
+  (.detail | contains("60s"))
+'
+printf '%s\n' "error: unexpected argument '--ignore-user-config' found" > "$classifier_stderr"
+PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" _classify-backend-failure \
+  2 "$classifier_stderr" 0 > "$CASE/cli-incompatible.json"
+assert_json "$CASE/cli-incompatible.json" '
+  .class == "config-permanent" and
+  .code == "backend-cli-incompatible" and
+  .retryable == false and
+  (.summary | contains("Codex CLI"))
+'
 printf 'PASS: classifier ordering covers permanent, mixed, and unknown failures\n'
 
 # 33. Pane loss before cmd_decide starts a model is a lifecycle stop. It does

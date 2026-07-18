@@ -181,6 +181,39 @@ chk "opencode end clears the permission mark it set" "! grep -q 'needs approval'
 chk "opencode end removes the registry row" "! grep -q 'opencode' '$REG' 2>/dev/null || ! [ -s '$REG' ]"
 kill "$OC" 2>/dev/null
 
+echo
+echo "### #11 HIGH: generic agent events fail closed before state mutation"
+"$N" clear-all
+rm -f "$REG" "$MARKS"
+assert_agent_event_rejected() {
+  local name="$1" kind="$2" event="$3" payload="$4" rc
+  rc=0
+  printf '%s' "$payload" | "$N" agent-event "$kind" "$event" >/dev/null 2>"$T/agent-event.err"
+  rc=$?
+  chk "$name returns usage/data error" "[ '$rc' -eq 2 ]"
+  chk "$name leaves registry untouched" "[ ! -s '$REG' ]"
+  chk "$name leaves marks untouched" "[ ! -s '$MARKS' ]"
+}
+
+assert_agent_event_rejected "malformed JSON" demo approval '{'
+assert_agent_event_rejected "missing session id" demo approval \
+  '{"pane":"%1","pid":1,"process":"demo"}'
+assert_agent_event_rejected "unknown normalized event" demo mystery \
+  '{"session_id":"bad-event","pane":"%1","pid":1,"process":"demo"}'
+assert_agent_event_rejected "invalid pane id" demo approval \
+  '{"session_id":"bad-pane","pane":"1","pid":1,"process":"demo"}'
+assert_agent_event_rejected "invalid pid" demo approval \
+  '{"session_id":"bad-pid","pane":"%1","pid":"abc","process":"demo"}'
+assert_agent_event_rejected "invalid agent kind" '../demo' approval \
+  '{"session_id":"bad-kind","pane":"%1","pid":1,"process":"demo"}'
+
+KIMI_UNKNOWN_RC=0
+printf '%s' '{"hook_event_name":"Unknown","session_id":"kimi-unknown","cwd":"/tmp"}' |
+  "$N" kimi-hook >/dev/null 2>"$T/kimi-hook.err"
+KIMI_UNKNOWN_RC=$?
+chk "unknown Kimi hook event is rejected" "[ '$KIMI_UNKNOWN_RC' -eq 2 ]"
+chk "unknown Kimi hook event leaves state untouched" "[ ! -s '$REG' ] && [ ! -s '$MARKS' ]"
+
 tmux -L radarreg kill-server 2>/dev/null || true
 rm -f /tmp/PWNED_BY_ASK
 echo

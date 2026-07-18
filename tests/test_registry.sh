@@ -122,6 +122,64 @@ chk "codex mark key matches its registry key" \
   "[ '$CODEX_REG_KEY' = 's:codex-key' ] && [ '$CODEX_MARK_KEY' = '$CODEX_REG_KEY' ]"
 "$N" clear-all
 
+# Kimi's documented hook payload always carries hook_event_name, session_id,
+# and cwd. pid/process are optional normalized-adapter fields; the fixture
+# supplies this shell's identity so registry liveness remains deterministic.
+kimi_event() {
+  local event="$1" sid="$2" label="${3:-}"
+  jq -cn --arg event "$event" --arg sid "$sid" --arg cwd "/tmp/kimi-$sid" \
+    --arg pane "$PANE" --argjson pid "$$" --arg process bash --arg label "$label" \
+    '{hook_event_name:$event,session_id:$sid,cwd:$cwd,pane:$pane,pid:$pid,
+      process:$process,label:$label}' | "$N" kimi-hook
+}
+
+kimi_event SessionStart kimi-a
+chk "Kimi SessionStart registers one stable session key" \
+  "awk -F'\t' '\$1==\"kimi\" && \$2==\"s:kimi-a\" && \$4==\"$PANE\" && \$7==\"working\"' '$REG' | grep -q ."
+kimi_event PermissionRequest kimi-a "apply core.sh edits"
+chk "Kimi PermissionRequest creates an approval mark" \
+  "awk -F'\t' '\$3==\"kimi\" && \$4==\"s:kimi-a\" && \$5 ~ /needs approval/ && \$5 ~ /core.sh/' '$MARKS' | grep -q ."
+
+kimi_event SessionStart kimi-b
+kimi_event PermissionRequest kimi-b "run release tests"
+kimi_event PermissionResult kimi-a
+chk "Kimi PermissionResult clears only its matching session" \
+  "! grep -q 's:kimi-a' '$MARKS' && grep -q 's:kimi-b' '$MARKS'"
+kimi_event Interrupt kimi-b
+chk "Kimi Interrupt clears stale automatic action state" \
+  "! grep -q 's:kimi-b' '$MARKS'"
+
+kimi_event PermissionRequest kimi-a "one more approval"
+kimi_event UserPromptSubmit kimi-a
+chk "Kimi UserPromptSubmit returns the registry to working and clears action" \
+  "awk -F'\t' '\$1==\"kimi\" && \$2==\"s:kimi-a\" && \$7==\"working\"' '$REG' | grep -q . && ! grep -q 's:kimi-a' '$MARKS'"
+kimi_event Stop kimi-a
+KIMI_REG_KEY="$(awk -F '\t' '$1=="kimi" && $2=="s:kimi-a" { print $2; exit }' "$REG")"
+KIMI_MARK_KEY="$(awk -F '\t' '$3=="kimi" && $4=="s:kimi-a" { print $4; exit }' "$MARKS")"
+chk "Kimi Stop creates a done mark with registry-key identity" \
+  "[ '$KIMI_REG_KEY' = 's:kimi-a' ] && [ '$KIMI_MARK_KEY' = '$KIMI_REG_KEY' ] && grep -q 'Kimi finished' '$MARKS'"
+kimi_event SessionEnd kimi-a
+chk "Kimi SessionEnd removes registry/action state but retains completion notice" \
+  "! awk -F'\t' '\$1==\"kimi\" && \$2==\"s:kimi-a\"' '$REG' | grep -q . && grep -q 's:kimi-a.*Kimi finished' '$MARKS'"
+kimi_event SessionEnd kimi-b
+"$N" clear-all
+
+# The public normalized adapter is the extension point for agents that do not
+# have a first-class installer. It must own registry/mark identity exactly like
+# native adapters.
+jq -cn --arg sid generic-1 --arg pane "$PANE" --argjson pid "$$" \
+  '{session_id:$sid,pane:$pane,pid:$pid,process:"bash",cwd:"/tmp/generic",label:"deploy preview"}' |
+  "$N" agent-event demo approval
+GENERIC_REG_KEY="$(awk -F '\t' '$1=="demo" { print $2; exit }' "$REG")"
+GENERIC_MARK_KEY="$(awk -F '\t' '$3=="demo" { print $4; exit }' "$MARKS")"
+chk "generic agent-event uses one session key for registry and mark" \
+  "[ '$GENERIC_REG_KEY' = 's:generic-1' ] && [ '$GENERIC_MARK_KEY' = '$GENERIC_REG_KEY' ]"
+jq -cn --arg sid generic-1 --arg pane "$PANE" --argjson pid "$$" \
+  '{session_id:$sid,pane:$pane,pid:$pid,process:"bash"}' |
+  "$N" agent-event demo session_end
+chk "generic session_end removes action and registry state" \
+  "! grep -q 's:generic-1' '$REG' 2>/dev/null && ! grep -q 's:generic-1' '$MARKS' 2>/dev/null"
+
 # --- 7. bar exact-restore (baseline status off) ------------------------------
 env -u CLAUDE_JOB_DIR "$N" mark "$PANE" claude "Claude needs your permission" s:bar1
 # the marked pane is on-screen (only pane) so bar may not raise; force paneless

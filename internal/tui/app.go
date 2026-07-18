@@ -24,6 +24,7 @@ type AppOptions struct {
 	StateRoot   string
 	MonitorPane string
 	Surface     Surface
+	FocusTarget func(context.Context) error
 }
 
 type appPhase uint8
@@ -54,6 +55,7 @@ type App struct {
 	stateRoot   string
 	monitorPane string
 	surface     Surface
+	focusTarget func(context.Context) error
 	phase       appPhase
 	lifecycle   *appLifecycle
 
@@ -74,7 +76,8 @@ func NewApp(options AppOptions) *App {
 	app := &App{
 		setup: NewSetup(options.Setup), checker: options.Checker, engine: options.Engine,
 		stateRoot: options.StateRoot, monitorPane: options.MonitorPane, surface: options.Surface,
-		phase: phaseSetup, lifecycle: &appLifecycle{}, context: appContext, cancel: cancel,
+		focusTarget: options.FocusTarget,
+		phase:       phaseSetup, lifecycle: &appLifecycle{}, context: appContext, cancel: cancel,
 	}
 	if app.checker != nil {
 		app.setup.beginPreflight()
@@ -194,6 +197,7 @@ func (app *App) updateStarting(message tea.Msg) (tea.Model, tea.Cmd) {
 		live, err := NewLive(LiveOptions{
 			RunDir: message.result.RunDir, RunID: message.result.RunID, Reader: message.reader,
 			Controller: app.engine, Surface: app.surface, ReadOnly: message.readOnly,
+			FocusTarget: app.focusTarget,
 		})
 		if err != nil {
 			_ = app.closeLease()

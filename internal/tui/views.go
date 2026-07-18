@@ -288,6 +288,16 @@ func (model LiveModel) nextLine() string {
 		return "Next  waiting for " + model.pending.Action + " acknowledgement"
 	}
 	if model.snapshot.Final != nil {
+		if model.completionKept {
+			return "Next  report kept open; q closes this console"
+		}
+		if !model.completionDeadline.IsZero() {
+			remaining := int(time.Until(model.completionDeadline).Seconds())
+			if remaining < 0 {
+				remaining = 0
+			}
+			return fmt.Sprintf("Next  close console in %ds; k keeps it open", remaining)
+		}
 		return "Next  terminal report available in Logs"
 	}
 	if model.snapshot.State != nil && model.snapshot.State.Next.At > 0 {

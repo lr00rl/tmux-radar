@@ -239,6 +239,63 @@ func TestLiveActiveStopRequiresConfirmation(t *testing.T) {
 	}
 }
 
+func TestLiveCompletionTimerClosesConsoleAndOwnerSurface(t *testing.T) {
+	model, _ := newLiveFixture(t, SurfaceSplit)
+	config := model.snapshot.Config
+	config.Values.CompletionCloseDelay = runmodel.Value[int]{Value: 0, Source: runmodel.SourceCustom}
+	final := &runmodel.Final{SchemaVersion: 1, Outcome: "completed", Reason: "goal done", RunID: "run-1", Pane: "%42"}
+	updated, command := model.Update(runPollMsg{Snapshot: runmodel.Snapshot{Config: config, Final: final}, SnapshotChanged: true})
+	model = updated
+	if command == nil || model.closed {
+		t.Fatalf("completion timer command=%v closed=%v", command, model.closed)
+	}
+	updated, quit := model.Update(command())
+	model = updated
+	if !model.closed || quit == nil {
+		t.Fatalf("completion auto-close: closed=%v quit=%v", model.closed, quit)
+	}
+}
+
+func TestLiveKeepInvalidatesPendingCompletionTimer(t *testing.T) {
+	model, controller := newLiveFixture(t, SurfaceSplit)
+	config := model.snapshot.Config
+	config.Values.CompletionCloseDelay = runmodel.Value[int]{Value: 0, Source: runmodel.SourceCustom}
+	final := &runmodel.Final{SchemaVersion: 1, Outcome: "completed", Reason: "goal done", RunID: "run-1", Pane: "%42"}
+	updated, closeCommand := model.Update(runPollMsg{Snapshot: runmodel.Snapshot{Config: config, Final: final}, SnapshotChanged: true})
+	model = updated
+	updated, keepCommand := model.Update(keyPress('k', "k"))
+	model = updated
+	if keepCommand == nil || !model.completionKept {
+		t.Fatalf("keep did not hold completion: command=%v kept=%v", keepCommand, model.completionKept)
+	}
+	model = updateLive(t, model, closeCommand())
+	if model.closed {
+		t.Fatal("stale completion timer closed a kept report")
+	}
+	model = updateLive(t, model, keepCommand())
+	if len(controller.calls) == 0 || !strings.Contains(controller.calls[len(controller.calls)-1], "|keep|") || !model.completionKept {
+		t.Fatalf("keep acknowledgement: calls=%#v kept=%v", controller.calls, model.completionKept)
+	}
+}
+
+func TestLiveEnterFocusesSplitTargetThroughInjectedAction(t *testing.T) {
+	model, _ := newLiveFixture(t, SurfaceSplit)
+	called := 0
+	model.focusTargetCommand = func(context.Context) error {
+		called++
+		return nil
+	}
+	updated, command := model.Update(keyPress('\r', "enter"))
+	model = updated
+	if command == nil || called != 0 {
+		t.Fatalf("focus command=%v called=%d", command, called)
+	}
+	model = updateLive(t, model, command())
+	if called != 1 || !model.focusTarget || !strings.Contains(model.controlNotice, "focused") {
+		t.Fatalf("focus result: called=%d requested=%v notice=%q", called, model.focusTarget, model.controlNotice)
+	}
+}
+
 func TestLiveRenderingFitsFixedTerminalSizes(t *testing.T) {
 	for _, size := range []struct{ width, height int }{{40, 18}, {56, 24}, {84, 40}, {96, 50}} {
 		t.Run(fmt.Sprintf("%dx%d", size.width, size.height), func(t *testing.T) {

@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/lr00rl/tmux-radar/internal/enginebridge"
@@ -175,6 +177,7 @@ func runSetup(ctx context.Context, args []string, input io.Reader, output, error
 	app := tui.NewApp(tui.AppOptions{
 		Setup: tui.SetupOptions{TargetPane: *targetPane, Entry: entry}, Checker: checker, Engine: bridge,
 		StateRoot: stateRoot, MonitorPane: *monitorPane, Surface: surface,
+		FocusTarget: focusTmuxPane(*targetPane),
 	})
 	_, programErr := launchProgram(ctx, app, input, output)
 	closeErr := app.Close()
@@ -191,6 +194,20 @@ func runSetup(ctx context.Context, args []string, input io.Reader, output, error
 		return classifyError(startupErr, exitEngine)
 	}
 	return exitOK
+}
+
+func focusTmuxPane(targetPane string) func(context.Context) error {
+	return func(ctx context.Context) error {
+		focusContext, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		command := exec.CommandContext(focusContext, "tmux", "select-pane", "-t", targetPane)
+		var stderr strings.Builder
+		command.Stderr = &stderr
+		if err := command.Run(); err != nil {
+			return fmt.Errorf("tmux select-pane: %w: %s", err, strings.TrimSpace(stderr.String()))
+		}
+		return nil
+	}
 }
 
 func runAttach(ctx context.Context, args []string, input io.Reader, output, errorOutput io.Writer) int {

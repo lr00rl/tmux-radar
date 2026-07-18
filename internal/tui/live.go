@@ -48,13 +48,14 @@ type ControlClient interface {
 }
 
 type LiveOptions struct {
-	RunDir     string
-	RunID      string
-	Reader     *runmodel.Reader
-	Controller ControlClient
-	Surface    Surface
-	ReadOnly   bool
-	RequestID  func() string
+	RunDir      string
+	RunID       string
+	Reader      *runmodel.Reader
+	Controller  ControlClient
+	Surface     Surface
+	ReadOnly    bool
+	RequestID   func() string
+	FocusTarget func(context.Context) error
 }
 
 type TimelineGroup struct {
@@ -87,6 +88,8 @@ type runPollMsg struct {
 
 type pollStoppedMsg struct{}
 type clockTickMsg time.Time
+type completionCloseMsg struct{ TimerID uint64 }
+type focusTargetResultMsg struct{ Err error }
 
 type artifactInfo struct {
 	Path string
@@ -106,13 +109,14 @@ type runDetails struct {
 }
 
 type LiveModel struct {
-	runDir     string
-	runID      string
-	reader     *runmodel.Reader
-	controller ControlClient
-	surface    Surface
-	readOnly   bool
-	requestID  func() string
+	runDir             string
+	runID              string
+	reader             *runmodel.Reader
+	controller         ControlClient
+	surface            Surface
+	readOnly           bool
+	requestID          func() string
+	focusTargetCommand func(context.Context) error
 
 	pollContext context.Context
 	pollCancel  context.CancelFunc
@@ -132,14 +136,17 @@ type LiveModel struct {
 	height         int
 	now            time.Time
 
-	pending       *pendingControl
-	controlNotice string
-	controlError  string
-	confirmStop   bool
-	showHelp      bool
-	focusTarget   bool
-	detached      bool
-	closed        bool
+	pending            *pendingControl
+	controlNotice      string
+	controlError       string
+	confirmStop        bool
+	showHelp           bool
+	focusTarget        bool
+	detached           bool
+	closed             bool
+	completionTimerID  uint64
+	completionKept     bool
+	completionDeadline time.Time
 }
 
 func NewLive(options LiveOptions) (LiveModel, error) {
@@ -169,7 +176,8 @@ func NewLive(options LiveOptions) (LiveModel, error) {
 	model := LiveModel{
 		runDir: options.RunDir, runID: options.RunID, reader: reader,
 		controller: options.Controller, surface: options.Surface, readOnly: options.ReadOnly,
-		requestID: requestID, pollContext: pollContext, pollCancel: pollCancel,
+		requestID: requestID, focusTargetCommand: options.FocusTarget,
+		pollContext: pollContext, pollCancel: pollCancel,
 		viewport: view, timelineFollow: true, width: 72, height: 24, now: time.Now(),
 	}
 	model.refreshViewport()
@@ -193,7 +201,7 @@ func (model LiveModel) Update(message tea.Msg) (LiveModel, tea.Cmd) {
 		model.applyRunUpdate(message)
 		if model.snapshot.Final != nil {
 			model.pollCancel()
-			return model, nil
+			return model, model.scheduleCompletionClose()
 		}
 		return model, waitForRunChange(model.pollContext, model.reader, model.runDir)
 	case pollStoppedMsg:
@@ -206,6 +214,22 @@ func (model LiveModel) Update(message tea.Msg) (LiveModel, tea.Cmd) {
 		return model, nextClockTick()
 	case controlResultMsg:
 		return model.applyControlResult(message)
+	case completionCloseMsg:
+		if message.TimerID != model.completionTimerID || model.completionKept || model.closed {
+			return model, nil
+		}
+		model.close()
+		return model, tea.Quit
+	case focusTargetResultMsg:
+		if message.Err != nil {
+			model.controlError = "Focus target: " + message.Err.Error()
+			model.controlNotice = ""
+		} else {
+			model.focusTarget = true
+			model.controlError = ""
+			model.controlNotice = "Target pane focused"
+		}
+		return model, nil
 	case tea.KeyPressMsg:
 		return model.handleKey(message)
 	case tea.MouseWheelMsg:
@@ -339,7 +363,13 @@ func (model LiveModel) handleKey(message tea.KeyPressMsg) (LiveModel, tea.Cmd) {
 		model.scroll(1)
 	case "k", "up":
 		if key == "k" && model.snapshot.Final != nil {
-			return model.startControl("keep")
+			updated, command := model.startControl("keep")
+			if command != nil {
+				updated.completionKept = true
+				updated.completionTimerID++
+				updated.completionDeadline = time.Time{}
+			}
+			return updated, command
 		}
 		model.scroll(-1)
 	case "pgdown":
@@ -360,8 +390,16 @@ func (model LiveModel) handleKey(message tea.KeyPressMsg) (LiveModel, tea.Cmd) {
 		if model.surface == SurfacePopup && model.snapshot.Final == nil {
 			return model.startControl("detach")
 		}
-		model.focusTarget = true
-		model.controlNotice = "Target focus requested"
+		if model.focusTargetCommand == nil {
+			model.controlError = "Target focus action is unavailable"
+			return model, nil
+		}
+		model.controlNotice = "Target focus pending"
+		model.controlError = ""
+		focusTarget := model.focusTargetCommand
+		return model, func() tea.Msg {
+			return focusTargetResultMsg{Err: focusTarget(context.Background())}
+		}
 	case "q":
 		if model.snapshot.Final != nil {
 			model.close()
@@ -430,13 +468,13 @@ func (model LiveModel) applyControlResult(message controlResultMsg) (LiveModel, 
 	if message.Err != nil {
 		model.controlError = message.Err.Error()
 		model.controlNotice = ""
-		return model, nil
+		return model.afterControlFailure(message.Action)
 	}
 	if message.Result.RunID != model.runID || message.Result.Pane != model.snapshot.Config.Pane ||
 		message.Result.Action != message.Action || message.Result.RequestID != message.RequestID {
 		model.controlError = "Control acknowledgement identity does not match the pending request"
 		model.controlNotice = ""
-		return model, nil
+		return model.afterControlFailure(message.Action)
 	}
 	if !message.Result.OK || message.Result.Status != "acknowledged" {
 		if message.Result.Error != nil {
@@ -445,7 +483,7 @@ func (model LiveModel) applyControlResult(message controlResultMsg) (LiveModel, 
 			model.controlError = firstNonEmpty(message.Result.Status, "control was not acknowledged")
 		}
 		model.controlNotice = ""
-		return model, nil
+		return model.afterControlFailure(message.Action)
 	}
 	model.controlError = ""
 	model.controlNotice = message.Action + " acknowledged"
@@ -454,7 +492,37 @@ func (model LiveModel) applyControlResult(message controlResultMsg) (LiveModel, 
 		model.close()
 		return model, tea.Quit
 	}
+	if message.Action == "keep" {
+		model.completionKept = true
+		model.completionDeadline = time.Time{}
+	}
 	return model, nil
+}
+
+func (model LiveModel) afterControlFailure(action string) (LiveModel, tea.Cmd) {
+	if action != "keep" {
+		return model, nil
+	}
+	model.completionKept = false
+	return model, model.scheduleCompletionCloseAfter(time.Second)
+}
+
+func (model *LiveModel) scheduleCompletionClose() tea.Cmd {
+	delay := model.snapshot.Config.Values.CompletionCloseDelay.Value
+	if delay < 0 {
+		delay = 0
+	}
+	return model.scheduleCompletionCloseAfter(time.Duration(delay) * time.Second)
+}
+
+func (model *LiveModel) scheduleCompletionCloseAfter(delay time.Duration) tea.Cmd {
+	if model.completionKept || model.closed {
+		return nil
+	}
+	model.completionTimerID++
+	timerID := model.completionTimerID
+	model.completionDeadline = time.Now().Add(delay)
+	return tea.Tick(delay, func(time.Time) tea.Msg { return completionCloseMsg{TimerID: timerID} })
 }
 
 func (model *LiveModel) setActiveView(view LiveView) {

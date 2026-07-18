@@ -3886,13 +3886,29 @@ cmd_ask() {
   explain="$(printf '%s' "$json" | jq -r '.explain // ""' 2>/dev/null || echo '')"
   cmds_file="$(mktemp "${TMPDIR:-/tmp}/tmuxask.XXXXXX")"
   printf '%s' "$json" | jq -r '.commands[]? // empty' 2>/dev/null > "$cmds_file" || true
-  n="$(grep -cve '^$' "$cmds_file" 2>/dev/null || echo 0)"
+  # grep -c prints 0 but exits 1 when there are no matches. `|| echo 0` would
+  # therefore produce two lines ("0\n0") and break the numeric comparison.
+  n="$(grep -cve '^$' "$cmds_file" 2>/dev/null | head -1)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
   [ "$n" -gt 0 ] || { echo "${explain:-无可执行命令}"; rm -f "$cmds_file"; return 0; }
 
   echo "计划：${explain}"; echo "--- tmux 命令 ---"; cat "$cmds_file"; echo "-----------------"
-  # catastrophic denylist — these break out of "just arrange my tmux"
-  if grep -qiE '(^|[[:space:]])(run-shell|if-shell|source-file|kill-server|respawn-pane|respawn-window)([[:space:]]|$)' "$cmds_file"; then
-    echo "⚠ 含有危险命令(run-shell/kill-server 等)，已拒绝执行。"; rm -f "$cmds_file"; return 4
+  # This command palette owns layout only. Reject separators before checking
+  # the first verb because tmux source-file treats `;` as another command.
+  local bad
+  bad="$(awk '
+    NF == 0 { next }
+    $1 ~ /^#/ { next }
+    /(^|[[:space:]]);/ { print "  " NR ": " $0 "   ← 链式 ; 命令不允许"; next }
+    {
+      v = $1
+      if (v == "tmux") v = $2
+      if (v !~ /^(split-window|splitw|join-pane|joinp|move-window|movew|swap-pane|swapp|swap-window|link-window|select-layout|selectl|resize-pane|resizep|break-pane|breakp|new-window|neww|rename-window|renamew)$/)
+        print "  " NR ": " $0
+    }' "$cmds_file")"
+  if [ -n "$bad" ]; then
+    printf '⚠ 只允许布局类命令（split/join/swap/move/resize/layout/break/new/rename），以下被拒绝：\n%s\n上面的计划仅供参考，请自行执行。\n' "$bad"
+    rm -f "$cmds_file"; return 4
   fi
   case "$autonomy" in
     suggest) echo "(suggest 模式：自行执行)"; rm -f "$cmds_file"; return 6 ;;

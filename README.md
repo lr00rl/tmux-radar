@@ -33,7 +33,7 @@ long-running agents.
   The current window stays in the list, one `↑` away.
 - **Live preview** — the selected window's content, no wrap, anchored to the
   bottom (current prompt/state visible), with line/page scroll.
-- **AI status alerts** — Claude/Codex flag their pane for action-required
+- **AI status alerts** — Claude/Codex/OpenCode flag their pane for action-required
   prompts and finished-turn notices; a **persistent bar** appears on a second
   status line while an off-screen mark is fresh,
   the pane's **title flips to a status label** (`⚠` action required, `✓`
@@ -57,6 +57,8 @@ long-running agents.
 - tmux ≥ 3.2 (uses `display-popup`)
 - [`fzf`](https://github.com/junegunn/fzf)
 - `jq` (AI-status hook installation and the optional supervisor runtime)
+- macOS or Linux; hook installation avoids platform-specific `sed -i` behavior
+  and preserves symlinked dotfile configs.
 - The optional native supervisor console: a release binary installed by
   `scripts/ensure-native.sh install <version>`, or Go 1.25+ for a local build
 
@@ -136,9 +138,10 @@ Set these **before** the plugin loads:
 | `@radar-preview` | `right:62%` | fzf preview position/size. |
 | `@radar-preview-follow` | `on` | Anchor preview to the bottom (tail-style). |
 | `@radar-needinput` | `on` | Enable the AI-status system (hooks/bar). |
-| `@radar-needinput-commands` | `codex claude` | Process names the AI status view treats as AI panes. Comma/space/colon separated. |
+| `@radar-needinput-commands` | `codex claude opencode` | Process names the AI status view treats as AI panes. Comma/space/colon separated. |
 | `@radar-retitle` | `on` | Rename a marked pane's title to a status label (`⚠` action required, `✓` finished, `!` notice), restored on clear. |
 | `@radar-claude-bg` | `on` | Also track Claude sessions running outside tmux panes (background/dashboard/cloud). |
+| `@radar-bar` | `auto` | `auto` raises line 2 only while needed and restores the exact previous `status`; `pinned` keeps line 2; `off` tracks marks without raising it. |
 | `@radar-bar-ttl` | `60` | Seconds a chip stays on the bar before fading (`0` = until handled). The mark itself persists in the AI status view / pane title until cleared. |
 | `@radar-claude-bg-ignore` | `~/.claude:~/.claude-mem` | Colon-separated path prefixes; background sessions whose cwd starts with one (plugin observers, SDK helpers) are not tracked. |
 | `@radar-ai` | `off` | Enable the **AI supervisor** (`prefix + A` menu). Needs the `codex` CLI + `jq`. |
@@ -200,10 +203,10 @@ exists, even without setting `@radar-ai-rules`):
 - If Claude asks which approach to take, prefer the smallest change.
 ```
 
-## AI status view + alerts (Claude Code / Codex)
+## AI status view + alerts (Claude Code / Codex / OpenCode)
 
 The `ctrl-i` view scans live tmux panes for configured AI processes, defaulting
-to `codex` and `claude`, and lists matching panes directly. Matching is based on
+to `codex`, `claude`, and `opencode`, and lists matching panes directly. Matching is based on
 the pane process tree and processes attached to the pane TTY, not on tmux window
 or pane names. Rows are labeled by meaning: **ACTION** for permissions/input that
 really need a decision, **DONE** for finished-turn notifications that are useful
@@ -212,7 +215,7 @@ only as context. Background Claude sessions are shown as non-jumpable status row
 instead of pretending to be a tmux pane.
 
 The plugin sets up the tmux side automatically (AI-status bar status line +
-clear on window focus). To let Claude Code and Codex flag their pane, install
+clear on window focus). To let Claude Code, Codex, and OpenCode flag their pane, install
 the hooks once:
 
 ```sh
@@ -221,19 +224,19 @@ the hooks once:
 ~/.tmux/plugins/tmux-radar/scripts/install-hooks.sh uninstall   # remove
 ```
 
-It edits `~/.claude/settings.json` (3 hooks: `Notification` + `Stop` mark the
-pane, `UserPromptSubmit` clears it) and merges native Codex command handlers into
-`~/.codex/hooks.json`: `PermissionRequest` marks approval prompts, `Stop` marks a
-finished turn, and `UserPromptSubmit` clears old marks. The managed block in
-`~/.codex/config.toml` contains only matching trust state plus the wrapped legacy
-`notify` turn-ended fallback. Existing OMX/user hook groups, handlers, trust
-entries, and notify chains are preserved. Restart Claude/Codex sessions after an
-install, then review `/hooks` if Codex asks you to trust the handlers.
-
-> `SessionEnd` is intentionally **not** hooked: it fires the instant a session
-> ends — right after `Stop` for short-lived / print-mode / background runs — so
-> clearing on it would erase the "finished" mark before you ever see it. The
-> mark instead clears when you navigate to the window.
+It edits `~/.claude/settings.json` with five lifecycle hooks:
+`SessionStart` registers a live session, `Notification` marks input,
+`Stop` marks a finished turn, `UserPromptSubmit` clears the handled mark, and
+`SessionEnd` removes the live registry row plus stale action notices while
+deliberately preserving the preceding finished-turn mark. Native Codex handlers
+are merged into `~/.codex/hooks.json`; the managed block in
+`~/.codex/config.toml` contains matching trust state plus the wrapped legacy
+`notify` fallback. When OpenCode is installed, the installer writes the
+dependency-free lifecycle bridge to
+`~/.config/opencode/plugins/tmux-radar.js`. Existing user hooks, trust entries,
+notify chains, and symlinked config paths are preserved. Restart the affected
+agent sessions after installation, then review `/hooks` if Codex asks you to
+trust the handlers.
 
 ### How marks are targeted and cleared
 
@@ -251,19 +254,17 @@ install, then review `/hooks` if Codex asks you to trust the handlers.
 - **Background Claude sessions** — sessions genuinely outside tmux
   (`$CLAUDE_JOB_DIR` set: the dashboard, background jobs, cloud) get a
   **paneless mark keyed by `session_id`**, labelled `Claude·<project>`. It
-  clears when you reply to that session (`UserPromptSubmit`) and expires after
-  24h (`TMUX_RADAR_BG_TTL`) as a safety net. In the AI status view these rows
+  clears when you reply to that session (`UserPromptSubmit`) and is removed by
+  `SessionEnd` or process-identity GC. In the AI status view these rows
   are non-jumpable status rows, because there is no real tmux pane to select.
 - **Stale marks (agent-liveness GC)** — a pane mark is stale in two ways, and
   both self-heal: the **pane died** (dropped on every state change), or the
-  pane is alive but the **agent TUI exited** and the shell got reused. The
-  latter is detected by scanning the process tree — a claude/codex mark whose
-  pane no longer hosts that agent is dropped (and the pane title restored).
-  Claude daemon jobs keyed by `s:<session_id>` are kept while the corresponding
-  `~/.claude/jobs/<short>/state.json` is still live (`blocked`, `working`, or
-  `idle`), because their visible parent pane may not itself host a `claude`
-  process.
-  Detection matches ps **argv0 path components**, never
+  pane is alive but the **agent TUI exited** and the shell got reused.
+  Native events maintain `agent-registry` rows containing session key, PID,
+  pane, state, cwd, and process identity. GC requires both the recorded PID and
+  argv identity to match, so PID reuse cannot keep a dead session alive.
+  Pre-upgrade/unhooked sessions retain the process-tree fallback. Detection
+  matches ps **argv0 path components**, never
   `pane_current_command`: Claude Code's foreground binary is a bare version
   number (e.g. `2.1.199`), so the naive match would miss it. The GC runs on
   plugin load, while the bar is visible (every ≤30s), and whenever the
@@ -274,9 +275,10 @@ install, then review `/hooks` if Codex asks you to trust the handlers.
 ### Bar position note
 
 tmux has a single `status-position`, so the bar renders on a second status line
-adjacent to your main status bar (revealed only while something waits, via
-`status 2`). A bar strictly at the top while the main line stays at the bottom
-is not possible natively.
+adjacent to your main status bar. In `@radar-bar auto` mode the notifier records
+the exact prior `status` value, raises `status 2`, and restores only the setting
+it owns. `pinned` and `off` are available for explicit control. A bar strictly at
+the top while the main line stays at the bottom is not possible natively.
 
 ## AI supervisor (Codex)
 
@@ -425,6 +427,8 @@ Need-input internals are inspectable too:
 
 ```sh
 needinput-notify.sh tick         # prune + agent-liveness GC + bar resync
+needinput-notify.sh registry     # registry rows with liveness verdicts
+needinput-notify.sh doctor       # full hooks/marks/registry diagnostic
 needinput-notify.sh agent-panes  # which panes host a watched agent right now
 needinput-notify.sh resolve-pane # which pane THIS process tree belongs to
 needinput-notify.sh resolve-cwd [cwd] # which pane owns a Claude hook/job cwd
@@ -463,6 +467,8 @@ when the bar renders (≤30s), and whenever the AI status view opens.
   - `need-input` — one TAB-separated AI-status mark per line:
     `pane ⇥ epoch ⇥ source ⇥ key ⇥ label ⇥ saved_title` (`pane` is `-` for
     background-session marks; `key` is `s:<claude session_id>` or the pane id).
+  - `agent-registry` — one live agent session per line:
+    `kind ⇥ key ⇥ pid ⇥ pane ⇥ started ⇥ last_event ⇥ state ⇥ cwd ⇥ proc`.
   - `ai-watch/` — one small `<pane>.watch` compatibility pointer per live run,
     including watcher PID, run directory, wake channel, and monitor pane IDs.
     While a model call is active, `<pane>.brain.pid` records its PID/process
@@ -494,14 +500,14 @@ when the bar renders (≤30s), and whenever the AI status view opens.
   Force a pass with `scripts/needinput-notify.sh tick`; see which panes are
   currently detected as agents with `scripts/needinput-notify.sh agent-panes`.
 - **A claude pane isn't detected as an AI pane** — detection matches ps argv0
-  path components against `@radar-needinput-commands` (`codex claude` by
+  path components against `@radar-needinput-commands` (`codex claude opencode` by
   default) via the pane's tty and process tree. `pane_current_command` showing
   a version number (`2.1.199`) is normal and does not matter. If you renamed
   the binary, add that name to `@radar-needinput-commands`.
 - **Hooks don't fire** — run `scripts/install-hooks.sh status`. It reports
   Claude coverage plus each Codex native event (`PermissionRequest`, `Stop`,
   `UserPromptSubmit`) and the legacy notify fallback separately. Re-run
-  `install`, then restart Claude/Codex sessions because hooks are read at
+  `install`, then restart Claude/Codex/OpenCode sessions because hooks are read at
   session start. A missing native hook is visible; stable-screen fallback does
   not claim native coverage.
 - **A watcher seems to launch a new model every poll interval** — update the

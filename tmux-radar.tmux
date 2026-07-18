@@ -73,10 +73,19 @@ if [ "$(tmux show-option -gqv @radar-hooked 2>/dev/null || true)" != "$HOOK_VERS
   tmux set-option -g @radar-hooked "$HOOK_VERSION"
 fi
 
-# Transient toast line (revealed only while toasts are live; the notifier
-# toggles `status 2` <-> `on`). Re-set each load (idempotent).
+# Toast line. @radar-bar: auto (default; notifier restores the exact previous
+# status setting) | pinned (always show line 2) | off (track marks only).
 if [ "$NEEDINPUT" = "on" ]; then
-  tmux set-option -g status-format[1] "#[align=right]#($SCRIPTS/needinput-toast.sh render) "
+  case "$(opt @radar-bar auto)" in
+    off) ;;
+    pinned)
+      tmux set-option -g status 2
+      tmux set-option -g status-format[1] "#[align=right]#($SCRIPTS/needinput-toast.sh render) "
+      ;;
+    *)
+      tmux set-option -g status-format[1] "#[align=right]#($SCRIPTS/needinput-toast.sh render) "
+      ;;
+  esac
   # prune marks left over from a previous server / restore on every (re)load
   tmux run-shell -b "$SCRIPTS/needinput-notify.sh tick" 2>/dev/null || true
 fi

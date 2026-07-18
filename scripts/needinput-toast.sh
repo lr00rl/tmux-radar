@@ -96,8 +96,22 @@ case "${1:-render}" in
         ("$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/needinput-notify.sh" tick >/dev/null 2>&1 &)
       fi
     else
-      # nothing left to show: drop the extra status line (idempotent)
-      tmux set -g status on >/dev/null 2>&1 || true
+      # nothing left to show: give the user back their exact status setting.
+      # pinned mode never touches the line count; only lower a bar WE raised
+      # (@radar-prev-status is set by the notifier's _bar_raise).
+      case "$(opt @radar-bar auto)" in
+        pinned) : ;;
+        *)
+          prev="$(tmux show-option -gqv @radar-prev-status 2>/dev/null || true)"
+          if [ -n "$prev" ]; then
+            [ "$prev" = "2" ] && prev=on
+            if [ "$(tmux show-option -gv status 2>/dev/null || echo on)" = "2" ]; then
+              tmux set -g status "$prev" >/dev/null 2>&1 || true
+            fi
+            tmux set -gu @radar-prev-status >/dev/null 2>&1 || true
+          fi
+          ;;
+      esac
     fi
     ;;
   prune)  # legacy no-op kept for compatibility; state GC lives in the notifier

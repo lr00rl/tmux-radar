@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Install / uninstall the AI-status hooks for Claude Code and Codex so they flag
-# action-required prompts and finished-turn notices in tmux.
+# Install / uninstall the AI-status hooks for Claude Code, Codex and OpenCode so
+# they flag action-required prompts and finished-turn notices in tmux.
 #
 # Edits, idempotently and with a timestamped backup:
 #   ~/.claude/settings.json   (Claude hooks)
 #   ~/.codex/config.toml      (Codex trust marker + legacy notify fallback)
 #   ~/.codex/hooks.json       (Codex native hooks)
+#   ~/.config/opencode/plugins/tmux-radar.js (OpenCode lifecycle plugin)
 #
 # Usage: install-hooks.sh [install|uninstall|status]
 set -euo pipefail
@@ -16,14 +17,13 @@ CODEX_WRAP="${TMUX_RADAR_CODEX_WRAP:-${TMUX_SWITCHER_CODEX_WRAP:-$SCRIPT_DIR/cod
 CLAUDE_SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 CODEX_CONFIG="${CODEX_CONFIG:-$HOME/.codex/config.toml}"
 CODEX_HOOKS_JSON="${CODEX_HOOKS_JSON:-$HOME/.codex/hooks.json}"
+OPENCODE_DIR="${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}"
+OPENCODE_PLUGIN="$OPENCODE_DIR/plugins/tmux-radar.js"
 
-# NOTE: SessionEnd is intentionally NOT hooked. It fires the instant a session
-# ends — which immediately follows Stop for short-lived / print-mode / background
-# runs — so a SessionEnd clear would wipe the "finished" mark the moment a session
-# ended. Marks are cleared when you navigate to the window (session-window-changed
-# hook) and dead panes are filtered from the view.
-CLAUDE_EVENTS=(Notification Stop UserPromptSubmit)
-CLAUDE_SUBCMDS=(claude-mark claude-stop claude-clear)
+# SessionEnd removes the session registry row and stale action marks, but the
+# notifier deliberately keeps done-level marks from the preceding Stop event.
+CLAUDE_EVENTS=(SessionStart Notification Stop UserPromptSubmit SessionEnd)
+CLAUDE_SUBCMDS=(claude-register claude-mark claude-stop claude-clear claude-end)
 CODEX_EVENTS=(PermissionRequest Stop UserPromptSubmit)
 CODEX_NOTIFY_JSON="[\"$NOTIFY\", \"codex\"]"
 CODEX_HOOK_CMD="$NOTIFY codex-hook"
@@ -37,6 +37,17 @@ RADAR_TS="$(date +%Y%m%d%H%M%S)"
 die()  { echo "error: $*" >&2; exit 1; }
 info() { echo "  $*"; }
 need_jq() { command -v jq >/dev/null 2>&1 || die "jq is required (brew install jq)"; }
+
+# Config files are often symlinks into a dotfiles repository. Replacing a path
+# with `mv` detaches that symlink; writing through it preserves the link and the
+# target file mode on both BSD and GNU userlands.
+_replace_file() {  # _replace_file <tmp> <target>
+  local tmp="$1" target="$2"
+  cat "$tmp" > "$target" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+}
+
+_esc_rhs() { printf '%s' "${1:-}" | sed 's/[&#\]/\\&/g'; }
 
 toml_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
@@ -237,7 +248,7 @@ merge_codex_hooks_json() {
     die "failed to merge $CODEX_HOOKS_JSON"
   }
   backup_file "$CODEX_HOOKS_JSON"
-  mv "$tmp" "$CODEX_HOOKS_JSON"
+  _replace_file "$tmp" "$CODEX_HOOKS_JSON"
 }
 
 install_notify_fallback() {
@@ -337,7 +348,7 @@ write_codex_config_with_marker() {
   tmp="$(mktemp "$(dirname "$CODEX_CONFIG")/.config-final.XXXXXX")" || die "mktemp failed for $CODEX_CONFIG"
   append_marker_block "$base_file" "$marker_file" > "$tmp"
   backup_file "$CODEX_CONFIG"
-  mv "$tmp" "$CODEX_CONFIG"
+  _replace_file "$tmp" "$CODEX_CONFIG"
 }
 
 codex_install() {
@@ -406,16 +417,17 @@ claude_install() {
   [ -f "$CLAUDE_SETTINGS" ] || echo '{}' > "$CLAUDE_SETTINGS"
   jq empty "$CLAUDE_SETTINGS" >/dev/null 2>&1 || die "$CLAUDE_SETTINGS is not valid JSON"
   backup_file "$CLAUDE_SETTINGS"
-  # Migration: older versions hooked SessionEnd -> claude-clear, which wiped the
-  # "finished" mark the moment a session ended. Strip it so upgrades self-heal.
+  # Migration: remove only the legacy SessionEnd -> claude-clear wiring. The
+  # current claude-end hook has selective cleanup semantics and must survive
+  # idempotent reinstalls.
   local mtmp; mtmp="$(mktemp)"
-  jq --arg p "$NOTIFY " '
+  jq --arg legacy "$NOTIFY claude-clear" '
     if (.hooks // {}).SessionEnd then
-      .hooks.SessionEnd |= ( map(.hooks |= map(select((.command // "") | startswith($p) | not)))
+      .hooks.SessionEnd |= ( map(.hooks |= map(select((.command // "") != $legacy)))
                              | map(select((.hooks // []) | length > 0)) )
       | if (.hooks.SessionEnd | length) == 0 then del(.hooks.SessionEnd) else . end
     else . end
-  ' "$CLAUDE_SETTINGS" > "$mtmp" && mv "$mtmp" "$CLAUDE_SETTINGS"
+  ' "$CLAUDE_SETTINGS" > "$mtmp" && _replace_file "$mtmp" "$CLAUDE_SETTINGS"
   local i ev cmd tmp
   for i in "${!CLAUDE_EVENTS[@]}"; do
     ev="${CLAUDE_EVENTS[$i]}"; cmd="$NOTIFY ${CLAUDE_SUBCMDS[$i]}"; tmp="$(mktemp)"
@@ -423,7 +435,7 @@ claude_install() {
       .hooks //= {} | .hooks[$ev] //= []
       | if any(.hooks[$ev][]?; ((.hooks // [])[]?.command) == $cmd) then .
         else .hooks[$ev] += [ { "hooks": [ { "type": "command", "command": $cmd } ] } ] end
-    ' "$CLAUDE_SETTINGS" > "$tmp" && mv "$tmp" "$CLAUDE_SETTINGS"
+    ' "$CLAUDE_SETTINGS" > "$tmp" && _replace_file "$tmp" "$CLAUDE_SETTINGS"
     info "Claude $ev -> $cmd"
   done
 }
@@ -441,15 +453,55 @@ claude_uninstall() {
                     | map(select((.hooks // []) | length > 0)) )
       ) | .hooks |= with_entries(select((.value | length) > 0))
     else . end
-  ' "$CLAUDE_SETTINGS" > "$tmp" && mv "$tmp" "$CLAUDE_SETTINGS"
+  ' "$CLAUDE_SETTINGS" > "$tmp" && _replace_file "$tmp" "$CLAUDE_SETTINGS"
   info "removed Claude AI-status hooks"
 }
 
 claude_status() {
   if command -v jq >/dev/null 2>&1 && [ -f "$CLAUDE_SETTINGS" ]; then
     local c; c="$(jq --arg p "$NOTIFY " '[.hooks // {} | .. | .command? // empty | select(startswith($p))] | length' "$CLAUDE_SETTINGS" 2>/dev/null || echo 0)"
-    echo "Claude hooks installed: ${c:-0}/3"
+    echo "Claude hooks installed: ${c:-0}/5"
   else echo "Claude settings: (none / jq missing)"; fi
+}
+
+opencode_present() {
+  [ -d "$OPENCODE_DIR" ] || command -v opencode >/dev/null 2>&1
+}
+
+opencode_install() {
+  if ! opencode_present; then
+    info "OpenCode not found (no $OPENCODE_DIR, no 'opencode' on PATH) - skipped"
+    return 0
+  fi
+  local src="$SCRIPT_DIR/opencode-tmux-notify.js" tmp esc
+  [ -f "$src" ] || die "$src not found"
+  mkdir -p "$(dirname "$OPENCODE_PLUGIN")"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/radar-opencode.XXXXXX")"
+  case "$NOTIFY" in
+    *'"'*|*\\*|*$'\n'*) die "notify path cannot be represented safely in JavaScript: $NOTIFY" ;;
+  esac
+  esc="$(_esc_rhs "$NOTIFY")"
+  sed "s#__TMUX_RADAR_NOTIFY__#$esc#g" "$src" > "$tmp"
+  if [ -f "$OPENCODE_PLUGIN" ] && ! cmp -s "$tmp" "$OPENCODE_PLUGIN"; then
+    backup_file "$OPENCODE_PLUGIN"
+  fi
+  _replace_file "$tmp" "$OPENCODE_PLUGIN"
+  info "OpenCode plugin -> $OPENCODE_PLUGIN"
+}
+
+opencode_uninstall() {
+  if [ -f "$OPENCODE_PLUGIN" ]; then
+    rm -f "$OPENCODE_PLUGIN"
+    info "removed OpenCode plugin"
+  else
+    info "no OpenCode plugin installed"
+  fi
+}
+
+opencode_status() {
+  if ! opencode_present; then echo "OpenCode: not installed (skipped)"
+  elif [ -f "$OPENCODE_PLUGIN" ]; then echo "OpenCode plugin: installed"
+  else echo "OpenCode plugin: absent"; fi
 }
 
 [ -x "$NOTIFY" ] || die "$NOTIFY not found/executable"
@@ -457,22 +509,25 @@ claude_status() {
 case "${1:-install}" in
   install)
     echo "Installing tmux-radar AI-status hooks:"
-    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON"
+    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$OPENCODE_PLUGIN"
     codex_install
     claude_install
+    opencode_install
     transaction_commit
-    echo "Done. Restart Claude/Codex sessions (or open new ones) to pick up the hooks."
+    echo "Done. Restart Claude/Codex/OpenCode sessions (or open new ones) to pick up the hooks."
     ;;
   uninstall)
     echo "Uninstalling tmux-radar AI-status hooks:"
-    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON"
+    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$OPENCODE_PLUGIN"
     codex_uninstall
     claude_uninstall
+    opencode_uninstall
     transaction_commit
     ;;
   status)
     claude_status
     codex_status
+    opencode_status
     ;;
   *) die "usage: install-hooks.sh [install|uninstall|status]" ;;
 esac

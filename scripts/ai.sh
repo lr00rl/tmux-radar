@@ -156,6 +156,12 @@ WATCH_OWNER_HEARTBEAT=""
 WATCH_OWNER_LAST_CHECK_SECOND=-1
 WATCH_OWNER_LAST_OK=1
 WATCH_OWNER_REASON=""
+WATCH_FALLBACK_CANDIDATE_HASH=""
+WATCH_FALLBACK_LAST_HASH=""
+WATCH_FALLBACK_ACTIVE_HASH=""
+WATCH_FALLBACK_CANDIDATE_FILE=""
+WATCH_FALLBACK_LAST_FILE=""
+WATCH_FALLBACK_ACTIVE_FILE=""
 
 DELIVERY_GATE_HELD=0
 DELIVERY_GATE_TOKEN=""
@@ -1700,7 +1706,8 @@ _send() {  # _send <pane> <text> <key> <key> ...
 cmd_decide() {
   need_jq
   local pane autonomy policy goal cap cap_tail where json pretty_json action text safe reason extra="" prompt backend
-  local excerpt_lines errfile err_tail call_tag="" logging snapshots TMUX_RADAR_AI_ERR="" TMUX_SWITCHER_AI_ERR=""
+  local capture_lines event_kind excerpt_lines errfile err_tail call_tag="" logging snapshots
+  local TMUX_RADAR_AI_ERR="" TMUX_SWITCHER_AI_ERR=""
   DECISION_READY=0
   DECISION_FAILURE_KIND=""
   DECISION_FAILURE_DETAIL=""
@@ -1721,8 +1728,12 @@ cmd_decide() {
   autonomy="${2:-$(opt @radar-ai-autonomy confirm)}"
   policy="${3:-}"
   goal="${4:-}"
+  event_kind="${TMUX_RADAR_EVENT_KIND:-manual_reassess}"
+  capture_lines="${TMUX_RADAR_DECIDE_CAPTURE_LINES:-$(opt @radar-ai-capture-lines 120)}"
+  case "$capture_lines" in ''|*[!0-9]*) capture_lines=120 ;; esac
+  extra=$'\n\nSUPERVISOR EVENT: kind='"$event_kind"$'. Treat the visible pane as the source of truth. A screen_idle event is a low-cost fallback for an agent without a native hook; decide whether the stable visible state actually needs action.'
   if [ -n "$goal" ]; then
-    extra=$'\n\nGOAL (set by the user for this watch): '"$goal"
+    extra="$extra"$'\n\nGOAL (set by the user for this watch): '"$goal"
     case "$goal" in
       *$'\n') : ;;
       *) extra="$extra"$'\n' ;;
@@ -1737,7 +1748,7 @@ cmd_decide() {
     extra="$extra"$'\n\nREPAIR: the previous decision was invalid: '"${TMUX_RADAR_REPAIR_REASON:-decision schema/type validation failed}"$'. Return exactly one corrected decision object that satisfies both the JSON schema and the event-specific action constraints; do not add prose or markdown.'
   fi
   where="$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}' 2>/dev/null || echo "$pane")"
-  cap="$(tmux capture-pane -p -t "$pane" -S "-$(opt @radar-ai-capture-lines 120)" 2>/dev/null || true)"
+  cap="$(tmux capture-pane -p -t "$pane" -S "-$capture_lines" 2>/dev/null | tail -n "$capture_lines" || true)"
   if [ -z "$cap" ]; then
     if tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
       DECISION_FAILURE_KIND='capture-error'
@@ -1773,7 +1784,7 @@ cmd_decide() {
     [ -n "${errfile:-}" ] || errfile="$(_wbase "$pane").brain.err"
     _watch_detail "$pane" "模型请求中" "$(printf 'Backend: %s\nTarget: %s\nAutonomy: %s\nPolicy: %s\nGoal: %s\n\nPane excerpt shown here (last %s lines; model receives last %s lines):\n%s\n' \
       "$backend" "$where" "$autonomy" "${policy:-safe-auto}" "${goal:-<none>}" \
-      "$excerpt_lines" "$(opt @radar-ai-capture-lines 120)" "$cap_tail")"
+      "$excerpt_lines" "$capture_lines" "$cap_tail")"
   fi
   if [ -n "${TMUX_RADAR_AI_DETAIL:-${TMUX_SWITCHER_AI_DETAIL:-}}" ]; then
     TMUX_RADAR_AI_ERR="$errfile"
@@ -1904,8 +1915,109 @@ cmd_decide() {
 # post-send verification.
 # ---------------------------------------------------------------------------
 _watch_fingerprint() {
-  tmux capture-pane -p -t "$WATCH_PANE" -S "-$(opt @radar-ai-capture-lines 120)" 2>/dev/null |
+  local lines="${TMUX_RADAR_RUN_CAPTURE_LINES:-$(opt @radar-ai-capture-lines 120)}"
+  case "$lines" in ''|*[!0-9]*) lines=120 ;; esac
+  tmux capture-pane -p -t "$WATCH_PANE" -S "-$lines" 2>/dev/null |
+    tail -n "$lines" |
     cksum | awk '{print $1 ":" $2}'
+}
+
+_watch_fallback_capture() {  # _watch_fallback_capture <output-file>
+  local output="$1" lines="${TMUX_RADAR_RUN_FALLBACK_CAPTURE_LINES:-20}" tmp
+  case "$lines" in ''|*[!0-9]*) lines=20 ;; esac
+  tmp="$(mktemp "$RADAR_RUN_DIR/.fallback-sample.XXXXXX")" || return 1
+  if ! tmux capture-pane -p -t "$WATCH_PANE" -S "-$lines" 2>/dev/null |
+    tail -n "$lines" |
+    awk '{ sub(/\r$/, ""); sub(/[ \t]+$/, ""); print }' > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$output"
+}
+
+_watch_stable_projection() {  # _watch_stable_projection <before> <after> <output>
+  local before="$1" after="$2" output="$3" tmp
+  tmp="$(mktemp "$RADAR_RUN_DIR/.fallback-projection.XXXXXX")" || return 1
+  awk '
+    NR == FNR { before[++before_count] = $0; next }
+    { after[++after_count] = $0 }
+    END {
+      for (i = 0; i <= before_count; i++) lcs[i, 0] = 0
+      for (j = 0; j <= after_count; j++) lcs[0, j] = 0
+      for (i = 1; i <= before_count; i++) {
+        for (j = 1; j <= after_count; j++) {
+          if (before[i] == after[j]) lcs[i, j] = lcs[i - 1, j - 1] + 1
+          else if (lcs[i - 1, j] >= lcs[i, j - 1]) lcs[i, j] = lcs[i - 1, j]
+          else lcs[i, j] = lcs[i, j - 1]
+        }
+      }
+      i = before_count
+      j = after_count
+      while (i > 0 && j > 0) {
+        if (before[i] == after[j]) {
+          stable[++stable_count] = before[i]
+          i--
+          j--
+        } else if (lcs[i - 1, j] >= lcs[i, j - 1]) i--
+        else j--
+      }
+      for (i = stable_count; i >= 1; i--) {
+        if (stable[i] != "") print stable[i]
+      }
+    }
+  ' "$before" "$after" > "$tmp"
+  mv "$tmp" "$output"
+}
+
+_watch_file_hash() {
+  cksum "$1" 2>/dev/null | awk '{print $1 ":" $2}'
+}
+
+_watch_file_is_subsequence() {  # every line in $1 appears in order in $2
+  local candidate="$1" evidence="$2"
+  [ -s "$candidate" ] || return 1
+  awk '
+    NR == FNR { wanted[++wanted_count] = $0; next }
+    matched < wanted_count && $0 == wanted[matched + 1] { matched++ }
+    END { exit !(wanted_count > 0 && matched == wanted_count) }
+  ' "$candidate" "$evidence"
+}
+
+_watch_fallback_evidence_fingerprint() {
+  local current="$RADAR_RUN_DIR/.fallback-guard.$$" hash
+  if ! _watch_fallback_capture "$current"; then
+    rm -f "$current"
+    return 1
+  fi
+  if [ -s "$WATCH_FALLBACK_ACTIVE_FILE" ] &&
+    _watch_file_is_subsequence "$WATCH_FALLBACK_ACTIVE_FILE" "$current"; then
+    printf '%s' "$WATCH_FALLBACK_ACTIVE_HASH"
+  else
+    hash="$(_watch_file_hash "$current")"
+    printf 'fallback-changed:%s' "$hash"
+  fi
+  rm -f "$current"
+}
+
+_watch_evidence_fingerprint() {
+  case "${1:-}" in
+    screen_idle) _watch_fallback_evidence_fingerprint ;;
+    *) _watch_fingerprint ;;
+  esac
+}
+
+_watch_record_fallback_samples() {
+  local before="$1" after="$2" sequence="$3" dir
+  if [ "${TMUX_RADAR_RUN_LOGGING:-decision}" != full ] &&
+    [ "${TMUX_RADAR_RUN_SCREEN_SNAPSHOTS:-off}" != on ]; then
+    return 0
+  fi
+  dir="$RADAR_RUN_DIR/fallback"
+  mkdir -p "$dir"
+  cp "$before" "$dir/$(printf '%04d-before.txt' "$sequence")"
+  cp "$after" "$dir/$(printf '%04d-after.txt' "$sequence")"
+  chmod 600 "$dir/$(printf '%04d-before.txt' "$sequence")" \
+    "$dir/$(printf '%04d-after.txt' "$sequence")" 2>/dev/null || true
 }
 
 _watch_kill_waiters() {
@@ -2435,7 +2547,7 @@ _watch_post_decision_guard() {
     rm -f "$batch" "$retained"
     return 2
   fi
-  current="$(_watch_fingerprint || true)"
+  current="$(_watch_evidence_fingerprint "$current_kind" || true)"
   rm -f "$batch" "$retained"
   if [ -z "$current" ]; then return 2; fi
   if [ "$current" != "$pre" ]; then
@@ -2471,7 +2583,7 @@ _watch_verification_batch() {
 }
 
 _watch_verify_send() {
-  local pre="$1" timeout="${TMUX_RADAR_TEST_VERIFY_TIMEOUT:-$(opt @radar-ai-verify-timeout 30)}"
+  local pre="$1" current_kind="$2" timeout="${TMUX_RADAR_TEST_VERIFY_TIMEOUT:-$(opt @radar-ai-verify-timeout 30)}"
   local tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.05}" batch="$RADAR_RUN_DIR/.verify-batch.$$"
   local deferred="$RADAR_RUN_DIR/.verify-deferred.$$" reason="timeout" current
   : > "$batch"; : > "$deferred"
@@ -2485,7 +2597,7 @@ _watch_verify_send() {
     _watch_lifecycle_live || {
       reason="pane_death"; break
     }
-    current="$(_watch_fingerprint || true)"
+    current="$(_watch_evidence_fingerprint "$current_kind" || true)"
     if [ -n "$current" ] && [ "$current" != "$pre" ]; then reason="screen_change"; break; fi
     [ -e "$WATCH_TIMER_DONE" ] && break
     if [ -e "$WATCH_WAITER_DONE" ]; then
@@ -2557,7 +2669,7 @@ _watch_deliver_under_gate() {
       continue
     fi
 
-    delivery="$(_watch_fingerprint || true)"
+    delivery="$(_watch_evidence_fingerprint "$current_kind" || true)"
     if [ -z "$delivery" ]; then _delivery_gate_release; return 2; fi
     if [ "$delivery" != "$evidence" ]; then
       _watch_supersede_current evidence_changed "$current_kind"
@@ -2621,7 +2733,10 @@ _watch_finalize() {
   fi
   _watch_remove_owned_pointer
   rm -f "$BRAIN_PID_FILE" "$BRAIN_OUT_FILE" \
-    "$RADAR_RUN_DIR/paused" "$RADAR_RUN_DIR/resume-request" "$RADAR_RUN_DIR/keep-open"
+    "$RADAR_RUN_DIR/paused" "$RADAR_RUN_DIR/resume-request" "$RADAR_RUN_DIR/keep-open" \
+    "$RADAR_RUN_DIR"/.fallback-before.* "$RADAR_RUN_DIR"/.fallback-after.* \
+    "$RADAR_RUN_DIR"/.fallback-projection.* "$RADAR_RUN_DIR"/.fallback-guard.* \
+    "$WATCH_FALLBACK_CANDIDATE_FILE" "$WATCH_FALLBACK_LAST_FILE" "$WATCH_FALLBACK_ACTIVE_FILE"
 }
 
 _watch_signal_exit() {
@@ -2643,9 +2758,10 @@ _watch_signal_exit() {
 cmd_watch_loop() {
   local pane goal policy poll auto maxcalls config supplied_config="${6:-}" precreated_run="${7:-}"
   local batch wait_rc coalesce_rc event_kind requested_backend frozen_backend run_id generation channel resume_request_id
-  local rc valid failure evidence_fingerprint delivery_fingerprint armed_fingerprint current_fingerprint guard_rc
+  local rc valid failure evidence_fingerprint delivery_fingerprint guard_rc decide_capture_lines
   local retry_rc retry_cancelled verify_rc classification error_class retryable summary detail stderr_path failure_kind repair_reason
   local requested_policy requested_poll requested_auto always_allow_source
+  local fallback_before fallback_after fallback_projection projection_hash stable_lines fallback_sequence
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane" >&2; return 1; }
   if [ -n "$supplied_config" ]; then
     config="$supplied_config"
@@ -2726,7 +2842,8 @@ cmd_watch_loop() {
   WATCH_AUTONOMY="$auto"; WATCH_MAX_CALLS="$maxcalls"; WATCH_CALLS=0
   WATCH_RETRY=0; WATCH_TRANSIENT_RETRIES=0; WATCH_REPAIR_ATTEMPTS=0
   WATCH_EVENT_ID=""; WATCH_LAST_DECISION=""; WATCH_FINALIZED=0
-  WATCH_STABLE_COUNT=0
+  WATCH_STABLE_COUNT=0; WATCH_IDLE_SEQ=0; WATCH_FALLBACK_CANDIDATE_HASH=""
+  WATCH_FALLBACK_LAST_HASH=""; WATCH_FALLBACK_ACTIVE_HASH=""
   if [ -n "$precreated_run" ]; then
     run_id="$(printf '%s' "$config" | jq -r '.run_id // empty')"
     generation="$(jq -r '.generation // empty' "$precreated_run/start.json" 2>/dev/null || true)"
@@ -2735,6 +2852,10 @@ cmd_watch_loop() {
   else
     radar_run_create "$pane" "$config"
   fi
+  WATCH_FALLBACK_CANDIDATE_FILE="$RADAR_RUN_DIR/.fallback-candidate"
+  WATCH_FALLBACK_LAST_FILE="$RADAR_RUN_DIR/.fallback-last-assessed"
+  WATCH_FALLBACK_ACTIVE_FILE="$RADAR_RUN_DIR/.fallback-active"
+  rm -f "$WATCH_FALLBACK_CANDIDATE_FILE" "$WATCH_FALLBACK_LAST_FILE" "$WATCH_FALLBACK_ACTIVE_FILE"
   WATCH_WF="$(radar_watch_file "$pane")"
   if [ "$BRAIN_BACKEND_OK" -ne 1 ]; then
     classification="$(jq -cn --arg summary "$(printf '%s' "$BRAIN_PREFLIGHT_JSON" | jq -r '.summary')" \
@@ -2784,12 +2905,22 @@ cmd_watch_loop() {
   batch="$RADAR_RUN_DIR/.batch.$$"
   while :; do
     _watch_phase ARMED "waiting for native event or idle fallback" idle 0
-    armed_fingerprint="$(_watch_fingerprint || true)"
-    [ -n "$armed_fingerprint" ] || { _watch_finalize stopped STOPPED "target pane disappeared while arming"; break; }
+    fallback_before="$RADAR_RUN_DIR/.fallback-before.$$"
+    fallback_after="$RADAR_RUN_DIR/.fallback-after.$$"
+    fallback_projection="$RADAR_RUN_DIR/.fallback-projection.$$"
+    if ! _watch_fallback_capture "$fallback_before"; then
+      _watch_finalize stopped STOPPED "target pane disappeared while arming"
+      break
+    fi
     set +e; _watch_wait_for_batch "$batch"; wait_rc=$?; set -e
     case "$wait_rc" in
-      2) _watch_finalize stopped STOPPED "${WATCH_LIFECYCLE_REASON:-target pane disappeared}"; break ;;
+      2)
+        rm -f "$fallback_before" "$fallback_after" "$fallback_projection"
+        _watch_finalize stopped STOPPED "${WATCH_LIFECYCLE_REASON:-target pane disappeared}"
+        break
+        ;;
       3)
+        rm -f "$fallback_before" "$fallback_after" "$fallback_projection"
         _watch_phase PAUSED_USER "paused by user" resume 0
         while [ -e "$RADAR_RUN_DIR/paused" ]; do
           _watch_lifecycle_live || {
@@ -2803,36 +2934,82 @@ cmd_watch_loop() {
           --arg request_id "$resume_request_id" \
           '{record:"control",request_id:$request_id}')"
         rm -f "$RADAR_RUN_DIR/resume-request"
-        WATCH_STABLE_COUNT=0
+        WATCH_STABLE_COUNT=0; WATCH_FALLBACK_CANDIDATE_HASH=""
         continue
         ;;
-      0) WATCH_STABLE_COUNT=0 ;;
+      0)
+        rm -f "$fallback_before" "$fallback_after" "$fallback_projection"
+        WATCH_STABLE_COUNT=0; WATCH_FALLBACK_CANDIDATE_HASH=""
+        ;;
       1)
-        current_fingerprint="$(_watch_fingerprint || true)"
-        if [ -z "$current_fingerprint" ]; then
+        if ! _watch_fallback_capture "$fallback_after"; then
+          rm -f "$fallback_before" "$fallback_after" "$fallback_projection"
           _watch_finalize stopped STOPPED "target pane disappeared at idle deadline"
           break
         fi
-        if [ "$current_fingerprint" != "$armed_fingerprint" ]; then
-          WATCH_STABLE_COUNT=0
-          radar_event_append idle_reset watcher "screen changed during idle interval" "$(jq -cn \
-            --arg before "$armed_fingerprint" --arg after "$current_fingerprint" \
-            '{record:"idle_reset",before:$before,after:$after}')"
+        fallback_sequence=$(( ${WATCH_FALLBACK_SEQUENCE:-0} + 1 ))
+        WATCH_FALLBACK_SEQUENCE="$fallback_sequence"
+        _watch_record_fallback_samples "$fallback_before" "$fallback_after" "$fallback_sequence"
+        if ! _watch_stable_projection "$fallback_before" "$fallback_after" "$fallback_projection"; then
+          rm -f "$fallback_before" "$fallback_after" "$fallback_projection"
+          _watch_finalize paused_error PAUSED_ERROR "failed to compute fallback projection"
+          break
+        fi
+        rm -f "$fallback_before" "$fallback_after"
+        stable_lines="$(awk 'NF { count++ } END { print count + 0 }' "$fallback_projection")"
+        if [ "$stable_lines" -lt 1 ]; then
+          WATCH_STABLE_COUNT=0; WATCH_FALLBACK_CANDIDATE_HASH=""
+          rm -f "$fallback_projection" "$WATCH_FALLBACK_CANDIDATE_FILE"
+          radar_event_append fallback_unstable watcher "no stable fallback evidence" "$(jq -cn \
+            --argjson sample "$fallback_sequence" \
+            '{record:"fallback_projection",sample:$sample,stable_lines:0,deduped:false}')"
           continue
         fi
-        WATCH_STABLE_COUNT=$((WATCH_STABLE_COUNT + 1))
+        projection_hash="$(_watch_file_hash "$fallback_projection")"
+        if [ "$projection_hash" = "$WATCH_FALLBACK_CANDIDATE_HASH" ]; then
+          WATCH_STABLE_COUNT=$((WATCH_STABLE_COUNT + 1))
+          rm -f "$fallback_projection"
+        else
+          WATCH_FALLBACK_CANDIDATE_HASH="$projection_hash"
+          WATCH_STABLE_COUNT=1
+          mv "$fallback_projection" "$WATCH_FALLBACK_CANDIDATE_FILE"
+        fi
         if [ "$WATCH_STABLE_COUNT" -lt "$WATCH_STABLE_THRESHOLD" ]; then
-          radar_event_append idle_stable watcher "stable sample $WATCH_STABLE_COUNT/$WATCH_STABLE_THRESHOLD" "$(jq -cn \
+          radar_event_append fallback_candidate watcher "stable projection $WATCH_STABLE_COUNT/$WATCH_STABLE_THRESHOLD" "$(jq -cn \
+            --arg hash "$projection_hash" --argjson lines "$stable_lines" \
             --argjson count "$WATCH_STABLE_COUNT" --argjson threshold "$WATCH_STABLE_THRESHOLD" \
-            '{record:"idle_stable",count:$count,threshold:$threshold}')"
+            '{record:"fallback_projection",projection_hash:$hash,stable_lines:$lines,
+              count:$count,threshold:$threshold,deduped:false}')"
           continue
         fi
         WATCH_STABLE_COUNT=0
+        if [ -s "$WATCH_FALLBACK_LAST_FILE" ] &&
+          { _watch_file_is_subsequence "$WATCH_FALLBACK_CANDIDATE_FILE" "$WATCH_FALLBACK_LAST_FILE" ||
+            _watch_file_is_subsequence "$WATCH_FALLBACK_LAST_FILE" "$WATCH_FALLBACK_CANDIDATE_FILE"; }; then
+          radar_event_append fallback_deduped watcher "stable projection already assessed" "$(jq -cn \
+            --arg hash "$projection_hash" --arg previous "$WATCH_FALLBACK_LAST_HASH" \
+            --argjson lines "$stable_lines" \
+            '{record:"fallback_projection",projection_hash:$hash,
+              previous_projection_hash:$previous,stable_lines:$lines,deduped:true}')"
+          continue
+        fi
+        WATCH_FALLBACK_LAST_HASH="$projection_hash"
+        WATCH_FALLBACK_ACTIVE_HASH="$projection_hash"
+        cp "$WATCH_FALLBACK_CANDIDATE_FILE" "$WATCH_FALLBACK_LAST_FILE"
+        cp "$WATCH_FALLBACK_CANDIDATE_FILE" "$WATCH_FALLBACK_ACTIVE_FILE"
         WATCH_IDLE_SEQ=$(( ${WATCH_IDLE_SEQ:-0} + 1 ))
         WATCH_EVENT_ID="idle-$RADAR_RUN_ID-$WATCH_IDLE_SEQ"
         jq -cn --arg id "$WATCH_EVENT_ID" --arg pane "$pane" --arg timestamp "$(_radar_now_iso)" \
+          --arg projection_hash "$projection_hash" --argjson stable_lines "$stable_lines" \
           --argjson event_order "$(_watch_next_event_order)" \
-          '{kind:"screen_idle",source:"watcher",label:"idle fallback",event_id:$id,pane:$pane,timestamp:$timestamp,event_order:$event_order}' > "$batch"
+          '{kind:"screen_idle",source:"watcher",label:"stable screen fallback",
+            event_id:$id,pane:$pane,timestamp:$timestamp,event_order:$event_order,
+            projection_hash:$projection_hash,stable_lines:$stable_lines}' > "$batch"
+        radar_event_append fallback_ready watcher "stable projection queued for assessment" "$(jq -cn \
+          --arg event_id "$WATCH_EVENT_ID" --arg hash "$projection_hash" \
+          --argjson lines "$stable_lines" \
+          '{record:"fallback_projection",event_id:$event_id,projection_hash:$hash,
+            stable_lines:$lines,deduped:false,queued:true}')"
         ;;
     esac
     _watch_defer_native_events "$batch"
@@ -2856,7 +3033,7 @@ cmd_watch_loop() {
       _watch_finalize stopped STOPPED "$WATCH_LIFECYCLE_REASON"
       break
     fi
-    evidence_fingerprint="$(_watch_fingerprint || true)"
+    evidence_fingerprint="$(_watch_evidence_fingerprint "$event_kind" || true)"
     if [ -z "$evidence_fingerprint" ]; then _watch_finalize stopped STOPPED "target pane disappeared during capture"; break; fi
 
     WATCH_RETRY=0; WATCH_TRANSIENT_RETRIES=0; WATCH_REPAIR_ATTEMPTS=0; retry_cancelled=0; repair_reason=""
@@ -2879,8 +3056,13 @@ cmd_watch_loop() {
         while [ -e "$TMUX_RADAR_TEST_BEFORE_DECIDE_BLOCK" ]; do sleep 0.01; done
       fi
       set +e
+      decide_capture_lines="$TMUX_RADAR_RUN_CAPTURE_LINES"
+      [ "$event_kind" != screen_idle ] ||
+        decide_capture_lines="$TMUX_RADAR_RUN_FALLBACK_CAPTURE_LINES"
       TMUX_RADAR_REPAIR_ATTEMPT="$WATCH_REPAIR_ATTEMPTS" \
         TMUX_RADAR_REPAIR_REASON="${repair_reason:-}" \
+        TMUX_RADAR_EVENT_KIND="$event_kind" \
+        TMUX_RADAR_DECIDE_CAPTURE_LINES="$decide_capture_lines" \
         TMUX_RADAR_AI_DETAIL=1 TMUX_RADAR_DECIDE_PARSE_ONLY=1 \
         cmd_decide "$pane" "$auto" "$policy" "$goal"
       rc=$?
@@ -3068,7 +3250,7 @@ cmd_watch_loop() {
     radar_event_append sent watcher "${DECISION_REASON:-safe action sent}" "$(jq -cn --arg event_id "$WATCH_EVENT_ID" \
       --arg pre "$delivery_fingerprint" '{record:"execution",event_id:$event_id,sent:true,pre_send_fingerprint:$pre}')"
     _clearmark "$pane"
-    set +e; _watch_verify_send "$delivery_fingerprint"; verify_rc=$?; set -e
+    set +e; _watch_verify_send "$delivery_fingerprint" "$event_kind"; verify_rc=$?; set -e
     case "$verify_rc" in
       0) : ;;
       2) _watch_finalize stopped STOPPED "${WATCH_LIFECYCLE_REASON:-target pane disappeared during verification}"; break ;;

@@ -7,6 +7,7 @@ source "$ROOT/tests/test_helpers.sh"
 
 TMP="$(test_tmpdir ai-supervision)"
 WATCH_PID=""
+SCREEN_UPDATER_PID=""
 RUN_DIR=""
 OLD_PATH="$PATH"
 
@@ -15,6 +16,9 @@ cleanup() {
   trap - EXIT TERM INT HUP
   [ -z "${TEST_WAITER_LIVENESS:-}" ] || rm -f "$TEST_WAITER_LIVENESS"
   [ -z "${TEST_PROCESS_LIVENESS:-}" ] || rm -f "$TEST_PROCESS_LIVENESS"
+  [ -z "$SCREEN_UPDATER_PID" ] || kill "$SCREEN_UPDATER_PID" 2>/dev/null || true
+  [ -z "$SCREEN_UPDATER_PID" ] || wait "$SCREEN_UPDATER_PID" 2>/dev/null || true
+  SCREEN_UPDATER_PID=""
   stop_watch || rc=1
   stop_recorded_waiters || rc=1
   PATH="$OLD_PATH"
@@ -259,6 +263,7 @@ reset_case() {
   export TEST_BLOCK_BACKEND="$CASE/block-backend"
   export TEST_RESPONSES="$CASE/responses"
   export TEST_PROMPT_FILE="$CASE/prompt.txt"
+  export TEST_CAPTURE_ARGS="$CASE/capture.args"
   export TEST_ROOT="$ROOT"
   export TEST_AI_TIMEOUT=5
   export TEST_MAX_CALLS=40
@@ -287,6 +292,7 @@ reset_case() {
   : > "$TEST_BACKEND_PIDS"
   : > "$TEST_WAITER_PIDS"
   : > "$TEST_CODEX_EXEC_LOG"
+  : > "$TEST_CAPTURE_ARGS"
   printf 'screen-0\n' > "$TEST_SCREEN"
   touch "$TEST_PANE_ALIVE"
   touch "$TEST_WAITER_LIVENESS"
@@ -320,6 +326,34 @@ start_watch_config() {
   RUN_DIR="$(awk -F= '$1 == "run_dir" { print $2; exit }' "$CASE/state/ai-watch/_1.watch")"
   [ -n "$RUN_DIR" ] || _fail_assert 'watch pointer lacks run_dir'
   wait_until 'initial configured state snapshot' "[ -s '$RUN_DIR/state.json' ]"
+}
+
+write_dynamic_screen() {
+  local prompt="$1" elapsed="$2" footer="$3" i=1 tmp="$TEST_SCREEN.next.$$"
+  : > "$tmp"
+  while [ "$i" -le 30 ]; do
+    printf 'history-%02d\n' "$i" >> "$tmp"
+    i=$((i + 1))
+  done
+  {
+    printf 'Kimi approval\n'
+    printf '%s\n' "$prompt"
+    printf '1. Approve once\n'
+    printf '2. Approve for this session\n'
+    printf 'elapsed=%ss\n' "$elapsed"
+    printf 'tip=%s\n' "$footer"
+  } >> "$tmp"
+  mv "$tmp" "$TEST_SCREEN"
+}
+
+write_fully_dynamic_screen() {
+  local generation="$1" line=1 tmp="$TEST_SCREEN.next.$$"
+  : > "$tmp"
+  while [ "$line" -le 24 ]; do
+    printf 'generation-%s-line-%02d\n' "$generation" "$line" >> "$tmp"
+    line=$((line + 1))
+  done
+  mv "$tmp" "$TEST_SCREEN"
 }
 
 stop_watch() {
@@ -713,7 +747,93 @@ wait_until 'hooks-off idle fallback' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d
 stop_watch
 printf 'PASS: hooks-first off defers native events but keeps fallback triggers\n'
 
-# 21. A terminal newline in the goal survives config, runtime state, and the
+# 21. A no-hook agent can keep volatile elapsed/footer rows while the stable
+# approval body triggers one bounded model call. The same projection is
+# deduplicated; a new stable prompt can trigger one new call.
+reset_case semantic-fallback
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"approval remains pending"}'
+write_response 2 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"new approval remains pending"}'
+write_dynamic_screen 'Apply the first patch?' 1 alpha
+start_watch_config 0.12 1 on 'supervise Kimi' 'fallback_capture_lines=20,capture_lines=120'
+wait_until 'dynamic fallback armed' "jq -e '.phase == \"ARMED\"' '$RUN_DIR/state.json' >/dev/null"
+(
+  update=2
+  while [ "$update" -le 120 ]; do
+    sleep 0.04
+    write_dynamic_screen 'Apply the first patch?' "$update" "tip-$update"
+    update=$((update + 1))
+  done
+) &
+screen_updater=$!
+SCREEN_UPDATER_PID="$screen_updater"
+wait_until 'dynamic fallback decision' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 1 ]" 400
+kill -0 "$screen_updater" 2>/dev/null ||
+  _fail_assert 'volatile rows postponed fallback until the screen stopped changing'
+kill "$screen_updater" 2>/dev/null || true
+wait "$screen_updater" 2>/dev/null || true
+SCREEN_UPDATER_PID=""
+assert_contains "$(cat "$TEST_PROMPT_FILE")" 'Apply the first patch?' \
+  'fallback prompt keeps stable approval evidence'
+case "$(cat "$TEST_PROMPT_FILE")" in
+  *history-01*) _fail_assert 'fallback prompt exceeded its 20-line budget' ;;
+esac
+
+sleep 0.05
+write_dynamic_screen 'Apply the first patch?' 121 eta
+sleep 0.16
+write_dynamic_screen 'Apply the first patch?' 122 theta
+sleep 0.2
+assert_eq 1 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" \
+  'same stable projection spends only one call'
+
+write_dynamic_screen 'Apply the second patch?' 123 iota
+sleep 0.16
+write_dynamic_screen 'Apply the second patch?' 124 kappa
+wait_until 'new semantic fallback decision' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 2 ]" 400
+assert_contains "$(cat "$TEST_PROMPT_FILE")" 'Apply the second patch?' \
+  'new stable projection reaches the model'
+stop_watch
+printf 'PASS: semantic fallback ignores volatile rows and deduplicates model cost\n'
+
+# 22. Output with no stable line projection remains call-free while it changes.
+reset_case continuously-changing
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"must not run"}'
+write_fully_dynamic_screen 1
+start_watch_config 0.1 1 on 'watch changing output' 'fallback_capture_lines=20'
+(
+  generation=2
+  while [ "$generation" -le 80 ]; do
+    sleep 0.025
+    write_fully_dynamic_screen "$generation"
+    generation=$((generation + 1))
+  done
+) &
+screen_updater=$!
+SCREEN_UPDATER_PID="$screen_updater"
+sleep 0.7
+kill -0 "$screen_updater" 2>/dev/null ||
+  _fail_assert 'continuous-change fixture ended before the assertion'
+assert_eq 0 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" \
+  'screen with no stable projection spends zero calls'
+kill "$screen_updater" 2>/dev/null || true
+wait "$screen_updater" 2>/dev/null || true
+SCREEN_UPDATER_PID=""
+stop_watch
+printf 'PASS: continuously changing output with no stable projection is call-free\n'
+
+# 23. Fallback capture is bounded independently while a native event retains
+# the normal capture budget.
+reset_case capture-budgets
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"native evidence"}'
+write_dynamic_screen 'Native approval' 1 native
+start_watch_config 30 1 on 'capture budgets' 'fallback_capture_lines=20,capture_lines=120'
+emit_event native-budget approval inspect
+wait_until 'native capture budget decision' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 1 ]"
+assert_contains "$(cat "$TEST_CAPTURE_ARGS")" '-S -120' 'native decision uses capture_lines'
+stop_watch
+printf 'PASS: native and fallback evidence budgets stay independent\n'
+
+# 24. A terminal newline in the goal survives config, runtime state, and the
 # exact model prompt boundary.
 reset_case exact-goal
 goal=$'  exact\ngoal  \n'

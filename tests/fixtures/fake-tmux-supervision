@@ -37,7 +37,20 @@ case "$cmd" in
     ;;
   capture-pane)
     [ -f "$TEST_PANE_ALIVE" ] || exit 1
-    cat "$TEST_SCREEN"
+    [ -z "${TEST_CAPTURE_ARGS:-}" ] || printf '%s\n' "$*" >> "$TEST_CAPTURE_ARGS"
+    start=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -S ] && [ "$#" -ge 2 ]; then
+        start="$2"
+        shift 2
+      else
+        shift
+      fi
+    done
+    case "$start" in
+      -[0-9]*) tail -n "${start#-}" "$TEST_SCREEN" ;;
+      *) cat "$TEST_SCREEN" ;;
+    esac
     ;;
   send-keys)
     count=1

@@ -233,10 +233,13 @@ are merged into `~/.codex/hooks.json`; the managed block in
 `~/.codex/config.toml` contains matching trust state plus the wrapped legacy
 `notify` fallback. When OpenCode is installed, the installer writes the
 dependency-free lifecycle bridge to
-`~/.config/opencode/plugins/tmux-radar.js`. Existing user hooks, trust entries,
-notify chains, and symlinked config paths are preserved. Restart the affected
-agent sessions after installation, then review `/hooks` if Codex asks you to
-trust the handlers.
+`~/.config/opencode/plugins/tmux-radar.js`. One bridge process blocks on a pipe
+for the lifetime of each OpenCode TUI; it does not spawn or poll per event.
+Permission requests, structured questions, replies, idle completion, errors,
+and deletion are ordered by session/generation before changing marks. Existing
+user hooks, trust entries, notify chains, and symlinked config paths are
+preserved. Restart the affected agent sessions after installation, then review
+`/hooks` if Codex asks you to trust the handlers.
 
 ### How marks are targeted and cleared
 
@@ -287,7 +290,7 @@ CLI, logged in, plus `jq`). Then `prefix + A` opens a menu:
 
 | Key | Entry | What it does |
 |-----|-------|--------------|
-| `a` | **指挥 tmux（自然语言）** | Type a request ("split this window into build/test/lint"); Codex proposes a batch of tmux commands, you confirm, they run. |
+| `a` | **指挥 tmux 布局（自然语言）** | Describe a split/join/move/resize/layout change; Codex proposes a layout-only argv batch, you confirm, and tmux runs it directly. Shell commands and pane input are rejected. |
 | `c` | **让当前 pane 继续 / 决定一次** | Reads the current pane (a Claude Code / Codex TUI waiting on you), figures out the right answer, and — after you confirm — sends the keystrokes. |
 | `w` | **常驻监控当前 pane 直到完成** | Opens the quick goal field, then a complete launch summary. Safe blocked prompts are handled until that exact goal is done. |
 | `W` | **常驻监控 + always-allow** | The same goal-first flow with always-allow preset for safe repeated approvals. |
@@ -469,6 +472,9 @@ when the bar renders (≤30s), and whenever the AI status view opens.
     background-session marks; `key` is `s:<claude session_id>` or the pane id).
   - `agent-registry` — one live agent session per line:
     `kind ⇥ key ⇥ pid ⇥ pane ⇥ started ⇥ last_event ⇥ state ⇥ cwd ⇥ proc`.
+  - `opencode-events` — one ordering watermark/tombstone per OpenCode session:
+    `key ⇥ generation ⇥ generation_started_ms ⇥ sequence ⇥ updated`. It rejects
+    duplicate, out-of-order, and old-process events after a TUI restart.
   - `ai-watch/` — one small `<pane>.watch` compatibility pointer per live run,
     including watcher PID, run directory, wake channel, and monitor pane IDs.
     While a model call is active, `<pane>.brain.pid` records its PID/process

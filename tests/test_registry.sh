@@ -76,10 +76,8 @@ chk "claude-end removes registry row" "! grep -q 's:rs1' '$REG'"
 # --- 6. opencode-hook lifecycle ---------------------------------------------
 sleep 300 & OC=$!
 printf '{"event":"start","session_id":"oc1","pane":"%s","pid":%s,"cwd":"/tmp/oc","message":""}' "$PANE" "$OC" | "$N" opencode-hook
-# opencode is keyed by pane (stable across every event), not by the session id
-# that only some events carry — see cmd_opencode_hook
-chk "opencode start registers pane-keyed (numeric pid parsed)" \
-  "awk -F'\t' '\$1==\"opencode\" && \$2==\"oc:$PANE\" && \$3=='$OC'' '$REG' | grep -q ."
+chk "opencode start registers session-keyed (numeric pid parsed)" \
+  "awk -F'\t' '\$1==\"opencode\" && \$2==\"oc:s:oc1\" && \$3=='$OC'' '$REG' | grep -q ."
 printf '{"event":"permission","session_id":"oc1","pane":"%s","pid":%s,"cwd":"/tmp/oc","message":"run tests"}' "$PANE" "$OC" | "$N" opencode-hook
 chk "opencode permission marks the pane" "grep -q 'opencode needs approval: run tests' '$MARKS'"
 printf '{"event":"user","session_id":"oc1","pane":"%s","pid":%s,"cwd":"/tmp/oc","message":""}' "$PANE" "$OC" | "$N" opencode-hook
@@ -87,6 +85,42 @@ chk "opencode user reply clears the mark" "! grep -q 'needs approval' '$MARKS'"
 printf '{"event":"end","session_id":"oc1","pane":"%s","pid":%s,"cwd":"/tmp/oc","message":""}' "$PANE" "$OC" | "$N" opencode-hook
 chk "opencode end removes registry row" "! grep -q 'opencode' '$REG' 2>/dev/null || ! [ -s '$REG' ]"
 kill "$OC" 2>/dev/null
+
+# Multiple OpenCode sessions may share one TUI pane. Session B must not
+# overwrite or clear session A, and old generations/sequences cannot mutate a
+# newer replacement session.
+"$N" clear-all
+oc_event() { printf '%s' "$1" | "$N" opencode-hook; }
+oc_event "{\"event\":\"start\",\"session_id\":\"oc-a\",\"pane\":\"$PANE\",\"pid\":$$,\"cwd\":\"/tmp/oc\",\"generation\":\"g-old\",\"generation_started\":100,\"sequence\":1}"
+oc_event "{\"event\":\"permission\",\"session_id\":\"oc-a\",\"pane\":\"$PANE\",\"pid\":$$,\"cwd\":\"/tmp/oc\",\"message\":\"bash: go test\",\"generation\":\"g-old\",\"generation_started\":100,\"sequence\":2}"
+oc_event "{\"event\":\"start\",\"session_id\":\"oc-b\",\"pane\":\"$PANE\",\"pid\":$$,\"cwd\":\"/tmp/oc\",\"generation\":\"g-old\",\"generation_started\":100,\"sequence\":3}"
+oc_event "{\"event\":\"idle\",\"session_id\":\"oc-b\",\"pane\":\"$PANE\",\"pid\":$$,\"cwd\":\"/tmp/oc\",\"generation\":\"g-old\",\"generation_started\":100,\"sequence\":4}"
+oc_event "{\"event\":\"end\",\"session_id\":\"oc-b\",\"pane\":\"$PANE\",\"pid\":$$,\"cwd\":\"/tmp/oc\",\"generation\":\"g-old\",\"generation_started\":100,\"sequence\":5}"
+chk "session B idle/end does not clear session A action" "grep -q 'oc:s:oc-a.*bash: go test' '$MARKS'"
+chk "session B end leaves session A registry row" "grep -q $'opencode\\toc:s:oc-a\\t' '$REG'"
+
+oc_event "{\"event\":\"start\",\"session_id\":\"oc-a\",\"pane\":\"$PANE\",\"pid\":$$,\"cwd\":\"/tmp/oc\",\"generation\":\"g-new\",\"generation_started\":200,\"sequence\":1}"
+oc_event "{\"event\":\"permission\",\"session_id\":\"oc-a\",\"pane\":\"$PANE\",\"pid\":$$,\"cwd\":\"/tmp/oc\",\"message\":\"edit: README\",\"generation\":\"g-new\",\"generation_started\":200,\"sequence\":2}"
+oc_event "{\"event\":\"end\",\"session_id\":\"oc-a\",\"pane\":\"$PANE\",\"pid\":$$,\"cwd\":\"/tmp/oc\",\"generation\":\"g-old\",\"generation_started\":100,\"sequence\":99}"
+chk "old-generation delayed end cannot delete replacement session" "grep -q $'opencode\\toc:s:oc-a\\t' '$REG'"
+chk "old-generation delayed end cannot clear replacement mark" "grep -q 'oc:s:oc-a.*edit: README' '$MARKS'"
+oc_event "{\"event\":\"user\",\"session_id\":\"oc-a\",\"pane\":\"$PANE\",\"pid\":$$,\"cwd\":\"/tmp/oc\",\"generation\":\"g-new\",\"generation_started\":200,\"sequence\":1}"
+chk "out-of-order sequence cannot clear a newer mark" "grep -q 'oc:s:oc-a.*edit: README' '$MARKS'"
+oc_event "{\"event\":\"input\",\"session_id\":\"oc-a\",\"pane\":\"$PANE\",\"pid\":$$,\"cwd\":\"/tmp/oc\",\"message\":\"Which target?\",\"generation\":\"g-new\",\"generation_started\":200,\"sequence\":3}"
+chk "question input becomes an ACTION mark" "grep -q 'oc:s:oc-a.*Which target' '$MARKS'"
+oc_event "{\"event\":\"user\",\"session_id\":\"oc-a\",\"pane\":\"$PANE\",\"pid\":$$,\"cwd\":\"/tmp/oc\",\"generation\":\"g-new\",\"generation_started\":200,\"sequence\":4}"
+chk "matching question reply clears only its session mark" "! grep -q 'oc:s:oc-a' '$MARKS'"
+"$N" clear-all
+
+# Codex registry and mark keys must be identical so registry liveness remains
+# authoritative instead of silently falling back to pane-process heuristics.
+printf '{"hook_event_name":"PermissionRequest","thread_id":"codex-key"}' |
+  TMUX_PANE="$PANE" "$N" codex-hook
+CODEX_REG_KEY="$(awk -F '\t' '$1=="codex" { print $2; exit }' "$REG")"
+CODEX_MARK_KEY="$(awk -F '\t' '$3=="codex" { print $4; exit }' "$MARKS")"
+chk "codex mark key matches its registry key" \
+  "[ '$CODEX_REG_KEY' = 's:codex-key' ] && [ '$CODEX_MARK_KEY' = '$CODEX_REG_KEY' ]"
+"$N" clear-all
 
 # --- 7. bar exact-restore (baseline status off) ------------------------------
 env -u CLAUDE_JOB_DIR "$N" mark "$PANE" claude "Claude needs your permission" s:bar1
@@ -99,6 +133,24 @@ chk "prev status value saved (off)" "[ '$PREV' = 'off' ]"
 "$N" clear-all
 ST2="$(tmux show-option -gv status)"
 chk "clear-all restores the EXACT prior status (off, not on)" "[ '$ST2' = 'off' ]"
+
+tmux set -g status 2
+tmux set -gu @radar-prev-status 2>/dev/null || true
+"$N" mark - claude "Claude needs your permission" s:bar-two
+chk "auto bar preserves a user-owned status 2" \
+  "[ \"\$(tmux show-option -gv status)\" = 2 ] && [ -z \"\$(tmux show-option -gqv @radar-prev-status)\" ]"
+"$N" clear-all
+chk "clear preserves user-owned status 2" "[ \"\$(tmux show-option -gv status)\" = 2 ]"
+
+tmux set -g status 3
+"$N" mark - claude "Claude needs your permission" s:bar-three
+chk "auto bar never reduces an existing status 3" \
+  "[ \"\$(tmux show-option -gv status)\" = 3 ] && [ -z \"\$(tmux show-option -gqv @radar-prev-status)\" ]"
+"$N" clear-all
+tmux set -g @radar-bar pinned
+bash "$WT/tmux-radar.tmux"
+chk "pinned bar never reduces an existing status 3" "[ \"\$(tmux show-option -gv status)\" = 3 ]"
+tmux set -gu @radar-bar
 
 # --- 8. switcher renders + preview ------------------------------------------
 sleep 300 & S3=$!

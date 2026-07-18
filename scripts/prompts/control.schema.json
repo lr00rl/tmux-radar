@@ -6,11 +6,11 @@
     "commands": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Ordered tmux commands WITHOUT the leading 'tmux' word; run via tmux source-file."
+      "description": "Ordered layout-only tmux argv lines without the leading 'tmux' word. No quoting, shell commands, or executable formats."
     },
     "explain": {
       "type": "string",
-      "description": "One or two sentences (user's language) describing what the batch does; flag anything destructive."
+      "description": "One or two sentences in the user's language describing the layout change or why the request is outside this layout-only surface."
     }
   }
 }

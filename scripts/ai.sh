@@ -3866,9 +3866,138 @@ cmd_monitor() {
 
 # ---------------------------------------------------------------------------
 # ask: arrange tmux from natural language. Codex returns a batch of tmux
-# commands (no leading "tmux"); we run them via `source-file` (native tmux
-# parsing, no shell eval) after a denylist scan + autonomy gate.
+# commands (no leading "tmux"). We parse a deliberately small layout-only argv
+# grammar and invoke tmux directly; model-authored source text is never loaded.
 # ---------------------------------------------------------------------------
+LAYOUT_REJECT_REASON=""
+
+_layout_command_safe() {  # _layout_command_safe <line>
+  local line="$1" offset=0 verb token i positional=0
+  local -a words
+  LAYOUT_REJECT_REASON=""
+
+  case "$line" in
+    *\"*|*\'*|*\\*|*\`*|*';'*)
+      LAYOUT_REJECT_REASON="引号、转义、反引号和链式命令分隔符均不允许"
+      return 1
+      ;;
+    *'#('*|*\$\(*)
+      LAYOUT_REJECT_REASON="可执行 tmux format 不允许"
+      return 1
+      ;;
+  esac
+  read -r -a words <<< "$line"
+  [ "${#words[@]}" -gt 0 ] || return 0
+  if [ "${words[0]}" = "tmux" ]; then offset=1; fi
+  [ "${#words[@]}" -gt "$offset" ] || {
+    LAYOUT_REJECT_REASON="missing tmux verb"
+    return 1
+  }
+  verb="${words[$offset]}"
+  case "$verb" in
+    splitw) verb=split-window ;;
+    joinp) verb=join-pane ;;
+    movew) verb=move-window ;;
+    swapp) verb=swap-pane ;;
+    selectl) verb=select-layout ;;
+    resizep) verb=resize-pane ;;
+    breakp) verb=break-pane ;;
+    neww) verb=new-window ;;
+    renamew) verb=rename-window ;;
+  esac
+
+  i=$((offset + 1))
+  while [ "$i" -lt "${#words[@]}" ]; do
+    token="${words[$i]}"
+    case "$verb:$token" in
+      split-window:-b|split-window:-d|split-window:-f|split-window:-h|split-window:-v|split-window:-Z|\
+      join-pane:-b|join-pane:-d|join-pane:-f|join-pane:-h|join-pane:-v|\
+      move-window:-a|move-window:-d|move-window:-k|move-window:-r|\
+      swap-pane:-d|swap-pane:-D|swap-pane:-U|swap-window:-d|\
+      link-window:-a|link-window:-d|link-window:-k|\
+      select-layout:-E|select-layout:-n|select-layout:-o|select-layout:-p|\
+      resize-pane:-D|resize-pane:-L|resize-pane:-R|resize-pane:-U|resize-pane:-Z|\
+      break-pane:-a|break-pane:-d|\
+      new-window:-a|new-window:-d|new-window:-k|new-window:-S)
+        ;;
+      split-window:-c|split-window:-l|split-window:-t|\
+      join-pane:-l|join-pane:-s|join-pane:-t|\
+      move-window:-s|move-window:-t|\
+      swap-pane:-s|swap-pane:-t|swap-window:-s|swap-window:-t|\
+      link-window:-s|link-window:-t|select-layout:-t|\
+      resize-pane:-t|resize-pane:-x|resize-pane:-y|\
+      break-pane:-n|break-pane:-s|break-pane:-t|\
+      new-window:-c|new-window:-n|new-window:-t|rename-window:-t)
+        i=$((i + 1))
+        [ "$i" -lt "${#words[@]}" ] || {
+          LAYOUT_REJECT_REASON="$token requires one argument"
+          return 1
+        }
+        ;;
+      select-layout:*)
+        positional=$((positional + 1))
+        case "$token" in
+          even-horizontal|even-vertical|main-horizontal|main-vertical|tiled|next|previous) ;;
+          *) LAYOUT_REJECT_REASON="unsupported layout name: $token"; return 1 ;;
+        esac
+        [ "$positional" -le 1 ] || {
+          LAYOUT_REJECT_REASON="select-layout accepts one layout name"
+          return 1
+        }
+        ;;
+      resize-pane:*)
+        positional=$((positional + 1))
+        if ! [[ "$token" =~ ^[+-]?[0-9]+$ ]]; then
+          LAYOUT_REJECT_REASON="invalid resize adjustment: $token"
+          return 1
+        fi
+        [ "$positional" -le 1 ] || {
+          LAYOUT_REJECT_REASON="resize-pane accepts one adjustment"
+          return 1
+        }
+        ;;
+      rename-window:*)
+        positional=$((positional + 1))
+        [ "$positional" -le 1 ] || {
+          LAYOUT_REJECT_REASON="rename-window accepts one name"
+          return 1
+        }
+        ;;
+      split-window:*|new-window:*)
+        LAYOUT_REJECT_REASON="$verb positional shell commands are not allowed"
+        return 1
+        ;;
+      join-pane:*|move-window:*|swap-pane:*|swap-window:*|link-window:*|break-pane:*)
+        LAYOUT_REJECT_REASON="unexpected positional argument for $verb: $token"
+        return 1
+        ;;
+      *)
+        LAYOUT_REJECT_REASON="unsupported layout verb or option: $verb $token"
+        return 1
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  case "$verb" in
+    split-window|join-pane|move-window|swap-pane|swap-window|link-window|select-layout|resize-pane|break-pane|new-window|rename-window) ;;
+    *) LAYOUT_REJECT_REASON="unsupported layout verb: $verb"; return 1 ;;
+  esac
+}
+
+_layout_execute_file() {  # _layout_execute_file <validated-file>
+  local file="$1" line offset rc=0
+  local -a words argv
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    read -r -a words <<< "$line"
+    offset=0
+    [ "${words[0]}" = "tmux" ] && offset=1
+    argv=("${words[@]:$offset}")
+    tmux "${argv[@]}" || rc=1
+  done < "$file"
+  return "$rc"
+}
+
 cmd_ask() {
   need_jq
   have_brain || { echo "codex 未安装/不可用，无法使用 AI 指挥。"; return 3; }
@@ -3893,21 +4022,16 @@ cmd_ask() {
   [ "$n" -gt 0 ] || { echo "${explain:-无可执行命令}"; rm -f "$cmds_file"; return 0; }
 
   echo "计划：${explain}"; echo "--- tmux 命令 ---"; cat "$cmds_file"; echo "-----------------"
-  # This command palette owns layout only. Reject separators before checking
-  # the first verb because tmux source-file treats `;` as another command.
-  local bad
-  bad="$(awk '
-    NF == 0 { next }
-    $1 ~ /^#/ { next }
-    /(^|[[:space:]]);/ { print "  " NR ": " $0 "   ← 链式 ; 命令不允许"; next }
-    {
-      v = $1
-      if (v == "tmux") v = $2
-      if (v !~ /^(split-window|splitw|join-pane|joinp|move-window|movew|swap-pane|swapp|swap-window|link-window|select-layout|selectl|resize-pane|resizep|break-pane|breakp|new-window|neww|rename-window|renamew)$/)
-        print "  " NR ": " $0
-    }' "$cmds_file")"
+  local bad="" line line_no=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_no=$((line_no + 1))
+    case "$line" in ''|'#'*) continue ;; esac
+    if ! _layout_command_safe "$line"; then
+      bad="${bad}  ${line_no}: ${line} ← ${LAYOUT_REJECT_REASON}"$'\n'
+    fi
+  done < "$cmds_file"
   if [ -n "$bad" ]; then
-    printf '⚠ 只允许布局类命令（split/join/swap/move/resize/layout/break/new/rename），以下被拒绝：\n%s\n上面的计划仅供参考，请自行执行。\n' "$bad"
+    printf '⚠ 只允许无 shell 参数的布局操作，以下被拒绝：\n%s上面的计划仅供参考，请自行执行。\n' "$bad"
     rm -f "$cmds_file"; return 4
   fi
   case "$autonomy" in
@@ -3916,7 +4040,7 @@ cmd_ask() {
       printf '执行? [y/N] '; local ans=""; readline_tty ans
       case "$ans" in y|Y|yes) ;; *) echo "已取消"; rm -f "$cmds_file"; return 6 ;; esac ;;
   esac
-  tmux source-file "$cmds_file" 2>&1 && echo "✓ 已执行 $n 条" || echo "部分命令执行失败"
+  _layout_execute_file "$cmds_file" 2>&1 && echo "✓ 已执行 $n 条" || echo "部分命令执行失败"
   audit "ask\t$req\t$n cmds"
   rm -f "$cmds_file"
 }

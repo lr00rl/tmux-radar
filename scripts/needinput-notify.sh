@@ -44,8 +44,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
 STATE_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
 REG_FILE="${TMUX_RADAR_REGISTRY_FILE:-$STATE_DIR/agent-registry}"
+OC_EVENTS_FILE="${TMUX_RADAR_OPENCODE_EVENTS_FILE:-$STATE_DIR/opencode-events}"
 BG_TTL="${TMUX_RADAR_BG_TTL:-${TMUX_SWITCHER_BG_TTL:-86400}}"   # paneless marks expire after 24h
 LOCK="$STATE_DIR/.need-input.lock"    # one lock guards need-input AND agent-registry
+PS_BIN="${TMUX_RADAR_TEST_PS_BIN:-ps}"
 
 # labels that mean "turn finished": these marks survive session end / GC so
 # short-lived and background runs still surface. Keep in sync with level_for
@@ -58,25 +60,76 @@ mkdir -p "$STATE_DIR"
 
 have_tmux() { command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2>&1; }
 
-# mkdir lock with an owner pid: a crashed hook's lock is reaped instead of
-# stalling every later hook for 2s, and a caller that gave up waiting never
-# rmdir's the live holder's lock (LOCK_OWNED gates unlock).
+# Use an OS lock primitive instead of a shell-level reaper protocol. macOS
+# shlock publishes with link(2) and reaps dead PIDs; Linux flock is released by
+# the kernel when the process exits. Legacy directory locks are migrated only
+# when their recorded owner is dead.
 LOCK_OWNED=0
-lock() {
-  local n=0 holder
-  while ! mkdir "$LOCK" 2>/dev/null; do
-    holder="$(cat "$LOCK/pid" 2>/dev/null || true)"
-    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
-      rm -rf "$LOCK" 2>/dev/null || true; continue      # stale: owner is gone
-    fi
-    n=$((n+1))
-    [ "$n" -gt 100 ] && return 1                        # give up; never write unlocked
-    sleep 0.02
-  done
-  printf '%s' "$$" > "$LOCK/pid" 2>/dev/null || true
-  LOCK_OWNED=1
+LOCK_KIND=""
+
+_legacy_lock_migrate() {
+  local owner holder stale
+  [ -d "$LOCK" ] || return 0
+  if [ -r "$LOCK/owner" ]; then owner="$(cat "$LOCK/owner" 2>/dev/null || true)"
+  else owner="$(cat "$LOCK/pid" 2>/dev/null || true)"; fi
+  holder="${owner%% *}"
+  [ -n "$holder" ] || return 1
+  [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null && return 1
+  # The owner is absent/dead. Atomic rename means concurrent migrators cannot
+  # delete a replacement lock published after this legacy directory.
+  stale="${LOCK}.legacy.$$.$RANDOM"
+  if mv "$LOCK" "$stale" 2>/dev/null; then
+    rm -rf "$stale" 2>/dev/null || true
+  fi
+  [ ! -d "$LOCK" ]
 }
-unlock() { [ "${LOCK_OWNED:-0}" = 1 ] && rm -rf "$LOCK" 2>/dev/null; LOCK_OWNED=0; return 0; }
+
+lock() {
+  local n=0 max_attempts=40
+  while [ -d "$LOCK" ]; do
+    _legacy_lock_migrate && continue
+    n=$((n + 1))
+    [ "$n" -gt "$max_attempts" ] && return 1
+    sleep 0.05
+  done
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK" 2>/dev/null || return 1
+    if flock -w 2 9 2>/dev/null; then
+      LOCK_KIND=flock
+      LOCK_OWNED=1
+      return 0
+    fi
+    exec 9>&-
+    return 1
+  fi
+  if command -v shlock >/dev/null 2>&1; then
+    n=0
+    while ! shlock -f "$LOCK" -p "$$" 2>/dev/null; do
+      n=$((n + 1))
+      [ "$n" -gt "$max_attempts" ] && return 1
+      sleep 0.05
+    done
+    LOCK_KIND=shlock
+    LOCK_OWNED=1
+    return 0
+  fi
+  return 1
+}
+unlock() {
+  [ "${LOCK_OWNED:-0}" = 1 ] || return 0
+  case "$LOCK_KIND" in
+    flock)
+      flock -u 9 2>/dev/null || true
+      exec 9>&-
+      ;;
+    shlock)
+      [ "$(cat "$LOCK" 2>/dev/null || true)" = "$$" ] && rm -f "$LOCK"
+      ;;
+  esac
+  LOCK_OWNED=0
+  LOCK_KIND=""
+  return 0
+}
 trap 'unlock' EXIT INT TERM                             # never leak on set -e abort
 
 opt() {  # opt <option> <default> (empty/no server -> default)
@@ -133,7 +186,10 @@ _agent_panes() {
   cmds="${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude opencode')}}"
   panes="$(tmux list-panes -a -F '#{pane_id} #{pane_pid} #{pane_tty}' 2>/dev/null)" || return 0
   [ -n "$panes" ] || return 0
-  ps_rows="$(ps -axo pid=,ppid=,tty=,command= 2>/dev/null)" || return 0
+  ps_rows="${1:-}"
+  if [ "$#" -eq 0 ]; then
+    ps_rows="$("$PS_BIN" -axo pid=,ppid=,tty=,command= 2>/dev/null)" || return 0
+  fi
   [ -n "$ps_rows" ] || return 0
   { printf '__PANES__\n%s\n__PS__\n%s\n' "$panes" "$ps_rows"; } | LC_ALL=C awk -v cmds="$cmds" '
     function cleantty(t) { sub(/^\/dev\//, "", t); return t }
@@ -178,7 +234,7 @@ _agent_panes() {
 _resolve_agent_pid() {  # _resolve_agent_pid <kind>
   local kind="${1:-}" rel
   [ -n "$kind" ] || return 0
-  rel="$(ps -axo pid=,ppid=,command= 2>/dev/null)" || return 0
+  rel="$("$PS_BIN" -axo pid=,ppid=,command= 2>/dev/null)" || return 0
   [ -n "$rel" ] || return 0
   printf '%s\n' "$rel" | LC_ALL=C awk -v me="$$" -v kind="$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')" '
     function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
@@ -208,15 +264,13 @@ _resolve_agent_pid() {  # _resolve_agent_pid <kind>
     }'
 }
 
-# --- agent-session registry (see header). Writes are atomic; callers must
-# NOT hold the lock (these helpers take it themselves). ---------------------
-_reg_upsert() {  # _reg_upsert <kind> <key> <pid> <pane> <state> <cwd> <proc>
+# --- agent-session registry (see header). -----------------------------------
+_reg_upsert_locked() {  # caller holds lock
   local kind="${1:-}" key="${2:-}" pid="${3:-0}" pane="${4:--}" state="${5:-working}" cwd="${6:-}" proc="${7:-}"
   [ -n "$kind" ] && [ -n "$key" ] || return 0
   case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
   local now old started tmp
   now="$(date +%s)"
-  lock || return 0
   old="$(awk -F '\t' -v k="$key" 'NF >= 9 && $2 == k { print; exit }' "$REG_FILE" 2>/dev/null || true)"
   started="$now"
   if [ -n "$old" ]; then
@@ -228,21 +282,30 @@ _reg_upsert() {  # _reg_upsert <kind> <key> <pid> <pane> <state> <cwd> <proc>
     [ -z "$proc" ] && proc="$(printf '%s' "$old" | cut -f9)"
   fi
   [ -n "$proc" ] || proc="$kind"
-  tmp="$(mktemp "${REG_FILE}.XXXXXX")" || { unlock; return 0; }
+  tmp="$(mktemp "${REG_FILE}.XXXXXX")" || return 0
   { [ -r "$REG_FILE" ] && awk -F '\t' -v k="$key" 'NF >= 9 && $2 != k' "$REG_FILE"; :; } > "$tmp" 2>/dev/null
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$kind" "$(_san "$key")" "$pid" "$pane" "$started" "$now" "$state" "$(_san "$cwd")" "$(_san "$proc")" >> "$tmp"
   mv "$tmp" "$REG_FILE"
+}
+
+_reg_upsert() {  # _reg_upsert <kind> <key> <pid> <pane> <state> <cwd> <proc>
+  lock || return 0
+  _reg_upsert_locked "$@"
   unlock
 }
 
-_reg_remove() {  # _reg_remove <key>
+_reg_remove_locked() {  # caller holds lock
   local key="${1:-}" tmp
   [ -n "$key" ] && [ -r "$REG_FILE" ] || return 0
-  lock || return 0
-  tmp="$(mktemp "${REG_FILE}.XXXXXX")" || { unlock; return 0; }
+  tmp="$(mktemp "${REG_FILE}.XXXXXX")" || return 0
   awk -F '\t' -v k="$key" 'NF >= 9 && $2 != k' "$REG_FILE" > "$tmp" 2>/dev/null || true
   mv "$tmp" "$REG_FILE"
+}
+
+_reg_remove() {  # _reg_remove <key>
+  lock || return 0
+  _reg_remove_locked "$1"
   unlock
 }
 
@@ -264,7 +327,7 @@ _resolve_pane_by_proc() {
   local map rel
   map="$(tmux list-panes -a -F '#{pane_id} #{pane_pid} #{pane_tty}' 2>/dev/null)"
   [ -n "$map" ] || return 1
-  rel="$(ps -axo pid=,ppid=,tty= 2>/dev/null)"
+  rel="$("$PS_BIN" -axo pid=,ppid=,tty= 2>/dev/null)"
   [ -n "$rel" ] || return 1
   { printf '__PANES__\n%s\n__PS__\n%s\n' "$map" "$rel"; } | awk -v me="$$" '
     function cleantty(t) { sub(/^\/dev\//, "", t); return t }
@@ -376,13 +439,9 @@ _drop_rows() {  # _drop_rows <awk-condition-marking-rows-to-DROP> [extra -v args
 _bar_raise() {  # remember the user's status value, then show line 2
   local cur
   cur="$(tmux show-option -gv status 2>/dev/null || echo on)"
-  if [ "$cur" = "2" ]; then
-    # already raised — but a raise/lower interleave can leave status=2 with no
-    # saved value, which would strand the extra line forever. Re-arm it.
-    [ -z "$(tmux show-option -gqv @radar-prev-status 2>/dev/null || true)" ] &&
-      tmux set -g @radar-prev-status on >/dev/null 2>&1 || true
-    return 0
-  fi
+  # Two or more lines are already sufficient and user-owned unless the marker
+  # below proves radar raised them. Never reduce an existing multi-line status.
+  case "$cur" in 2|[3-9]|[1-9][0-9]*) return 0 ;; esac
   tmux set -g @radar-prev-status "$cur" >/dev/null 2>&1 || true
   tmux set -g status 2 >/dev/null 2>&1 || true
 }
@@ -393,7 +452,6 @@ _bar_lower() {  # restore EXACTLY what the user had; never touch what we didn't 
   [ -n "$prev" ] || return 0                     # we never raised — not ours
   cur="$(tmux show-option -gv status 2>/dev/null || echo on)"
   if [ "$cur" = "2" ]; then
-    [ "$prev" = "2" ] && prev=on
     tmux set -g status "$prev" >/dev/null 2>&1 || true
   fi                                             # user changed it since: leave it
   tmux set -gu @radar-prev-status >/dev/null 2>&1 || true
@@ -500,8 +558,8 @@ cmd_clear_all() { lock || return 0; _drop_rows '1'; unlock; _sync_bar; }
 # marks stay until handled (or BG_TTL for paneless ones). If both the ps
 # snapshot and the pane scan failed we only do the plain prune.
 cmd_tick() {
-  local snapshot verdicts dead_keys="" live_keys="" agents tmp reg_ok=""
-  snapshot="$(ps -axo pid=,command= 2>/dev/null || true)"
+  local snapshot verdicts dead_specs="" dead_keys="" registry_keys="" agents tmp reg_ok=""
+  snapshot="$("$PS_BIN" -axo pid=,ppid=,tty=,command= 2>/dev/null || true)"
   # reg_ok = "the registry answered". Without it (ps failed, or the registry
   # was never created — pre-upgrade, hooks not installed) we must NOT infer
   # death from a missing row: absence of evidence isn't evidence of absence.
@@ -519,7 +577,9 @@ cmd_tick() {
       $0 == "__REG__" { mode = 2; next }
       mode == 1 && $0 != "" {
         rest = trim($0)
-        pid = rest; sub(/[[:space:]].*/, "", pid); sub(/^[^[:space:]]+[[:space:]]*/, "", rest)
+        pid = rest; sub(/[[:space:]].*/, "", pid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
+        ppid = rest; sub(/[[:space:]].*/, "", ppid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
+        tty = rest; sub(/[[:space:]].*/, "", tty); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
         a0 = rest; sub(/[[:space:]].*/, "", a0)
         argv[pid] = a0; next
       }
@@ -528,34 +588,53 @@ cmd_tick() {
         alive = 0
         if (pid <= 0) alive = 1            # unresolved pid: GC via pane scan only
         else if ((pid in argv) && argmatch(argv[pid], tolower($9))) alive = 1
-        print (alive ? "L" : "D") "\t" $2
+        print (alive ? "L" : "D") "\t" $0
       }')"
-    dead_keys="$(printf '%s\n' "$verdicts" | awk -F '\t' '$1 == "D" { printf "%s\001", $2 }')"
-    live_keys="$(printf '%s\n' "$verdicts" | awk -F '\t' '$1 == "L" { printf "%s\001", $2 }')"
-    if [ -n "$dead_keys" ]; then
+    dead_specs="$(printf '%s\n' "$verdicts" | awk -F '\t' '$1 == "D" { print }')"
+    if [ -n "$dead_specs" ]; then
       lock || return 0
-      tmp="$(mktemp "${REG_FILE}.XXXXXX")" || { unlock; return 0; }
-      awk -F '\t' -v dk="$(printf '\001%s' "$dead_keys")" \
-        'NF >= 9 && index(dk, "\001" $2 "\001") == 0' "$REG_FILE" > "$tmp" 2>/dev/null || true
-      mv "$tmp" "$REG_FILE"
+      # Revalidate the exact row identity under the lock. A SessionStart may
+      # have replaced the same key after the snapshot; key-only deletion would
+      # erase that newer live session and its mark.
+      dead_keys="$({ printf '__DEAD__\n%s\n__REG__\n' "$dead_specs"; cat "$REG_FILE"; } |
+        awk -F '\t' '
+          $0 == "__DEAD__" { mode=1; next }
+          $0 == "__REG__"  { mode=2; next }
+          mode == 1 && $1 == "D" {
+            row=$0
+            sub(/^D\t/, "", row)
+            dead[row]=1
+            next
+          }
+          mode == 2 && NF >= 9 {
+            if ($0 in dead) printf "%s\001", $2
+          }')"
+      if [ -n "$dead_keys" ]; then
+        tmp="$(mktemp "${REG_FILE}.XXXXXX")" || { unlock; return 0; }
+        awk -F '\t' -v dk="$(printf '\001%s' "$dead_keys")" \
+          'NF >= 9 && index(dk, "\001" $2 "\001") == 0' "$REG_FILE" > "$tmp" 2>/dev/null || true
+        mv "$tmp" "$REG_FILE"
+        _drop_rows 'index(dk, "\001" $4 "\001") > 0 && tolower($5) !~ donere' \
+          -v dk="$(printf '\001%s' "$dead_keys")" -v donere="$DONE_RE"
+      fi
       unlock
     fi
   fi
-  agents="$(_agent_panes || true)"
+  agents="$(_agent_panes "$snapshot" || true)"
   lock || return 0
-  if [ -n "$agents" ] || [ -n "$dead_keys" ] || [ -n "$live_keys" ]; then
-    # 1) marks of registry-dead sessions: keep only unseen "finished" notices;
-    # 2) agent-source pane marks with no live registry row whose pane no longer
+  [ -r "$REG_FILE" ] &&
+    registry_keys="$(awk -F '\t' 'NF >= 9 { printf "%s\001", $2 }' "$REG_FILE" 2>/dev/null || true)"
+  if [ -n "$agents" ] || [ -n "$registry_keys" ] || [ -n "$reg_ok" ]; then
+    # 1) agent-source pane marks with no current registry row whose pane no longer
     #    hosts that agent (TUI closed, shell reused) — pre-registry fallback;
-    # 3) paneless agent action/notice marks with no live registry row are stale
+    # 2) paneless agent action/notice marks with no current registry row are stale
     #    (a background session that cannot take input any more). Requires
     #    regok, and only touches agent sources — a `mark - tool ...` from a
     #    user script has no registry row by design and must survive.
-    _drop_rows '( index(dk, "\001" $4 "\001") > 0 && tolower($5) !~ donere ) ||
-      ( $1 != "-" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "ai") && index(lk, "\001" $4 "\001") == 0 && ag != "" && index(ag, "\001" $1 "\001") == 0 ) ||
-      ( $1 == "-" && regok != "" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "ai") && index(lk, "\001" $4 "\001") == 0 && tolower($5) !~ donere )' \
-      -v dk="$(printf '\001%s' "$dead_keys")" -v lk="$(printf '\001%s' "$live_keys")" \
-      -v ag="${agents#OK}" -v donere="$DONE_RE" -v regok="$reg_ok"
+    _drop_rows '( $1 != "-" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 && ag != "" && index(ag, "\001" $1 "\001") == 0 ) ||
+      ( $1 == "-" && regok != "" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 && tolower($5) !~ donere )' \
+      -v rk="$(printf '\001%s' "$registry_keys")" -v ag="${agents#OK}" \
+      -v donere="$DONE_RE" -v regok="$reg_ok"
   else
     _rewrite ''
   fi
@@ -698,8 +777,10 @@ _codex_pane() {
   printf '%s' "$pane"
 }
 
-_codex_adopt() {  # _codex_adopt <state> <json> <pane> — registry upsert
+CODEX_KEY=""
+_codex_adopt() {  # _codex_adopt <state> <json> <pane> — sets CODEX_KEY
   local state="$1" json="$2" pane="${3:--}" sid key agent pid="" proc=""
+  CODEX_KEY=""
   agent="$(_resolve_agent_pid codex || true)"
   if [ -n "$agent" ]; then pid="${agent%%$'\t'*}"; proc="${agent#*$'\t'}"; fi
   # notify payloads carry thread-id / thread_id; hook payloads may not — fall
@@ -710,7 +791,11 @@ _codex_adopt() {  # _codex_adopt <state> <json> <pane> — registry upsert
   if [ -n "$sid" ]; then key="s:${sid}"
   elif [ -n "$pid" ]; then key="p:${pid}"
   else return 0; fi
+  if [ -n "$sid" ] && [ -n "$pid" ]; then
+    _reg_remove "p:${pid}"
+  fi
   _reg_upsert codex "$key" "${pid:-0}" "$pane" "$state" "$(_json_field cwd "$json")" "$proc"
+  CODEX_KEY="$key"
 }
 
 _codex_event_kind() {
@@ -761,7 +846,8 @@ cmd_codex_hook() {  # Codex native hooks pass JSON on stdin
       if [ -n "$pane" ]; then
         label="$(_codex_label "$event" "$json")"
         _watch_event "$pane" user_resumed codex "$label"
-        cmd_clear_pane "$pane"
+        [ -n "$CODEX_KEY" ] && cmd_clear_key "$CODEX_KEY"
+        cmd_clear_pane "$pane"  # also clears pre-registry pane-keyed marks
       fi
       ;;
     *)
@@ -772,7 +858,7 @@ cmd_codex_hook() {  # Codex native hooks pass JSON on stdin
       else _codex_adopt waiting "$json" "$pane"; fi
       _watch_event "$pane" "$kind" codex "$label"
       [ "$(opt @radar-needinput on)" = "on" ] || exit 0
-      cmd_mark "$pane" codex "$label"
+      cmd_mark "$pane" codex "$label" "$CODEX_KEY"
       ;;
   esac
 }
@@ -788,7 +874,8 @@ cmd_codex() {  # Codex notify passes its event JSON as the last argv argument
       if [ -n "$pane" ]; then
         label="$(_codex_label "$type" "$json")"
         _watch_event "$pane" user_resumed codex "$label"
-        cmd_clear_pane "$pane"
+        [ -n "$CODEX_KEY" ] && cmd_clear_key "$CODEX_KEY"
+        cmd_clear_pane "$pane"  # also clears pre-registry pane-keyed marks
       fi
       ;;
     *)
@@ -799,68 +886,165 @@ cmd_codex() {  # Codex notify passes its event JSON as the last argv argument
       else _codex_adopt waiting "$json" "$pane"; fi
       _watch_event "$pane" "$kind" codex "$label"
       [ "$(opt @radar-needinput on)" = "on" ] || exit 0
-      cmd_mark "$pane" codex "$label"
+      cmd_mark "$pane" codex "$label" "$CODEX_KEY"
       ;;
   esac
 }
 
-# opencode plugin events (see scripts/opencode-tmux-notify.js): the plugin
-# runs inside the TUI process, so pane/pid/cwd come straight from the JSON.
-cmd_opencode_hook() {
-  local json event sid key pane pid cwd msg where label
-  json="$(cat 2>/dev/null || true)"
+# OpenCode watermarks are tombstones as well as ordering metadata:
+#   key<TAB>generation<TAB>generation_started_ms<TAB>sequence<TAB>updated_epoch
+# A newer plugin generation supersedes an older one for the same session. The
+# row remains after end so a delayed event from the old process cannot resurrect
+# a deleted/replaced session.
+_opencode_accept_locked() {  # <key> <generation> <started-ms> <sequence>
+  local key="$1" generation="$2" generation_started="$3" sequence="$4"
+  local old old_generation old_started old_sequence now tmp
+  generation="$(_san "$generation")"
+  case "$generation_started" in ''|*[!0-9]*) generation_started=0 ;; esac
+  case "$sequence" in ''|*[!0-9]*) sequence=0 ;; esac
+  old="$(awk -F '\t' -v k="$key" 'NF >= 5 && $1 == k { print; exit }' "$OC_EVENTS_FILE" 2>/dev/null || true)"
+  if [ -n "$old" ]; then
+    old_generation="$(printf '%s' "$old" | cut -f2)"
+    old_started="$(printf '%s' "$old" | cut -f3)"
+    old_sequence="$(printf '%s' "$old" | cut -f4)"
+  else
+    old_generation=""; old_started=0; old_sequence=0
+  fi
+
+  # Legacy one-shot events carry no ordering fields. Accept them only when they
+  # are not attempting to overwrite a generation-aware row.
+  if [ -z "$generation" ]; then
+    case "$old_generation" in ""|legacy) ;; *) return 1 ;; esac
+    generation="legacy"
+    generation_started=0
+    sequence=$((old_sequence + 1))
+  elif [ "$generation" = "$old_generation" ]; then
+    [ "$sequence" -gt "$old_sequence" ] || return 1
+  elif [ -n "$old_generation" ]; then
+    [ "$generation_started" -gt "$old_started" ] || return 1
+  fi
+
+  now="$(date +%s)"
+  tmp="$(mktemp "${OC_EVENTS_FILE}.XXXXXX")" || return 2
+  { [ -r "$OC_EVENTS_FILE" ] &&
+      awk -F '\t' -v k="$key" -v now="$now" -v ttl="$BG_TTL" \
+        'NF >= 5 && $1 != k && now - $5 <= ttl' "$OC_EVENTS_FILE"; :; } > "$tmp" 2>/dev/null
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$(_san "$key")" "$generation" "$generation_started" "$sequence" "$now" >> "$tmp"
+  mv "$tmp" "$OC_EVENTS_FILE"
+}
+
+_opencode_mark_locked() {  # <pane|-> <label> <key>
+  local pane="$1" label key="$3" now saved_title="" prev_title=""
+  label="$(_san "$2")"
+  now="$(date +%s)"
+  if [ "$pane" != "-" ] && [ -n "$pane" ] && [ "$(opt @radar-retitle on)" != "off" ]; then
+    saved_title="$(_san "$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)")"
+    case "$saved_title" in "⚠ "*|"✓ "*|"! "*|"· "*) saved_title="" ;; esac
+  fi
+  prev_title="$(awk -F '\t' -v k="$key" -v p="$pane" \
+    'NF >= 6 && ($4 == k || $1 == p) && $6 != "" { print $6; exit }' "$STATE_FILE" 2>/dev/null || true)"
+  [ -n "$prev_title" ] && saved_title="$prev_title"
+  # OpenCode can host several sessions in one pane. Replace only this session,
+  # unlike the public pane mark API which intentionally keeps one row per pane.
+  _rewrite 'if (key == delkey) next' -v delkey="$key"
+  printf '%s\t%s\topencode\t%s\t%s\t%s\n' \
+    "$pane" "$now" "$key" "$label" "$saved_title" >> "$STATE_FILE"
+}
+
+_opencode_event() {  # _opencode_event <one JSON object>
+  local json="$1" event sid key pane pid cwd msg where label
+  local generation generation_started sequence watch_kind=""
   event="$(_json_field event "$json")"
-  [ -n "$event" ] || exit 0
+  [ -n "$event" ] || return 0
   sid="$(_json_field session_id "$json")"
   pane="$(_json_field pane "$json")"
   pid="$(_json_field_any pid "$json")"; case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
   cwd="$(_json_field cwd "$json")"
   msg="$(_json_field message "$json")"
+  generation="$(_json_field generation "$json")"
+  generation_started="$(_json_field_any generation_started "$json")"
+  sequence="$(_json_field_any sequence "$json")"
   [ -n "$pane" ] || pane="$(_resolve_pane_by_proc || true)"
-  # key on the PANE first: the plugin lives inside the TUI process and only
-  # runs when TMUX_PANE is set, so the pane is stable for the whole session
-  # while session_id only appears on some events — keying on sid would split
-  # one session across two registry rows (start/user/end vs permission/idle).
-  if [ -n "$pane" ]; then key="oc:${pane}"
-  elif [ -n "$sid" ]; then key="s:${sid}"
-  elif [ "$pid" -gt 0 ]; then key="p:${pid}"
-  else exit 0; fi
+  if [ -n "$sid" ]; then key="oc:s:$(_san "$sid")"
+  elif [ -n "$generation" ]; then key="oc:g:$(_san "$generation")"
+  elif [ "$pid" -gt 0 ]; then key="oc:p:$pid"
+  else return 0; fi
   where=""; [ -n "$cwd" ] && where="$(basename "$cwd")"
+
+  lock || return 0
+  if ! _opencode_accept_locked "$key" "$generation" "$generation_started" "$sequence"; then
+    unlock
+    return 0
+  fi
   case "$event" in
     start)
-      _reg_upsert opencode "$key" "$pid" "${pane:--}" working "$cwd" opencode
+      _reg_upsert_locked opencode "$key" "$pid" "${pane:--}" working "$cwd" opencode
       ;;
     user)
-      _reg_upsert opencode "$key" "$pid" "${pane:--}" working "$cwd" opencode
-      if [ "${key#s:}" != "$key" ]; then cmd_clear_key "$key"
-      elif [ -n "$pane" ]; then cmd_clear_pane "$pane"; fi
+      _reg_upsert_locked opencode "$key" "$pid" "${pane:--}" working "$cwd" opencode
+      _drop_rows '$4 == k' -v k="$key"
+      watch_kind=user_resumed
       ;;
-    permission)
-      _reg_upsert opencode "$key" "$pid" "${pane:--}" waiting "$cwd" opencode
-      [ "$(opt @radar-needinput on)" = "on" ] || exit 0
-      label="opencode needs approval${msg:+: $msg}"
-      [ -n "$pane" ] || label="opencode·${where:-bg}: needs approval${msg:+: $msg}"
-      cmd_mark "${pane:--}" opencode "$label" "$key"
+    permission|input)
+      _reg_upsert_locked opencode "$key" "$pid" "${pane:--}" waiting "$cwd" opencode
+      if [ "$(opt @radar-needinput on)" = "on" ]; then
+        if [ "$event" = "input" ]; then
+          label="opencode needs your input${msg:+: $msg}"
+          watch_kind=input_required
+        else
+          label="opencode needs approval${msg:+: $msg}"
+          watch_kind=approval
+        fi
+        [ -n "$pane" ] || label="opencode·${where:-bg}: ${label#opencode }"
+        _opencode_mark_locked "${pane:--}" "$label" "$key"
+      fi
       ;;
     idle)
-      _reg_upsert opencode "$key" "$pid" "${pane:--}" "done" "$cwd" opencode
-      [ "$(opt @radar-needinput on)" = "on" ] || exit 0
-      label="opencode finished — your turn"
-      [ -n "$pane" ] || label="opencode·${where:-bg}: finished — your turn"
-      cmd_mark "${pane:--}" opencode "$label" "$key"
+      _reg_upsert_locked opencode "$key" "$pid" "${pane:--}" "done" "$cwd" opencode
+      if [ "$(opt @radar-needinput on)" = "on" ]; then
+        label="opencode finished — your turn"
+        [ -n "$pane" ] || label="opencode·${where:-bg}: finished — your turn"
+        _opencode_mark_locked "${pane:--}" "$label" "$key"
+        watch_kind=turn_complete
+      fi
       ;;
     error)
-      [ "$(opt @radar-needinput on)" = "on" ] || exit 0
-      label="opencode: ${msg:-error}"
-      [ -n "$pane" ] || label="opencode·${where:-bg}: ${msg:-error}"
-      cmd_mark "${pane:--}" opencode "$label" "$key"
+      if [ "$(opt @radar-needinput on)" = "on" ]; then
+        label="opencode: ${msg:-error}"
+        [ -n "$pane" ] || label="opencode·${where:-bg}: ${msg:-error}"
+        _opencode_mark_locked "${pane:--}" "$label" "$key"
+      fi
       ;;
     end)
-      _reg_remove "$key"
-      _drop_session_marks "$key"
-      _sync_bar
+      _reg_remove_locked "$key"
+      _drop_rows '$4 == k && tolower($5) !~ donere' -v k="$key" -v donere="$DONE_RE"
       ;;
   esac
+  unlock
+  [ -n "$watch_kind" ] && [ -n "$pane" ] &&
+    _watch_event "$pane" "$watch_kind" opencode "${label:-opencode resumed}"
+  _refresh_titles
+  _sync_bar
+}
+
+cmd_opencode_hook() {
+  local json
+  json="$(cat 2>/dev/null || true)"
+  _opencode_event "$json"
+}
+
+# One blocking reader per OpenCode TUI. It sleeps in read(2), creates no polling
+# processes, and exits on pipe EOF. Acknowledgements make the JS side apply
+# backpressure and prove each event finished before the next begins.
+cmd_opencode_stream() {
+  local json generation sequence
+  while IFS= read -r json; do
+    _opencode_event "$json"
+    generation="$(_json_field generation "$json")"
+    sequence="$(_json_field_any sequence "$json")"
+    printf 'ok\t%s\t%s\n' "$generation" "$sequence"
+  done
 }
 
 # Public API for any other agent that wants radar tracking: register with a
@@ -890,7 +1074,7 @@ cmd_registry() {  # debug: registry rows + per-row liveness verdicts
     [ -n "$kind" ] || continue
     if [ "${pid:-0}" -gt 0 ] 2>/dev/null; then
       if ! kill -0 "$pid" 2>/dev/null; then verdict="dead: pid $pid gone → GC next tick"
-      elif ps -p "$pid" -o command= 2>/dev/null | head -1 | grep -Fqi "$proc"; then verdict="alive: pid $pid ($proc)"
+      elif "$PS_BIN" -p "$pid" -o command= 2>/dev/null | head -1 | grep -Fqi "$proc"; then verdict="alive: pid $pid ($proc)"
       else verdict="dead: pid $pid reused (argv is no longer $proc) → GC next tick"; fi
     else
       verdict="pid unresolved → liveness via pane scan only"
@@ -970,6 +1154,7 @@ case "${1:-}" in
   codex-hook)      cmd_codex_hook ;;
   codex)           shift; cmd_codex "${1:-}" ;;
   opencode-hook)   cmd_opencode_hook ;;
+  opencode-stream) cmd_opencode_stream ;;
   agent-register)  shift; cmd_agent_register "${1:-}" "${2:-}" "${3:-0}" "${4:--}" "${5:-}" ;;
   agent-end)       shift; cmd_agent_end "${1:-}" "${2:-}" ;;
   registry)        cmd_registry ;;                   # debug: registry + liveness verdicts
@@ -977,5 +1162,5 @@ case "${1:-}" in
   agent-panes)     _agent_panes | tr '\001' '\n' ;;  # debug: which panes host an agent
   resolve-pane)    _resolve_pane_by_proc ;;          # debug: pane of this process tree
   resolve-cwd)     shift; _resolve_pane_by_cwd "${1:-$PWD}" ;;  # debug: pane owning a cwd
-  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|claude-mark|claude-stop|claude-clear|claude-register|claude-end|codex-hook|codex <json>|opencode-hook|agent-register <kind> <key> <pid> <pane> [cwd]|agent-end <kind> <key>|registry|doctor|agent-panes|resolve-pane|resolve-cwd [cwd]}" >&2; exit 2 ;;
+  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|claude-mark|claude-stop|claude-clear|claude-register|claude-end|codex-hook|codex <json>|opencode-hook|opencode-stream|agent-register <kind> <key> <pid> <pane> [cwd]|agent-end <kind> <key>|registry|doctor|agent-panes|resolve-pane|resolve-cwd [cwd]}" >&2; exit 2 ;;
 esac

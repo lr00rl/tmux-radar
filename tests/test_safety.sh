@@ -33,6 +33,9 @@ JSON
 cat > "$T/clean.json" <<'JSON'
 {"explain":"x","commands":["# a comment","split-window -d"]}
 JSON
+cat > "$T/shell-arg.json" <<'JSON'
+{"explain":"x","commands":["split-window -d touch /tmp/PWNED_BY_ASK"]}
+JSON
 export TMUX_RADAR_AI_PAUSE=1
 tmux set -g @radar-ai-autonomy auto     # worst case: no confirmation gate
 export TMUX_RADAR_AI_CMD="cat >/dev/null; cat '$T/evil.json'"
@@ -41,6 +44,13 @@ sleep 0.5
 chk "';'-chained run-shell is rejected (rc=4)" "[ $RC -eq 4 ]"
 chk "';'-chain never executed (no PWNED file)" "[ ! -f /tmp/PWNED_BY_ASK ]"
 chk "rejection names the chain reason" "printf '%s' \"\$OUT\" | grep -q '链式'"
+# An allowed tmux verb can itself accept a shell command. Reject that positional
+# argument even when it contains no separator or shell metacharacter.
+export TMUX_RADAR_AI_CMD="cat >/dev/null; cat '$T/shell-arg.json'"
+OUT_SHELL="$(TMUX_PANE="$PANE" bash "$AI" ask "make a split" 2>&1)"; RC_SHELL=$?
+sleep 0.2
+chk "split-window positional shell command is rejected" "[ $RC_SHELL -eq 4 ]"
+chk "split-window shell argument never executed" "[ ! -f /tmp/PWNED_BY_ASK ]"
 # a clean layout batch still passes the allowlist (no false rejection)
 export TMUX_RADAR_AI_CMD="cat >/dev/null; cat '$T/clean.json'"
 OUT2="$(TMUX_PANE="$PANE" bash "$AI" ask "split" 2>&1)"; RC2=$?
@@ -94,16 +104,78 @@ mkdir -p "$LOCK"; printf '%s' "$HOLDER" > "$LOCK/pid"
 chk "live holder's lock NOT rmdir'd by a give-up path" "[ -d '$LOCK' ] && [ \"\$(cat '$LOCK/pid')\" = '$HOLDER' ]"
 chk "lock timeout never falls through to an unlocked write" "! grep -q 'k:lock-race' '$MARKS' 2>/dev/null"
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; rm -rf "$LOCK"
+# A legacy holder may be between mkdir and owner publication. Absence of an
+# owner is not proof of death, so the new implementation must fail closed.
+mkdir -p "$LOCK"
+"$N" mark - tool "must not steal unpublished lock" k:unpublished >/dev/null 2>&1
+chk "owner-publication window is never stolen" \
+  "[ -d '$LOCK' ] && ! grep -q 'k:unpublished' '$MARKS' 2>/dev/null"
+rm -rf "$LOCK"
 
 echo
-echo "### #7/#8 follow-ups"
+echo "### #5 HIGH: concurrent stale reapers have exactly one lock owner"
+rm -f "$MARKS"; mkdir -p "$LOCK"; printf '999999' > "$LOCK/pid"
+PIDS=""
+for i in 1 2 3 4 5 6 7 8; do
+  "$N" mark - tool "parallel-$i" "k:parallel-$i" >/dev/null 2>&1 &
+  PIDS="$PIDS $!"
+done
+for p in $PIDS; do wait "$p"; done
+chk "all concurrent marks survive stale-lock recovery" \
+  "[ \$(grep -c 'k:parallel-' '$MARKS' 2>/dev/null || true) -eq 8 ]"
+chk "parallel stale recovery leaves no lock" "[ ! -d '$LOCK' ]"
+"$N" clear-all
+
+echo
+echo "### #6 MEDIUM: an orphaned legacy reaper guard cannot disable notifications"
+rm -f "$MARKS"; rm -rf "$LOCK"; mkdir -p "$LOCK" "${LOCK}.reap"
+printf '999999' > "$LOCK/pid"
+"$N" mark - tool "guard-independent" k:guard-independent >/dev/null 2>&1
+chk "orphaned legacy reaper guard does not block a new mark" \
+  "grep -q 'k:guard-independent' '$MARKS'"
+rm -rf "${LOCK}.reap"; "$N" clear-all
+
+echo
+echo "### #7 LOW: tick takes one ps snapshot, including failure"
+PSBIN="$T/ps-bin"; mkdir -p "$PSBIN"
+cat > "$PSBIN/ps" <<'SH'
+#!/usr/bin/env bash
+printf '1\n' >> "$TMUX_RADAR_PS_COUNT"
+exit 0
+SH
+chmod +x "$PSBIN/ps"
+PS_COUNT="$T/ps-count"; : > "$PS_COUNT"
+TMUX_RADAR_TEST_PS_BIN="$PSBIN/ps" TMUX_RADAR_PS_COUNT="$PS_COUNT" "$N" tick >/dev/null 2>&1
+chk "empty/failed ps path is not retried inside one tick" \
+  "[ \$(wc -l < '$PS_COUNT' | tr -d ' ') -eq 1 ]"
+
+echo
+echo "### #8 HIGH: tick cannot delete a newer row from a stale snapshot"
+sleep 30 & FRESH=$!
+now="$(date +%s)"
+printf 'claude\ts:gc-race\t999999\t-\t%s\t%s\twaiting\t/tmp\tclaude\n' "$now" "$now" > "$REG"
+"$N" mark - claude "Claude needs your permission" s:gc-race
+mkdir -p "$LOCK"; printf '%s' "$$" > "$LOCK/pid"
+"$N" tick >/dev/null 2>&1 & TICK_PID=$!
+sleep 0.2
+printf 'claude\ts:gc-race\t%s\t-\t%s\t%s\twaiting\t/tmp\tsleep\n' "$FRESH" "$now" "$((now + 1))" > "$REG"
+rm -rf "$LOCK"
+wait "$TICK_PID"
+chk "newer live registry row survives stale GC verdict" \
+  "awk -F'\t' -v p='$FRESH' '\$2==\"s:gc-race\" && \$3==p' '$REG' | grep -q ."
+chk "newer session action mark survives stale GC verdict" "grep -q 's:gc-race' '$MARKS'"
+kill "$FRESH" 2>/dev/null; wait "$FRESH" 2>/dev/null
+"$N" clear-all
+
+echo
+echo "### #9/#10 follow-ups"
 chk "DONE_RE includes bare 'done' (matches switcher level_for)" \
   "grep -q \"DONE_RE='(finished|your turn|turn complete|task complete|done|\" '$N'"
 sleep 30 & OC=$!
-printf '{"event":"start","session_id":"","pane":"%s","pid":%s,"cwd":"/tmp/oc"}' "$PANE" "$OC" | "$N" opencode-hook
+printf '{"event":"start","session_id":"realsid","pane":"%s","pid":%s,"cwd":"/tmp/oc"}' "$PANE" "$OC" | "$N" opencode-hook
 printf '{"event":"permission","session_id":"realsid","pane":"%s","pid":%s,"cwd":"/tmp/oc","message":"y?"}' "$PANE" "$OC" | "$N" opencode-hook
-chk "opencode uses ONE key per session (pane-keyed), not two rows" \
-  "[ \$(awk -F'\t' '\$1==\"opencode\"' '$REG' | wc -l | tr -d ' ') -eq 1 ]"
+chk "opencode uses ONE session key across lifecycle events" \
+  "[ \$(awk -F'\t' '\$1==\"opencode\" && \$2==\"oc:s:realsid\"' '$REG' | wc -l | tr -d ' ') -eq 1 ]"
 printf '{"event":"end","session_id":"realsid","pane":"%s","pid":%s,"cwd":"/tmp/oc"}' "$PANE" "$OC" | "$N" opencode-hook
 chk "opencode end clears the permission mark it set" "! grep -q 'needs approval' '$MARKS' 2>/dev/null || ! [ -s '$MARKS' ]"
 chk "opencode end removes the registry row" "! grep -q 'opencode' '$REG' 2>/dev/null || ! [ -s '$REG' ]"

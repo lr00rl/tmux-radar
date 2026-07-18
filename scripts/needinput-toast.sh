@@ -104,7 +104,6 @@ case "${1:-render}" in
         *)
           prev="$(tmux show-option -gqv @radar-prev-status 2>/dev/null || true)"
           if [ -n "$prev" ]; then
-            [ "$prev" = "2" ] && prev=on
             if [ "$(tmux show-option -gv status 2>/dev/null || echo on)" = "2" ]; then
               tmux set -g status "$prev" >/dev/null 2>&1 || true
             fi

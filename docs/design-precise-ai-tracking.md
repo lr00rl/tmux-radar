@@ -33,8 +33,8 @@ kind \t key \t pid \t pane \t started \t last_event \t state \t cwd \t proc
 ```
 
 - `kind`   — claude | codex | opencode
-- `key`    — same key space as marks: `s:<session_id>` (claude), pane/pid
-             fallback otherwise
+- `key`    — same key space as marks: `s:<session_id>` (Claude/Codex),
+             `oc:s:<session_id>` (OpenCode), generation/pid fallback otherwise
 - `pid`    — the agent process PID, resolved by walking the hook process's
              ancestor chain until an argv matches the agent pattern
              (hooks run as children of the agent process)
@@ -108,10 +108,12 @@ answer "why is this row (not) showing?".
 - Hooks run as children of the claude process; parent-chain resolution
   (already used by `_resolve_pane_by_proc`) reaches the agent pid.
 - opencode: drop-in plugin dir `~/.config/opencode/plugins/*.{ts,js}`
-  is auto-discovered (no config merge); plugins run inside the TUI
-  process (can read `TMUX_PANE`, `process.pid` directly) and receive
-  `session.status(idle)` / legacy `session.idle`, `permission.updated`,
-  `chat.message`, `session.error`, `dispose`. Integration =
+  is auto-discovered (no config merge); plugins run inside the TUI process and
+  receive current `permission.asked/replied`, `question.asked/replied/rejected`,
+  `session.created/idle/status/deleted/error`, and `message.updated` events.
+  The bridge owns one acknowledged pipe reader per TUI, keys state by session,
+  and persists generation/sequence tombstones so delayed events from an old
+  process cannot overwrite a replacement session. Integration =
   `scripts/opencode-tmux-notify.js` installed as
   `~/.config/opencode/plugins/tmux-radar.js` by install-hooks.sh.
 - tmux (3.6b installed, verified in source): keys sent to a pane in

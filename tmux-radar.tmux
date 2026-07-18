@@ -79,7 +79,11 @@ if [ "$NEEDINPUT" = "on" ]; then
   case "$(opt @radar-bar auto)" in
     off) ;;
     pinned)
-      tmux set-option -g status 2
+      BAR_STATUS="$(tmux show-option -gv status 2>/dev/null || echo on)"
+      case "$BAR_STATUS" in
+        2|[3-9]|[1-9][0-9]*) ;;
+        *) tmux set-option -g status 2 ;;
+      esac
       tmux set-option -g status-format[1] "#[align=right]#($SCRIPTS/needinput-toast.sh render) "
       ;;
     *)

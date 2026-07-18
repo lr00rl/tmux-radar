@@ -91,7 +91,8 @@ func formatEvent(event runmodel.Event) string {
 		if event.Error.Class == "config-permanent" {
 			severity = "PERMANENT"
 		}
-		summary = fmt.Sprintf("[%s] %s", severity, firstNonEmpty(event.Error.Summary, event.Error.Detail, summary))
+		summary = fmt.Sprintf("[%s %s] %s", severity, event.Error.Code,
+			firstNonEmpty(event.Error.Summary, event.Error.Detail, summary))
 	}
 	return fmt.Sprintf("%s  %-16s %s", timestamp, kind, summary)
 }
@@ -276,11 +277,42 @@ func (model LiveModel) liveHeader(width int) []string {
 	goal := "Goal  " + firstNonEmpty(model.snapshot.Config.Goal, "loading")
 	nowLine := "Now   " + status
 	nextLine := model.nextLine()
+	if backendError := model.currentBackendError(); backendError != nil {
+		severity := "ERROR"
+		if backendError.Class == "config-permanent" {
+			severity = "PERMANENT"
+		}
+		nowLine = fmt.Sprintf("Now   %s %s · %s", severity, backendError.Code,
+			firstNonEmpty(backendError.Summary, backendError.Detail, status))
+		if phase == "PAUSED_ERROR" {
+			nextLine = "Next  " + firstNonEmpty(backendError.Detail,
+				"fix the backend configuration") + " · r reassess · 5 Logs"
+		} else {
+			nextLine += " · 5 Logs"
+		}
+	}
 	tabs := model.renderTabs(width)
 	return []string{
 		fitLine(title, width), fitLine(goal, width), fitLine(nowLine, width),
 		fitLine(nextLine, width), fitLine(tabs, width), fitLine(strings.Repeat("─", width), width),
 	}
+}
+
+func (model LiveModel) currentBackendError() *runmodel.BackendError {
+	if model.snapshot.State == nil || model.snapshot.State.LatestErrorEventID == "" {
+		return nil
+	}
+	status := strings.ToLower(model.snapshot.State.Status)
+	if model.snapshot.State.Phase != "PAUSED_ERROR" && !strings.Contains(status, "backend") {
+		return nil
+	}
+	for index := len(model.events) - 1; index >= 0; index-- {
+		event := model.events[index]
+		if event.EventID == model.snapshot.State.LatestErrorEventID && event.Error != nil {
+			return event.Error
+		}
+	}
+	return nil
 }
 
 func (model LiveModel) nextLine() string {

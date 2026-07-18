@@ -270,6 +270,19 @@ test_profile_executes_the_frozen_explicit_codex() {
   esac
 }
 
+test_spark_disables_reasoning_summaries() {
+  local invocation
+  TEST_CASE_NAME=spark TEST_MODEL=gpt-5.3-codex-spark TEST_EFFORT=high \
+    run_ai decide %1 auto-safe safe-auto 'complete fixture'
+  invocation="$(cat "$TMP/spark.exec.log")"
+  assert_contains "$invocation" '-m gpt-5.3-codex-spark' \
+    'Spark execution uses the reviewed model'
+  assert_contains "$invocation" 'model_reasoning_effort=high' \
+    'Spark execution keeps the reviewed effort'
+  assert_contains "$invocation" 'model_reasoning_summary="none"' \
+    'Spark execution disables unavailable reasoning summaries'
+}
+
 test_version_probe_is_bounded_and_rejects_prereleases() {
   local result="$TMP/slow-doctor.json" started elapsed
   started="$(date '+%s')"
@@ -352,6 +365,7 @@ run_test 'old explicit Codex reports a diagnostic-only newer candidate' test_old
 run_test 'custom command bypasses Codex preflight' test_custom_command_bypasses_codex_preflight
 run_test 'custom command keeps precedence over profile with a warning' test_custom_command_precedes_profile_with_warning
 run_test 'profile execution uses the frozen explicit Codex' test_profile_executes_the_frozen_explicit_codex
+run_test 'Spark execution disables unavailable reasoning summaries' test_spark_disables_reasoning_summaries
 run_test 'version probes are bounded and prereleases fail closed' test_version_probe_is_bounded_and_rejects_prereleases
 run_test 'incompatible setup launches no model process' test_incompatible_setup_starts_no_model_process
 run_test 'reviewed config drives preflight backend identity' test_reviewed_config_drives_preflight_backend

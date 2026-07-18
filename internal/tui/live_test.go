@@ -201,10 +201,19 @@ func TestLivePermanentErrorCompletionKeepAndHelp(t *testing.T) {
 		BackendVersion: "0.139.0", StderrPath: "/tmp/backend/0001.stderr", Call: 1,
 		Timestamp: "2026-07-16T12:00:00Z",
 	}
+	model.snapshot.State = &runmodel.State{
+		SchemaVersion: 1, Phase: "PAUSED_ERROR", Status: "backend failed",
+		LatestErrorEventID: "backend-error-1",
+	}
 	model.applyRunUpdate(runPollMsg{Events: []runmodel.Event{{
-		SchemaVersion: 1, Kind: "backend_error", Source: "watcher", Label: "backend failed", Error: backendError,
+		SchemaVersion: 1, Kind: "backend_error", Source: "watcher", Label: "backend failed",
+		EventID: "backend-error-1", Error: backendError,
 	}}})
-	if view := ansi.Strip(model.View()); !strings.Contains(view, "Codex is too old") || !strings.Contains(view, "PERMANENT") {
+	if view := ansi.Strip(model.View()); !strings.Contains(view, "Codex is too old") ||
+		!strings.Contains(view, "codex-too-old") ||
+		!strings.Contains(view, "PERMANENT") ||
+		!strings.Contains(view, "5 Logs") ||
+		!strings.Contains(view, "r reassess") {
 		t.Fatalf("permanent error is not explicit\n%s", view)
 	}
 

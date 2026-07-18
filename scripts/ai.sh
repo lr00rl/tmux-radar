@@ -1382,6 +1382,7 @@ _resolve_pane() {
 # ---------------------------------------------------------------------------
 _brain() {
   local schema="$1" prompt="$2" out err pid pid_tmp rc=0 started timeout stop_reason="" had_job_control=0
+  local -a codex_args=()
   _ensure_backend_frozen
   BRAIN_RESULT=""
   BRAIN_LAST_RC=0
@@ -1425,11 +1426,16 @@ _brain() {
       -s read-only --ephemeral --skip-git-repo-check \
       --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" &
   else
-    TMUX_RADAR_INTERNAL=1 "$BRAIN_BACKEND_PATH" exec \
-      -m "$BRAIN_BACKEND_MODEL" \
-      -c model_reasoning_effort="$BRAIN_BACKEND_EFFORT" \
-      -s read-only --ephemeral --skip-git-repo-check \
-      --output-schema "$schema" -o "$out" -- "$prompt" >/dev/null 2>"$err" &
+    codex_args=(exec
+      -m "$BRAIN_BACKEND_MODEL"
+      -c "model_reasoning_effort=$BRAIN_BACKEND_EFFORT")
+    if [ "$BRAIN_BACKEND_MODEL" = gpt-5.3-codex-spark ]; then
+      codex_args+=(-c 'model_reasoning_summary="none"')
+    fi
+    codex_args+=(
+      -s read-only --ephemeral --skip-git-repo-check
+      --output-schema "$schema" -o "$out" -- "$prompt")
+    TMUX_RADAR_INTERNAL=1 "$BRAIN_BACKEND_PATH" "${codex_args[@]}" >/dev/null 2>"$err" &
   fi
   BRAIN_PID=$!
   DECISION_MODEL_LAUNCHED=1
@@ -1533,6 +1539,16 @@ _classify_backend_failure() {
         ;;
       *)
         case "$normalized" in
+          *invalid_json_schema*|*invalid*schema*response_format*)
+            class='config-permanent'; code='decision-schema-invalid'; retryable=0
+            summary='decision output schema is incompatible with Codex'
+            detail='update the tmux-radar decision schema'
+            ;;
+          *invalid_request_error*)
+            class='config-permanent'; code='backend-request-invalid'; retryable=0
+            summary='Codex rejected the supervisor request as invalid'
+            detail='correct the rejected backend configuration'
+            ;;
           *requires*a*newer*version*|*unsupported*model*|*unknown*model*|*model*not*found*|\
           *profile*not*found*|*authentication*|*unauthorized*|*invalid*api*key*|\
           *not*logged*in*|*forbidden*|*permission*denied*)

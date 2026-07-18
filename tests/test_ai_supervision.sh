@@ -942,10 +942,22 @@ printf 'PASS: launch exit status outranks fuzzy stderr classification\n'
 # 32. Ordered classifier rules keep permanent evidence ahead of transport words
 # and leave unknown nonzero failures retryable.
 reset_case classifier-matrix
+assert_json "$ROOT/scripts/prompts/decide.schema.json" '
+  (.required | sort) == (.properties | keys | sort)
+'
 classifier_stderr="$CASE/classifier.stderr"
 printf '%s\n' 'connection timeout followed by unsupported model' > "$classifier_stderr"
 PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" _classify-backend-failure 1 "$classifier_stderr" 0 > "$CASE/mixed.json"
 assert_json "$CASE/mixed.json" '.class == "config-permanent" and .retryable == false'
+printf '%s\n' "invalid_request_error: invalid_json_schema: required is missing 'pane_state' (status 400)" \
+  > "$classifier_stderr"
+PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" _classify-backend-failure 1 "$classifier_stderr" 0 \
+  > "$CASE/schema.json"
+assert_json "$CASE/schema.json" '
+  .class == "config-permanent" and
+  .code == "decision-schema-invalid" and
+  .retryable == false
+'
 printf '%s\n' 'profile not found' > "$classifier_stderr"
 PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" _classify-backend-failure 1 "$classifier_stderr" 0 > "$CASE/profile.json"
 assert_json "$CASE/profile.json" '.class == "config-permanent"'

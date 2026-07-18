@@ -71,7 +71,7 @@ than to approve the wrong destructive action.
 `reason` — one concise sentence: what the pane is asking and why your action is
 the safe choice. Write it in the user's language if the pane is in that language.
 
-When the schema supports them, also return `pane_state`, `goal_status`, `risk`,
-and a short `evidence` list. Evidence must be directly observable in the supplied
+Always return `pane_state`, `goal_status`, `risk`, and a short `evidence` list.
+Evidence must be directly observable in the supplied
 pane text, such as a named approval prompt, a test result, or a completion
 summary. Do not expose hidden chain-of-thought or speculative internal reasoning.

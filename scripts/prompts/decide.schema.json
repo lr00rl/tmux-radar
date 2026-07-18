@@ -1,7 +1,17 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["action", "text", "keys", "safe", "reason"],
+  "required": [
+    "action",
+    "text",
+    "keys",
+    "safe",
+    "reason",
+    "pane_state",
+    "goal_status",
+    "risk",
+    "evidence"
+  ],
   "properties": {
     "action": {
       "type": "string",
@@ -28,22 +38,22 @@
     "pane_state": {
       "type": "string",
       "enum": ["working", "blocked", "idle", "done", "unknown"],
-      "description": "Optional observable state of the target pane."
+      "description": "Observable state of the target pane."
     },
     "goal_status": {
       "type": "string",
       "enum": ["working", "blocked", "done", "unclear"],
-      "description": "Optional progress of the exact configured goal."
+      "description": "Progress of the exact configured goal."
     },
     "risk": {
       "type": "string",
       "enum": ["low", "medium", "high", "unknown"],
-      "description": "Optional risk level of the proposed action."
+      "description": "Risk level of the proposed action."
     },
     "evidence": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Optional short observable facts from the pane supporting the decision."
+      "description": "Short observable facts from the pane supporting the decision; use an empty array when none are available."
     }
   }
 }

@@ -114,6 +114,40 @@ func TestAppCreatesLeaseBeforeEngineStartAndKeepsItThroughLive(t *testing.T) {
 	}
 }
 
+func TestAppPreservesAndTracksPaneSizeAfterLiveTransition(t *testing.T) {
+	engine := &fakeSupervisorEngine{}
+	app := readyApp(t, engine)
+	runDir := newAppRun(t, app.stateRoot, "run-sized")
+	engine.startResult = runmodel.StartResult{
+		ProtocolVersion: 1, OK: true, Status: "started", RunID: "run-sized", RunDir: runDir, WatcherPID: 1234,
+	}
+
+	_, _ = app.Update(tea.WindowSizeMsg{Width: 84, Height: 54})
+	command := requestAppStart(t, app)
+	_, _ = app.Update(command())
+	assertAppLiveSize(t, app, 84, 54)
+
+	_, _ = app.Update(tea.WindowSizeMsg{Width: 100, Height: 42})
+	assertAppLiveSize(t, app, 100, 42)
+}
+
+func assertAppLiveSize(t *testing.T, app *App, width, height int) {
+	t.Helper()
+	if app.phase != phaseLive {
+		t.Fatalf("phase = %v, want live", app.phase)
+	}
+	if app.live.width != width || app.live.height != height {
+		t.Fatalf("live size = %dx%d, want %dx%d", app.live.width, app.live.height, width, height)
+	}
+	lines := strings.Split(app.live.View(), "\n")
+	if len(lines) != height {
+		t.Fatalf("rendered rows = %d, want %d", len(lines), height)
+	}
+	if !strings.Contains(lines[len(lines)-2], "1-5") {
+		t.Fatalf("controls are not anchored at the pane bottom: %q", lines[len(lines)-2])
+	}
+}
+
 func TestAppStartFailureReturnsToSetupAndClosesLease(t *testing.T) {
 	engine := &fakeSupervisorEngine{startErr: errors.New("engine unavailable")}
 	app := readyApp(t, engine)

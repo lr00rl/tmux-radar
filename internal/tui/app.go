@@ -216,6 +216,7 @@ func (app *App) updateStarting(message tea.Msg) (tea.Model, tea.Cmd) {
 			app.setup.blockingError = "Start failed: " + err.Error()
 			return app, nil
 		}
+		live.resize(app.setup.width, app.setup.height)
 		app.live = live
 		app.phase = phaseLive
 		app.startupError = nil

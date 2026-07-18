@@ -44,6 +44,7 @@ func DefaultConfig(pane, goal string) Config {
 			MaxDecisions:          defaultInt(40),
 			RetryLimit:            defaultInt(3),
 			RetryBackoff:          defaultInt(15),
+			FallbackCaptureLines:  defaultInt(20),
 			CaptureLines:          defaultInt(120),
 			MonitorExcerptLines:   defaultInt(16),
 			MonitorPosition:       defaultString("right"),
@@ -335,6 +336,9 @@ func (config Config) Validate() error {
 		return err
 	}
 	if err := validateInt("retry_backoff", v.RetryBackoff, 0, 3600); err != nil {
+		return err
+	}
+	if err := validateInt("fallback_capture_lines", v.FallbackCaptureLines, 8, 200); err != nil {
 		return err
 	}
 	if err := validateInt("capture_lines", v.CaptureLines, 20, 5000); err != nil {

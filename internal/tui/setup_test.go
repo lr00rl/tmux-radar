@@ -116,6 +116,25 @@ func TestSetupEnumToggleAndNumericValidation(t *testing.T) {
 		t.Fatalf("valid timeout rejected: editing=%v error=%q timeout=%#v", model.editing,
 			model.errors[fieldTimeout], model.config.Values.Timeout)
 	}
+
+	model.groups[groupContext] = true
+	model.rebuildFocus()
+	model.setFocus(fieldFallbackCapture)
+	model = updateSetup(t, model, keyPress(tea.KeyEnter, ""))
+	setSetupInput(&model, fieldFallbackCapture, "7")
+	model = updateSetup(t, model, keyPress(tea.KeyEnter, ""))
+	if !model.editing || model.errors[fieldFallbackCapture] == "" ||
+		model.config.Values.FallbackCaptureLines.Value != 20 {
+		t.Fatalf("invalid fallback capture accepted: editing=%v error=%q lines=%d", model.editing,
+			model.errors[fieldFallbackCapture], model.config.Values.FallbackCaptureLines.Value)
+	}
+	setSetupInput(&model, fieldFallbackCapture, "19")
+	model = updateSetup(t, model, keyPress(tea.KeyEnter, ""))
+	if model.editing || model.errors[fieldFallbackCapture] != "" ||
+		model.config.Values.FallbackCaptureLines != (runmodel.Value[int]{Value: 19, Source: runmodel.SourceCustom}) {
+		t.Fatalf("valid fallback capture rejected: editing=%v error=%q lines=%#v", model.editing,
+			model.errors[fieldFallbackCapture], model.config.Values.FallbackCaptureLines)
+	}
 }
 
 func TestSetupAdvancedCountsAndEntryModes(t *testing.T) {

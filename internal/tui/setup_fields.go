@@ -23,33 +23,34 @@ const (
 )
 
 const (
-	fieldGoal       = "goal"
-	fieldPreset     = "preset"
-	fieldApproval   = "approval_policy"
-	fieldAutonomy   = "autonomy"
-	fieldAdvanced   = "advanced"
-	fieldStart      = "start"
-	fieldAlways     = "always_allow"
-	fieldHooksFirst = "hooks_first"
-	fieldPoll       = "poll"
-	fieldStable     = "stable_screen_threshold"
-	fieldCommand    = "command"
-	fieldProfile    = "profile"
-	fieldModel      = "model"
-	fieldEffort     = "effort"
-	fieldTimeout    = "timeout"
-	fieldMaxCalls   = "max_decisions"
-	fieldRetryLimit = "retry_limit"
-	fieldRetryBack  = "retry_backoff"
-	fieldCapture    = "capture_lines"
-	fieldExcerpt    = "monitor_excerpt_lines"
-	fieldPosition   = "monitor_position"
-	fieldWidth      = "monitor_width"
-	fieldRatio      = "overview_ratio"
-	fieldCloseDelay = "completion_close_delay"
-	fieldLogging    = "logging"
-	fieldSnapshots  = "screen_snapshots"
-	fieldRetention  = "retention_days"
+	fieldGoal            = "goal"
+	fieldPreset          = "preset"
+	fieldApproval        = "approval_policy"
+	fieldAutonomy        = "autonomy"
+	fieldAdvanced        = "advanced"
+	fieldStart           = "start"
+	fieldAlways          = "always_allow"
+	fieldHooksFirst      = "hooks_first"
+	fieldPoll            = "poll"
+	fieldStable          = "stable_screen_threshold"
+	fieldCommand         = "command"
+	fieldProfile         = "profile"
+	fieldModel           = "model"
+	fieldEffort          = "effort"
+	fieldTimeout         = "timeout"
+	fieldMaxCalls        = "max_decisions"
+	fieldRetryLimit      = "retry_limit"
+	fieldRetryBack       = "retry_backoff"
+	fieldFallbackCapture = "fallback_capture_lines"
+	fieldCapture         = "capture_lines"
+	fieldExcerpt         = "monitor_excerpt_lines"
+	fieldPosition        = "monitor_position"
+	fieldWidth           = "monitor_width"
+	fieldRatio           = "overview_ratio"
+	fieldCloseDelay      = "completion_close_delay"
+	fieldLogging         = "logging"
+	fieldSnapshots       = "screen_snapshots"
+	fieldRetention       = "retention_days"
 )
 
 const (
@@ -101,6 +102,7 @@ var advancedFields = []fieldSpec{
 	{ID: fieldMaxCalls, Label: "Decision limit", Group: groupBudget, Kind: kindInt, Min: 1, Max: 10000},
 	{ID: fieldRetryLimit, Label: "Retry limit", Group: groupBudget, Kind: kindInt, Min: 0, Max: 10},
 	{ID: fieldRetryBack, Label: "Retry backoff", Group: groupBudget, Kind: kindInt, Min: 0, Max: 3600},
+	{ID: fieldFallbackCapture, Label: "Fallback capture", Group: groupContext, Kind: kindInt, Min: 8, Max: 200},
 	{ID: fieldCapture, Label: "Capture lines", Group: groupContext, Kind: kindInt, Min: 20, Max: 5000},
 	{ID: fieldExcerpt, Label: "Screen excerpt", Group: groupContext, Kind: kindInt, Min: 3, Max: 500},
 	{ID: fieldPosition, Label: "Monitor position", Group: groupConsole, Kind: kindEnum, Options: []string{"right", "top", "bottom"}},
@@ -241,6 +243,8 @@ func (model *SetupModel) setIntField(id string, value int) {
 		model.config.Values.RetryLimit = custom
 	case fieldRetryBack:
 		model.config.Values.RetryBackoff = custom
+	case fieldFallbackCapture:
+		model.config.Values.FallbackCaptureLines = custom
 	case fieldCapture:
 		model.config.Values.CaptureLines = custom
 	case fieldExcerpt:
@@ -287,6 +291,8 @@ func (model SetupModel) fieldValue(id string) string {
 		return strconv.Itoa(v.RetryLimit.Value)
 	case fieldRetryBack:
 		return strconv.Itoa(v.RetryBackoff.Value)
+	case fieldFallbackCapture:
+		return strconv.Itoa(v.FallbackCaptureLines.Value)
 	case fieldCapture:
 		return strconv.Itoa(v.CaptureLines.Value)
 	case fieldExcerpt:
@@ -337,6 +343,8 @@ func (model SetupModel) fieldSource(id string) runmodel.Source {
 		return v.RetryLimit.Source
 	case fieldRetryBack:
 		return v.RetryBackoff.Source
+	case fieldFallbackCapture:
+		return v.FallbackCaptureLines.Source
 	case fieldCapture:
 		return v.CaptureLines.Source
 	case fieldExcerpt:

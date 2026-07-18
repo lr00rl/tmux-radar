@@ -168,6 +168,7 @@ test_build_watch_config_contains_all_settings_and_provenance() {
       "command",
       "completion_close_delay",
       "effort",
+      "fallback_capture_lines",
       "goal",
       "hooks_first",
       "logging",
@@ -192,6 +193,7 @@ test_build_watch_config_contains_all_settings_and_provenance() {
     (.values.poll == {value:17, source:"tmux"}) and
     (.values.model == {value:"gpt-5.6-luna", source:"default"}) and
     (.values.effort == {value:"high", source:"default"}) and
+    (.values.fallback_capture_lines == {value:20, source:"default"}) and
     (.values.completion_close_delay == {value:12, source:"default"}) and
     (.values.timeout == {value:45, source:"custom"}) and
     (.values.logging == {value:"full", source:"custom"}) and
@@ -337,7 +339,7 @@ test_advanced_summary_lists_every_group_field_and_provenance() {
   done
   for key in goal autonomy approval_policy always_allow hooks_first poll \
     stable_screen_threshold command profile model effort timeout max_decisions \
-    retry_limit retry_backoff capture_lines monitor_excerpt_lines monitor_position \
+    retry_limit retry_backoff fallback_capture_lines capture_lines monitor_excerpt_lines monitor_position \
     monitor_width overview_ratio completion_close_delay logging screen_snapshots retention_days; do
     assert_contains "$summary" "$key" "advanced summary contains $key"
   done
@@ -347,7 +349,7 @@ test_advanced_summary_lists_every_group_field_and_provenance() {
 
 test_config_reaches_run_config_and_runtime_without_codex() {
   local config_file="$TMP/launch-config.json" runtime_file="$TMP/runtime.json" run_config
-  TMUX_RADAR_SETUP_OVERRIDES='autonomy=suggest,approval_policy=manual,always_allow=on,hooks_first=off,poll=23,stable_screen_threshold=4,command=fake-backend,profile=qa,model=gpt-test,effort=high,timeout=45,max_decisions=9,retry_limit=2,retry_backoff=7,capture_lines=77,monitor_excerpt_lines=11,monitor_position=bottom,monitor_width=66,overview_ratio=30,completion_close_delay=8,logging=full,screen_snapshots=on,retention_days=13' \
+  TMUX_RADAR_SETUP_OVERRIDES='autonomy=suggest,approval_policy=manual,always_allow=on,hooks_first=off,poll=23,stable_screen_threshold=4,command=fake-backend,profile=qa,model=gpt-test,effort=high,timeout=45,max_decisions=9,retry_limit=2,retry_backoff=7,fallback_capture_lines=19,capture_lines=77,monitor_excerpt_lines=11,monitor_position=bottom,monitor_width=66,overview_ratio=30,completion_close_delay=8,logging=full,screen_snapshots=on,retention_days=13' \
     run_ai _build-watch-config %39 $'  launch\ngoal  \n' > "$config_file"
 
   TMUX_RADAR_TEST_EXIT_AFTER_CONFIG=1 \
@@ -360,6 +362,7 @@ test_config_reaches_run_config_and_runtime_without_codex() {
     (.values.model == {value:"gpt-test",source:"custom"}) and
     (.values.timeout == {value:45,source:"custom"}) and
     (.values.max_decisions == {value:9,source:"custom"}) and
+    (.values.fallback_capture_lines == {value:19,source:"custom"}) and
     (.values.screen_snapshots == {value:"on",source:"custom"}) and
     (.values.retention_days == {value:13,source:"custom"})
   '
@@ -369,7 +372,8 @@ test_config_reaches_run_config_and_runtime_without_codex() {
     .hooks_first == "off" and .poll == 23 and .stable_screen_threshold == 4 and
     .command == "fake-backend" and .profile == "qa" and .model == "gpt-test" and
     .effort == "high" and .timeout == 45 and .max_decisions == 9 and
-    .retry_limit == 2 and .retry_backoff == 7 and .capture_lines == 77 and
+    .retry_limit == 2 and .retry_backoff == 7 and .fallback_capture_lines == 19 and
+    .capture_lines == 77 and
     .monitor_excerpt_lines == 11 and .monitor_position == "bottom" and
     .monitor_width == 66 and .overview_ratio == 30 and
     .completion_close_delay == 8 and .logging == "full" and

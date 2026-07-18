@@ -46,6 +46,7 @@ type ConfigValues struct {
 	MaxDecisions          Value[int]     `json:"max_decisions"`
 	RetryLimit            Value[int]     `json:"retry_limit"`
 	RetryBackoff          Value[int]     `json:"retry_backoff"`
+	FallbackCaptureLines  Value[int]     `json:"fallback_capture_lines"`
 	CaptureLines          Value[int]     `json:"capture_lines"`
 	MonitorExcerptLines   Value[int]     `json:"monitor_excerpt_lines"`
 	MonitorPosition       Value[string]  `json:"monitor_position"`

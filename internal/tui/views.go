@@ -142,6 +142,7 @@ func (model LiveModel) screenLines() []string {
 	config := model.snapshot.Config
 	lines := []string{
 		setupStyles.group.Render("Model screen evidence"),
+		fmt.Sprintf("Fallback capture    %d lines", config.Values.FallbackCaptureLines.Value),
 		fmt.Sprintf("Configured capture  %d lines", config.Values.CaptureLines.Value),
 		fmt.Sprintf("Console excerpt     %d lines", config.Values.MonitorExcerptLines.Value),
 	}
@@ -183,6 +184,7 @@ func configLines(config runmodel.Config) []string {
 	appendValue("Retry limit", fmt.Sprint(v.RetryLimit.Value), v.RetryLimit.Source)
 	appendValue("Retry backoff", fmt.Sprintf("%ds", v.RetryBackoff.Value), v.RetryBackoff.Source)
 	lines = append(lines, setupStyles.group.Render("Context"))
+	appendValue("Fallback capture", fmt.Sprint(v.FallbackCaptureLines.Value), v.FallbackCaptureLines.Source)
 	appendValue("Capture lines", fmt.Sprint(v.CaptureLines.Value), v.CaptureLines.Source)
 	appendValue("Screen excerpt", fmt.Sprint(v.MonitorExcerptLines.Value), v.MonitorExcerptLines.Source)
 	lines = append(lines, setupStyles.group.Render("Console"))

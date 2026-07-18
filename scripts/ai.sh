@@ -36,6 +36,7 @@
 #   @radar-ai-poll           5                     watch: seconds between polls
 #   @radar-ai-max-calls      40                    watch: cost cap on brain calls
 #   @radar-ai-timeout        120                   hard limit for one brain call
+#   @radar-ai-fallback-capture-lines 20            bottom lines used by no-hook fallback
 #   @radar-ai-capture-lines  120                   pane lines fed to the brain
 #   @radar-ai-monitor        on                    open companion monitor pane
 #   @radar-ai-monitor-pos    top                   top|bottom|right
@@ -173,6 +174,7 @@ opt() {
     @radar-ai-poll) run_var=TMUX_RADAR_RUN_POLL ;;
     @radar-ai-max-calls) run_var=TMUX_RADAR_RUN_MAX_DECISIONS ;;
     @radar-ai-timeout) run_var=TMUX_RADAR_RUN_TIMEOUT ;;
+    @radar-ai-fallback-capture-lines) run_var=TMUX_RADAR_RUN_FALLBACK_CAPTURE_LINES ;;
     @radar-ai-capture-lines) run_var=TMUX_RADAR_RUN_CAPTURE_LINES ;;
     @radar-ai-monitor-excerpt-lines) run_var=TMUX_RADAR_RUN_MONITOR_EXCERPT_LINES ;;
     @radar-ai-monitor-pos) run_var=TMUX_RADAR_RUN_MONITOR_POSITION ;;
@@ -219,6 +221,7 @@ _config_constraint() {
     max_decisions) printf 'integer from 1 to 10000' ;;
     retry_limit) printf 'integer from 0 to 10' ;;
     retry_backoff) printf 'integer from 0 to 3600' ;;
+    fallback_capture_lines) printf 'integer from 8 to 200' ;;
     capture_lines) printf 'integer from 20 to 5000' ;;
     monitor_excerpt_lines) printf 'integer from 3 to 500' ;;
     monitor_position) printf 'one of top, bottom, right' ;;
@@ -259,6 +262,8 @@ _config_value_valid() {
       ;;
     retry_backoff) _integer_between "$value" 0 3600; return $?
       ;;
+    fallback_capture_lines) _integer_between "$value" 8 200; return $?
+      ;;
     capture_lines) _integer_between "$value" 20 5000; return $?
       ;;
     monitor_excerpt_lines) _integer_between "$value" 3 500; return $?
@@ -283,7 +288,7 @@ _integer_between() {
 
 _config_value_type() {
   case "$1" in
-    poll|stable_screen_threshold|timeout|max_decisions|retry_limit|retry_backoff|capture_lines|monitor_excerpt_lines|monitor_width|overview_ratio|completion_close_delay|retention_days)
+    poll|stable_screen_threshold|timeout|max_decisions|retry_limit|retry_backoff|fallback_capture_lines|capture_lines|monitor_excerpt_lines|monitor_width|overview_ratio|completion_close_delay|retention_days)
       printf number ;;
     *) printf string ;;
   esac
@@ -348,6 +353,7 @@ timeout	@radar-ai-timeout
 max_decisions	@radar-ai-max-calls
 retry_limit	@radar-ai-retry-limit
 retry_backoff	@radar-ai-retry-backoff
+fallback_capture_lines	@radar-ai-fallback-capture-lines
 capture_lines	@radar-ai-capture-lines
 monitor_excerpt_lines	@radar-ai-monitor-excerpt-lines
 monitor_position	@radar-ai-monitor-pos
@@ -383,6 +389,7 @@ cmd_build_watch_config() {
       max_decisions:{value:40,source:"default"},
       retry_limit:{value:3,source:"default"},
       retry_backoff:{value:15,source:"default"},
+      fallback_capture_lines:{value:20,source:"default"},
       capture_lines:{value:120,source:"default"},
       monitor_excerpt_lines:{value:16,source:"default"},
       monitor_position:{value:"right",source:"default"},
@@ -432,7 +439,7 @@ Authority	autonomy approval_policy always_allow
 Triggering	hooks_first poll stable_screen_threshold
 Brain	command profile model effort timeout
 Budget	max_decisions retry_limit retry_backoff
-Context	capture_lines monitor_excerpt_lines
+Context	fallback_capture_lines capture_lines monitor_excerpt_lines
 Console	monitor_position monitor_width overview_ratio completion_close_delay
 Logging	logging screen_snapshots retention_days
 EOF
@@ -471,6 +478,7 @@ _apply_watch_config() {
   _config_assign "$config" max_decisions TMUX_RADAR_RUN_MAX_DECISIONS
   _config_assign "$config" retry_limit TMUX_RADAR_RUN_RETRY_LIMIT
   _config_assign "$config" retry_backoff TMUX_RADAR_RUN_RETRY_BACKOFF
+  _config_assign "$config" fallback_capture_lines TMUX_RADAR_RUN_FALLBACK_CAPTURE_LINES
   _config_assign "$config" capture_lines TMUX_RADAR_RUN_CAPTURE_LINES
   _config_assign "$config" monitor_excerpt_lines TMUX_RADAR_RUN_MONITOR_EXCERPT_LINES
   _config_assign "$config" monitor_position TMUX_RADAR_RUN_MONITOR_POSITION
@@ -487,7 +495,7 @@ _apply_watch_config() {
   export TMUX_RADAR_RUN_MODEL_SOURCE TMUX_RADAR_RUN_EFFORT_SOURCE
   export TMUX_RADAR_RUN_TIMEOUT
   export TMUX_RADAR_RUN_MAX_DECISIONS TMUX_RADAR_RUN_RETRY_LIMIT TMUX_RADAR_RUN_RETRY_BACKOFF
-  export TMUX_RADAR_RUN_CAPTURE_LINES TMUX_RADAR_RUN_MONITOR_EXCERPT_LINES
+  export TMUX_RADAR_RUN_FALLBACK_CAPTURE_LINES TMUX_RADAR_RUN_CAPTURE_LINES TMUX_RADAR_RUN_MONITOR_EXCERPT_LINES
   export TMUX_RADAR_RUN_MONITOR_POSITION TMUX_RADAR_RUN_MONITOR_WIDTH TMUX_RADAR_RUN_OVERVIEW_RATIO
   export TMUX_RADAR_RUN_COMPLETION_CLOSE_DELAY TMUX_RADAR_RUN_LOGGING
   export TMUX_RADAR_RUN_SCREEN_SNAPSHOTS TMUX_RADAR_RUN_RETENTION_DAYS
@@ -505,6 +513,7 @@ _watch_runtime_json() {
     --argjson poll "$TMUX_RADAR_RUN_POLL" --argjson stable_screen_threshold "$TMUX_RADAR_RUN_STABLE_SCREEN_THRESHOLD" \
     --argjson timeout "$TMUX_RADAR_RUN_TIMEOUT" --argjson max_decisions "$TMUX_RADAR_RUN_MAX_DECISIONS" \
     --argjson retry_limit "$TMUX_RADAR_RUN_RETRY_LIMIT" --argjson retry_backoff "$TMUX_RADAR_RUN_RETRY_BACKOFF" \
+    --argjson fallback_capture_lines "$TMUX_RADAR_RUN_FALLBACK_CAPTURE_LINES" \
     --argjson capture_lines "$TMUX_RADAR_RUN_CAPTURE_LINES" --argjson monitor_excerpt_lines "$TMUX_RADAR_RUN_MONITOR_EXCERPT_LINES" \
     --argjson monitor_width "$TMUX_RADAR_RUN_MONITOR_WIDTH" --argjson overview_ratio "$TMUX_RADAR_RUN_OVERVIEW_RATIO" \
     --argjson completion_close_delay "$TMUX_RADAR_RUN_COMPLETION_CLOSE_DELAY" --argjson retention_days "$TMUX_RADAR_RUN_RETENTION_DAYS" \
@@ -513,7 +522,8 @@ _watch_runtime_json() {
       hooks_first:$hooks_first,poll:$poll,stable_screen_threshold:$stable_screen_threshold,
       command:$command,profile:$profile,model:$model,effort:$effort,timeout:$timeout,
       max_decisions:$max_decisions,retry_limit:$retry_limit,retry_backoff:$retry_backoff,
-      capture_lines:$capture_lines,monitor_excerpt_lines:$monitor_excerpt_lines,
+      fallback_capture_lines:$fallback_capture_lines,capture_lines:$capture_lines,
+      monitor_excerpt_lines:$monitor_excerpt_lines,
       monitor_position:$monitor_position,monitor_width:$monitor_width,overview_ratio:$overview_ratio,
       completion_close_delay:$completion_close_delay,logging:$logging,
       screen_snapshots:$screen_snapshots,retention_days:$retention_days,backend:$backend}'
@@ -780,7 +790,7 @@ cmd_doctor_config_json() {
       (.[0].values | exact([
         "goal","autonomy","approval_policy","always_allow","hooks_first","poll",
         "stable_screen_threshold","command","profile","model","effort","timeout",
-        "max_decisions","retry_limit","retry_backoff","capture_lines",
+        "max_decisions","retry_limit","retry_backoff","fallback_capture_lines","capture_lines",
         "monitor_excerpt_lines","monitor_position","monitor_width","overview_ratio",
         "completion_close_delay","logging","screen_snapshots","retention_days"
       ])) and
@@ -3331,7 +3341,7 @@ _native_request_valid() {
     (.config.values | exact([
       "goal","autonomy","approval_policy","always_allow","hooks_first","poll",
       "stable_screen_threshold","command","profile","model","effort","timeout",
-      "max_decisions","retry_limit","retry_backoff","capture_lines",
+      "max_decisions","retry_limit","retry_backoff","fallback_capture_lines","capture_lines",
       "monitor_excerpt_lines","monitor_position","monitor_width","overview_ratio",
       "completion_close_delay","logging","screen_snapshots","retention_days"
     ])) and

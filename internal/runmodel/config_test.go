@@ -31,6 +31,9 @@ func TestDefaultConfigUsesLunaHighAndTracksProvenance(t *testing.T) {
 	if config.Values.Poll.Value != 5 || config.Values.Timeout.Value != 120 {
 		t.Fatalf("unexpected timing defaults: poll=%v timeout=%v", config.Values.Poll, config.Values.Timeout)
 	}
+	if config.Values.FallbackCaptureLines != (Value[int]{Value: 20, Source: SourceDefault}) {
+		t.Fatalf("fallback capture lines = %#v", config.Values.FallbackCaptureLines)
+	}
 	if err := config.Validate(); err != nil {
 		t.Fatalf("default config rejected: %v", err)
 	}
@@ -369,6 +372,8 @@ func TestConfigValidationRejectsInvalidEnumsAndNumbers(t *testing.T) {
 		{"poll", func(c *Config) { c.Values.Poll.Value = 0.01 }, "poll"},
 		{"timeout", func(c *Config) { c.Values.Timeout.Value = 4 }, "timeout"},
 		{"max decisions", func(c *Config) { c.Values.MaxDecisions.Value = 0 }, "max_decisions"},
+		{"fallback capture low", func(c *Config) { c.Values.FallbackCaptureLines.Value = 7 }, "fallback_capture_lines"},
+		{"fallback capture high", func(c *Config) { c.Values.FallbackCaptureLines.Value = 201 }, "fallback_capture_lines"},
 		{"overview ratio", func(c *Config) { c.Values.OverviewRatio.Value = 51 }, "overview_ratio"},
 		{"source", func(c *Config) { c.Values.Model.Source = "magic" }, "model.source"},
 	}

@@ -492,7 +492,7 @@ printf 'PASS: idle fallback starts after completed verification\n'
 reset_case active-idle
 write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"stable idle"}'
 start_watch 0.18
-wait_until 'active idle timer armed' "[ -s '$RUN_DIR/state.json' ] && jq -e '.phase == \"ARMED\" and .timer_pid > 0' '$RUN_DIR/state.json' >/dev/null 2>&1"
+wait_until 'active idle deadline armed' "[ -s '$RUN_DIR/state.json' ] && jq -e '.phase == \"ARMED\" and .waiter_pid == 0 and .timer_pid == 0' '$RUN_DIR/state.json' >/dev/null 2>&1"
 sleep 0.05
 printf 'screen-active-1\n' > "$TEST_SCREEN"
 sleep 0.2
@@ -678,7 +678,7 @@ export TEST_BACKEND_STDERR='temporary connection reset by peer'
 export TMUX_RADAR_TEST_RETRY_DELAYS=30,30,30
 start_watch 30
 emit_event backoff-approval approval retry
-wait_until 'retry waiter armed' "jq -e '.phase == \"DECIDING\" and .retry == 1 and .waiter_pid > 0' '$RUN_DIR/state.json' >/dev/null 2>&1" 400
+wait_until 'retry deadline armed' "jq -e '.phase == \"DECIDING\" and .retry == 1 and .waiter_pid == 0 and .timer_pid == 0' '$RUN_DIR/state.json' >/dev/null 2>&1" 400
 emit_event backoff-user user_resumed resumed
 wait_until 'retry cancelled by takeover' "jq -e 'select(.kind == \"retry_cancelled\" and .event_id == \"backoff-approval\")' '$RUN_DIR/events.jsonl' >/dev/null" 400
 sleep 0.2
@@ -687,7 +687,8 @@ assert_eq 0 "$(wc -l < "$TEST_SENDS" | tr -d ' ')" 'takeover during backoff send
 stop_watch
 printf 'PASS: retry backoff is interruptible by takeover\n'
 
-# 18. Ctrl-C/TERM tears down waiter, timer, backend group, and live pointer.
+# 18. Ctrl-C/TERM tears down the backend group and live pointer without ever
+# creating an idle waiter or timer child.
 reset_case cleanup
 write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"blocked"}'
 touch "$TEST_BLOCK_BACKEND"
@@ -703,6 +704,8 @@ assert_process_gone "$backend_pid" backend
 assert_process_group_gone "$backend_pgid" backend-group
 [ "$waiter_pid" = 0 ] || assert_process_gone "$waiter_pid" waiter
 [ "$timer_pid" = 0 ] || assert_process_gone "$timer_pid" timer
+assert_eq 0 "$(wc -l < "$TEST_WAITER_PIDS" | tr -d ' ')" \
+  'watcher creates no tmux wait-for child'
 while IFS= read -r waiter_child; do
   assert_process_gone "$waiter_child" waiter-child
 done < "$TEST_WAITER_PIDS"
@@ -710,7 +713,19 @@ done < "$TEST_WAITER_PIDS"
 assert_json "$RUN_DIR/final.json" '.outcome == "stopped"'
 printf 'PASS: watcher cleanup leaves no owned process or live pointer\n'
 
-# 19. A configured stable-screen threshold requires consecutive stable samples,
+# 19. Stopping directly from ARMED reproduces the Kimi incident shape. The
+# watcher must publish terminal evidence with no waiter/timer child to orphan.
+reset_case armed-stop
+start_watch 30
+wait_until 'armed childless state' "jq -e '.phase == \"ARMED\" and .waiter_pid == 0 and .timer_pid == 0' '$RUN_DIR/state.json' >/dev/null"
+assert_eq 0 "$(wc -l < "$TEST_WAITER_PIDS" | tr -d ' ')" \
+  'armed watcher starts no tmux wait-for child'
+stop_watch
+assert_json "$RUN_DIR/final.json" '.outcome == "stopped"'
+[ ! -e "$CASE/state/ai-watch/_1.watch" ] || _fail_assert 'armed stop left a live pointer'
+printf 'PASS: ARMED stop leaves terminal evidence and no wait child\n'
+
+# 20. A configured stable-screen threshold requires consecutive stable samples,
 # and a screen change resets the count.
 reset_case stable-threshold
 write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"stable threshold reached"}'

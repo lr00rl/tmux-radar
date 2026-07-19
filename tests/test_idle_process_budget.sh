@@ -81,8 +81,14 @@ done
 assert_file "$TMP/state/ai-watch/_1.watch"
 /bin/sleep 2
 
-assert_eq 1 "$(wc -l < "$TEST_SLEEP_LOG" | tr -d ' ')" \
-  'idle watcher starts one timer and does not fork polling sleeps'
-assert_eq 30 "$(cat "$TEST_SLEEP_LOG")" 'only the configured idle timer sleeps'
+assert_eq 0 "$(wc -l < "$TEST_SLEEP_LOG" | tr -d ' ')" \
+  'idle watcher uses a builtin deadline instead of an external sleep timer'
+assert_eq 0 "$(wc -l < "$TEST_WAITER_PIDS" | tr -d ' ')" \
+  'idle watcher creates no tmux wait-for process'
+run_dir="$(awk -F= '$1 == "run_dir" { print $2; exit }' "$TMP/state/ai-watch/_1.watch")"
+assert_json "$run_dir/state.json" '.phase == "ARMED" and .waiter_pid == 0 and .timer_pid == 0'
+children="$(ps -axo pid=,ppid=,command= | awk -v parent="$WATCH_PID" '$2 == parent { print }')"
+[ -z "$children" ] || _fail_assert \
+  'idle watcher retained child processes while blocked' 'children' "$children"
 
-printf 'PASS: idle watcher has a one-process timer budget and no polling forks\n'
+printf 'PASS: idle watcher blocks childlessly with zero timer or wait-for forks\n'

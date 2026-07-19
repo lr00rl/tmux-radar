@@ -2021,36 +2021,15 @@ _watch_record_fallback_samples() {
 }
 
 _watch_kill_waiters() {
-  local pid
-  for pid in "${WATCH_WAITER_PID:-}" "${WATCH_TIMER_PID:-}"; do
-    case "$pid" in ''|0|*[!0-9]*) continue ;; esac
-    _terminate_process_tree "$pid" ""
-    wait "$pid" 2>/dev/null || true
-  done
   WATCH_WAITER_PID=""; WATCH_TIMER_PID=""
   [ -n "${WATCH_WAITER_DONE:-}" ] && rm -f "$WATCH_WAITER_DONE"
   [ -n "${WATCH_TIMER_DONE:-}" ] && rm -f "$WATCH_TIMER_DONE"
 }
 
-_watch_start_waiter() {
-  WATCH_WAITER_DONE="$RADAR_RUN_DIR/.waiter.$$"
-  rm -f "$WATCH_WAITER_DONE"
-  (tmux wait-for "$RADAR_RUN_CHANNEL" >/dev/null 2>&1 || true; : > "$WATCH_WAITER_DONE") &
-  WATCH_WAITER_PID=$!
-}
-
-_watch_start_timer() {
-  local delay="$1"
-  WATCH_TIMER_DONE="$RADAR_RUN_DIR/.timer.$$"
-  rm -f "$WATCH_TIMER_DONE"
-  (sleep "$delay"; : > "$WATCH_TIMER_DONE") &
-  WATCH_TIMER_PID=$!
-}
-
 _watch_pause() {
   local requested="${1:-1}" fifo
   if [ -n "${TMUX_RADAR_TEST_WAIT_TICK+x}" ]; then
-    sleep "$requested"
+    /bin/sleep "$requested"
     return 0
   fi
   if [ "${WATCH_PAUSE_FD_READY:-0}" -ne 1 ]; then
@@ -2060,25 +2039,43 @@ _watch_pause() {
       rm -f "$fifo"
       WATCH_PAUSE_FD_READY=1
     else
-      sleep 1
-      return 0
+      return 1
     fi
   fi
   IFS= read -r -t 1 _ <&9 || true
 }
 
+_watch_delay_steps() {  # _watch_delay_steps <seconds> <tick>
+  awk -v delay="$1" -v tick="$2" 'BEGIN {
+    delay += 0
+    tick += 0
+    if (tick <= 0) tick = 1
+    steps = int(delay / tick)
+    if ((steps * tick) < delay) steps++
+    if (steps < 1) steps = 1
+    print steps
+  }'
+}
+
+_watch_delay_ceil() {
+  awk -v delay="$1" 'BEGIN {
+    delay += 0
+    seconds = int(delay)
+    if (seconds < delay) seconds++
+    if (seconds < 1) seconds = 1
+    print seconds
+  }'
+}
+
 _watch_wait_delay() {
-  local delay="$1" tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.05}"
-  _watch_start_timer "$delay"
+  local delay="$1" tick="${TMUX_RADAR_TEST_WAIT_TICK:-1}" remaining
+  remaining="$(_watch_delay_steps "$delay" "$tick")"
   _watch_state_snapshot
-  while [ ! -e "$WATCH_TIMER_DONE" ]; do
-    _watch_lifecycle_live || {
-      _watch_kill_waiters
-      return 1
-    }
-    sleep "$tick"
+  while [ "$remaining" -gt 0 ]; do
+    _watch_lifecycle_live || return 1
+    _watch_pause "$tick" || return 1
+    remaining=$((remaining - 1))
   done
-  _watch_kill_waiters
 }
 
 _watch_event_seen() {
@@ -2359,59 +2356,40 @@ _watch_defer_native_events() {  # hooks-first=off: keep takeover/manual events, 
 }
 
 _watch_wait_for_batch() {
-  local batch="$1" tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.05}"
+  local batch="$1" tick="${TMUX_RADAR_TEST_WAIT_TICK:-1}" remaining deadline
   : > "$batch"
   [ ! -e "$RADAR_RUN_DIR/paused" ] || return 3
-  _watch_start_waiter
-  _watch_start_timer "$WATCH_POLL"
+  remaining="$(_watch_delay_steps "$WATCH_POLL" "$tick")"
+  deadline=$(( $(now) + $(_watch_delay_ceil "$WATCH_POLL") ))
+  WATCH_NEXT_KIND=idle
+  WATCH_NEXT_AT="$deadline"
   _watch_state_snapshot
-  # The waiter is installed before the durable inbox is inspected. If the
-  # signal raced with waiter startup, the durable file is still claimed here.
+  # The journal is authoritative. Controls may still signal the legacy tmux
+  # channel, but this watcher owns no waiter process and observes the durable
+  # inbox within one production second.
   radar_inbox_drain > "$batch"
   if [ -s "$batch" ]; then
-    _watch_kill_waiters
     return 0
   fi
-  while :; do
+  while [ "$remaining" -gt 0 ]; do
     if [ -e "$RADAR_RUN_DIR/paused" ]; then
-      _watch_kill_waiters
       return 3
     fi
-    _watch_lifecycle_live || {
-      _watch_kill_waiters
-      return 2
-    }
-    if [ -e "$WATCH_TIMER_DONE" ]; then
-      _watch_kill_waiters
-      return 1
-    fi
-    if [ -e "$WATCH_WAITER_DONE" ]; then
-      _terminate_process_tree "$WATCH_WAITER_PID" ""
-      wait "$WATCH_WAITER_PID" 2>/dev/null || true
-      WATCH_WAITER_PID=""
-      rm -f "$WATCH_WAITER_DONE"
-      # Re-arm before draining so an event that lands during this drain is
-      # either signalled to the new waiter or remains durable for the next one.
-      _watch_start_waiter
-      _watch_state_snapshot
-      radar_inbox_drain > "$batch"
-      if [ -s "$batch" ]; then
-        _watch_kill_waiters
-        return 0
-      fi
-    fi
-    # The journal is authoritative. A wake signal is only an optimization and
-    # may race with waiter replacement, so observe durable events directly on
-    # each built-in pause without spawning another polling process.
+    _watch_lifecycle_live || return 2
     if radar_inbox_pending; then
       radar_inbox_drain > "$batch"
       if [ -s "$batch" ]; then
-        _watch_kill_waiters
         return 0
       fi
     fi
-    _watch_pause "$tick"
+    _watch_pause "$tick" || return 2
+    remaining=$((remaining - 1))
   done
+  if radar_inbox_pending; then
+    radar_inbox_drain > "$batch"
+    [ ! -s "$batch" ] || return 0
+  fi
+  return 1
 }
 
 _watch_retry_batch() {
@@ -2449,7 +2427,7 @@ _watch_retry_batch() {
 _watch_retry_delay() {
   local retry="$1" current_kind="$2" base="${WATCH_RETRY_BACKOFF:-15}" schedule
   schedule="${TMUX_RADAR_TEST_RETRY_DELAYS:-$base,$((base * 2)),$((base * 4))}"
-  local old_ifs="$IFS" delay tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.05}"
+  local old_ifs="$IFS" delay tick="${TMUX_RADAR_TEST_WAIT_TICK:-1}" remaining deadline
   local batch="$RADAR_RUN_DIR/.retry-batch.$$" batch_rc
   IFS=,
   # Intentional field splitting turns the comma-separated test seam into the
@@ -2459,34 +2437,39 @@ _watch_retry_delay() {
   IFS="$old_ifs"
   case "$retry" in 1) delay="${1:-15}" ;; 2) delay="${2:-30}" ;; *) delay="${3:-60}" ;; esac
   : > "$batch"
-  _watch_start_waiter
-  _watch_start_timer "$delay"
+  remaining="$(_watch_delay_steps "$delay" "$tick")"
+  deadline=$(( $(now) + $(_watch_delay_ceil "$delay") ))
+  WATCH_NEXT_KIND=retry
+  WATCH_NEXT_AT="$deadline"
   _watch_state_snapshot
   radar_inbox_drain > "$batch"
-  while :; do
+  while [ "$remaining" -gt 0 ]; do
     if [ -s "$batch" ]; then
       set +e; _watch_retry_batch "$batch" "$current_kind"; batch_rc=$?; set -e
       : > "$batch"
       if [ "$batch_rc" -eq 10 ]; then
-        _watch_kill_waiters; rm -f "$batch"; return 10
+        rm -f "$batch"; return 10
       fi
     fi
-    _watch_lifecycle_live || {
-      _watch_kill_waiters; rm -f "$batch"; return 2
-    }
-    if [ -e "$WATCH_TIMER_DONE" ]; then
-      _watch_kill_waiters; rm -f "$batch"; return 0
-    fi
-    if [ -e "$WATCH_WAITER_DONE" ]; then
-      _terminate_process_tree "$WATCH_WAITER_PID" ""
-      wait "$WATCH_WAITER_PID" 2>/dev/null || true
-      WATCH_WAITER_PID=""; rm -f "$WATCH_WAITER_DONE"
-      _watch_start_waiter
-      _watch_state_snapshot
+    _watch_lifecycle_live || { rm -f "$batch"; return 2; }
+    if radar_inbox_pending; then
       radar_inbox_drain > "$batch"
     fi
-    _watch_pause "$tick"
+    _watch_pause "$tick" || { rm -f "$batch"; return 2; }
+    remaining=$((remaining - 1))
   done
+  if radar_inbox_pending; then
+    radar_inbox_drain > "$batch"
+  fi
+  if [ -s "$batch" ]; then
+    set +e; _watch_retry_batch "$batch" "$current_kind"; batch_rc=$?; set -e
+    if [ "$batch_rc" -eq 10 ]; then
+      rm -f "$batch"
+      return 10
+    fi
+  fi
+  rm -f "$batch"
+  return 0
 }
 
 _watch_requeue_file() {
@@ -2513,12 +2496,9 @@ _watch_post_decision_guard() {
   local pre="$1" current_kind="$2" batch="$RADAR_RUN_DIR/.post-decision.$$"
   local retained="$RADAR_RUN_DIR/.post-retained.$$" event normalized kind current
   : > "$batch"; : > "$retained"
-  # Re-arm before the post-model drain. Signals emitted while the model was
-  # running remain durable, and a new signal racing this drain is latched.
-  _watch_start_waiter
-  _watch_state_snapshot
+  # Signals emitted while the model was running remain durable. A signal that
+  # races this drain remains in the journal for the next serialized cycle.
   radar_inbox_drain > "$batch"
-  _watch_kill_waiters
   if [ -s "$batch" ] && jq -e 'select(.kind == "user_resumed")' "$batch" >/dev/null 2>&1; then
     while IFS= read -r event; do
       [ -n "$event" ] || continue
@@ -2584,34 +2564,45 @@ _watch_verification_batch() {
 
 _watch_verify_send() {
   local pre="$1" current_kind="$2" timeout="${TMUX_RADAR_TEST_VERIFY_TIMEOUT:-$(opt @radar-ai-verify-timeout 30)}"
-  local tick="${TMUX_RADAR_TEST_WAIT_TICK:-0.05}" batch="$RADAR_RUN_DIR/.verify-batch.$$"
-  local deferred="$RADAR_RUN_DIR/.verify-deferred.$$" reason="timeout" current
+  local tick="${TMUX_RADAR_TEST_WAIT_TICK:-1}" batch="$RADAR_RUN_DIR/.verify-batch.$$"
+  local deferred="$RADAR_RUN_DIR/.verify-deferred.$$" reason="timeout" current remaining deadline
   : > "$batch"; : > "$deferred"
   _watch_phase VERIFYING "waiting for send effect" verification 0 "$(jq -cn --arg pre "$pre" '{verification:{pre_send_fingerprint:$pre}}')"
-  _watch_start_waiter
-  _watch_start_timer "$timeout"
+  remaining="$(_watch_delay_steps "$timeout" "$tick")"
+  deadline=$(( $(now) + $(_watch_delay_ceil "$timeout") ))
+  WATCH_NEXT_KIND=verification
+  WATCH_NEXT_AT="$deadline"
   _watch_state_snapshot "$(jq -cn --arg pre "$pre" '{verification:{pre_send_fingerprint:$pre}}')"
   radar_inbox_drain > "$batch"
   if _watch_verification_batch "$batch" "$deferred"; then reason="user_resumed"; else :; fi
-  while [ "$reason" = timeout ]; do
+  : > "$batch"
+  while [ "$reason" = timeout ] && [ "$remaining" -gt 0 ]; do
     _watch_lifecycle_live || {
       reason="pane_death"; break
     }
     current="$(_watch_evidence_fingerprint "$current_kind" || true)"
     if [ -n "$current" ] && [ "$current" != "$pre" ]; then reason="screen_change"; break; fi
-    [ -e "$WATCH_TIMER_DONE" ] && break
-    if [ -e "$WATCH_WAITER_DONE" ]; then
-      _terminate_process_tree "$WATCH_WAITER_PID" ""
-      wait "$WATCH_WAITER_PID" 2>/dev/null || true
-      WATCH_WAITER_PID=""; rm -f "$WATCH_WAITER_DONE"
-      _watch_start_waiter
-      _watch_state_snapshot "$(jq -cn --arg pre "$pre" '{verification:{pre_send_fingerprint:$pre}}')"
+    if radar_inbox_pending; then
       radar_inbox_drain > "$batch"
       if _watch_verification_batch "$batch" "$deferred"; then reason="user_resumed"; break; fi
+      : > "$batch"
     fi
-    _watch_pause "$tick"
+    _watch_pause "$tick" || { reason="pane_death"; break; }
+    remaining=$((remaining - 1))
   done
-  _watch_kill_waiters
+  if [ "$reason" = timeout ]; then
+    if ! _watch_lifecycle_live; then
+      reason="pane_death"
+    else
+      current="$(_watch_evidence_fingerprint "$current_kind" || true)"
+      if [ -n "$current" ] && [ "$current" != "$pre" ]; then
+        reason="screen_change"
+      elif radar_inbox_pending; then
+        radar_inbox_drain > "$batch"
+        if _watch_verification_batch "$batch" "$deferred"; then reason="user_resumed"; fi
+      fi
+    fi
+  fi
   _watch_requeue_file "$deferred"
   rm -f "$batch" "$deferred"
   radar_event_append verification_completed watcher "$reason" "$(jq -cn \
@@ -3803,6 +3794,35 @@ _control_owner_valid() {
   ' >/dev/null 2>&1
 }
 
+_control_stop_complete() {  # _control_stop_complete <run-dir> <watch-file> <run-id> <generation> <pid>
+  local run_dir="$1" watch_file="$2" run_id="$3" generation="$4" pid="$5"
+  [ -s "$run_dir/final.json" ] || return 1
+  case "$pid" in
+    ''|0|*[!0-9]*) : ;;
+    *) kill -0 "$pid" 2>/dev/null && return 1 ;;
+  esac
+  if [ -r "$watch_file" ] &&
+    [ "$(_state_get "$watch_file" run_id)" = "$run_id" ] &&
+    [ "$(_state_get "$watch_file" generation)" = "$generation" ]; then
+    return 1
+  fi
+  return 0
+}
+
+_control_force_stop() {  # _control_force_stop <run-dir> <watch-file> <run-id> <generation> <pid>
+  local run_dir="$1" watch_file="$2" run_id="$3" generation="$4" pid="$5"
+  local brain_file="${watch_file%.watch}.brain.pid"
+  _terminate_process_tree "$pid" ""
+  _terminate_brain_file "$brain_file"
+  if [ -r "$watch_file" ] &&
+    [ "$(_state_get "$watch_file" run_id)" = "$run_id" ] &&
+    [ "$(_state_get "$watch_file" generation)" = "$generation" ]; then
+    rm -f "$watch_file"
+  fi
+  [ -s "$run_dir/final.json" ] || radar_run_finalize stopped \
+    'forced stop after watcher acknowledgement timeout'
+}
+
 cmd_control() {
   local run_id="${1:-}" pane="${2:-}" action="${3:-}" request_id="${4:-}"
   local run_dir watch_file pointer_run pointer_pane pointer_generation expected_generation channel pid
@@ -3953,15 +3973,22 @@ cmd_control() {
       [ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || true
       _native_release_lock
       attempts="${TMUX_RADAR_STOP_ATTEMPTS:-500}"
-      while [ "$attempt" -lt "$attempts" ] && [ ! -s "$run_dir/final.json" ]; do
+      while [ "$attempt" -lt "$attempts" ] &&
+        ! _control_stop_complete "$run_dir" "$watch_file" "$run_id" "$expected_generation" "$pid"; do
         sleep "${TMUX_RADAR_CONTROL_DELAY:-0.02}"
         attempt=$((attempt + 1))
       done
-      if [ ! -s "$run_dir/final.json" ]; then
-        _terminate_process_tree "$pid" ""
-        radar_run_finalize stopped 'forced stop after watcher acknowledgement timeout'
+      if ! _control_stop_complete "$run_dir" "$watch_file" "$run_id" "$expected_generation" "$pid"; then
+        _control_force_stop "$run_dir" "$watch_file" "$run_id" "$expected_generation" "$pid"
+        attempt=0
+        while [ "$attempt" -lt "${TMUX_RADAR_STOP_FORCE_ATTEMPTS:-100}" ] &&
+          ! _control_stop_complete "$run_dir" "$watch_file" "$run_id" "$expected_generation" "$pid"; do
+          sleep "${TMUX_RADAR_CONTROL_DELAY:-0.02}"
+          attempt=$((attempt + 1))
+        done
       fi
-      [ -s "$run_dir/final.json" ] || action='timeout'
+      _control_stop_complete "$run_dir" "$watch_file" "$run_id" "$expected_generation" "$pid" ||
+        action='timeout'
       ;;
   esac
 

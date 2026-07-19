@@ -211,8 +211,63 @@ KIMI_UNKNOWN_RC=0
 printf '%s' '{"hook_event_name":"Unknown","session_id":"kimi-unknown","cwd":"/tmp"}' |
   "$N" kimi-hook >/dev/null 2>"$T/kimi-hook.err"
 KIMI_UNKNOWN_RC=$?
-chk "unknown Kimi hook event is rejected" "[ '$KIMI_UNKNOWN_RC' -eq 2 ]"
+chk "unknown Kimi hook event fails open instead of blocking the agent" \
+  "[ '$KIMI_UNKNOWN_RC' -ne 0 ] && [ '$KIMI_UNKNOWN_RC' -ne 2 ]"
 chk "unknown Kimi hook event leaves state untouched" "[ ! -s '$REG' ] && [ ! -s '$MARKS' ]"
+
+KIMI_INVALID_RC=0
+printf '%s' '{"hook_event_name":"Stop","cwd":"/tmp"}' |
+  "$N" kimi-hook >/dev/null 2>"$T/kimi-hook-invalid.err"
+KIMI_INVALID_RC=$?
+chk "invalid Kimi Stop payload cannot block turn completion" \
+  "[ '$KIMI_INVALID_RC' -ne 0 ] && [ '$KIMI_INVALID_RC' -ne 2 ]"
+chk "invalid Kimi Stop payload leaves state untouched" "[ ! -s '$REG' ] && [ ! -s '$MARKS' ]"
+
+echo
+echo "### #12 HIGH: custom vendor adapters fail open on validation/notifier errors"
+ADAPTER="$WT/examples/hooks/custom-agent-adapter.sh"
+cat > "$T/adapter-notify" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$ADAPTER_ARGS"
+cat > "$ADAPTER_PAYLOAD"
+exit "${ADAPTER_NOTIFY_RC:-0}"
+EOF
+chmod +x "$T/adapter-notify"
+ADAPTER_ARGS="$T/adapter.args" ADAPTER_PAYLOAD="$T/adapter.payload" \
+  TMUX_RADAR_NOTIFY="$T/adapter-notify" TMUX_RADAR_AGENT_KIND=demo \
+  "$ADAPTER" <<'EOF'
+{"event":"VENDOR_PERMISSION_REQUEST","session_id":"vendor-1","cwd":"/tmp","pane":"%1","pid":1,"process":"demo","message":"approve"}
+EOF
+chk "custom adapter forwards the normalized event" \
+  "grep -qx 'agent-event demo approval' '$T/adapter.args'"
+chk "custom adapter forwards one normalized payload" \
+  "jq -e '.session_id == \"vendor-1\" and .label == \"approve\"' '$T/adapter.payload' >/dev/null"
+
+ADAPTER_NOTIFY_FAILURE_RC=0
+ADAPTER_ARGS="$T/adapter-fail.args" ADAPTER_PAYLOAD="$T/adapter-fail.payload" \
+  ADAPTER_NOTIFY_RC=2 TMUX_RADAR_NOTIFY="$T/adapter-notify" \
+  "$ADAPTER" <<'EOF' >/dev/null 2>"$T/adapter-fail.err"
+{"event":"VENDOR_PERMISSION_REQUEST","session_id":"vendor-2"}
+EOF
+ADAPTER_NOTIFY_FAILURE_RC=$?
+chk "custom adapter translates notifier validation errors to fail-open" \
+  "[ '$ADAPTER_NOTIFY_FAILURE_RC' -ne 0 ] && [ '$ADAPTER_NOTIFY_FAILURE_RC' -ne 2 ]"
+
+ADAPTER_UNKNOWN_RC=0
+TMUX_RADAR_NOTIFY="$T/adapter-notify" "$ADAPTER" <<'EOF' >/dev/null 2>"$T/adapter-unknown.err"
+{"event":"VENDOR_UNKNOWN","session_id":"vendor-3"}
+EOF
+ADAPTER_UNKNOWN_RC=$?
+chk "custom adapter unknown events cannot block the vendor" \
+  "[ '$ADAPTER_UNKNOWN_RC' -ne 0 ] && [ '$ADAPTER_UNKNOWN_RC' -ne 2 ]"
+
+ADAPTER_MALFORMED_RC=0
+TMUX_RADAR_NOTIFY="$T/adapter-notify" "$ADAPTER" <<'EOF' >/dev/null 2>"$T/adapter-malformed.err"
+{
+EOF
+ADAPTER_MALFORMED_RC=$?
+chk "custom adapter malformed payloads cannot block the vendor" \
+  "[ '$ADAPTER_MALFORMED_RC' -ne 0 ] && [ '$ADAPTER_MALFORMED_RC' -ne 2 ]"
 
 tmux -L radarreg kill-server 2>/dev/null || true
 rm -f /tmp/PWNED_BY_ASK

@@ -1175,7 +1175,7 @@ _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
       watch_kind=user_resumed
       ;;
     turn_complete)
-      _reg_upsert_locked "$kind" "$key" "$pid" "$pane" done "$cwd" "$proc"
+      _reg_upsert_locked "$kind" "$key" "$pid" "$pane" "done" "$cwd" "$proc"
       label="$display finished - your turn${detail:+: $detail}"
       [ "$(opt @radar-needinput on)" = "on" ] &&
         _session_mark_locked "$pane" "$kind" "$label" "$key"
@@ -1201,8 +1201,10 @@ cmd_agent_event() {  # agent-event <agent-kind> <normalized-event>
 }
 
 cmd_kimi_hook() {
-  local json event normalized
-  json="$(_agent_json_object)" || return 2
+  local json event normalized rc
+  # Kimi reserves exit 2 for an intentional block on Stop/UserPromptSubmit.
+  # Adapter/data failures must use an ordinary nonzero code so Kimi fails open.
+  json="$(_agent_json_object)" || return 1
   event="$(_json_field hook_event_name "$json")"
   case "$event" in
     SessionStart) normalized=session_start ;;
@@ -1214,10 +1216,14 @@ cmd_kimi_hook() {
     SessionEnd) normalized=session_end ;;
     *)
       echo "kimi-hook: unsupported event: ${event:-<missing>}" >&2
-      return 2
+      return 1
       ;;
   esac
-  _agent_event_apply kimi "$normalized" "$json"
+  _agent_event_apply kimi "$normalized" "$json" || {
+    rc=$?
+    [ "$rc" -eq 2 ] && return 1
+    return "$rc"
+  }
 }
 
 # Public API for any other agent that wants radar tracking: register with a

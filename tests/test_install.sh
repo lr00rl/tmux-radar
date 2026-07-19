@@ -130,6 +130,17 @@ chk "status reports all 3 Codex hooks" \
 chk "status reports all 7 Kimi hooks" "printf '%s' \"\$STATUS\" | grep -q 'Kimi hooks installed: 7/7'"
 chk "status reports the opencode plugin" "printf '%s' \"\$STATUS\" | grep -qi 'opencode plugin: installed'"
 
+awk '
+  /^# >>> tmux-radar kimi hooks >>>$/ { inside=1 }
+  inside && !changed && /^timeout = 5$/ { $0="timeout = 6"; changed=1 }
+  { print }
+' "$KIMI_CONFIG" > "$T/kimi-status-broken.toml"
+mv "$T/kimi-status-broken.toml" "$KIMI_CONFIG"
+STATUS_BROKEN="$(bash "$IH" status 2>&1)"
+chk "status rejects a Kimi event whose managed command contract drifted" \
+  "printf '%s' \"\$STATUS_BROKEN\" | grep -q 'Kimi hooks installed: 6/7'"
+bash "$IH" install >/dev/null 2>&1
+
 echo
 echo "### uninstall under the shim leaves the user's config intact"
 OUT2="$(bash "$IH" uninstall 2>&1)"; RC2=$?

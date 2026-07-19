@@ -600,7 +600,7 @@ kimi_uninstall() {
 }
 
 kimi_status() {
-  local event count=0 block=""
+  local event count=0 block="" command encoded stanza
   if ! kimi_present; then
     echo "Kimi: not installed (skipped)"
     return 0
@@ -622,8 +622,12 @@ kimi_status() {
     $0 == end { inside=0; next }
     inside { print }
   ' "$KIMI_CONFIG")"
+  command="$(shell_single_quote "$NOTIFY") kimi-hook"
+  encoded="$(toml_basic_string "$command")"
   for event in "${KIMI_EVENTS[@]}"; do
-    if printf '%s\n' "$block" | grep -qF "event = \"$event\""; then
+    stanza="$(printf '[[hooks]]\nevent = "%s"\ncommand = %s\ntimeout = %s' \
+      "$event" "$encoded" "$KIMI_HOOK_TIMEOUT")"
+    if [[ "$block" == *"$stanza"* ]]; then
       echo "Kimi native $event: installed"
       count=$((count + 1))
     else

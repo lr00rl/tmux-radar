@@ -20,7 +20,7 @@ long-running agents.
 | "Which pane is waiting for me?" | AI status view |
 | "What is happening in that pane?" | Bottom-anchored live preview |
 | "I know the pane title, not the session" | Title-focused fuzzy search |
-| "Claude/Codex finished while I was elsewhere" | Status marks and bar |
+| "Claude/Codex/Kimi finished while I was elsewhere" | Status marks and bar |
 
 ## Features
 
@@ -33,7 +33,7 @@ long-running agents.
   The current window stays in the list, one `↑` away.
 - **Live preview** — the selected window's content, no wrap, anchored to the
   bottom (current prompt/state visible), with line/page scroll.
-- **AI status alerts** — Claude/Codex/OpenCode flag their pane for action-required
+- **AI status alerts** — Claude/Codex/Kimi/OpenCode flag their pane for action-required
   prompts and finished-turn notices; a **persistent bar** appears on a second
   status line while an off-screen mark is fresh,
   the pane's **title flips to a status label** (`⚠` action required, `✓`
@@ -48,7 +48,7 @@ long-running agents.
   agent runners) are resolved back to their real pane via the process tree or
   Claude's hook/job cwd.
 - **Optional AI supervisor** — `prefix + A`: drive tmux from natural language,
-  have Codex answer a waiting Claude/Codex prompt for you, or run a resident
+  have Codex answer a waiting Claude/Codex/Kimi prompt for you, or run a resident
   watcher that auto-approves *safe* prompts until a pane's task is done — with
   a read-only brain, an audit log, and escalation for anything risky.
 
@@ -138,7 +138,7 @@ Set these **before** the plugin loads:
 | `@radar-preview` | `right:62%` | fzf preview position/size. |
 | `@radar-preview-follow` | `on` | Anchor preview to the bottom (tail-style). |
 | `@radar-needinput` | `on` | Enable the AI-status system (hooks/bar). |
-| `@radar-needinput-commands` | `codex claude opencode` | Process names the AI status view treats as AI panes. Comma/space/colon separated. |
+| `@radar-needinput-commands` | `codex claude opencode kimi` | Process names the AI status view treats as AI panes. Comma/space/colon separated. |
 | `@radar-retitle` | `on` | Rename a marked pane's title to a status label (`⚠` action required, `✓` finished, `!` notice), restored on clear. |
 | `@radar-claude-bg` | `on` | Also track Claude sessions running outside tmux panes (background/dashboard/cloud). |
 | `@radar-bar` | `auto` | `auto` raises line 2 only while needed and restores the exact previous `status`; `pinned` keeps line 2; `off` tracks marks without raising it. |
@@ -155,13 +155,14 @@ Set these **before** the plugin loads:
 | `@radar-ai-autonomy` | `confirm` | One-shot `ask`/`decide`: `suggest` (print only), `confirm` (ask first), `auto`. |
 | `@radar-ai-watch-autonomy` | `auto-safe` | Resident `watch`: `auto-safe` (auto-send only safe replies, escalate the rest), `suggest`, `auto`. |
 | `@radar-ai-approval-policy` | `safe-auto` | Per-watch approval policy inherited by quick setup; `W` presets `always-allow`. |
-| `@radar-ai-hooks-first` | `on` | Let native Claude/Codex lifecycle hooks wake the watcher immediately. `off` keeps only manual and stable-screen fallback triggers. |
+| `@radar-ai-hooks-first` | `on` | Let installed native Claude/Codex/Kimi/OpenCode lifecycle hooks wake the watcher immediately. `off` keeps only manual and semantic stable-screen fallback triggers. |
 | `@radar-ai-poll` | `5` | Idle-listen interval while watching a pane. The next interval starts after a model decision/action returns, so slow decisions do not overlap. |
-| `@radar-ai-stable-screen-threshold` | `1` | Consecutive unchanged idle samples required before the fallback asks the model. |
+| `@radar-ai-stable-screen-threshold` | `1` | Consecutive equal **stable projections** required before no-hook fallback asks the model. Changing spinners, elapsed timers, and footers are removed before comparison. |
 | `@radar-ai-max-calls` | `40` | Cost cap: a watcher pauses after this many model calls. |
 | `@radar-ai-timeout` | `120` | Hard limit in seconds for one model call (minimum `5`). A timed-out Codex wrapper and all of its children are terminated as one process group. |
 | `@radar-ai-retry-limit` | `3` | Maximum retries after invalid JSON, backend failure, or timeout. |
 | `@radar-ai-retry-backoff` | `15` | Initial retry delay; production retries use 15/30/60 seconds by default. |
+| `@radar-ai-fallback-capture-lines` | `20` | Bottom pane lines sampled by no-hook fallback. Keep this small to reduce capture/model cost; range `8`–`200`. Native events still use the full decision capture below. |
 | `@radar-ai-capture-lines` | `120` | Pane lines fed to the model per decision. |
 | `@radar-ai-watch-always-allow` | `off` | While watching, prefer the TUI's "don't ask again / always allow" option for **safe** actions (fewer interruptions, lower safety). Menu entry `W` enables it per-watch. |
 | `@radar-ai-monitor` | `on` | Legacy monitor toggle. Native supervision always has one visible owner surface so lifecycle and controls cannot become detached accidentally. |
@@ -184,7 +185,7 @@ Example:
 set -g @radar-default-view 'recent'
 set -g @radar-key 'C-j'
 set -g @radar-preview 'right:55%'
-set -g @radar-needinput-commands 'codex claude'
+set -g @radar-needinput-commands 'codex claude opencode kimi'
 
 # AI supervisor (optional)
 set -g @radar-ai 'on'
@@ -203,10 +204,14 @@ exists, even without setting `@radar-ai-rules`):
 - If Claude asks which approach to take, prefer the smallest change.
 ```
 
-## AI status view + alerts (Claude Code / Codex / OpenCode)
+For focused walkthroughs, see [configuration](docs/guides/configuration.md),
+[agent hooks](docs/guides/agent-hooks.md), and
+[development](docs/guides/development.md).
+
+## AI status view + alerts (Claude Code / Codex / Kimi / OpenCode)
 
 The `ctrl-i` view scans live tmux panes for configured AI processes, defaulting
-to `codex`, `claude`, and `opencode`, and lists matching panes directly. Matching is based on
+to `codex`, `claude`, `opencode`, and `kimi`, and lists matching panes directly. Matching is based on
 the pane process tree and processes attached to the pane TTY, not on tmux window
 or pane names. Rows are labeled by meaning: **ACTION** for permissions/input that
 really need a decision, **DONE** for finished-turn notifications that are useful
@@ -215,8 +220,8 @@ only as context. Background Claude sessions are shown as non-jumpable status row
 instead of pretending to be a tmux pane.
 
 The plugin sets up the tmux side automatically (AI-status bar status line +
-clear on window focus). To let Claude Code, Codex, and OpenCode flag their pane, install
-the hooks once:
+clear on window focus). To let Claude Code, Codex, Kimi, and OpenCode flag their
+pane, install the hooks once:
 
 ```sh
 ~/.tmux/plugins/tmux-radar/scripts/install-hooks.sh install     # wire hooks
@@ -231,7 +236,12 @@ It edits `~/.claude/settings.json` with five lifecycle hooks:
 deliberately preserving the preceding finished-turn mark. Native Codex handlers
 are merged into `~/.codex/hooks.json`; the managed block in
 `~/.codex/config.toml` contains matching trust state plus the wrapped legacy
-`notify` fallback. When OpenCode is installed, the installer writes the
+`notify` fallback. Kimi receives one owned marker block in
+`~/.kimi-code/config.toml` for `SessionStart`, `PermissionRequest`,
+`PermissionResult`, `UserPromptSubmit`, `Stop`, `Interrupt`, and `SessionEnd`.
+The installer preserves Kimi's other config and hooks, refuses malformed or
+duplicate managed markers, and rolls back all touched configs if a later write
+fails. When OpenCode is installed, the installer writes the
 dependency-free lifecycle bridge to
 `~/.config/opencode/plugins/tmux-radar.js`. One bridge process blocks on a pipe
 for the lifetime of each OpenCode TUI; it does not spawn or poll per event.
@@ -239,7 +249,27 @@ Permission requests, structured questions, replies, idle completion, errors,
 and deletion are ordered by session/generation before changing marks. Existing
 user hooks, trust entries, notify chains, and symlinked config paths are
 preserved. Restart the affected agent sessions after installation, then review
-`/hooks` if Codex asks you to trust the handlers.
+`/hooks` if Codex asks you to trust the handlers. Kimi's event names and TOML
+shape follow its [official hooks reference](https://moonshotai.github.io/kimi-code/en/customization/hooks).
+
+### Agents without native hooks
+
+A missing hook does not disable supervision. After each idle interval,
+tmux-radar captures only the bottom
+`@radar-ai-fallback-capture-lines` lines (20 by default) and compares adjacent
+samples. It projects only lines that remain in order across both samples, which
+removes changing spinners, elapsed counters, progress rows, and footers without
+matching prompt text. The model is called only when that stable semantic
+evidence reaches `@radar-ai-stable-screen-threshold`; an equal or
+containment-only projection is deduplicated until meaningful stable evidence
+changes.
+
+This is deliberately a fallback, not fake hook coverage:
+`install-hooks.sh status` still reports missing hooks, Timeline records
+`screen_idle`, and native
+events keep their immediate path and larger `@radar-ai-capture-lines` context.
+See [Agent hooks and custom adapters](docs/guides/agent-hooks.md) for the
+normalized event contract and a copyable adapter.
 
 ### How marks are targeted and cleared
 
@@ -316,7 +346,7 @@ The visible console adapts without hiding supervision:
 | ≤120 columns or <24 rows | 90% × 85% popup; the target pane is not split. |
 
 The launcher creates exactly one surface and then `exec`s one Go process. It
-never launches a watcher, heartbeat helper, redraw loop, or timer process.
+never launches a heartbeat helper, redraw loop, or timer process.
 Bubble Tea performs in-place terminal updates in the alternate screen; a single
 in-process 250 ms file poll waits before every attempt and the one-second header
 clock does not clear the evidence viewport. Scrolling up pins Timeline at the
@@ -351,10 +381,14 @@ its model process group to stop when the heartbeat lease expires.
 Native lifecycle hooks are the primary trigger. Approval/input events request a
 decision immediately; turn-complete asks whether the exact goal is done;
 UserPromptSubmit cancels stale queued approvals and resets idle timing. A stable
-screen is only the fallback when a hook is absent or unsupported. The `poll`
+semantic projection of the bottom 20 lines is only the fallback when a hook is
+absent or unsupported. The `poll`
 interval begins after the current decision/action/verification finishes. One
 watch owns at most one model process tree, so a slow call cannot create another
-call every five seconds; arrivals are durably queued and coalesced first.
+call every five seconds; arrivals are durably queued and coalesced first. While
+idle or backing off, the Bash watcher waits in-process on its owned FIFO and
+deadline: it does not fork `sleep` or `tmux wait-for` children. The only child
+a run may own is the currently active model process group.
 
 **Codex is a decision-only brain; the script is the only actor.** Each call uses
 `codex exec -s read-only --ephemeral` plus a JSON output schema, ignores the
@@ -438,6 +472,10 @@ needinput-notify.sh doctor       # full hooks/marks/registry diagnostic
 needinput-notify.sh agent-panes  # which panes host a watched agent right now
 needinput-notify.sh resolve-pane # which pane THIS process tree belongs to
 needinput-notify.sh resolve-cwd [cwd] # which pane owns a Claude hook/job cwd
+needinput-notify.sh kimi-hook     # Kimi hook adapter; JSON payload on stdin
+needinput-notify.sh agent-event <kind> \
+  <session_start|approval|approval_resolved|input_required|user_resumed|turn_complete|interrupt|session_end>
+                                 # public normalized adapter; JSON on stdin
 needinput-notify.sh mark|clear|clear-all …   # manual mark management
 ```
 
@@ -482,13 +520,15 @@ when the bar renders (≤30s), and whenever the AI status view opens.
     including watcher PID, run directory, wake channel, and monitor pane IDs.
     While a model call is active, `<pane>.brain.pid` records its PID/process
     group for `stop` and crash GC. Legacy `.timeline`/`.detail` files remain a
-    presentation fallback, not canonical history.
+    presentation fallback, not canonical history. Idle waits have no waiter or
+    timer child; compatibility state records both PIDs as `0`.
   - `ai-runs/<run-id>/` — `config.json` (immutable values + provenance), atomic
     `state.json`, append-only `events.jsonl`, hook `inbox/`, per-call
     `decisions/NNNN.json` + `.meta.json`, `backend/NNNN.stderr`, and
     `final.json`. `monitors` records the overview/detail pane IDs or popup
     ownership before the compatibility pointer is rewritten. `screens/` is
-    created only for snapshots/full logging;
+    created only for snapshots/full logging; fallback raw samples are persisted
+    only under those explicit modes.
     `prompts/` only for full logging. Default retention is seven days and a run
     referenced by a live `.watch` pointer is never collected.
   - `ai.log` — the AI supervisor's audit log.
@@ -508,20 +548,22 @@ when the bar renders (≤30s), and whenever the AI status view opens.
   marks are GC'd automatically (plugin load / bar render / opening the view).
   Force a pass with `scripts/needinput-notify.sh tick`; see which panes are
   currently detected as agents with `scripts/needinput-notify.sh agent-panes`.
-- **A claude pane isn't detected as an AI pane** — detection matches ps argv0
-  path components against `@radar-needinput-commands` (`codex claude opencode` by
+- **An agent pane isn't detected as an AI pane** — detection matches ps argv0
+  path components against `@radar-needinput-commands` (`codex claude opencode kimi` by
   default) via the pane's tty and process tree. `pane_current_command` showing
   a version number (`2.1.199`) is normal and does not matter. If you renamed
   the binary, add that name to `@radar-needinput-commands`.
 - **Hooks don't fire** — run `scripts/install-hooks.sh status`. It reports
-  Claude coverage plus each Codex native event (`PermissionRequest`, `Stop`,
-  `UserPromptSubmit`) and the legacy notify fallback separately. Re-run
-  `install`, then restart Claude/Codex/OpenCode sessions because hooks are read at
-  session start. A missing native hook is visible; stable-screen fallback does
-  not claim native coverage.
+  Claude, Codex, Kimi, and OpenCode coverage separately, including Kimi's seven
+  managed events and Codex's legacy notify fallback. Re-run `install`, then
+  restart the affected agent sessions because hooks are read at session start.
+  A missing native hook remains visible; semantic fallback does not claim native
+  coverage. The [agent hook guide](docs/guides/agent-hooks.md) includes payload
+  diagnostics and a custom-agent adapter.
 - **A watcher seems to launch a new model every poll interval** — update the
   plugin. Calls are serialized now: the idle interval begins only after the
-  current call/action verification ends, and queued hooks are coalesced. Inspect
+  current call/action verification ends, equal stable projections are
+  deduplicated, and queued hooks are coalesced. Inspect
   `ai.sh report latest`, `ai.sh status`, and the run's `events.jsonl`/
   `decisions/` before changing the interval.
 - **Where are the monitor logs?** — use `ai.sh report latest`. Default
@@ -543,8 +585,10 @@ when the bar renders (≤30s), and whenever the AI status view opens.
   deletes by Unicode character and is active immediately. Verify the launcher
   selected `bin/tmux-radar`, not the explicit legacy rollback.
 - **The supervisor consumed CPU after its pane closed** — current native owner
-  heartbeats run inside the one Go TUI process, and engine waits have bounded
-  lease checks. Run `ps -ef | grep tmux-radar` and `ai.sh cleanup`; no
+  heartbeats run inside the one Go TUI process, and engine waits are childless
+  with bounded lease checks. `ai.sh stop` acknowledges only after final evidence
+  exists, the watcher PID is gone, and its generation pointer is removed. Run
+  `ps -ef | grep tmux-radar` and `ai.sh cleanup`; no
   `tmux-radar-ai-supervision` shim or `ai-monitor.sh` process is part of the
   primary native path.
 - **The AI menu key** — default is capital `A` (`prefix + A`). If an old

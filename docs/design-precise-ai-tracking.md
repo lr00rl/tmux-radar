@@ -32,7 +32,7 @@ New state file `$STATE_DIR/agent-registry` (TSV, lock-shared with `need-input`):
 kind \t key \t pid \t pane \t started \t last_event \t state \t cwd \t proc
 ```
 
-- `kind`   — claude | codex | opencode
+- `kind`   — claude | codex | kimi | opencode | a custom adapter name
 - `key`    — same key space as marks: `s:<session_id>` (Claude/Codex),
              `oc:s:<session_id>` (OpenCode), generation/pid fallback otherwise
 - `pid`    — the agent process PID, resolved by walking the hook process's
@@ -135,3 +135,66 @@ answer "why is this row (not) showing?".
   prior `status` value instead of hardcoding `on`; pinned never touches
   the status line count.
 - README repositioning (workspace radar story) ships on this branch too.
+
+## 2026-07-18 extension: normalized events and bounded fallback
+
+Kimi and future agent integrations use one public lifecycle boundary:
+
+```sh
+printf '%s\n' "$hook_json" |
+  needinput-notify.sh agent-event <kind> <normalized-event>
+```
+
+Allowed normalized events are `session_start`, `approval`,
+`approval_resolved`, `input_required`, `user_resumed`, `turn_complete`,
+`interrupt`, and `session_end`. The payload must be valid JSON and identify a
+session; pane, PID/process, cwd, and label are accepted as resolution evidence.
+The notifier validates agent/event names, resolves the owning pane, updates the
+same registry/mark key, and emits a sanitized supervisor event. Agent-specific
+adapters should translate native payloads only; they must not maintain a second
+state machine. The normalized command uses exit `2` for validation errors.
+Vendor-facing adapters must translate that code to the vendor's documented
+fail-open error code when `2` means "block"; Kimi's adapter uses `1`.
+
+Kimi's adapter consumes `hook_event_name` and maps the official events:
+
+| Kimi event | Normalized event |
+|------------|------------------|
+| `SessionStart` | `session_start` |
+| `PermissionRequest` | `approval` |
+| `PermissionResult` | `approval_resolved` |
+| `UserPromptSubmit` | `user_resumed` |
+| `Stop` | `turn_complete` |
+| `Interrupt` | `interrupt` |
+| `SessionEnd` | `session_end` |
+
+`install-hooks.sh` owns only the text between its two Kimi markers in
+`~/.kimi-code/config.toml`. Install is idempotent and transactionally preserves
+unrelated TOML, user hooks, comments, and symlink targets. Missing Kimi is a
+reported skip; malformed/duplicate markers fail closed rather than guessing at
+ownership. The event set and payload shape follow the
+[Kimi hooks reference](https://moonshotai.github.io/kimi-code/en/customization/hooks).
+
+Native events remain the preferred supervisor trigger. For agents without
+hooks, the watcher samples only the bottom `fallback_capture_lines` (default
+20), normalizes carriage returns/trailing whitespace, and computes an
+order-preserving longest-common-subsequence projection across adjacent
+samples. Dynamic elapsed counters, spinners, and footers disappear from the
+projection without prompt-text regexes. A model call occurs only after the
+stable projection reaches `stable_screen_threshold`, and equal or
+containment-only evidence is deduplicated until meaningful stable evidence
+changes. Native events continue to receive the larger `capture_lines` context
+(default 120).
+
+The watcher also has a strict child-ownership contract:
+
+- idle, retry, and verification waits use one in-process FIFO/deadline loop;
+- no production `sleep` or `tmux wait-for` child exists;
+- at most one active model process group is owned by a run;
+- stop completion requires `final.json`, a dead watcher PID, and removal of the
+  matching generation pointer;
+- forced stop terminates both the watcher tree and the recorded brain process
+  group before acknowledging.
+
+This contract prevents deleted sockets/run directories from leaving orphaned
+poll loops and makes terminal UI state correspond to actual process state.

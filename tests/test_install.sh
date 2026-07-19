@@ -136,9 +136,27 @@ awk '
   { print }
 ' "$KIMI_CONFIG" > "$T/kimi-status-broken.toml"
 mv "$T/kimi-status-broken.toml" "$KIMI_CONFIG"
-STATUS_BROKEN="$(bash "$IH" status 2>&1)"
+STATUS_BROKEN_RC=0
+STATUS_BROKEN="$(bash "$IH" status 2>&1)" || STATUS_BROKEN_RC=$?
 chk "status rejects a Kimi event whose managed command contract drifted" \
-  "printf '%s' \"\$STATUS_BROKEN\" | grep -q 'Kimi hooks installed: 6/7'"
+  "[ '$STATUS_BROKEN_RC' -ne 0 ] && printf '%s' \"\$STATUS_BROKEN\" | grep -q 'Kimi hooks: managed block drifted'"
+bash "$IH" install >/dev/null 2>&1
+
+awk '
+  /^# >>> tmux-radar kimi hooks >>>$/ { inside=1 }
+  inside && !changed && /^timeout = 5$/ {
+    print
+    print "unsupported = true"
+    changed=1
+    next
+  }
+  { print }
+' "$KIMI_CONFIG" > "$T/kimi-status-extra.toml"
+mv "$T/kimi-status-extra.toml" "$KIMI_CONFIG"
+STATUS_EXTRA_RC=0
+STATUS_EXTRA="$(bash "$IH" status 2>&1)" || STATUS_EXTRA_RC=$?
+chk "status rejects unsupported fields inside the exact Kimi managed block" \
+  "[ '$STATUS_EXTRA_RC' -ne 0 ] && printf '%s' \"\$STATUS_EXTRA\" | grep -q 'Kimi hooks: managed block drifted'"
 bash "$IH" install >/dev/null 2>&1
 
 echo
@@ -184,6 +202,31 @@ chk "claude settings is still a symlink after uninstall" "[ -L '$CLAUDE_SETTINGS
 chk "codex config is still a symlink after uninstall" "[ -L '$CODEX_CONFIG' ]"
 chk "codex hooks is still a symlink after uninstall" "[ -L '$CODEX_HOOKS_JSON' ]"
 chk "kimi config is still a symlink after uninstall" "[ -L '$KIMI_CONFIG' ]"
+
+echo
+echo "### Kimi config path and byte-preserving ownership"
+unset KIMI_CONFIG
+export HOME="$T/kimi-path-home"
+export KIMI_CODE_HOME="$T/kimi-active-home"
+mkdir -p "$HOME/.kimi-code" "$KIMI_CODE_HOME"
+printf 'model = "inactive"\n' > "$HOME/.kimi-code/config.toml"
+printf 'model = "active-without-newline"' > "$KIMI_CODE_HOME/config.toml"
+cp "$HOME/.kimi-code/config.toml" "$T/kimi.inactive.before"
+cp "$KIMI_CODE_HOME/config.toml" "$T/kimi.active.before"
+bash "$IH" install >/dev/null 2>&1
+chk "KIMI_CODE_HOME selects the active Kimi config" \
+  "grep -qF '# >>> tmux-radar kimi hooks >>>' '$KIMI_CODE_HOME/config.toml'"
+chk "default HOME Kimi config is untouched when KIMI_CODE_HOME is set" \
+  "cmp -s '$HOME/.kimi-code/config.toml' '$T/kimi.inactive.before'"
+PATH_STATUS="$(bash "$IH" status 2>&1)"
+chk "status inspects the KIMI_CODE_HOME config" \
+  "printf '%s' \"\$PATH_STATUS\" | grep -q 'Kimi hooks installed: 7/7'"
+bash "$IH" uninstall >/dev/null 2>&1
+chk "Kimi uninstall restores a no-final-newline config byte-for-byte" \
+  "cmp -s '$KIMI_CODE_HOME/config.toml' '$T/kimi.active.before'"
+unset KIMI_CODE_HOME
+export HOME="$T/home"
+export KIMI_CONFIG="$T/home/.kimi-code/config.toml"
 
 echo
 echo "### malformed Kimi ownership markers fail without changing the file"

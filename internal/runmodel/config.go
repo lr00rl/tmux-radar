@@ -72,14 +72,15 @@ func EncodeConfig(config Config) ([]byte, error) {
 // run artifacts. Missing schema_version means v0; unknown fields are ignored.
 func DecodeConfig(payload []byte) (Config, error) {
 	var probe struct {
-		SchemaVersion *int              `json:"schema_version"`
-		Pane          string            `json:"pane"`
-		Goal          string            `json:"goal"`
-		Policy        string            `json:"policy"`
-		Autonomy      string            `json:"autonomy"`
-		Poll          *float64          `json:"poll"`
-		MaxCalls      *int              `json:"max_calls"`
-		Provenance    map[string]string `json:"provenance"`
+		SchemaVersion *int                       `json:"schema_version"`
+		Pane          string                     `json:"pane"`
+		Goal          string                     `json:"goal"`
+		Policy        string                     `json:"policy"`
+		Autonomy      string                     `json:"autonomy"`
+		Poll          *float64                   `json:"poll"`
+		MaxCalls      *int                       `json:"max_calls"`
+		Provenance    map[string]string          `json:"provenance"`
+		Values        map[string]json.RawMessage `json:"values"`
 	}
 	if err := json.Unmarshal(payload, &probe); err != nil {
 		return Config{}, fmt.Errorf("config JSON: %w", err)
@@ -96,6 +97,12 @@ func DecodeConfig(payload []byte) (Config, error) {
 		var config Config
 		if err := json.Unmarshal(payload, &config); err != nil {
 			return Config{}, fmt.Errorf("config JSON: %w", err)
+		}
+		// Durable schema-v1 artifacts predate some additive reader fields.
+		// Backfill only fields whose absence has a defined compatibility
+		// default; all other missing canonical values still fail validation.
+		if _, present := probe.Values["fallback_capture_lines"]; !present {
+			config.Values.FallbackCaptureLines = DefaultConfig(probe.Pane, probe.Goal).Values.FallbackCaptureLines
 		}
 		if err := config.Validate(); err != nil {
 			return Config{}, fmt.Errorf("config schema v%d: %w", version, err)

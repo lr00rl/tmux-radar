@@ -75,10 +75,12 @@ _legacy_lock_migrate() {
   holder="${owner%% *}"
   [ -n "$holder" ] || return 1
   [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null && return 1
-  # The owner is absent/dead. Atomic rename means concurrent migrators cannot
-  # delete a replacement lock published after this legacy directory.
+  # The owner is absent/dead. The trailing slash makes rename require the
+  # source to still be this directory. Without it, a concurrent migrator can
+  # replace the directory with a live shlock file between our read and mv, and
+  # this stale reaper would move that new lock away (an ABA race).
   stale="${LOCK}.legacy.$$.$RANDOM"
-  if mv "$LOCK" "$stale" 2>/dev/null; then
+  if mv "$LOCK/" "$stale" 2>/dev/null; then
     rm -rf "$stale" 2>/dev/null || true
   fi
   [ ! -d "$LOCK" ]
@@ -115,6 +117,13 @@ lock() {
   fi
   return 1
 }
+
+lock_or_error() {
+  lock && return 0
+  echo "tmux-radar: state lock unavailable: $LOCK" >&2
+  return 1
+}
+
 unlock() {
   [ "${LOCK_OWNED:-0}" = 1 ] || return 0
   case "$LOCK_KIND" in
@@ -159,8 +168,11 @@ _watch_event() {  # _watch_event <pane> <kind> <source> <label>
   run_dir="$(_watch_field "$wf" run_dir)"
   run_id="$(_watch_field "$wf" run_id)"
   [ -d "$run_dir" ] && [ -n "$run_id" ] || return 0
-  TMUX_RADAR_EXPECT_RUN_ID="$run_id" \
-    "$SCRIPT_DIR/ai.sh" emit-event "$pane" "$kind" "$source" "$(_san "$label")" >/dev/null 2>&1 || true
+  if ! TMUX_RADAR_EXPECT_RUN_ID="$run_id" \
+    "$SCRIPT_DIR/ai.sh" emit-event "$pane" "$kind" "$source" "$(_san "$label")" >/dev/null; then
+    echo "tmux-radar: failed to enqueue $kind for $pane (run $run_id)" >&2
+    return 1
+  fi
 }
 
 # One tmux round-trip: "<pane_id> <on_screen 0|1>" per live pane, records
@@ -282,15 +294,19 @@ _reg_upsert_locked() {  # caller holds lock
     [ -z "$proc" ] && proc="$(printf '%s' "$old" | cut -f9)"
   fi
   [ -n "$proc" ] || proc="$kind"
-  tmp="$(mktemp "${REG_FILE}.XXXXXX")" || return 0
-  { [ -r "$REG_FILE" ] && awk -F '\t' -v k="$key" 'NF >= 9 && $2 != k' "$REG_FILE"; :; } > "$tmp" 2>/dev/null
+  tmp="$(mktemp "${REG_FILE}.XXXXXX")" || return 1
+  if ! { [ -r "$REG_FILE" ] && awk -F '\t' -v k="$key" 'NF >= 9 && $2 != k' "$REG_FILE"; :; } > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$kind" "$(_san "$key")" "$pid" "$pane" "$started" "$now" "$state" "$(_san "$cwd")" "$(_san "$proc")" >> "$tmp"
-  mv "$tmp" "$REG_FILE"
+    "$kind" "$(_san "$key")" "$pid" "$pane" "$started" "$now" "$state" "$(_san "$cwd")" "$(_san "$proc")" >> "$tmp" ||
+    { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$REG_FILE" || { rm -f "$tmp"; return 1; }
 }
 
 _reg_upsert() {  # _reg_upsert <kind> <key> <pid> <pane> <state> <cwd> <proc>
-  lock || return 0
+  lock_or_error || return 1
   _reg_upsert_locked "$@"
   unlock
 }
@@ -298,13 +314,13 @@ _reg_upsert() {  # _reg_upsert <kind> <key> <pid> <pane> <state> <cwd> <proc>
 _reg_remove_locked() {  # caller holds lock
   local key="${1:-}" tmp
   [ -n "$key" ] && [ -r "$REG_FILE" ] || return 0
-  tmp="$(mktemp "${REG_FILE}.XXXXXX")" || return 0
+  tmp="$(mktemp "${REG_FILE}.XXXXXX")" || return 1
   awk -F '\t' -v k="$key" 'NF >= 9 && $2 != k' "$REG_FILE" > "$tmp" 2>/dev/null || true
-  mv "$tmp" "$REG_FILE"
+  mv "$tmp" "$REG_FILE" || { rm -f "$tmp"; return 1; }
 }
 
 _reg_remove() {  # _reg_remove <key>
-  lock || return 0
+  lock_or_error || return 1
   _reg_remove_locked "$1"
   unlock
 }
@@ -313,7 +329,7 @@ _reg_remove() {  # _reg_remove <key>
 # an action/notice mark for a session that can no longer take input is a lie.
 _drop_session_marks() {  # _drop_session_marks <key>
   [ -n "${1:-}" ] || return 0
-  lock || return 0
+  lock_or_error || return 1
   _drop_rows '$4 == k && tolower($5) !~ donere' -v k="$1" -v donere="$DONE_RE"
   unlock
 }
@@ -370,8 +386,9 @@ _resolve_pane_by_cwd() {  # _resolve_pane_by_cwd <cwd>
 # Also normalizes legacy 4-field rows and drops dead-pane / expired-bg rows.
 _rewrite() {  # _rewrite <awk-filter-body> [extra awk -v args...]
   local body="$1"; shift || true
-  local tmp; tmp="$(mktemp "${STATE_FILE}.XXXXXX")"
-  { [ -r "$STATE_FILE" ] && cat "$STATE_FILE"; :; } |
+  local tmp
+  tmp="$(mktemp "${STATE_FILE}.XXXXXX")" || return 1
+  if ! { [ -r "$STATE_FILE" ] && cat "$STATE_FILE"; :; } |
     awk -F '\t' -v OFS='\t' -v now="$(date +%s)" -v bgttl="$BG_TTL" -v panes="$(_pane_map)" "$@" '
       BEGIN {
         n = split(panes, pl, "\001")
@@ -388,8 +405,11 @@ _rewrite() {  # _rewrite <awk-filter-body> [extra awk -v args...]
         '"$body"'
         print pane, epoch, src, key, label, title
       }
-    ' > "$tmp" || true
-  mv "$tmp" "$STATE_FILE"
+    ' > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$STATE_FILE" || { rm -f "$tmp"; return 1; }
 }
 
 _restore_title() {  # _restore_title <pane> <saved_title>
@@ -512,7 +532,7 @@ cmd_mark() {  # cmd_mark <pane|-> <source> <label> [key]
     [ -n "$key" ] || exit 0
   fi
 
-  lock || return 0
+  lock_or_error || return 1
   # replace any previous mark with the same key or same pane (a pane waits for
   # at most one thing); keep the earliest saved title across re-marks
   local prev_title=""
@@ -525,11 +545,11 @@ cmd_mark() {  # cmd_mark <pane|-> <source> <label> [key]
   _sync_bar
 }
 
-cmd_clear_key()  { [ -n "${1:-}" ] || exit 0; lock || return 0; _drop_rows '$4 == k' -v k="$1"; unlock; _sync_bar; }
+cmd_clear_key()  { [ -n "${1:-}" ] || exit 0; lock_or_error || return 1; _drop_rows '$4 == k' -v k="$1"; unlock; _sync_bar; }
 cmd_clear_pane() {
   local pane="${1:-${TMUX_PANE:-}}"
   [ -n "$pane" ] || exit 0
-  lock || return 0
+  lock_or_error || return 1
   _drop_rows '$1 == p' -v p="$pane"
   unlock
   _sync_bar
@@ -542,13 +562,13 @@ cmd_clear_window() {  # clear marks for every pane inside a window target
   local panes
   panes="$(tmux list-panes -t "$target" -F '#{pane_id}' 2>/dev/null | tr '\n' '\034')"
   [ -n "$panes" ] || { _sync_bar; return 0; }
-  lock || return 0
+  lock_or_error || return 1
   _drop_rows 'index(ps, "\034" $1 "\034") > 0' -v ps=$'\034'"$panes"
   unlock
   _sync_bar
 }
 
-cmd_clear_all() { lock || return 0; _drop_rows '1'; unlock; _sync_bar; }
+cmd_clear_all() { lock_or_error || return 1; _drop_rows '1'; unlock; _sync_bar; }
 
 # tick = prune + liveness GC + bar resync. Liveness, in order of authority:
 #   1. registry rows: pid alive AND argv still matching the recorded proc
@@ -592,7 +612,7 @@ cmd_tick() {
       }')"
     dead_specs="$(printf '%s\n' "$verdicts" | awk -F '\t' '$1 == "D" { print }')"
     if [ -n "$dead_specs" ]; then
-      lock || return 0
+      lock_or_error || return 1
       # Revalidate the exact row identity under the lock. A SessionStart may
       # have replaced the same key after the snapshot; key-only deletion would
       # erase that newer live session and its mark.
@@ -621,7 +641,7 @@ cmd_tick() {
     fi
   fi
   agents="$(_agent_panes "$snapshot" || true)"
-  lock || return 0
+  lock_or_error || return 1
   [ -r "$REG_FILE" ] &&
     registry_keys="$(awk -F '\t' 'NF >= 9 { printf "%s\001", $2 }' "$REG_FILE" 2>/dev/null || true)"
   if [ -n "$agents" ] || [ -n "$registry_keys" ] || [ -n "$reg_ok" ]; then
@@ -977,7 +997,7 @@ _opencode_event() {  # _opencode_event <one JSON object>
   else return 0; fi
   where=""; [ -n "$cwd" ] && where="$(basename "$cwd")"
 
-  lock || return 0
+  lock_or_error || return 1
   if ! _opencode_accept_locked "$key" "$generation" "$generation_started" "$sequence"; then
     unlock
     return 0
@@ -1059,8 +1079,12 @@ _agent_json_object() {  # read exactly one JSON object from stdin
     return 2
   }
   raw="$(cat 2>/dev/null || true)"
-  printf '%s' "$raw" | jq -ce '
-    if type == "object" then . else error("expected one JSON object") end
+  printf '%s' "$raw" | jq -cse '
+    if length == 1 and (.[0] | type == "object") then
+      .[0]
+    else
+      error("expected exactly one JSON object")
+    end
   ' 2>/dev/null || {
     echo "agent event: expected one JSON object" >&2
     return 2
@@ -1109,7 +1133,7 @@ _agent_display_name() {
 
 _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
   local kind="$1" event="$2" json="$3" sid key pane pid cwd proc detail
-  local agent display label="" watch_kind="" state=working
+  local agent display label="" watch_kind="" state=working event_rc=0
   _agent_kind_valid "$kind" || {
     echo "agent-event: invalid agent kind" >&2
     return 2
@@ -1144,7 +1168,7 @@ _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
   detail="$(_json_field label "$json")"
   display="$(_agent_display_name "$kind")"
 
-  lock || return 0
+  lock_or_error || return 1
   case "$event" in
     session_start)
       _reg_upsert_locked "$kind" "$key" "$pid" "$pane" working "$cwd" "$proc"
@@ -1188,10 +1212,12 @@ _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
   esac
   unlock
 
-  [ -n "$watch_kind" ] && [ "$pane" != "-" ] &&
-    _watch_event "$pane" "$watch_kind" "$kind" "$label"
-  _refresh_titles
-  _sync_bar
+  if [ -n "$watch_kind" ] && [ "$pane" != "-" ]; then
+    _watch_event "$pane" "$watch_kind" "$kind" "$label" || event_rc=$?
+  fi
+  _refresh_titles || true
+  _sync_bar || true
+  return "$event_rc"
 }
 
 cmd_agent_event() {  # agent-event <agent-kind> <normalized-event>

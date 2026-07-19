@@ -18,7 +18,8 @@ CODEX_WRAP="${TMUX_RADAR_CODEX_WRAP:-${TMUX_SWITCHER_CODEX_WRAP:-$SCRIPT_DIR/cod
 CLAUDE_SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 CODEX_CONFIG="${CODEX_CONFIG:-$HOME/.codex/config.toml}"
 CODEX_HOOKS_JSON="${CODEX_HOOKS_JSON:-$HOME/.codex/hooks.json}"
-KIMI_CONFIG="${KIMI_CONFIG:-$HOME/.kimi-code/config.toml}"
+KIMI_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
+KIMI_CONFIG="${KIMI_CONFIG:-$KIMI_HOME/config.toml}"
 OPENCODE_DIR="${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}"
 OPENCODE_PLUGIN="$OPENCODE_DIR/plugins/tmux-radar.js"
 
@@ -514,23 +515,24 @@ kimi_validate_markers() {
 
 kimi_strip_block() {
   local path="$1"
-  awk -v begin="$KIMI_HOOK_BEGIN" -v end="$KIMI_HOOK_END" '
-    $0 == begin {
-      if (outside_pending && pending != "") print pending
-      pending=""
-      outside_pending=0
-      inside=1
-      next
-    }
-    $0 == end { inside=0; next }
-    !inside {
-      if (outside_pending) print pending
-      pending=$0
-      outside_pending=1
-    }
-    END {
-      if (outside_pending) print pending
-    }
+  jq -Rrsj --arg begin "$KIMI_HOOK_BEGIN" --arg end "$KIMI_HOOK_END" '
+    . as $source
+    | ($source | index($begin)) as $begin_at
+    | if $begin_at == null then
+        $source
+      else
+        ($source[$begin_at:] | index($end)) as $relative_end
+        | if $relative_end == null then
+            error("managed end marker missing")
+          else
+            ($begin_at + $relative_end + ($end | length)) as $after
+            | (if $begin_at > 0 and $source[$begin_at - 1:$begin_at] == "\n"
+               then $begin_at - 1
+               else $begin_at
+               end) as $from
+            | $source[0:$from] + $source[$after:]
+          end
+      end
   ' "$path"
 }
 
@@ -545,7 +547,7 @@ kimi_build_block() {
     printf 'command = %s\n' "$encoded"
     printf 'timeout = %s\n\n' "$KIMI_HOOK_TIMEOUT"
   done
-  printf '%s\n' "$KIMI_HOOK_END"
+  printf '%s' "$KIMI_HOOK_END"
 }
 
 kimi_install() {
@@ -600,7 +602,7 @@ kimi_uninstall() {
 }
 
 kimi_status() {
-  local event count=0 block="" command encoded stanza
+  local event expected actual
   if ! kimi_present; then
     echo "Kimi: not installed (skipped)"
     return 0
@@ -615,26 +617,22 @@ kimi_status() {
     END { exit !(begins <= 1 && ends <= 1 && begins == ends && !inside) }
   ' "$KIMI_CONFIG"; then
     echo "Kimi hooks: invalid managed markers ($KIMI_CONFIG)"
-    return 0
+    return 1
   fi
-  block="$(awk -v begin="$KIMI_HOOK_BEGIN" -v end="$KIMI_HOOK_END" '
-    $0 == begin { inside=1; next }
-    $0 == end { inside=0; next }
+  expected="$(kimi_build_block)"
+  actual="$(awk -v begin="$KIMI_HOOK_BEGIN" -v end="$KIMI_HOOK_END" '
+    $0 == begin { inside=1 }
     inside { print }
+    $0 == end { inside=0 }
   ' "$KIMI_CONFIG")"
-  command="$(shell_single_quote "$NOTIFY") kimi-hook"
-  encoded="$(toml_basic_string "$command")"
+  if [ "$actual" != "$expected" ]; then
+    echo "Kimi hooks: managed block drifted ($KIMI_CONFIG)"
+    return 1
+  fi
   for event in "${KIMI_EVENTS[@]}"; do
-    stanza="$(printf '[[hooks]]\nevent = "%s"\ncommand = %s\ntimeout = %s' \
-      "$event" "$encoded" "$KIMI_HOOK_TIMEOUT")"
-    if [[ "$block" == *"$stanza"* ]]; then
-      echo "Kimi native $event: installed"
-      count=$((count + 1))
-    else
-      echo "Kimi native $event: not installed"
-    fi
+    echo "Kimi native $event: installed"
   done
-  echo "Kimi hooks installed: $count/7"
+  echo "Kimi hooks installed: ${#KIMI_EVENTS[@]}/${#KIMI_EVENTS[@]}"
 }
 
 opencode_present() {
@@ -700,10 +698,12 @@ case "${1:-install}" in
     transaction_commit
     ;;
   status)
-    claude_status
-    codex_status
-    kimi_status
-    opencode_status
+    status_rc=0
+    claude_status || status_rc=1
+    codex_status || status_rc=1
+    kimi_status || status_rc=1
+    opencode_status || status_rc=1
+    exit "$status_rc"
     ;;
   *) die "usage: install-hooks.sh [install|uninstall|status]" ;;
 esac

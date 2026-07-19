@@ -76,6 +76,35 @@ func TestConfigV1RoundTripPreservesExactCJKBytes(t *testing.T) {
 	}
 }
 
+func TestDecodeConfigDefaultsNewAdditiveFieldInExistingSchemaV1Artifact(t *testing.T) {
+	t.Parallel()
+
+	config := DefaultConfig("%9", "existing run")
+	payload, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var artifact map[string]any
+	if err := json.Unmarshal(payload, &artifact); err != nil {
+		t.Fatal(err)
+	}
+	values := artifact["values"].(map[string]any)
+	delete(values, "fallback_capture_lines")
+	payload, err = json.Marshal(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	decoded, err := DecodeConfig(payload)
+	if err != nil {
+		t.Fatalf("DecodeConfig(existing schema-v1 artifact): %v", err)
+	}
+	if decoded.Values.FallbackCaptureLines != (Value[int]{Value: 20, Source: SourceDefault}) {
+		t.Fatalf("fallback capture lines = %#v, want additive default", decoded.Values.FallbackCaptureLines)
+	}
+}
+
 func TestDecodeConfigReadsLegacyV0AndIgnoresAdditiveFields(t *testing.T) {
 	t.Parallel()
 

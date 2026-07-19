@@ -99,10 +99,12 @@ chk "stale lock dir is gone" "[ ! -d '$LOCK' ]"
 # live holder: a real running pid owns the lock -> we must give up WITHOUT deleting it
 sleep 30 & HOLDER=$!
 mkdir -p "$LOCK"; printf '%s' "$HOLDER" > "$LOCK/pid"
-"$N" mark - tool "must not race" k:lock-race >/dev/null 2>&1
+LOCKED_MARK_RC=0
+"$N" mark - tool "must not race" k:lock-race >/dev/null 2>&1 || LOCKED_MARK_RC=$?
 "$N" tick >/dev/null 2>&1
 chk "live holder's lock NOT rmdir'd by a give-up path" "[ -d '$LOCK' ] && [ \"\$(cat '$LOCK/pid')\" = '$HOLDER' ]"
 chk "lock timeout never falls through to an unlocked write" "! grep -q 'k:lock-race' '$MARKS' 2>/dev/null"
+chk "state mutation reports lock exhaustion instead of false success" "[ '$LOCKED_MARK_RC' -eq 1 ]"
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; rm -rf "$LOCK"
 # A legacy holder may be between mkdir and owner publication. Absence of an
 # owner is not proof of death, so the new implementation must fail closed.
@@ -187,6 +189,7 @@ echo "### #11 HIGH: generic agent events fail closed before state mutation"
 rm -f "$REG" "$MARKS"
 assert_agent_event_rejected() {
   local name="$1" kind="$2" event="$3" payload="$4" rc
+  rm -f "$REG" "$MARKS"
   rc=0
   printf '%s' "$payload" | "$N" agent-event "$kind" "$event" >/dev/null 2>"$T/agent-event.err"
   rc=$?
@@ -196,6 +199,15 @@ assert_agent_event_rejected() {
 }
 
 assert_agent_event_rejected "malformed JSON" demo approval '{'
+assert_agent_event_rejected "two newline-delimited JSON objects" demo approval \
+  '{"session_id":"first","pane":"%1","pid":1,"process":"demo"}
+{"session_id":"second","pane":"%1","pid":1,"process":"demo"}'
+assert_agent_event_rejected "two concatenated JSON objects" demo approval \
+  '{"session_id":"first","pane":"%1","pid":1,"process":"demo"}{"session_id":"second","pane":"%1","pid":1,"process":"demo"}'
+assert_agent_event_rejected "JSON object followed by junk" demo approval \
+  '{"session_id":"first","pane":"%1","pid":1,"process":"demo"} trailing'
+assert_agent_event_rejected "JSON array" demo approval '[]'
+assert_agent_event_rejected "JSON scalar" demo approval '"one"'
 assert_agent_event_rejected "missing session id" demo approval \
   '{"pane":"%1","pid":1,"process":"demo"}'
 assert_agent_event_rejected "unknown normalized event" demo mystery \
@@ -206,6 +218,20 @@ assert_agent_event_rejected "invalid pid" demo approval \
   '{"session_id":"bad-pid","pane":"%1","pid":"abc","process":"demo"}'
 assert_agent_event_rejected "invalid agent kind" '../demo' approval \
   '{"session_id":"bad-kind","pane":"%1","pid":1,"process":"demo"}'
+
+sleep 30 & AGENT_LOCK_HOLDER=$!
+mkdir -p "$LOCK"; printf '%s' "$AGENT_LOCK_HOLDER" > "$LOCK/pid"
+AGENT_LOCK_RC=0
+printf '%s' '{"session_id":"locked","pane":"%1","pid":1,"process":"demo"}' |
+  "$N" agent-event demo approval >/dev/null 2>"$T/agent-event-lock.err" ||
+  AGENT_LOCK_RC=$?
+chk "generic event reports lock exhaustion as an operational error" \
+  "[ '$AGENT_LOCK_RC' -eq 1 ]"
+chk "generic event lock failure leaves registry and marks untouched" \
+  "[ ! -s '$REG' ] && [ ! -s '$MARKS' ]"
+kill "$AGENT_LOCK_HOLDER" 2>/dev/null
+wait "$AGENT_LOCK_HOLDER" 2>/dev/null
+rm -rf "$LOCK"
 
 KIMI_UNKNOWN_RC=0
 printf '%s' '{"hook_event_name":"Unknown","session_id":"kimi-unknown","cwd":"/tmp"}' |

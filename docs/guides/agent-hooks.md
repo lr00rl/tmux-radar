@@ -8,16 +8,18 @@ hook can still use the semantic idle fallback described in
 
 ## Install Kimi Code hooks
 
-Kimi Code reads repeated `[[hooks]]` tables from
-`~/.kimi-code/config.toml`. The installer manages exactly one marker-delimited
-block at that path:
+Kimi Code reads repeated `[[hooks]]` tables from its active `config.toml`.
+The installer follows the same path rule: `$KIMI_CODE_HOME/config.toml` when
+`KIMI_CODE_HOME` is set, otherwise `~/.kimi-code/config.toml`. It manages
+exactly one marker-delimited block at that path:
 
 ```sh
 scripts/install-hooks.sh install
 scripts/install-hooks.sh status
 ```
 
-The installer skips Kimi when neither `kimi` nor `~/.kimi-code` is present.
+The installer skips Kimi when neither `kimi` nor the active Kimi config
+directory is present.
 If Kimi is present, it creates a missing `config.toml`, preserves every byte
 outside tmux-radar’s block (including comments and user hooks), writes through
 a symlink target, and backs up a changed existing file. A reinstall replaces
@@ -49,16 +51,18 @@ tmux-radar run journal when a hook fails.
 
 ### Reload and status
 
-Hooks are loaded for a new Kimi session. Restart the affected session after
-installation, then check the current installation:
+After installation, run `/reload` inside an existing Kimi TUI or start a new
+session, then check the current installation:
 
 ```sh
 scripts/install-hooks.sh status
 ```
 
 Healthy output lists all seven Kimi events as installed and ends with
-`Kimi hooks installed: 7/7`. A partial count means only the reported events
-are installed; reinstall after resolving any marker/configuration error.
+`Kimi hooks installed: 7/7`. Status compares the complete owned block, not
+substrings. Any missing, reordered, duplicated, changed, or unsupported field
+reports `managed block drifted` and returns nonzero; reinstall after resolving
+the marker/configuration error.
 
 ### Uninstall
 

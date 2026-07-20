@@ -276,7 +276,7 @@ Expected: the dynamic approval case never calls the model under raw checksum com
 
 - [ ] **Step 1: Implement bounded capture normalization and stable projection**
 
-Capture the configured bottom lines, normalize only CR/trailing whitespace, compute an order-preserving unchanged-line projection, require a non-empty minimum evidence set, and hash it.
+Capture the configured bottom lines, normalize only CR/trailing whitespace, compute an order-preserving unchanged-line projection, require a non-empty minimum evidence set, and fingerprint it for cost deduplication. Persist one immutable normalized capture per fallback decision, feed those same bytes to the model, and use a direct byte comparison rather than a digest for delivery authority.
 
 - [ ] **Step 2: Add projection threshold and dedupe state**
 
@@ -448,9 +448,13 @@ Fast-forward `/Users/cdcd/roobli/RTFS_justTaste/tmux-radar` and `/Users/cdcd/.tm
 
 - [ ] **Step 6: Install and verify live Kimi hooks**
 
-Run the installed hook installer, verify `~/.kimi-code/config.toml` preserves user content and reports seven of seven Kimi hooks, inject isolated Kimi fixture events, and run a real tmux no-hook fallback smoke test. Existing Kimi sessions may require `/reload` or restart before emitting newly installed hooks; report this explicitly.
+Run the installed hook installer, verify the active Kimi config
+(`$KIMI_CODE_HOME/config.toml` or `~/.kimi-code/config.toml`) preserves user
+content and reports seven of seven Kimi hooks, inject isolated Kimi fixture
+events, and run a real tmux no-hook fallback smoke test. Existing Kimi sessions
+may require `/reload` or restart before emitting newly installed hooks; report
+this explicitly.
 
 - [ ] **Step 7: Publish v0.1.2**
 
 Push main, create annotated tag `v0.1.2` with release intent and verification evidence, push the tag, and verify local source, installed copy, origin main, and tag all identify the same commit.
-

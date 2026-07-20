@@ -30,7 +30,7 @@ This release must prove the original failure shape, not merely add another norma
 
 ### Native Kimi Events
 
-Kimi Code 0.26.0 reads repeated `[[hooks]]` tables from `~/.kimi-code/config.toml`. Each radar-owned table contains only the supported keys `event`, `command`, and `timeout`. Hook JSON arrives on stdin and contains at least `hook_event_name`, `session_id`, and `cwd`.
+Kimi Code 0.26.0 reads repeated `[[hooks]]` tables from its active config (`$KIMI_CODE_HOME/config.toml` when set, otherwise `~/.kimi-code/config.toml`). Each radar-owned table contains only the supported keys `event`, `command`, and `timeout`. Hook JSON arrives on stdin and contains at least `hook_event_name`, `session_id`, and `cwd`.
 
 tmux-radar maps Kimi events as follows:
 
@@ -132,6 +132,15 @@ At each idle deadline:
 6. Otherwise enqueue one `screen_idle` event and send only the current bottom fallback capture to the model.
 7. Record the projection hash, source samples, stable-line count, and dedupe result in the timeline. Persist raw samples only when full logging or screen snapshots are enabled.
 
+The stable projection controls triggering and deduplication only. It is not
+delivery authority. The watcher persists one immutable normalized capture and
+uses those same bytes to build the model prompt. The final guard compares a
+fresh normalized capture directly with that file and cancels delivery if any
+byte changed. This intentionally prefers a false-negative automatic action on
+a moving timer/spinner over sending keys to a changed menu. The authority path
+exists only inside the watcher process, is removed after assessment/delivery,
+and is garbage-collected immediately when cleanup finds that watcher dead.
+
 After a model decision, delivery, verification, native event, user takeover, or meaningful projection change, the fallback establishes a new baseline. The configured `poll` interval starts after the preceding operation reaches its terminal phase, never while a model call or verification is still running.
 
 The fallback may occasionally ask the model about a stable non-prompt screen. The model can return `wait`; projection deduplication then prevents repeated spending on the same state. This is preferred to brittle prompt regexes and to unconditional periodic model calls.
@@ -161,6 +170,9 @@ Terminal invariants:
 - A stop acknowledgement is successful only after the watcher is gone and no process recorded by the run remains alive.
 - A forced stop must scan and terminate all run-owned recorded PIDs before writing terminal evidence.
 - No code path may report terminal success while an owned waiter, timer, watcher, or backend remains.
+- A normally exiting model leader is reaped, then its process group is checked
+  for surviving helpers; the result and marker are released only after that
+  group is proven empty.
 - Repeated stop requests return the persisted acknowledgement and do not create a new process.
 
 ## Configuration Surface
@@ -221,4 +233,3 @@ Required release evidence:
 - A persistent daemon: unnecessary operational surface for local hook delivery.
 - Keeping background `tmux wait-for` and adding more kill calls: does not eliminate the orphan race demonstrated by the live run.
 - Moving the watcher into Go in this patch: too broad for a lifecycle integration release and reopens already-tested delivery semantics.
-

@@ -51,7 +51,7 @@ Values in parentheses are validated ranges or allowed values.
 | `@radar-ai-approval-policy` | `safe-auto` | Watch policy: `safe-auto`, `manual`, or `always-allow`. It constrains approval handling. |
 | `@radar-ai-watch-always-allow` | `off` | `on` prefers a visible “always allow” choice for safe actions. It lowers interruption frequency and increases authority. |
 | `@radar-ai-hooks-first` | `on` | Uses native approval/input/completion hooks immediately. See [Hooks first](#hooks-first-and-semantic-fallback). |
-| `@radar-ai-poll` | `5` | Idle interval in seconds (`0.05`–`3600`). Shorter intervals reduce fallback latency but sample panes more often. The next interval starts only after the preceding operation finishes. |
+| `@radar-ai-poll` | `5` | Idle interval in whole seconds (`1`–`3600`). Shorter intervals reduce fallback latency but sample panes more often. The next interval starts only after the preceding operation finishes. The one-second floor preserves a childless wait on macOS Bash 3.2. |
 | `@radar-ai-stable-screen-threshold` | `1` | Required repeated nonempty stable projections (`1`–`20`) before fallback assessment. Higher values reduce incidental assessments and add latency. |
 | `@radar-ai-max-calls` | `40` | Maximum model decisions per watch (`1`–`10000`). Reaching it pauses the watch rather than spending indefinitely. |
 | `@radar-ai-timeout` | `120` | Per-model-call hard limit in seconds (`5`–`3600`). Timeout terminates the owned model process group. |
@@ -106,9 +106,13 @@ they are deliberately deferred. The watcher waits for semantic fallback:
 2. It normalizes only carriage returns and trailing whitespace, then computes
    an order-preserving projection of lines unchanged between samples.
 3. A nonempty projection must recur `stable_screen_threshold` times.
-4. A projection already assessed is deduplicated. A materially new projection
-   creates one `screen_idle` event, and the model receives only the current
-   fallback capture.
+4. Only an exactly equal projection hash is deduplicated. Adding, removing, or
+   replacing any stable line creates one new `screen_idle` event, and the model
+   receives only the current fallback capture.
+5. The model reads one immutable normalized fallback capture. Before sending
+   keys, a fresh capture must compare byte-for-byte equal to that same file.
+   The stable projection controls triggering and cost only; it never authorizes
+   delivery to a changed screen.
 
 This troubleshooting mode can miss the immediacy and semantic precision of a
 hook. It has at least one poll interval of latency, can assess a stable
@@ -116,6 +120,10 @@ non-prompt screen, and may consume a model call before returning `wait`.
 Projection deduplication prevents repeated spending on unchanged evidence.
 Use it to diagnose a hook integration or for agents without hooks; do not use
 it as a lower-latency replacement for native lifecycle events.
+
+This exact delivery guard is intentionally conservative. A changing timer or
+spinner can cancel an automatic fallback action even when the prompt is still
+visible. Install a native hook when reliable automatic action matters.
 
 `capture_lines` and `fallback_capture_lines` are intentionally separate:
 native-event decisions use `capture_lines` (120 by default), while fallback

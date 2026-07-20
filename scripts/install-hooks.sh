@@ -6,7 +6,8 @@
 #   ~/.claude/settings.json   (Claude hooks)
 #   ~/.codex/config.toml      (Codex trust marker + legacy notify fallback)
 #   ~/.codex/hooks.json       (Codex native hooks)
-#   ~/.kimi-code/config.toml  (Kimi native lifecycle hooks)
+#   $KIMI_CODE_HOME/config.toml, or ~/.kimi-code/config.toml
+#                              (Kimi native lifecycle hooks)
 #   ~/.config/opencode/plugins/tmux-radar.js (OpenCode lifecycle plugin)
 #
 # Usage: install-hooks.sh [install|uninstall|status]

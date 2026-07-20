@@ -156,7 +156,7 @@ Set these **before** the plugin loads:
 | `@radar-ai-watch-autonomy` | `auto-safe` | Resident `watch`: `auto-safe` (auto-send only safe replies, escalate the rest), `suggest`, `auto`. |
 | `@radar-ai-approval-policy` | `safe-auto` | Per-watch approval policy inherited by quick setup; `W` presets `always-allow`. |
 | `@radar-ai-hooks-first` | `on` | Let installed native Claude/Codex/Kimi/OpenCode lifecycle hooks wake the watcher immediately. `off` keeps only manual and semantic stable-screen fallback triggers. |
-| `@radar-ai-poll` | `5` | Idle-listen interval while watching a pane. The next interval starts after a model decision/action returns, so slow decisions do not overlap. |
+| `@radar-ai-poll` | `5` | Idle-listen interval in whole seconds (`1`–`3600`). The next interval starts after a model decision/action returns, so slow decisions do not overlap. The one-second floor keeps production waits childless on macOS Bash 3.2. |
 | `@radar-ai-stable-screen-threshold` | `1` | Consecutive equal **stable projections** required before no-hook fallback asks the model. Changing spinners, elapsed timers, and footers are removed before comparison. |
 | `@radar-ai-max-calls` | `40` | Cost cap: a watcher pauses after this many model calls. |
 | `@radar-ai-timeout` | `120` | Hard limit in seconds for one model call (minimum `5`). A timed-out Codex wrapper and all of its children are terminated as one process group. |
@@ -170,7 +170,7 @@ Set these **before** the plugin loads:
 | `@radar-ai-monitor-size` | `12` | Legacy top/bottom compact-monitor height. |
 | `@radar-ai-monitor-size-h` | `84` | Requested native right-console width, clamped to 56–112 columns while preserving at least 64 target columns. |
 | `@radar-ai-overview-ratio` | `25` | Effective-config field retained for compatibility; the native console uses a fixed summary header and the remaining rows for the selected evidence view. |
-| `@radar-ai-monitor-excerpt-lines` | `16` | Pane-capture lines shown in the monitor detail view. The model still receives `@radar-ai-capture-lines`; this only keeps the UI readable. |
+| `@radar-ai-monitor-excerpt-lines` | `16` | Pane-capture lines shown in the monitor detail view. The detail header reports the actual decision budget: `capture_lines` for native events and `fallback_capture_lines` for semantic fallback. |
 | `@radar-ai-completion-close-delay` | `12` | Seconds to keep the final summary visible. Press `k` to keep it open or `q` to close now. |
 | `@radar-ai-logging` | `decision` | `decision` stores structured decisions/metadata/stderr; `full` also stores exact prompts and pane captures. |
 | `@radar-ai-screen-snapshots` | `off` | Persist per-call pane captures without enabling full prompt logging. These files may contain sensitive text. |
@@ -236,8 +236,9 @@ It edits `~/.claude/settings.json` with five lifecycle hooks:
 deliberately preserving the preceding finished-turn mark. Native Codex handlers
 are merged into `~/.codex/hooks.json`; the managed block in
 `~/.codex/config.toml` contains matching trust state plus the wrapped legacy
-`notify` fallback. Kimi receives one owned marker block in
-`~/.kimi-code/config.toml` for `SessionStart`, `PermissionRequest`,
+`notify` fallback. Kimi receives one owned marker block in the active
+`config.toml` (`$KIMI_CODE_HOME/config.toml` when set, otherwise
+`~/.kimi-code/config.toml`) for `SessionStart`, `PermissionRequest`,
 `PermissionResult`, `UserPromptSubmit`, `Stop`, `Interrupt`, and `SessionEnd`.
 The installer preserves Kimi's other config and hooks, refuses malformed or
 duplicate managed markers, and rolls back all touched configs if a later write
@@ -248,8 +249,9 @@ for the lifetime of each OpenCode TUI; it does not spawn or poll per event.
 Permission requests, structured questions, replies, idle completion, errors,
 and deletion are ordered by session/generation before changing marks. Existing
 user hooks, trust entries, notify chains, and symlinked config paths are
-preserved. Restart the affected agent sessions after installation, then review
-`/hooks` if Codex asks you to trust the handlers. Kimi's event names and TOML
+preserved. Restart the affected Claude/Codex/OpenCode sessions after
+installation, then review `/hooks` if Codex asks you to trust the handlers.
+For Kimi, run `/reload` in the TUI or start a new session. Kimi's event names and TOML
 shape follow its [official hooks reference](https://moonshotai.github.io/kimi-code/en/customization/hooks).
 
 ### Agents without native hooks
@@ -260,9 +262,14 @@ tmux-radar captures only the bottom
 samples. It projects only lines that remain in order across both samples, which
 removes changing spinners, elapsed counters, progress rows, and footers without
 matching prompt text. The model is called only when that stable semantic
-evidence reaches `@radar-ai-stable-screen-threshold`; an equal or
-containment-only projection is deduplicated until meaningful stable evidence
-changes.
+evidence reaches `@radar-ai-stable-screen-threshold`. Only the exact stable
+projection hash is deduplicated: adding, removing, or replacing a stable line
+creates a new decision identity. Semantic similarity never authorizes an
+automatic send: one immutable normalized fallback capture is supplied to the
+model and retained as delivery authority. Immediately before delivery,
+tmux-radar captures again and uses a byte-for-byte comparison; any changed byte
+cancels the old action. The private file is removed after the decision; normal
+cleanup also removes it from a run whose watcher died without running traps.
 
 This is deliberately a fallback, not fake hook coverage:
 `install-hooks.sh status` still reports missing hooks, Timeline records
@@ -383,12 +390,16 @@ decision immediately; turn-complete asks whether the exact goal is done;
 UserPromptSubmit cancels stale queued approvals and resets idle timing. A stable
 semantic projection of the bottom 20 lines is only the fallback when a hook is
 absent or unsupported. The `poll`
-interval begins after the current decision/action/verification finishes. One
+interval begins after the current decision/action/verification finishes. It is
+configured in whole seconds because the childless macOS Bash 3.2 waiter has a
+one-second wake resolution. One
 watch owns at most one model process tree, so a slow call cannot create another
 call every five seconds; arrivals are durably queued and coalesced first. While
 idle or backing off, the Bash watcher waits in-process on its owned FIFO and
 deadline: it does not fork `sleep` or `tmux wait-for` children. The only child
-a run may own is the currently active model process group.
+a run may own is the currently active model process group. A model leader that
+exits normally is not sufficient evidence: tmux-radar also proves that no
+same-group helper remains before accepting its result and deleting ownership.
 
 **Codex is a decision-only brain; the script is the only actor.** Each call uses
 `codex exec -s read-only --ephemeral` plus a JSON output schema, ignores the
@@ -400,7 +411,9 @@ sending exact keys. Destructive, irreversible, production, credential,
 remote-write, or ambiguous actions escalate regardless of always-allow. Invalid
 output and backend failures retry with bounded backoff; exact backend failures
 and timeout limits remain visible in `Timeline` and `Logs`, and all stop paths
-terminate the complete wrapper/Codex process group.
+terminate the complete wrapper/Codex process group. The same bounded group
+proof runs after normal model-leader exit so detached helpers cannot survive a
+successful decision.
 
 Every run is stored under `~/.local/state/tmux/ai-runs/<run-id>/`. Default
 `decision` logging persists config, state, events, structured decisions,
@@ -556,13 +569,14 @@ when the bar renders (≤30s), and whenever the AI status view opens.
 - **Hooks don't fire** — run `scripts/install-hooks.sh status`. It reports
   Claude, Codex, Kimi, and OpenCode coverage separately, including Kimi's seven
   managed events and Codex's legacy notify fallback. Re-run `install`, then
-  restart the affected agent sessions because hooks are read at session start.
+  restart the affected Claude/Codex/OpenCode sessions. Kimi can load the active
+  `$KIMI_CODE_HOME/config.toml` (or `~/.kimi-code/config.toml`) with `/reload`.
   A missing native hook remains visible; semantic fallback does not claim native
   coverage. The [agent hook guide](docs/guides/agent-hooks.md) includes payload
   diagnostics and a custom-agent adapter.
 - **A watcher seems to launch a new model every poll interval** — update the
   plugin. Calls are serialized now: the idle interval begins only after the
-  current call/action verification ends, equal stable projections are
+  current call/action verification ends, exactly equal stable projections are
   deduplicated, and queued hooks are coalesced. Inspect
   `ai.sh report latest`, `ai.sh status`, and the run's `events.jsonl`/
   `decisions/` before changing the interval.

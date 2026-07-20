@@ -168,8 +168,9 @@ Kimi's adapter consumes `hook_event_name` and maps the official events:
 | `Interrupt` | `interrupt` |
 | `SessionEnd` | `session_end` |
 
-`install-hooks.sh` owns only the text between its two Kimi markers in
-`~/.kimi-code/config.toml`. Install is idempotent and transactionally preserves
+`install-hooks.sh` owns only the text between its two Kimi markers in the active
+Kimi config (`$KIMI_CODE_HOME/config.toml` or `~/.kimi-code/config.toml`).
+Install is idempotent and transactionally preserves
 unrelated TOML, user hooks, comments, and symlink targets. Missing Kimi is a
 reported skip; malformed/duplicate markers fail closed rather than guessing at
 ownership. The event set and payload shape follow the
@@ -181,20 +182,24 @@ hooks, the watcher samples only the bottom `fallback_capture_lines` (default
 order-preserving longest-common-subsequence projection across adjacent
 samples. Dynamic elapsed counters, spinners, and footers disappear from the
 projection without prompt-text regexes. A model call occurs only after the
-stable projection reaches `stable_screen_threshold`, and equal or
-containment-only evidence is deduplicated until meaningful stable evidence
-changes. Native events continue to receive the larger `capture_lines` context
-(default 120).
+stable projection reaches `stable_screen_threshold`, and only an exactly equal
+projection hash is deduplicated. A stable line addition is new evidence and
+invalidates an in-flight decision. Projection identity is never delivery
+authority: the model reads one immutable normalized capture, and a fallback
+action is delivered only when a fresh capture compares byte-for-byte equal to
+that same file at the final guard. Native events continue to receive the larger
+`capture_lines` context (default 120).
 
 The watcher also has a strict child-ownership contract:
 
 - idle, retry, and verification waits use one in-process FIFO/deadline loop;
 - no production `sleep` or `tmux wait-for` child exists;
 - at most one active model process group is owned by a run;
-- stop completion requires `final.json`, a dead watcher PID, and removal of the
-  matching generation pointer;
-- forced stop terminates both the watcher tree and the recorded brain process
-  group before acknowledging.
+- stop completion requires `final.json`, a dead watcher PID, removal of the
+  matching generation pointer, and bounded proof that the recorded model group
+  and descendants are no longer runnable;
+- the brain marker is retained when that proof fails; forced stop cannot
+  acknowledge by deleting evidence after merely sending TERM/KILL.
 
 This contract prevents deleted sockets/run directories from leaving orphaned
 poll loops and makes terminal UI state correspond to actual process state.

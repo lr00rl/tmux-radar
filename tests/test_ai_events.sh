@@ -343,10 +343,45 @@ new_run %49 'old generation'
 old_run_id="$RADAR_RUN_ID"
 new_run %49 'new generation'
 reset_fake_tmux_logs
+set +e
 TMUX_RADAR_EXPECT_RUN_ID="$old_run_id" \
-  bash "$ROOT/scripts/ai.sh" emit-event %49 approval codex 'stale old-run event'
+  bash "$ROOT/scripts/ai.sh" emit-event %49 approval codex 'stale old-run event' \
+  >"$TMP/emit-stale.out" 2>"$TMP/emit-stale.err"
+stale_emit_rc=$?
+set -e
+[ "$stale_emit_rc" -ne 0 ] ||
+  _fail_assert 'stale run-bound emit-event must fail visibly'
+assert_contains "$(cat "$TMP/emit-stale.err")" 'active run changed' \
+  'stale run-bound emit-event explains the generation mismatch'
 assert_eq '' "$(radar_run_open %49 >/dev/null; radar_inbox_drain)" 'stale event must not enter a replacement run'
 assert_eq '' "$(cat "$TEST_TMUX_CALLS")" 'stale event must not signal a replacement run'
+
+new_run %59 'Kimi hook old generation'
+kimi_old_run_id="$RADAR_RUN_ID"
+kimi_emit_block="$TMP/kimi-stale-emit"
+touch "$kimi_emit_block"
+printf '%s' '{"hook_event_name":"PermissionRequest","session_id":"kimi-stale","pane":"%59","label":"stale permission"}' |
+  TMUX_PANE=%59 TMUX_RADAR_TEST_BEFORE_WATCH_EMIT="$kimi_emit_block" \
+  bash "$ROOT/scripts/needinput-notify.sh" kimi-hook \
+  >"$TMP/kimi-stale.out" 2>"$TMP/kimi-stale.err" &
+kimi_stale_pid=$!
+wait_for_file "$kimi_emit_block.ready"
+new_run %59 'Kimi hook replacement generation'
+kimi_replacement_run_id="$RADAR_RUN_ID"
+[ "$kimi_old_run_id" != "$kimi_replacement_run_id" ] ||
+  _fail_assert 'Kimi stale-event fixture did not replace the run generation'
+rm -f "$kimi_emit_block"
+set +e
+wait "$kimi_stale_pid"
+kimi_stale_rc=$?
+set -e
+[ "$kimi_stale_rc" -ne 0 ] && [ "$kimi_stale_rc" -ne 2 ] ||
+  _fail_assert 'Kimi stale-run delivery must fail open with an ordinary nonzero status' \
+    'rc' "$kimi_stale_rc"
+assert_contains "$(cat "$TMP/kimi-stale.err")" 'failed to enqueue approval' \
+  'Kimi stale-run delivery exposes the enqueue failure'
+assert_eq '' "$(radar_run_open %59 >/dev/null; radar_inbox_drain)" \
+  'Kimi stale event must not enter a replacement run'
 
 reset_fake_tmux_logs
 if ! bash "$ROOT/scripts/ai.sh" emit-event %88 approval codex 'missing watch is benign' >"$TMP/emit-nowatch.out" 2>"$TMP/emit-nowatch.err"; then

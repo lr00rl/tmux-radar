@@ -74,7 +74,6 @@ type fieldKind int
 const (
 	kindText fieldKind = iota
 	kindInt
-	kindFloat
 	kindEnum
 	kindToggle
 )
@@ -92,7 +91,7 @@ type fieldSpec struct {
 var advancedFields = []fieldSpec{
 	{ID: fieldAlways, Label: "Always allow", Group: groupAuthority, Kind: kindToggle},
 	{ID: fieldHooksFirst, Label: "Hooks first", Group: groupTriggering, Kind: kindToggle},
-	{ID: fieldPoll, Label: "Idle interval", Group: groupTriggering, Kind: kindFloat, Min: 0.05, Max: 3600},
+	{ID: fieldPoll, Label: "Idle interval", Group: groupTriggering, Kind: kindInt, Min: 1, Max: 3600},
 	{ID: fieldStable, Label: "Stable samples", Group: groupTriggering, Kind: kindInt, Min: 1, Max: 20},
 	{ID: fieldCommand, Label: "Command", Group: groupBrain, Kind: kindText},
 	{ID: fieldProfile, Label: "Profile", Group: groupBrain, Kind: kindText},
@@ -233,6 +232,10 @@ func (model *SetupModel) setTextField(id, value string) {
 func (model *SetupModel) setIntField(id string, value int) {
 	custom := runmodel.Value[int]{Value: value, Source: runmodel.SourceCustom}
 	switch id {
+	case fieldPoll:
+		model.config.Values.Poll = runmodel.Value[float64]{
+			Value: float64(value), Source: runmodel.SourceCustom,
+		}
 	case fieldStable:
 		model.config.Values.StableScreenThreshold = custom
 	case fieldTimeout:

@@ -168,6 +168,11 @@ _watch_event() {  # _watch_event <pane> <kind> <source> <label>
   run_dir="$(_watch_field "$wf" run_dir)"
   run_id="$(_watch_field "$wf" run_id)"
   [ -d "$run_dir" ] && [ -n "$run_id" ] || return 0
+  if [ -n "${TMUX_RADAR_TEST_BEFORE_WATCH_EMIT:-}" ]; then
+    printf 'ready\n' > "$TMUX_RADAR_TEST_BEFORE_WATCH_EMIT.ready"
+    while [ -e "$TMUX_RADAR_TEST_BEFORE_WATCH_EMIT" ]; do sleep 0.01; done
+    rm -f "$TMUX_RADAR_TEST_BEFORE_WATCH_EMIT.ready"
+  fi
   if ! TMUX_RADAR_EXPECT_RUN_ID="$run_id" \
     "$SCRIPT_DIR/ai.sh" emit-event "$pane" "$kind" "$source" "$(_san "$label")" >/dev/null; then
     echo "tmux-radar: failed to enqueue $kind for $pane (run $run_id)" >&2

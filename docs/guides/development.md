@@ -61,8 +61,9 @@ a vendor configuration), and tests.
    status, uninstall, symlink preservation, malformed markers, and rollback.
 
 Kimi Code is the reference integration: its adapter maps seven vendor events,
-its installer owns `~/.kimi-code/config.toml`, and the registry/safety/install
-suites prove lifecycle and fail-closed behavior.
+its installer owns a marked block in the active config
+(`$KIMI_CODE_HOME/config.toml` or `~/.kimi-code/config.toml`), and the
+registry/safety/install suites prove lifecycle and fail-closed behavior.
 
 ## Test-driven workflow
 
@@ -101,16 +102,26 @@ Treat the following as compatibility requirements, not tuning suggestions.
   processed immediately. Fallback uses a stable projection of only the bottom
   `fallback_capture_lines` lines and deduplicates an already assessed
   projection.
+- **One fallback evidence artifact.** A `screen_idle` decision must read the
+  immutable normalized capture retained by its watcher. Automatic delivery is
+  authorized only by `cmp -s` against a fresh capture; projection hashes and
+  separately repeated `capture-pane` calls are never delivery authority. The
+  path is an in-process watcher value, never an inherited environment input;
+  crash GC removes the artifact when its watcher is no longer live.
 - **No background waiters or timers.** ARMED polling, retry backoff,
   verification, and completion hold block in the watcher’s Bash process with
   bounded `read -t` waits. Do not add `tmux wait-for`, timer children, or a
-  fork-per-tick loop to these phases.
+  fork-per-tick loop to these phases. Production poll values are whole seconds
+  (`1`–`3600`) because macOS Bash 3.2 rejects fractional `read -t` values.
 - **Durable inbox first.** Deliver events through the run inbox. A tmux signal
   may accelerate a wake but must not become the source of truth.
 - **Owned process groups only.** A model process runs in an owned group and is
   recorded while active. On timeout, target loss, owner loss, or stop,
   terminate the group and recorded descendants before reporting a terminal
-  result.
+  result. A normal leader exit must also prove that no same-group helper
+  survived before its marker is removed. TERM/KILL delivery is not completion
+  evidence: bounded liveness checks must prove every recorded runnable process
+  is gone, and a failed proof retains the brain marker.
 - **One idempotent finalizer.** `q`, `Ctrl-C`, `TERM`, `INT`, `HUP`,
   pane loss, owner loss, and session termination must converge on one
   finalizer. It clears transient files, removes the live pointer only for its

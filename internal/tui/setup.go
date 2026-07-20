@@ -105,7 +105,7 @@ func NewSetup(options SetupOptions) SetupModel {
 		preflightRequestID: 1,
 	}
 	for _, spec := range advancedFields {
-		if spec.Kind != kindText && spec.Kind != kindInt && spec.Kind != kindFloat {
+		if spec.Kind != kindText && spec.Kind != kindInt {
 			continue
 		}
 		input := textinput.New()
@@ -370,15 +370,6 @@ func (model *SetupModel) commitInput(id string) bool {
 		}
 		if err == nil {
 			model.setIntField(id, parsed)
-		}
-	case kindFloat:
-		var parsed float64
-		parsed, err = strconv.ParseFloat(value, 64)
-		if err == nil && (parsed < spec.Min || parsed > spec.Max) {
-			err = fmt.Errorf("enter %g-%g", spec.Min, spec.Max)
-		}
-		if err == nil {
-			model.config.Values.Poll = runmodel.Value[float64]{Value: parsed, Source: runmodel.SourceCustom}
 		}
 	}
 	if err != nil {

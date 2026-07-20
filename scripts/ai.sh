@@ -83,6 +83,7 @@ mkdir -p "$STATE_DIR" "$WATCH_DIR"
 # tree. The pidfile is a second line of defence for `stop` and `cleanup`.
 BRAIN_PID=""
 BRAIN_PGID=""
+BRAIN_IDENTITY=""
 BRAIN_PID_FILE=""
 BRAIN_OUT_FILE=""
 BRAIN_BOUND_PANE=""
@@ -128,6 +129,7 @@ WATCH_WAITER_PID=""
 WATCH_TIMER_PID=""
 WATCH_PANE=""
 WATCH_WF=""
+WATCH_POINTER_TMP=""
 WATCH_STARTED=0
 WATCH_POLL=5
 WATCH_GOAL=""
@@ -162,6 +164,7 @@ WATCH_FALLBACK_ACTIVE_HASH=""
 WATCH_FALLBACK_CANDIDATE_FILE=""
 WATCH_FALLBACK_LAST_FILE=""
 WATCH_FALLBACK_ACTIVE_FILE=""
+WATCH_DECISION_CAPTURE_FILE=""
 
 DELIVERY_GATE_HELD=0
 DELIVERY_GATE_TOKEN=""
@@ -220,7 +223,7 @@ _config_constraint() {
     autonomy) printf 'one of suggest, confirm, auto-safe, auto' ;;
     approval_policy) printf 'one of safe-auto, manual, always-allow' ;;
     always_allow|hooks_first|screen_snapshots) printf 'one of on, off' ;;
-    poll) printf 'number from 0.05 to 3600' ;;
+    poll) printf 'whole seconds from 1 to 3600' ;;
     stable_screen_threshold) printf 'integer from 1 to 20' ;;
     effort) printf 'one of minimal, low, medium, high, xhigh' ;;
     timeout) printf 'integer from 5 to 3600' ;;
@@ -254,7 +257,10 @@ _config_value_valid() {
     poll)
       case "$value" in ''|*[!0-9.]*) return 1 ;; esac
       awk -v n="$value" 'BEGIN {
-        exit !(n ~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/ && n >= 0.05 && n <= 3600)
+        test_mode = (ENVIRON["TMUX_RADAR_TEST_ALLOW_SUBSECOND_POLL"] == "1")
+        valid_number = (n ~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/)
+        if (test_mode) exit !(valid_number && n >= 0.05 && n <= 3600)
+        exit !(valid_number && n >= 1 && n <= 3600 && n == int(n))
       }'
       return $?
       ;;
@@ -547,7 +553,7 @@ _codex_version() {
   started="$(date '+%s')"
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$(( $(date '+%s') - started ))" -ge "$timeout" ]; then
-      _terminate_process_tree "$pid" "$pid"
+      _terminate_process_tree "$pid" "$pid" || true
       break
     fi
     sleep 0.05
@@ -1015,6 +1021,7 @@ _watch_pointer_write() {
     [ "$locked" -eq 0 ] || radar_launch_lock_release >/dev/null 2>&1 || true
     return 1
   }
+  WATCH_POINTER_TMP="$tmp"
   {
     printf 'run_id=%s\nrun_dir=%s\ngeneration=%s\nchannel=%s\nowner_file=%s\n' \
       "$run_id" "$run_dir" "$generation" "$channel" "$owner_file"
@@ -1029,6 +1036,8 @@ _watch_pointer_write() {
     printf 'quiet=0\nmarked=0\n'
   } > "$tmp"
   if mv "$tmp" "$wf"; then rc=0; else rc=$?; fi
+  [ "$rc" -eq 0 ] || rm -f "$tmp"
+  WATCH_POINTER_TMP=""
   [ "$locked" -eq 0 ] || radar_launch_lock_release >/dev/null 2>&1 || true
   return "$rc"
 }
@@ -1201,44 +1210,91 @@ _process_tree_pids() {  # _process_tree_pids <root-pid>; descendants first
     }'
 }
 
+_process_identity() {  # _process_identity <pid>
+  local pid="$1"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  ps -p "$pid" -o lstart= -o pgid= 2>/dev/null |
+    awk '{$1=$1; if (NF) print; exit}'
+}
+
+_pid_effectively_alive() {
+  local pid="$1" state
+  case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  state="$(ps -p "$pid" -o state= 2>/dev/null | awk '{$1=$1; print; exit}')"
+  case "$state" in Z*|z*) return 1 ;; esac
+  return 0
+}
+
+_process_group_effectively_alive() {
+  local pgid="$1" snapshot
+  case "$pgid" in ''|0|*[!0-9]*|"$$") return 1 ;; esac
+  if snapshot="$(ps -axo pgid=,state= 2>/dev/null)"; then
+    printf '%s\n' "$snapshot" | awk -v pgid="$pgid" '
+      $1 == pgid && $2 !~ /^[Zz]/ { found=1 }
+      END { exit !found }
+    '
+    return $?
+  fi
+  kill -0 -- "-$pgid" 2>/dev/null
+}
+
+_termination_targets_alive() {  # _termination_targets_alive <pgid> <pid-list>
+  local pgid="$1" tree="$2" pid
+  [ "${TMUX_RADAR_TEST_FORCE_TERMINATION_LIVE:-0}" != 1 ] || return 0
+  _process_group_effectively_alive "$pgid" && return 0
+  for pid in $tree; do
+    _pid_effectively_alive "$pid" && return 0
+  done
+  return 1
+}
+
+_wait_termination_targets() {  # _wait_termination_targets <pgid> <pid-list> <attempts>
+  local pgid="$1" tree="$2" attempts="$3" delay="${TMUX_RADAR_TERMINATE_DELAY:-0.05}" attempt=0
+  while [ "$attempt" -lt "$attempts" ]; do
+    _termination_targets_alive "$pgid" "$tree" || return 0
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+  ! _termination_targets_alive "$pgid" "$tree"
+}
+
 _terminate_process_tree() {  # _terminate_process_tree <root-pid> [process-group-id]
-  local root="$1" pgid="${2:-}" tree pid alive
+  local root="$1" pgid="${2:-}" tree pid
   case "$root" in ''|*[!0-9]*) return 0 ;; esac
   case "$pgid" in
     ''|*[!0-9]*|"$$") pgid="" ;;
   esac
-  if [ -n "$pgid" ]; then
-    kill -TERM -- "-$pgid" 2>/dev/null || true
-    for _ in 1 2 3 4 5; do
-      kill -0 -- "-$pgid" 2>/dev/null || break
-      sleep 0.1
-    done
-    kill -0 -- "-$pgid" 2>/dev/null && kill -KILL -- "-$pgid" 2>/dev/null || true
-    return 0
-  fi
   tree="$(_process_tree_pids "$root")"
   [ -n "$tree" ] || tree="$root"
-  for pid in $tree; do kill -TERM "$pid" 2>/dev/null || true; done
-  for _ in 1 2 3 4 5; do
-    alive=0
-    for pid in $tree; do kill -0 "$pid" 2>/dev/null && alive=1; done
-    [ "$alive" -eq 0 ] && break
-    sleep 0.1
+  if [ -n "$pgid" ]; then
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+  fi
+  for pid in $tree; do
+    kill -TERM "$pid" 2>/dev/null || true
   done
-  # A CLI wrapper may ignore TERM or fail to forward it to its native child.
-  # Kill every PID captured before the parent can orphan its descendants.
+  if _wait_termination_targets "$pgid" "$tree" "${TMUX_RADAR_TERMINATE_TERM_ATTEMPTS:-10}"; then
+    return 0
+  fi
+  [ -z "$pgid" ] || kill -KILL -- "-$pgid" 2>/dev/null || true
   for pid in $tree; do
     kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
   done
+  _wait_termination_targets "$pgid" "$tree" "${TMUX_RADAR_TERMINATE_KILL_ATTEMPTS:-40}"
 }
 
 _terminate_brain_file() {  # _terminate_brain_file <brain-pidfile>
-  local file="$1" pid pgid output
+  local file="$1" pid pgid identity current_identity output
   [ -r "$file" ] || return 0
   pid="$(_state_get "$file" pid)"
   pgid="$(_state_get "$file" pgid)"
+  identity="$(_state_get "$file" identity)"
   output="$(_state_get "$file" output)"
-  _terminate_process_tree "$pid" "$pgid"
+  if _pid_effectively_alive "$pid" && [ -n "$identity" ]; then
+    current_identity="$(_process_identity "$pid" || true)"
+    [ "$current_identity" = "$identity" ] || return 1
+  fi
+  _terminate_process_tree "$pid" "$pgid" || return 1
   [ -n "$output" ] && rm -f "$output"
   rm -f "$file"
 }
@@ -1246,11 +1302,19 @@ _terminate_brain_file() {  # _terminate_brain_file <brain-pidfile>
 # shellcheck disable=SC2329  # invoked from the watcher's signal trap
 _terminate_current_brain() {
   local pid="${BRAIN_PID:-}" pgid="${BRAIN_PGID:-}" file="${BRAIN_PID_FILE:-}" output="${BRAIN_OUT_FILE:-}"
-  [ -n "$pid" ] && _terminate_process_tree "$pid" "$pgid"
+  if [ -n "$pid" ]; then
+    _terminate_process_tree "$pid" "$pgid" || return 1
+    # Liveness proof treats zombies as terminated; wait is now only a
+    # nonblocking reap of this shell's already-dead direct child.
+    wait "$pid" 2>/dev/null || true
+  elif [ -n "$file" ] && [ -e "$file" ]; then
+    _terminate_brain_file "$file" || return 1
+  fi
   [ -n "$output" ] && rm -f "$output"
   [ -n "$file" ] && rm -f "$file"
   BRAIN_PID=""
   BRAIN_PGID=""
+  BRAIN_IDENTITY=""
   BRAIN_OUT_FILE=""
 }
 
@@ -1398,7 +1462,7 @@ _resolve_pane() {
 # ---------------------------------------------------------------------------
 _brain() {
   local schema="$1" prompt="$2" out err pid pid_tmp rc=0 started timeout stop_reason="" had_job_control=0
-  local brain_workdir
+  local brain_workdir termination_proven=1
   local -a codex_args=()
   _ensure_backend_frozen
   BRAIN_RESULT=""
@@ -1479,6 +1543,7 @@ _brain() {
   BRAIN_PID=$!
   DECISION_MODEL_LAUNCHED=1
   BRAIN_PGID="$BRAIN_PID"
+  BRAIN_IDENTITY="$(_process_identity "$BRAIN_PID" || true)"
   [ "$had_job_control" -eq 1 ] || set +m
   pid="$BRAIN_PID"
   started="$(now)"
@@ -1494,8 +1559,8 @@ _brain() {
   fi
   if [ -n "${pid_tmp:-}" ]; then
     {
-      printf 'pid=%s\npgid=%s\nwatch_pid=%s\npane=%s\nstarted=%s\noutput=%s\n' \
-        "$pid" "$BRAIN_PGID" "$$" "${BRAIN_BOUND_PANE:-}" "$started" "$out"
+      printf 'pid=%s\npgid=%s\nidentity=%s\nwatch_pid=%s\npane=%s\nstarted=%s\noutput=%s\n' \
+        "$pid" "$BRAIN_PGID" "$BRAIN_IDENTITY" "$$" "${BRAIN_BOUND_PANE:-}" "$started" "$out"
     } > "$pid_tmp"
     chmod 600 "$pid_tmp" 2>/dev/null || true
     mv "$pid_tmp" "$BRAIN_PID_FILE"
@@ -1508,28 +1573,48 @@ _brain() {
     if [ -n "${BRAIN_BOUND_PANE:-}" ] && \
        ! tmux display-message -p -t "$BRAIN_BOUND_PANE" '#{pane_id}' >/dev/null 2>&1; then
       stop_reason="target pane $BRAIN_BOUND_PANE disappeared"
-      _terminate_process_tree "$pid" "$BRAIN_PGID"
+      _terminate_process_tree "$pid" "$BRAIN_PGID" || termination_proven=0
       break
     fi
     if ! _watch_owner_live; then
       stop_reason="$WATCH_OWNER_REASON"
       BRAIN_STOP_KIND="lifecycle-stop"
-      _terminate_process_tree "$pid" "$BRAIN_PGID"
+      _terminate_process_tree "$pid" "$BRAIN_PGID" || termination_proven=0
       break
     fi
     if [ "$(( $(now) - started ))" -ge "$timeout" ]; then
       stop_reason="brain call exceeded ${timeout}s timeout"
-      _terminate_process_tree "$pid" "$BRAIN_PGID"
+      _terminate_process_tree "$pid" "$BRAIN_PGID" || termination_proven=0
       break
     fi
     sleep 0.2
   done
-  if wait "$pid" 2>/dev/null; then rc=0; else rc=$?; fi
+  if [ "$termination_proven" -eq 1 ]; then
+    if wait "$pid" 2>/dev/null; then rc=0; else rc=$?; fi
+    # A wrapper can exit after writing its result while leaving helpers in the
+    # owned process group. Normal leader exit is not group-exit evidence.
+    if _process_group_effectively_alive "$BRAIN_PGID"; then
+      if ! _terminate_process_tree "$pid" "$BRAIN_PGID"; then
+        stop_reason="model leader exited but its process group remained active"
+        termination_proven=0
+      fi
+    fi
+  fi
+  if [ "$termination_proven" -ne 1 ]; then
+    BRAIN_LAST_RC=125
+    BRAIN_LAST_ELAPSED="$(( $(now) - started ))"
+    BRAIN_STOP_KIND="process-ownership"
+    BRAIN_STOP_REASON="${stop_reason:-model termination requested}; process-group exit was not proven"
+    printf 'tmux-radar: %s\n' "$BRAIN_STOP_REASON" >> "$err" 2>/dev/null || true
+    audit "brain-termination-unproven\t${BRAIN_BOUND_PANE:--}\tpid=$pid\tpgid=$BRAIN_PGID"
+    return 0
+  fi
   BRAIN_LAST_RC="$rc"
   BRAIN_LAST_ELAPSED="$(( $(now) - started ))"
   BRAIN_STOP_REASON="$stop_reason"
   BRAIN_PID=""
   BRAIN_PGID=""
+  BRAIN_IDENTITY=""
   [ -n "${BRAIN_PID_FILE:-}" ] && rm -f "$BRAIN_PID_FILE"
   if [ -n "$stop_reason" ]; then
     printf 'tmux-radar: %s\n' "$stop_reason" >> "$err" 2>/dev/null || true
@@ -1707,6 +1792,7 @@ cmd_decide() {
   need_jq
   local pane autonomy policy goal cap cap_tail where json pretty_json action text safe reason extra="" prompt backend
   local capture_lines event_kind excerpt_lines errfile err_tail call_tag="" logging snapshots
+  local capture_file=""
   local TMUX_RADAR_AI_ERR="" TMUX_SWITCHER_AI_ERR=""
   DECISION_READY=0
   DECISION_FAILURE_KIND=""
@@ -1731,6 +1817,11 @@ cmd_decide() {
   event_kind="${TMUX_RADAR_EVENT_KIND:-manual_reassess}"
   capture_lines="${TMUX_RADAR_DECIDE_CAPTURE_LINES:-$(opt @radar-ai-capture-lines 120)}"
   case "$capture_lines" in ''|*[!0-9]*) capture_lines=120 ;; esac
+  if [ "$event_kind" = screen_idle ] &&
+    [ -n "${RADAR_RUN_DIR:-}" ] &&
+    [ "${WATCH_DECISION_CAPTURE_FILE:-}" = "$RADAR_RUN_DIR/.decision-capture" ]; then
+    capture_file="$WATCH_DECISION_CAPTURE_FILE"
+  fi
   extra=$'\n\nSUPERVISOR EVENT: kind='"$event_kind"$'. Treat the visible pane as the source of truth. A screen_idle event is a low-cost fallback for an agent without a native hook; decide whether the stable visible state actually needs action.'
   if [ -n "$goal" ]; then
     extra="$extra"$'\n\nGOAL (set by the user for this watch): '"$goal"
@@ -1748,7 +1839,17 @@ cmd_decide() {
     extra="$extra"$'\n\nREPAIR: the previous decision was invalid: '"${TMUX_RADAR_REPAIR_REASON:-decision schema/type validation failed}"$'. Return exactly one corrected decision object that satisfies both the JSON schema and the event-specific action constraints; do not add prose or markdown.'
   fi
   where="$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}' 2>/dev/null || echo "$pane")"
-  cap="$(tmux capture-pane -p -t "$pane" -S "-$capture_lines" 2>/dev/null | tail -n "$capture_lines" || true)"
+  if [ -n "$capture_file" ]; then
+    if [ ! -r "$capture_file" ]; then
+      DECISION_FAILURE_KIND='capture-error'
+      DECISION_FAILURE_DETAIL='immutable decision capture is missing or unreadable'
+      echo "pane $pane: decision capture is unavailable"
+      return 5
+    fi
+    cap="$(cat "$capture_file")"
+  else
+    cap="$(tmux capture-pane -p -t "$pane" -S "-$capture_lines" 2>/dev/null | tail -n "$capture_lines" || true)"
+  fi
   if [ -z "$cap" ]; then
     if tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
       DECISION_FAILURE_KIND='capture-error'
@@ -1796,6 +1897,12 @@ cmd_decide() {
   _brain "$(_skill_file decide.schema.json)" "$prompt"
   json="$BRAIN_RESULT"
   BRAIN_BOUND_PANE=""
+  if [ "$BRAIN_STOP_KIND" = process-ownership ]; then
+    DECISION_FAILURE_KIND='process-ownership'
+    DECISION_FAILURE_DETAIL="$BRAIN_STOP_REASON"
+    echo "tmux-radar: $BRAIN_STOP_REASON"
+    return 5
+  fi
   BRAIN_PID_FILE=""
   if [ "$BRAIN_STOP_KIND" = lifecycle-stop ]; then
     DECISION_FAILURE_KIND='lifecycle-stop'
@@ -1862,7 +1969,7 @@ cmd_decide() {
         printf 'Backend stderr (last 20 lines):\n%s\n\n' "$err_tail"
       fi
       printf 'Pane excerpt shown here (last %s lines; model receives last %s lines):\n%s\n' \
-        "$excerpt_lines" "$(opt @radar-ai-capture-lines 120)" "$cap_tail"
+        "$excerpt_lines" "$capture_lines" "$cap_tail"
     )"
     _watch_timeline "$pane" "${action:-unknown}" "${reason:-no reason} · $plan"
   fi
@@ -1973,30 +2080,16 @@ _watch_file_hash() {
   cksum "$1" 2>/dev/null | awk '{print $1 ":" $2}'
 }
 
-_watch_file_is_subsequence() {  # every line in $1 appears in order in $2
-  local candidate="$1" evidence="$2"
-  [ -s "$candidate" ] || return 1
-  awk '
-    NR == FNR { wanted[++wanted_count] = $0; next }
-    matched < wanted_count && $0 == wanted[matched + 1] { matched++ }
-    END { exit !(wanted_count > 0 && matched == wanted_count) }
-  ' "$candidate" "$evidence"
-}
-
 _watch_fallback_evidence_fingerprint() {
   local current="$RADAR_RUN_DIR/.fallback-guard.$$" hash
   if ! _watch_fallback_capture "$current"; then
     rm -f "$current"
     return 1
   fi
-  if [ -s "$WATCH_FALLBACK_ACTIVE_FILE" ] &&
-    _watch_file_is_subsequence "$WATCH_FALLBACK_ACTIVE_FILE" "$current"; then
-    printf '%s' "$WATCH_FALLBACK_ACTIVE_HASH"
-  else
-    hash="$(_watch_file_hash "$current")"
-    printf 'fallback-changed:%s' "$hash"
-  fi
+  hash="$(_watch_file_hash "$current")"
   rm -f "$current"
+  [ -n "$hash" ] || return 1
+  printf 'fallback-sample:%s' "$hash"
 }
 
 _watch_evidence_fingerprint() {
@@ -2004,6 +2097,38 @@ _watch_evidence_fingerprint() {
     screen_idle) _watch_fallback_evidence_fingerprint ;;
     *) _watch_fingerprint ;;
   esac
+}
+
+_watch_fallback_authority_matches() {
+  local authority="$1" current="$RADAR_RUN_DIR/.fallback-guard.$$" rc
+  [ -r "$authority" ] || return 2
+  if ! _watch_fallback_capture "$current"; then
+    rm -f "$current"
+    return 2
+  fi
+  if cmp -s "$authority" "$current"; then rc=0; else rc=$?; fi
+  rm -f "$current"
+  return "$rc"
+}
+
+_watch_evidence_matches() {
+  local expected="$1" current_kind="$2" current rc
+  if [ "$current_kind" = screen_idle ]; then
+    if _watch_fallback_authority_matches "$WATCH_DECISION_CAPTURE_FILE"; then
+      return 0
+    else
+      rc=$?
+      return "$rc"
+    fi
+  fi
+  current="$(_watch_evidence_fingerprint "$current_kind" || true)"
+  [ -n "$current" ] || return 2
+  [ "$current" = "$expected" ]
+}
+
+_watch_clear_decision_capture() {
+  [ -z "${WATCH_DECISION_CAPTURE_FILE:-}" ] || rm -f "$WATCH_DECISION_CAPTURE_FILE"
+  WATCH_DECISION_CAPTURE_FILE=""
 }
 
 _watch_record_fallback_samples() {
@@ -2494,7 +2619,7 @@ _watch_supersede_current() {
 
 _watch_post_decision_guard() {
   local pre="$1" current_kind="$2" batch="$RADAR_RUN_DIR/.post-decision.$$"
-  local retained="$RADAR_RUN_DIR/.post-retained.$$" event normalized kind current
+  local retained="$RADAR_RUN_DIR/.post-retained.$$" event normalized kind match_rc
   : > "$batch"; : > "$retained"
   # Signals emitted while the model was running remain durable. A signal that
   # races this drain remains in the journal for the next serialized cycle.
@@ -2527,14 +2652,19 @@ _watch_post_decision_guard() {
     rm -f "$batch" "$retained"
     return 2
   fi
-  current="$(_watch_evidence_fingerprint "$current_kind" || true)"
+  set +e
+  _watch_evidence_matches "$pre" "$current_kind"
+  match_rc=$?
+  set -e
   rm -f "$batch" "$retained"
-  if [ -z "$current" ]; then return 2; fi
-  if [ "$current" != "$pre" ]; then
-    _watch_supersede_current evidence_changed "$current_kind"
-    return 12
-  fi
-  return 0
+  case "$match_rc" in
+    0) return 0 ;;
+    1)
+      _watch_supersede_current evidence_changed "$current_kind"
+      return 12
+      ;;
+    *) return 2 ;;
+  esac
 }
 
 _watch_verification_batch() {
@@ -2633,7 +2763,7 @@ _watch_pre_send_test_seam() {
 }
 
 _watch_deliver_under_gate() {
-  local evidence="$1" current_kind="$2" guard_rc seam_rc wait_rc delivery
+  local evidence="$1" current_kind="$2" guard_rc seam_rc wait_rc match_rc
   WATCH_DELIVERY_FINGERPRINT=""
   if ! _delivery_gate_acquire; then return 20; fi
 
@@ -2660,18 +2790,24 @@ _watch_deliver_under_gate() {
       continue
     fi
 
-    delivery="$(_watch_evidence_fingerprint "$current_kind" || true)"
-    if [ -z "$delivery" ]; then _delivery_gate_release; return 2; fi
-    if [ "$delivery" != "$evidence" ]; then
-      _watch_supersede_current evidence_changed "$current_kind"
-      _delivery_gate_release
-      return 12
-    fi
+    set +e
+    _watch_evidence_matches "$evidence" "$current_kind"
+    match_rc=$?
+    set -e
+    case "$match_rc" in
+      0) : ;;
+      1)
+        _watch_supersede_current evidence_changed "$current_kind"
+        _delivery_gate_release
+        return 12
+        ;;
+      *) _delivery_gate_release; return 2 ;;
+    esac
     if ! _send "$WATCH_PANE" "$DECISION_TEXT" ${DECISION_KEYS[@]+"${DECISION_KEYS[@]}"}; then
       _delivery_gate_release
       return 21
     fi
-    WATCH_DELIVERY_FINGERPRINT="$delivery"
+    WATCH_DELIVERY_FINGERPRINT="$evidence"
     _delivery_gate_release
     return 0
   done
@@ -2708,7 +2844,13 @@ _watch_finalize() {
   local outcome="$1" phase="$2" reason="$3" delay deadline
   _delivery_cleanup
   _watch_kill_waiters
-  _terminate_current_brain
+  if ! _terminate_current_brain; then
+    _watch_phase PAUSED_ERROR "model process termination could not be proven" none 0 || true
+    radar_event_append termination_error watcher \
+      "model process termination could not be proven" \
+      '{"record":"error","error":{"class":"process-ownership","retryable":true}}' || true
+    return 1
+  fi
   if [ "$outcome" = completed ]; then
     delay="${TMUX_RADAR_TEST_COMPLETION_DELAY:-${TMUX_RADAR_RUN_COMPLETION_CLOSE_DELAY:-12}}"
     case "$delay" in ''|*[!0-9]*) delay=12 ;; esac
@@ -2723,16 +2865,38 @@ _watch_finalize() {
     WATCH_FINALIZED=1
   fi
   _watch_remove_owned_pointer
+  [ -z "${WATCH_POINTER_TMP:-}" ] || rm -f "$WATCH_POINTER_TMP"
+  WATCH_POINTER_TMP=""
   rm -f "$BRAIN_PID_FILE" "$BRAIN_OUT_FILE" \
     "$RADAR_RUN_DIR/paused" "$RADAR_RUN_DIR/resume-request" "$RADAR_RUN_DIR/keep-open" \
     "$RADAR_RUN_DIR"/.fallback-before.* "$RADAR_RUN_DIR"/.fallback-after.* \
     "$RADAR_RUN_DIR"/.fallback-projection.* "$RADAR_RUN_DIR"/.fallback-guard.* \
     "$WATCH_FALLBACK_CANDIDATE_FILE" "$WATCH_FALLBACK_LAST_FILE" "$WATCH_FALLBACK_ACTIVE_FILE"
+  _watch_clear_decision_capture
+}
+
+_watch_exit_cleanup() {
+  local rc="${1:-0}"
+  trap - EXIT TERM INT HUP
+  set +e
+  if [ "$WATCH_FINALIZED" -eq 0 ] && [ -n "${RADAR_RUN_DIR:-}" ]; then
+    _watch_finalize stopped STOPPED "watcher exited unexpectedly (status $rc)"
+  else
+    _delivery_cleanup
+    _watch_kill_waiters
+    _terminate_current_brain
+    _watch_remove_owned_pointer
+    [ -z "${WATCH_POINTER_TMP:-}" ] || rm -f "$WATCH_POINTER_TMP"
+    WATCH_POINTER_TMP=""
+  fi
+  _watch_clear_decision_capture
+  return "$rc"
 }
 
 _watch_signal_exit() {
   local signal="$1" rc="$2"
   trap - TERM INT HUP
+  set +e
   _delivery_cleanup
   if [ "$WATCH_FINALIZED" -eq 0 ] && [ -n "${RADAR_RUN_DIR:-}" ]; then
     _watch_finalize stopped STOPPED "watcher received $signal"
@@ -2743,6 +2907,7 @@ _watch_signal_exit() {
     [ -n "${RADAR_RUN_DIR:-}" ] && rm -f \
       "$RADAR_RUN_DIR/paused" "$RADAR_RUN_DIR/resume-request" "$RADAR_RUN_DIR/keep-open"
   fi
+  _watch_clear_decision_capture
   exit "$rc"
 }
 
@@ -2846,7 +3011,10 @@ cmd_watch_loop() {
   WATCH_FALLBACK_CANDIDATE_FILE="$RADAR_RUN_DIR/.fallback-candidate"
   WATCH_FALLBACK_LAST_FILE="$RADAR_RUN_DIR/.fallback-last-assessed"
   WATCH_FALLBACK_ACTIVE_FILE="$RADAR_RUN_DIR/.fallback-active"
-  rm -f "$WATCH_FALLBACK_CANDIDATE_FILE" "$WATCH_FALLBACK_LAST_FILE" "$WATCH_FALLBACK_ACTIVE_FILE"
+  WATCH_DECISION_CAPTURE_FILE="$RADAR_RUN_DIR/.decision-capture"
+  rm -f "$WATCH_FALLBACK_CANDIDATE_FILE" "$WATCH_FALLBACK_LAST_FILE" \
+    "$WATCH_FALLBACK_ACTIVE_FILE" "$WATCH_DECISION_CAPTURE_FILE"
+  WATCH_DECISION_CAPTURE_FILE=""
   WATCH_WF="$(radar_watch_file "$pane")"
   if [ "$BRAIN_BACKEND_OK" -ne 1 ]; then
     classification="$(jq -cn --arg summary "$(printf '%s' "$BRAIN_PREFLIGHT_JSON" | jq -r '.summary')" \
@@ -2876,6 +3044,7 @@ cmd_watch_loop() {
   trap '_watch_signal_exit TERM 143' TERM
   trap '_watch_signal_exit INT 130' INT
   trap '_watch_signal_exit HUP 129' HUP
+  trap '_watch_exit_cleanup $?' EXIT
   if ! _watch_owner_load || ! _watch_owner_live 1; then
     _watch_phase CREATED "run created" none 0
     _watch_finalize stopped STOPPED "${WATCH_OWNER_REASON:-owner lease is not live at startup}"
@@ -2946,16 +3115,17 @@ cmd_watch_loop() {
           _watch_finalize paused_error PAUSED_ERROR "failed to compute fallback projection"
           break
         fi
-        rm -f "$fallback_before" "$fallback_after"
         stable_lines="$(awk 'NF { count++ } END { print count + 0 }' "$fallback_projection")"
         if [ "$stable_lines" -lt 1 ]; then
           WATCH_STABLE_COUNT=0; WATCH_FALLBACK_CANDIDATE_HASH=""
-          rm -f "$fallback_projection" "$WATCH_FALLBACK_CANDIDATE_FILE"
+          rm -f "$fallback_before" "$fallback_after" "$fallback_projection" \
+            "$WATCH_FALLBACK_CANDIDATE_FILE"
           radar_event_append fallback_unstable watcher "no stable fallback evidence" "$(jq -cn \
             --argjson sample "$fallback_sequence" \
             '{record:"fallback_projection",sample:$sample,stable_lines:0,deduped:false}')"
           continue
         fi
+        rm -f "$fallback_before" "$fallback_after"
         projection_hash="$(_watch_file_hash "$fallback_projection")"
         if [ "$projection_hash" = "$WATCH_FALLBACK_CANDIDATE_HASH" ]; then
           WATCH_STABLE_COUNT=$((WATCH_STABLE_COUNT + 1))
@@ -2974,9 +3144,8 @@ cmd_watch_loop() {
           continue
         fi
         WATCH_STABLE_COUNT=0
-        if [ -s "$WATCH_FALLBACK_LAST_FILE" ] &&
-          { _watch_file_is_subsequence "$WATCH_FALLBACK_CANDIDATE_FILE" "$WATCH_FALLBACK_LAST_FILE" ||
-            _watch_file_is_subsequence "$WATCH_FALLBACK_LAST_FILE" "$WATCH_FALLBACK_CANDIDATE_FILE"; }; then
+        if [ -n "$WATCH_FALLBACK_LAST_HASH" ] &&
+          [ "$projection_hash" = "$WATCH_FALLBACK_LAST_HASH" ]; then
           radar_event_append fallback_deduped watcher "stable projection already assessed" "$(jq -cn \
             --arg hash "$projection_hash" --arg previous "$WATCH_FALLBACK_LAST_HASH" \
             --argjson lines "$stable_lines" \
@@ -3024,7 +3193,19 @@ cmd_watch_loop() {
       _watch_finalize stopped STOPPED "$WATCH_LIFECYCLE_REASON"
       break
     fi
-    evidence_fingerprint="$(_watch_evidence_fingerprint "$event_kind" || true)"
+    _watch_clear_decision_capture
+    if [ "$event_kind" = screen_idle ]; then
+      WATCH_DECISION_CAPTURE_FILE="$RADAR_RUN_DIR/.decision-capture"
+      if ! _watch_fallback_capture "$WATCH_DECISION_CAPTURE_FILE"; then
+        evidence_fingerprint=""
+      else
+        evidence_fingerprint="$(_watch_file_hash "$WATCH_DECISION_CAPTURE_FILE")"
+        [ -z "$evidence_fingerprint" ] ||
+          evidence_fingerprint="fallback-sample:$evidence_fingerprint"
+      fi
+    else
+      evidence_fingerprint="$(_watch_evidence_fingerprint "$event_kind" || true)"
+    fi
     if [ -z "$evidence_fingerprint" ]; then _watch_finalize stopped STOPPED "target pane disappeared during capture"; break; fi
 
     WATCH_RETRY=0; WATCH_TRANSIENT_RETRIES=0; WATCH_REPAIR_ATTEMPTS=0; retry_cancelled=0; repair_reason=""
@@ -3082,6 +3263,11 @@ cmd_watch_loop() {
 
       if [ "$failure_kind" = lifecycle-stop ]; then
         _watch_finalize stopped STOPPED "$failure"
+        break 2
+      fi
+      if [ "$failure_kind" = process-ownership ]; then
+        _watch_finalize paused_error PAUSED_ERROR "$failure" || true
+        _escalate "$pane" "AI 监控无法证明模型进程已退出，已停止自动操作"
         break 2
       fi
 
@@ -3161,6 +3347,7 @@ cmd_watch_loop() {
     done
 
     if [ "$retry_cancelled" -eq 1 ]; then
+      _watch_clear_decision_capture
       WATCH_EVENT_ID=""; WATCH_RETRY=0
       continue
     fi
@@ -3170,6 +3357,7 @@ cmd_watch_loop() {
       0) : ;;
       2) _watch_finalize stopped STOPPED "${WATCH_LIFECYCLE_REASON:-target pane disappeared after decision}"; break ;;
       10|12)
+        _watch_clear_decision_capture
         WATCH_EVENT_ID=""; WATCH_RETRY=0
         continue
         ;;
@@ -3179,21 +3367,25 @@ cmd_watch_loop() {
     _watch_phase POLICY_GATE "evaluating $DECISION_ACTION (safe=$DECISION_SAFE)" none 0
     case "$DECISION_ACTION" in
       done)
+        _watch_clear_decision_capture
         _clearmark "$pane"; _escalate "$pane" "AI: 任务完成 ✓${goal:+ ($goal)}"
         _watch_finalize completed COMPLETED "${DECISION_REASON:-goal completed}"
         break
         ;;
       wait)
+        _watch_clear_decision_capture
         radar_event_append wait watcher "${DECISION_REASON:-model says wait}" "$(jq -cn --arg event_id "$WATCH_EVENT_ID" '{record:"decision",event_id:$event_id}')"
         WATCH_EVENT_ID=""; WATCH_RETRY=0
         continue
         ;;
       suggest)
+        _watch_clear_decision_capture
         radar_event_append suggest watcher "${DECISION_REASON:-suggestion only}" "$(jq -cn --arg event_id "$WATCH_EVENT_ID" '{record:"decision",event_id:$event_id,sent:false}')"
         WATCH_EVENT_ID=""; WATCH_RETRY=0
         continue
         ;;
       escalate)
+        _watch_clear_decision_capture
         classification="$(_classify_outcome policy-halt "${DECISION_REASON:-model requested human judgment}")"
         radar_event_append policy_halt policy "${DECISION_REASON:-model requested human judgment}" "$(jq -cn \
           --arg event_id "$WATCH_EVENT_ID" --argjson classification "$classification" \
@@ -3207,6 +3399,7 @@ cmd_watch_loop() {
         ;;
       send)
         if [ "$DECISION_SAFE" != 1 ] || [ "$auto" = suggest ] || [ "$auto" = confirm ]; then
+          _watch_clear_decision_capture
           classification="$(_classify_outcome policy-halt "${DECISION_REASON:-unsafe or non-auto action}")"
           radar_event_append policy_halt policy "${DECISION_REASON:-unsafe or non-auto action}" "$(jq -cn \
             --arg event_id "$WATCH_EVENT_ID" --argjson classification "$classification" \
@@ -3222,6 +3415,7 @@ cmd_watch_loop() {
     esac
     _watch_phase EXECUTING "final delivery guard" none 0
     set +e; _watch_deliver_under_gate "$evidence_fingerprint" "$event_kind"; guard_rc=$?; set -e
+    _watch_clear_decision_capture
     case "$guard_rc" in
       0) : ;;
       2) _watch_finalize stopped STOPPED "${WATCH_LIFECYCLE_REASON:-target pane disappeared at final delivery guard}"; break ;;
@@ -3281,7 +3475,7 @@ _abort_watch_launch() {  # _abort_watch_launch <pane> <watcher-pid>
   base="$(_wbase "$pane")"
   [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
   [ -n "$pid" ] && wait "$pid" 2>/dev/null || true
-  _terminate_brain_file "$base.brain.pid"
+  _terminate_brain_file "$base.brain.pid" || return 1
   rm -f "$base.watch" "$base.out" "$base.timeline" "$base.detail" \
     "$base.detail.log" "$base.brain.err"
 }
@@ -3725,7 +3919,7 @@ cmd_engine_start() {
 
   kill -TERM "$watcher_pid" 2>/dev/null || true
   sleep 0.05
-  _terminate_process_tree "$watcher_pid" ""
+  _terminate_process_tree "$watcher_pid" "" || true
   wait "$watcher_pid" 2>/dev/null || true
   [ -s "$run_dir/final.json" ] || radar_run_finalize startup-failed 'watcher did not publish a ready acknowledgement'
   [ "$(_state_get "$watch_file" run_id)" != "$run_id" ] || rm -f "$watch_file"
@@ -3796,11 +3990,23 @@ _control_owner_valid() {
 
 _control_stop_complete() {  # _control_stop_complete <run-dir> <watch-file> <run-id> <generation> <pid>
   local run_dir="$1" watch_file="$2" run_id="$3" generation="$4" pid="$5"
+  local brain_file="${watch_file%.watch}.brain.pid" owned
   [ -s "$run_dir/final.json" ] || return 1
   case "$pid" in
     ''|0|*[!0-9]*) : ;;
     *) kill -0 "$pid" 2>/dev/null && return 1 ;;
   esac
+  # Active model calls publish this file before state.json references the
+  # model. The watcher removes it only after the complete process group exits.
+  [ ! -e "$brain_file" ] || return 1
+  for owned in \
+    "$(jq -r '.waiter_pid // 0' "$run_dir/state.json" 2>/dev/null || echo 0)" \
+    "$(jq -r '.timer_pid // 0' "$run_dir/state.json" 2>/dev/null || echo 0)"; do
+    case "$owned" in
+      ''|0|*[!0-9]*) : ;;
+      *) kill -0 "$owned" 2>/dev/null && return 1 ;;
+    esac
+  done
   if [ -r "$watch_file" ] &&
     [ "$(_state_get "$watch_file" run_id)" = "$run_id" ] &&
     [ "$(_state_get "$watch_file" generation)" = "$generation" ]; then
@@ -3811,9 +4017,18 @@ _control_stop_complete() {  # _control_stop_complete <run-dir> <watch-file> <run
 
 _control_force_stop() {  # _control_force_stop <run-dir> <watch-file> <run-id> <generation> <pid>
   local run_dir="$1" watch_file="$2" run_id="$3" generation="$4" pid="$5"
-  local brain_file="${watch_file%.watch}.brain.pid"
-  _terminate_process_tree "$pid" ""
-  _terminate_brain_file "$brain_file"
+  local brain_file="${watch_file%.watch}.brain.pid" owned rc=0
+  _terminate_process_tree "$pid" "" || rc=1
+  _terminate_brain_file "$brain_file" || rc=1
+  for owned in \
+    "$(jq -r '.waiter_pid // 0' "$run_dir/state.json" 2>/dev/null || echo 0)" \
+    "$(jq -r '.timer_pid // 0' "$run_dir/state.json" 2>/dev/null || echo 0)"; do
+    case "$owned" in
+      ''|0|*[!0-9]*) : ;;
+      *) _terminate_process_tree "$owned" "" || rc=1 ;;
+    esac
+  done
+  [ "$rc" -eq 0 ] || return 1
   if [ -r "$watch_file" ] &&
     [ "$(_state_get "$watch_file" run_id)" = "$run_id" ] &&
     [ "$(_state_get "$watch_file" generation)" = "$generation" ]; then
@@ -3979,13 +4194,14 @@ cmd_control() {
         attempt=$((attempt + 1))
       done
       if ! _control_stop_complete "$run_dir" "$watch_file" "$run_id" "$expected_generation" "$pid"; then
-        _control_force_stop "$run_dir" "$watch_file" "$run_id" "$expected_generation" "$pid"
-        attempt=0
-        while [ "$attempt" -lt "${TMUX_RADAR_STOP_FORCE_ATTEMPTS:-100}" ] &&
-          ! _control_stop_complete "$run_dir" "$watch_file" "$run_id" "$expected_generation" "$pid"; do
-          sleep "${TMUX_RADAR_CONTROL_DELAY:-0.02}"
-          attempt=$((attempt + 1))
-        done
+        if _control_force_stop "$run_dir" "$watch_file" "$run_id" "$expected_generation" "$pid"; then
+          attempt=0
+          while [ "$attempt" -lt "${TMUX_RADAR_STOP_FORCE_ATTEMPTS:-100}" ] &&
+            ! _control_stop_complete "$run_dir" "$watch_file" "$run_id" "$expected_generation" "$pid"; do
+            sleep "${TMUX_RADAR_CONTROL_DELAY:-0.02}"
+            attempt=$((attempt + 1))
+          done
+        fi
       fi
       _control_stop_complete "$run_dir" "$watch_file" "$run_id" "$expected_generation" "$pid" ||
         action='timeout'
@@ -4075,35 +4291,100 @@ cmd_report() {
   ' "$final"
 }
 
+_stop_legacy_watch_file() {  # _stop_legacy_watch_file <watch-file>
+  local wf="$1" pid brain_file run_id run_dir pane channel attempt=0
+  pid="$(_state_get "$wf" pid)"
+  brain_file="${wf%.watch}.brain.pid"
+  run_id="$(_state_get "$wf" run_id)"
+  run_dir="$(_state_get "$wf" run_dir)"
+  pane="$(_state_get "$wf" pane)"
+  channel="$(_state_get "$wf" channel)"
+  # Stop the potentially stubborn model group first. Killing the watcher tree
+  # at the same time races its signal trap: both paths wait for that group and
+  # the outer KILL can land just before the watcher publishes final.json.
+  _terminate_brain_file "$brain_file" || true
+  case "$pid" in ''|0|*[!0-9]*) : ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac
+  while [ "$attempt" -lt 100 ]; do
+    case "$pid" in
+      ''|0|*[!0-9]*) break ;;
+      *) kill -0 "$pid" 2>/dev/null || break ;;
+    esac
+    sleep 0.02
+    attempt=$((attempt + 1))
+  done
+  case "$pid" in
+    ''|0|*[!0-9]*) : ;;
+    *) kill -0 "$pid" 2>/dev/null && _terminate_process_tree "$pid" "" || true ;;
+  esac
+  case "$pid" in
+    ''|0|*[!0-9]*) : ;;
+    *) kill -0 "$pid" 2>/dev/null && return 1 ;;
+  esac
+  [ ! -e "$brain_file" ] || _terminate_brain_file "$brain_file" || return 1
+  if [ -n "$run_id" ] && [ -d "$run_dir" ] && [ ! -s "$run_dir/final.json" ]; then
+    _radar_use_run "$pane" "$run_id" "$run_dir" "$channel"
+    radar_run_finalize stopped 'legacy stop completed after watcher exit'
+  fi
+  [ -z "$run_id" ] || [ ! -d "$run_dir" ] || [ -s "$run_dir/final.json" ] || return 1
+  rm -f "$wf"
+}
+
+_stop_watch_file() {  # _stop_watch_file <watch-file>
+  local wf="$1" run_id run_dir pane generation request_id result rc=0
+  run_id="$(_state_get "$wf" run_id)"
+  run_dir="$(_state_get "$wf" run_dir)"
+  pane="$(_state_get "$wf" pane)"
+  generation="$(_state_get "$wf" generation)"
+  if [ -n "$run_id" ] && [ -d "$run_dir" ] && [ -n "$pane" ] && [ -n "$generation" ]; then
+    request_id="cli-stop-$(date +%s)-$$-$RANDOM"
+    set +e
+    result="$(cmd_control "$run_id" "$pane" stop "$request_id")"
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+      printf '%s\n' "$result" >&2
+      return "$rc"
+    fi
+    printf 'stopped watcher for %s (run %s)\n' "$pane" "$run_id"
+    return 0
+  fi
+  if ! _stop_legacy_watch_file "$wf"; then
+    echo "failed to stop legacy watcher recorded in $wf" >&2
+    return 1
+  fi
+  printf 'stopped legacy watcher for %s\n' "${pane:-unknown pane}"
+}
+
 cmd_stop() {
-  local target="${1:-all}" wf pid brain_file
+  local target="${1:-all}" wf brain_file rc=0 found=0
   if [ "$target" = "all" ]; then
     for wf in "$WATCH_DIR"/*.watch; do
       [ -e "$wf" ] || continue
-      pid="$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)"
-      brain_file="${wf%.watch}.brain.pid"
-      [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-      _terminate_brain_file "$brain_file"
-      rm -f "$wf"
+      found=1
+      _stop_watch_file "$wf" || rc=1
     done
     for brain_file in "$WATCH_DIR"/*.brain.pid; do
       [ -e "$brain_file" ] || continue
-      _terminate_brain_file "$brain_file"
+      _terminate_brain_file "$brain_file" || rc=1
+      [ ! -e "$brain_file" ] || rc=1
     done
-    echo "stopped all watchers"; return 0
+    [ "$rc" -eq 0 ] || return 1
+    [ "$found" -eq 1 ] && echo "stopped all watchers" || echo "no active watchers"
+    return 0
   fi
   target="$(_resolve_pane "$target" 2>/dev/null || echo "$target")"
   wf="$(_wf "$target")"
   brain_file="${wf%.watch}.brain.pid"
   if [ ! -f "$wf" ]; then
-    _terminate_brain_file "$brain_file"
+    _terminate_brain_file "$brain_file" || true
+    [ ! -e "$brain_file" ] || {
+      echo "failed to stop orphan model process for $target" >&2
+      return 1
+    }
     echo "no watcher for $target"
     return 0
   fi
-  pid="$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)"
-  [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-  _terminate_brain_file "$brain_file"
-  rm -f "$wf"; echo "stopped watcher for $target"
+  _stop_watch_file "$wf"
 }
 
 cmd_status() {
@@ -4433,14 +4714,41 @@ cmd_list() {
 # Safe to run any time; wired to plugin load and (optionally) the
 # tmux-resurrect post-restore hook.
 # ---------------------------------------------------------------------------
+_cleanup_run_has_live_watcher() {
+  local run_dir="$1" wf owned_run pid
+  for wf in "$WATCH_DIR"/*.watch; do
+    [ -r "$wf" ] || continue
+    owned_run="$(_state_get "$wf" run_dir)"
+    [ "$owned_run" = "$run_dir" ] || continue
+    pid="$(_state_get "$wf" pid)"
+    case "$pid" in ''|0|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+_cleanup_run_transients() {
+  local run_dir="$1"
+  case "$run_dir" in "$RADAR_RUNS_DIR"/*) : ;; *) return 1 ;; esac
+  [ -d "$run_dir" ] || return 0
+  rm -f "$run_dir/.decision-capture" "$run_dir"/.fallback-*
+}
+
 cmd_cleanup() {
-  local wf pid f base n=0 mon start watched live_pids orphan_pids opid
+  local wf pid f base n=0 mon start watched live_pids orphan_pids opid run_dir
   for wf in "$WATCH_DIR"/*.watch; do
     [ -e "$wf" ] || continue
     pid="$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)"
     kill -0 "$pid" 2>/dev/null && continue
-    _terminate_brain_file "${wf%.watch}.brain.pid"
-    rm -f "$wf" "${wf%.watch}.out" "${wf%.watch}.timeline" "${wf%.watch}.detail" "${wf%.watch}.detail.log" "${wf%.watch}.brain.err"; n=$((n+1))
+    if _terminate_brain_file "${wf%.watch}.brain.pid"; then
+      rm -f "$wf" "${wf%.watch}.out" "${wf%.watch}.timeline" "${wf%.watch}.detail" "${wf%.watch}.detail.log" "${wf%.watch}.brain.err"
+      n=$((n+1))
+    fi
+  done
+  for run_dir in "$RADAR_RUNS_DIR"/*; do
+    [ -d "$run_dir" ] || continue
+    _cleanup_run_has_live_watcher "$run_dir" && continue
+    _cleanup_run_transients "$run_dir"
   done
   for f in "$WATCH_DIR"/*.out "$WATCH_DIR"/*.timeline "$WATCH_DIR"/*.detail "$WATCH_DIR"/*.detail.log "$WATCH_DIR"/*.brain.err "$WATCH_DIR"/*.brain.pid; do
     [ -e "$f" ] || continue
@@ -4454,7 +4762,7 @@ cmd_cleanup() {
       *) base="${f%.*}" ;;
     esac
     if [ ! -f "$base.watch" ]; then
-      case "$f" in *.brain.pid) _terminate_brain_file "$f" ;; *) rm -f "$f" ;; esac
+      case "$f" in *.brain.pid) _terminate_brain_file "$f" || true ;; *) rm -f "$f" ;; esac
     fi
   done
   live_pids=""
@@ -4532,10 +4840,15 @@ cmd_emit_event() {
   fi
   sanitized="$(_flat "$label")"
   if ! radar_run_open "$pane" >/dev/null 2>&1; then
+    [ -z "$expected_run_id" ] || {
+      echo "emit-event: expected run is no longer active: $expected_run_id" >&2
+      return 1
+    }
     return 0
   fi
   if [ -n "$expected_run_id" ] && [ "$RADAR_RUN_ID" != "$expected_run_id" ]; then
-    return 0
+    echo "emit-event: active run changed (expected $expected_run_id, found $RADAR_RUN_ID)" >&2
+    return 1
   fi
   [ -d "${RADAR_RUN_DIR:-}" ] || return 0
   event_id="${TMUX_RADAR_EVENT_ID:-}"

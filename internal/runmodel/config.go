@@ -303,8 +303,11 @@ func (config Config) Validate() error {
 	if err := validateEnum("hooks_first", v.HooksFirst, "on", "off"); err != nil {
 		return err
 	}
-	if err := validateFloat("poll", v.Poll, 0.05, 3600); err != nil {
+	if err := validateFloat("poll", v.Poll, 1, 3600); err != nil {
 		return err
+	}
+	if v.Poll.Value != float64(int(v.Poll.Value)) {
+		return errors.New("poll: must be a whole number of seconds")
 	}
 	if err := validateInt("stable_screen_threshold", v.StableScreenThreshold, 1, 20); err != nil {
 		return err

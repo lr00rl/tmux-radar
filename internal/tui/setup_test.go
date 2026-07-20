@@ -98,6 +98,21 @@ func TestSetupEnumToggleAndNumericValidation(t *testing.T) {
 	if model.config.Values.HooksFirst.Value != "off" || model.config.Values.HooksFirst.Source != runmodel.SourceCustom {
 		t.Fatalf("hooks toggle=%#v", model.config.Values.HooksFirst)
 	}
+	model.setFocus(fieldPoll)
+	model = updateSetup(t, model, keyPress(tea.KeyEnter, ""))
+	setSetupInput(&model, fieldPoll, "10.5")
+	model = updateSetup(t, model, keyPress(tea.KeyEnter, ""))
+	if !model.editing || model.errors[fieldPoll] == "" || model.config.Values.Poll.Value != 5 {
+		t.Fatalf("fractional poll accepted: editing=%v error=%q poll=%g", model.editing,
+			model.errors[fieldPoll], model.config.Values.Poll.Value)
+	}
+	setSetupInput(&model, fieldPoll, "10")
+	model = updateSetup(t, model, keyPress(tea.KeyEnter, ""))
+	if model.editing || model.errors[fieldPoll] != "" || model.config.Values.Poll.Value != 10 ||
+		model.config.Values.Poll.Source != runmodel.SourceCustom {
+		t.Fatalf("whole-second poll rejected: editing=%v error=%q poll=%#v", model.editing,
+			model.errors[fieldPoll], model.config.Values.Poll)
+	}
 
 	model.groups[groupBrain] = true
 	model.rebuildFocus()
@@ -205,7 +220,7 @@ func TestSetupProducesExactImmutableConfig(t *testing.T) {
 	model.rebuildFocus()
 	model.setFocus(fieldPoll)
 	model = updateSetup(t, model, keyPress(tea.KeyEnter, ""))
-	setSetupInput(&model, fieldPoll, "10.5")
+	setSetupInput(&model, fieldPoll, "10")
 	model = updateSetup(t, model, keyPress(tea.KeyEnter, ""))
 
 	config, err := model.immutableConfig()
@@ -216,7 +231,7 @@ func TestSetupProducesExactImmutableConfig(t *testing.T) {
 	want.Values.ApprovalPolicy = runmodel.Value[string]{Value: "always-allow", Source: runmodel.SourcePreset}
 	want.Values.AlwaysAllow = runmodel.Value[string]{Value: "on", Source: runmodel.SourcePreset}
 	want.Values.Autonomy = runmodel.Value[string]{Value: "auto-safe", Source: runmodel.SourcePreset}
-	want.Values.Poll = runmodel.Value[float64]{Value: 10.5, Source: runmodel.SourceCustom}
+	want.Values.Poll = runmodel.Value[float64]{Value: 10, Source: runmodel.SourceCustom}
 	backend := compatiblePreflight().Backend
 	want.Backend = &backend
 	if !reflect.DeepEqual(config, want) {

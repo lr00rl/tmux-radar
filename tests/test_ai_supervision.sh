@@ -241,6 +241,7 @@ reset_case() {
   export TMUX_RADAR_TEST_RETRY_DELAYS="0.02,0.02,0.02"
   export TMUX_RADAR_TEST_VERIFY_TIMEOUT="2"
   export TMUX_RADAR_TEST_WAIT_TICK="0.01"
+  export TMUX_RADAR_TEST_ALLOW_SUBSECOND_POLL=1
   export TEST_PANE_ALIVE="$CASE/pane-alive"
   export TEST_FAKE_TMUX="$TMP/bin/tmux"
   export BASH_ENV="$TMP/bashenv"
@@ -329,7 +330,7 @@ start_watch_config() {
 }
 
 write_dynamic_screen() {
-  local prompt="$1" elapsed="$2" footer="$3" i=1 tmp="$TEST_SCREEN.next.$$"
+  local prompt="$1" elapsed="$2" footer="$3" extra="${4:-}" i=1 tmp="$TEST_SCREEN.next.$$"
   : > "$tmp"
   while [ "$i" -le 30 ]; do
     printf 'history-%02d\n' "$i" >> "$tmp"
@@ -340,6 +341,7 @@ write_dynamic_screen() {
     printf '%s\n' "$prompt"
     printf '1. Approve once\n'
     printf '2. Approve for this session\n'
+    [ -z "$extra" ] || printf '%s\n' "$extra"
     printf 'elapsed=%ss\n' "$elapsed"
     printf 'tip=%s\n' "$footer"
   } >> "$tmp"
@@ -353,6 +355,25 @@ write_fully_dynamic_screen() {
     printf 'generation-%s-line-%02d\n' "$generation" "$line" >> "$tmp"
     line=$((line + 1))
   done
+  mv "$tmp" "$TEST_SCREEN"
+}
+
+write_static_approval_screen() {
+  local extra="${1:-}" volatile="${2:-}" prompt="${3:-Apply the first patch?}"
+  local i=1 tmp="$TEST_SCREEN.next.$$"
+  : > "$tmp"
+  while [ "$i" -le 10 ]; do
+    printf 'history-%02d\n' "$i" >> "$tmp"
+    i=$((i + 1))
+  done
+  {
+    printf 'Kimi approval\n'
+    printf '%s\n' "$prompt"
+    printf '1. Approve once\n'
+    printf '2. Approve for this session\n'
+    [ -z "$extra" ] || printf '%s\n' "$extra"
+    [ -z "$volatile" ] || printf '%s\n' "$volatile"
+  } >> "$tmp"
   mv "$tmp" "$TEST_SCREEN"
 }
 
@@ -713,7 +734,29 @@ done < "$TEST_WAITER_PIDS"
 assert_json "$RUN_DIR/final.json" '.outcome == "stopped"'
 printf 'PASS: watcher cleanup leaves no owned process or live pointer\n'
 
-# 19. Stopping directly from ARMED reproduces the Kimi incident shape. The
+# 19. The public stop command must use the run-scoped control protocol and
+# return only after the watcher and active backend process group are gone.
+reset_case public-stop
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"blocked"}'
+touch "$TEST_BLOCK_BACKEND"
+start_watch 30
+emit_event public-stop-event approval stop
+wait_until 'public stop backend metadata' "jq -e '.model.pid > 0 and .model.pgid > 0' '$RUN_DIR/state.json' >/dev/null"
+public_backend_pid="$(jq -r '.model.pid' "$RUN_DIR/state.json")"
+public_backend_pgid="$(jq -r '.model.pgid' "$RUN_DIR/state.json")"
+PUBLIC_STOP_OUT="$(PATH="$TMP/bin:$OLD_PATH" bash "$ROOT/scripts/ai.sh" stop %1)"
+assert_contains "$PUBLIC_STOP_OUT" 'stopped legacy watcher for %1' \
+  'public stop reports the legacy watcher it stopped'
+wait_for_exit "$WATCH_PID" 200 0.02
+assert_process_gone "$WATCH_PID" public-stop-watcher
+assert_process_gone "$public_backend_pid" public-stop-backend
+assert_process_group_gone "$public_backend_pgid" public-stop-backend-group
+assert_json "$RUN_DIR/final.json" '.outcome == "stopped"'
+[ ! -e "$CASE/state/ai-watch/_1.watch" ] || _fail_assert 'public stop left a live pointer'
+WATCH_PID=""
+printf 'PASS: public stop waits for run-scoped process termination evidence\n'
+
+# 20. Stopping directly from ARMED reproduces the Kimi incident shape. The
 # watcher must publish terminal evidence with no waiter/timer child to orphan.
 reset_case armed-stop
 start_watch 30
@@ -725,7 +768,7 @@ assert_json "$RUN_DIR/final.json" '.outcome == "stopped"'
 [ ! -e "$CASE/state/ai-watch/_1.watch" ] || _fail_assert 'armed stop left a live pointer'
 printf 'PASS: ARMED stop leaves terminal evidence and no wait child\n'
 
-# 20. A configured stable-screen threshold requires consecutive stable samples,
+# 21. A configured stable-screen threshold requires consecutive stable samples,
 # and a screen change resets the count.
 reset_case stable-threshold
 write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"stable threshold reached"}'
@@ -767,7 +810,8 @@ printf 'PASS: hooks-first off defers native events but keeps fallback triggers\n
 # deduplicated; a new stable prompt can trigger one new call.
 reset_case semantic-fallback
 write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"approval remains pending"}'
-write_response 2 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"new approval remains pending"}'
+write_response 2 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"new stable option remains pending"}'
+write_response 3 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"new approval remains pending"}'
 write_dynamic_screen 'Apply the first patch?' 1 alpha
 start_watch_config 0.12 1 on 'supervise Kimi' 'fallback_capture_lines=20,capture_lines=120'
 wait_until 'dynamic fallback armed' "jq -e '.phase == \"ARMED\"' '$RUN_DIR/state.json' >/dev/null"
@@ -801,16 +845,92 @@ sleep 0.2
 assert_eq 1 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" \
   'same stable projection spends only one call'
 
+write_dynamic_screen 'Apply the first patch?' 123 iota '3. Always approve this command'
+sleep 0.16
+write_dynamic_screen 'Apply the first patch?' 124 kappa '3. Always approve this command'
+wait_until 'appended semantic fallback decision' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 2 ]" 400
+assert_contains "$(cat "$TEST_PROMPT_FILE")" '3. Always approve this command' \
+  'new stable line is not hidden by old projection containment'
+
 write_dynamic_screen 'Apply the second patch?' 123 iota
 sleep 0.16
 write_dynamic_screen 'Apply the second patch?' 124 kappa
-wait_until 'new semantic fallback decision' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 2 ]" 400
+wait_until 'new semantic fallback decision' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 3 ]" 400
 assert_contains "$(cat "$TEST_PROMPT_FILE")" 'Apply the second patch?' \
   'new stable projection reaches the model'
 stop_watch
 printf 'PASS: semantic fallback ignores volatile rows and deduplicates model cost\n'
 
-# 22. Output with no stable line projection remains call-free while it changes.
+# 22. Containment is not identity: adding one stable choice while every old
+# line remains must create a new fallback decision.
+reset_case fallback-appended-choice
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"old choices assessed"}'
+write_response 2 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"new choice assessed"}'
+write_static_approval_screen
+start_watch_config 0.1 1 on 'supervise static Kimi prompt' 'fallback_capture_lines=20'
+wait_until 'initial static fallback decision' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 1 ]" 400
+assert_contains "$(cat "$CASE/state/ai-watch/_1.detail")" 'model receives last 20 lines' \
+  'fallback detail reports the effective fallback capture budget'
+wait_until 'fallback wait capture cleanup' "[ ! -e '$RUN_DIR/.decision-capture' ]" 400
+write_static_approval_screen '3. Always approve this command'
+wait_until 'appended stable choice decision' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 2 ]" 400
+assert_contains "$(cat "$TEST_PROMPT_FILE")" '3. Always approve this command' \
+  'appended stable choice reaches a new model call'
+stop_watch
+printf 'PASS: appended fallback evidence is a new decision identity\n'
+
+# 23. A fallback send is bound to the exact stable projection. If a choice is
+# appended while the backend is running, the old decision must not reach it.
+reset_case fallback-stale-send
+write_response 1 '{"action":"send","text":"","keys":["Enter"],"safe":true,"reason":"approve old choices"}'
+write_static_approval_screen '' $'elapsed=1s\ntip=alpha'
+touch "$TEST_BLOCK_BACKEND"
+export TMUX_RADAR_TEST_PRE_SEND_BLOCK="$CASE/fallback-pre-send"
+touch "$TMUX_RADAR_TEST_PRE_SEND_BLOCK"
+start_watch_config 0.1 1 on 'supervise changing Kimi prompt' 'fallback_capture_lines=20'
+wait_until 'blocked fallback backend' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 1 ]"
+rm -f "$TEST_BLOCK_BACKEND"
+wait_until 'fallback final guard seam' "[ -s '$TMUX_RADAR_TEST_PRE_SEND_BLOCK.ready' ]" 400
+write_static_approval_screen '3. Always approve this command' 'tip=beta'
+rm -f "$TMUX_RADAR_TEST_PRE_SEND_BLOCK"
+wait_until 'changed fallback decision superseded' \
+  "jq -e 'select(.kind == \"superseded\" and .reason == \"evidence_changed\" and .supersedes_kind == \"screen_idle\")' '$RUN_DIR/events.jsonl' >/dev/null" 400
+assert_eq 0 "$(wc -l < "$TEST_SENDS" | tr -d ' ')" \
+  'fallback decision for an older exact projection sends no keys'
+wait_until 'superseded fallback capture cleanup' "[ ! -e '$RUN_DIR/.decision-capture' ]" 400
+stop_watch
+printf 'PASS: exact fallback evidence cancels stale sends\n'
+
+# 24. The immutable fallback authority must also be the exact evidence supplied
+# to the model. An A -> B -> A transition around cmd_decide must not let the
+# model assess B while the delivery guard authorizes A.
+reset_case fallback-model-evidence
+write_response 1 '{"action":"send","text":"","keys":["Enter"],"safe":true,"reason":"approve the captured first prompt"}'
+write_static_approval_screen
+touch "$TEST_BLOCK_BACKEND" "$TMUX_RADAR_TEST_BEFORE_DECIDE_BLOCK"
+start_watch_config 0.1 1 on 'supervise immutable evidence' 'fallback_capture_lines=20'
+wait_until 'fallback authority captured before decide' \
+  "[ -e '${TMUX_RADAR_TEST_BEFORE_DECIDE_BLOCK}.ready' ]" 400
+write_static_approval_screen '' '' 'Apply the second patch?'
+rm -f "$TMUX_RADAR_TEST_BEFORE_DECIDE_BLOCK"
+wait_until 'fallback backend received immutable prompt' \
+  "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 1 ]" 400
+assert_contains "$(cat "$TEST_PROMPT_FILE")" 'Apply the first patch?' \
+  'model receives the immutable authority capture'
+case "$(cat "$TEST_PROMPT_FILE")" in
+  *'Apply the second patch?'*)
+    _fail_assert 'model independently recaptured changed fallback evidence'
+    ;;
+esac
+write_static_approval_screen
+rm -f "$TEST_BLOCK_BACKEND"
+wait_until 'immutable fallback decision delivered to restored evidence' \
+  "[ \"\$(wc -l < '$TEST_SENDS' | tr -d ' ')\" = 1 ]" 400
+wait_until 'delivered fallback capture cleanup' "[ ! -e '$RUN_DIR/.decision-capture' ]" 400
+stop_watch
+printf 'PASS: fallback model evidence and delivery authority are the same bytes\n'
+
+# 25. Output with no stable line projection remains call-free while it changes.
 reset_case continuously-changing
 write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"must not run"}'
 write_fully_dynamic_screen 1
@@ -836,7 +956,7 @@ SCREEN_UPDATER_PID=""
 stop_watch
 printf 'PASS: continuously changing output with no stable projection is call-free\n'
 
-# 23. Fallback capture is bounded independently while a native event retains
+# 26. Fallback capture is bounded independently while a native event retains
 # the normal capture budget.
 reset_case capture-budgets
 write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"native evidence"}'
@@ -848,7 +968,7 @@ assert_contains "$(cat "$TEST_CAPTURE_ARGS")" '-S -120' 'native decision uses ca
 stop_watch
 printf 'PASS: native and fallback evidence budgets stay independent\n'
 
-# 24. A terminal newline in the goal survives config, runtime state, and the
+# 27. A terminal newline in the goal survives config, runtime state, and the
 # exact model prompt boundary.
 reset_case exact-goal
 goal=$'  exact\ngoal  \n'

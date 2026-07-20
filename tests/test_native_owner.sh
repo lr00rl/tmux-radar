@@ -92,6 +92,14 @@ if [ "${1:-}" = --version ]; then
   exit 0
 fi
 cat >/dev/null
+if [ -n "${TEST_BRAIN_BLOCK:-}" ] && [ -e "$TEST_BRAIN_BLOCK" ]; then
+  trap '' TERM INT HUP
+  /bin/sleep 300 &
+  child=$!
+  printf '%s %s\n' "$$" "$child" > "$TEST_BRAIN_PIDS"
+  wait "$child"
+  exit $?
+fi
 printf '%s\n' '{"action":"wait","text":"","keys":[],"safe":true,"reason":"fixture wait","pane_state":"working","goal_status":"working","risk":"low","evidence":[]}'
 SH
 chmod +x "$TMP/bin/codex"
@@ -175,6 +183,9 @@ assert_eq "$run_count_before" \
   "$(find "$TMP/state/ai-runs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')" \
   'backend drift creates no run directory'
 
+export TEST_BRAIN_BLOCK="$TMP/spark-brain-block"
+export TEST_BRAIN_PIDS="$TMP/spark-brain.pids"
+touch "$TEST_BRAIN_BLOCK"
 spark_result="$(printf '%s\n' "$spark_request" | run_ai_codex engine-start)"
 printf '%s' "$spark_result" | jq -e '.ok == true and .status == "started"' >/dev/null ||
   _fail_assert 'reviewed Spark backend did not start' 'actual' "$spark_result"
@@ -189,10 +200,30 @@ assert_json "$spark_run_dir/config.json" '
   .backend.effort == "high" and
   .backend.effort_source == "tmux"
 '
-run_ai_codex control "$spark_run_id" %1 stop req-stop-spark >/dev/null
+TMUX_RADAR_EXPECT_RUN_ID="$spark_run_id" \
+  run_ai_codex emit-event %1 approval native-owner 'exercise active native stop'
+wait_for_file "$TEST_BRAIN_PIDS" 200 0.02
+wait_for_file "$TMP/state/ai-watch/_1.brain.pid" 200 0.02
+read -r spark_brain_pid spark_brain_child < "$TEST_BRAIN_PIDS"
+spark_brain_pgid="$(awk -F= '$1 == "pgid" { print $2; exit }' "$TMP/state/ai-watch/_1.brain.pid")"
+spark_stop_output="$(run_ai_codex stop %1)"
+assert_contains "$spark_stop_output" "stopped watcher for %1 (run $spark_run_id)" \
+  'public stop resolves the native run before reporting success'
+find "$spark_run_dir/controls" -name 'cli-stop-*.ack.json' -type f -exec \
+  jq -e '.ok == true and .action == "stop" and .status == "acknowledged"' {} \; |
+  grep -q true || _fail_assert 'public native stop did not persist a successful acknowledgement'
 wait_for_exit "$WATCHER_PID" 200 0.02
+kill -0 "$spark_brain_pid" 2>/dev/null &&
+  _fail_assert 'native public stop left the active backend alive' 'pid' "$spark_brain_pid"
+kill -0 "$spark_brain_child" 2>/dev/null &&
+  _fail_assert 'native public stop left the backend descendant alive' 'pid' "$spark_brain_child"
+if ps -axo pgid=,state= 2>/dev/null |
+  awk -v pgid="$spark_brain_pgid" '$1 == pgid && $2 !~ /^[Zz]/ { found=1 } END { exit !found }'; then
+  _fail_assert 'native public stop left a live backend process group' 'pgid' "$spark_brain_pgid"
+fi
+unset TEST_BRAIN_BLOCK TEST_BRAIN_PIDS
 WATCHER_PID=""
-printf 'PASS: reviewed Spark/tmux config survives preflight and engine-start without drift\n'
+printf 'PASS: reviewed Spark config and active native stop retain exact process ownership\n'
 
 request="$(build_request "$goal")"
 

@@ -399,6 +399,7 @@ func TestConfigValidationRejectsInvalidEnumsAndNumbers(t *testing.T) {
 		{"toggle", func(c *Config) { c.Values.HooksFirst.Value = "true" }, "hooks_first"},
 		{"effort", func(c *Config) { c.Values.Effort.Value = "ultra" }, "effort"},
 		{"poll", func(c *Config) { c.Values.Poll.Value = 0.01 }, "poll"},
+		{"fractional poll", func(c *Config) { c.Values.Poll.Value = 1.5 }, "poll"},
 		{"timeout", func(c *Config) { c.Values.Timeout.Value = 4 }, "timeout"},
 		{"max decisions", func(c *Config) { c.Values.MaxDecisions.Value = 0 }, "max_decisions"},
 		{"fallback capture low", func(c *Config) { c.Values.FallbackCaptureLines.Value = 7 }, "fallback_capture_lines"},

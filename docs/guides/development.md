@@ -127,6 +127,11 @@ Treat the following as compatibility requirements, not tuning suggestions.
   finalizer. It clears transient files, removes the live pointer only for its
   generation, writes one `final.json`, and cannot claim success with an owned
   process still alive.
+- **Keep legacy owner GC explicit.** `cleanup` recognizes both `_watch_loop`
+  and native `_watch_run <run-id>` command identities. A native orphan is
+  eligible only after a schema-valid matching `final.json` proves completion
+  and a fresh pre-termination pointer check finds no live PID/run owner;
+  terminate its captured process tree with bounded proof.
 - **No silent partial delivery.** A failed model call, invalid output, blocked
   policy decision, send failure, or failed verification must be journaled and
   surfaced as an error/escalation/paused outcome rather than a successful run.

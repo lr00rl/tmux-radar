@@ -7,6 +7,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/tmux-radar-lifecycle.XXXXXX")"
 WATCH_PID=""
 MONITOR_PID=""
+LEGACY_PID=""
+LEGACY_CHILD_PID=""
 RUN_DIR=""
 
 process_alive() {
@@ -39,6 +41,15 @@ wait_for_exit() {
   return 1
 }
 
+wait_for_effective_exit() {
+  local pid="$1"
+  for _ in {1..600}; do
+    process_effectively_alive "$pid" || return 0
+    sleep 0.05
+  done
+  return 1
+}
+
 current_run_dir() {
   local watch_file="$TMP/state/ai-watch/_1.watch"
   [ -r "$watch_file" ] || return 1
@@ -66,6 +77,8 @@ cleanup() {
   local rc="${1:-$?}" pid brain_pid="" brain_child_pid=""
   [ -n "$MONITOR_PID" ] && kill -KILL "$MONITOR_PID" 2>/dev/null || true
   [ -n "$WATCH_PID" ] && kill -KILL "$WATCH_PID" 2>/dev/null || true
+  [ -n "$LEGACY_PID" ] && kill -KILL "$LEGACY_PID" 2>/dev/null || true
+  [ -n "$LEGACY_CHILD_PID" ] && kill -KILL "$LEGACY_CHILD_PID" 2>/dev/null || true
   if [ -r "$TMP/brain.pids" ]; then
     read -r brain_pid brain_child_pid < "$TMP/brain.pids" || true
     for pid in "$brain_pid" "$brain_child_pid"; do
@@ -75,6 +88,7 @@ cleanup() {
   fi
   wait "$MONITOR_PID" 2>/dev/null || true
   wait "$WATCH_PID" 2>/dev/null || true
+  wait "$LEGACY_PID" 2>/dev/null || true
   if [ "$rc" -eq 0 ]; then
     rm -rf "$TMP"
   else
@@ -110,6 +124,35 @@ printf '%s\n' '#!/usr/bin/env bash' \
   'esac' > "$TMP/bin/tmux"
 chmod +x "$TMP/bin/tmux"
 printf '%s\n' 'tmux() { "$TEST_FAKE_TMUX" "$@"; }' > "$TMP/bashenv"
+
+printf '%s\n' '#!/usr/bin/env bash' \
+  'if [ -n "${TEST_CLEANUP_ORPHAN_PID:-}" ] && [ "$*" = "-axo pid=,command=" ]; then' \
+  '  /bin/ps "$@" 2>/dev/null || true' \
+  '  if [ -n "${TEST_CLEANUP_PUBLISH_POINTER:-}" ]; then' \
+  '    printf "pane=%%99\npid=%s\nrun_id=%s\nrun_dir=%s\n" "$TEST_CLEANUP_ORPHAN_PID" "$TEST_CLEANUP_ORPHAN_RUN" "$TEST_CLEANUP_ORPHAN_DIR" > "$TEST_CLEANUP_PUBLISH_POINTER"' \
+  '  fi' \
+  '  printf "%s bash %s _watch_run %s\n" "$TEST_CLEANUP_ORPHAN_PID" "$TEST_CLEANUP_AI" "$TEST_CLEANUP_ORPHAN_RUN"' \
+  '  exit 0' \
+  'fi' \
+  'if [ -n "${TEST_CLEANUP_ORPHAN_CHILD_PID:-}" ] && [ "$*" = "-axo pid=,ppid=" ]; then' \
+  '  /bin/ps "$@" 2>/dev/null || true' \
+  '  printf "%s 1\n%s %s\n" "$TEST_CLEANUP_ORPHAN_PID" "$TEST_CLEANUP_ORPHAN_CHILD_PID" "$TEST_CLEANUP_ORPHAN_PID"' \
+  '  exit 0' \
+  'fi' \
+  'if [ -n "${TEST_CLEANUP_ORPHAN_PID:-}" ] && [ "$*" = "-p $TEST_CLEANUP_ORPHAN_PID -o command=" ]; then' \
+  '  printf "bash %s _watch_run %s\n" "$TEST_CLEANUP_AI" "$TEST_CLEANUP_ORPHAN_RUN"' \
+  '  exit 0' \
+  'fi' \
+  'exec /bin/ps "$@"' > "$TMP/bin/ps"
+chmod +x "$TMP/bin/ps"
+
+printf '%s\n' '#!/usr/bin/env bash' \
+  'trap "" TERM INT HUP' \
+  '(trap "" TERM INT HUP; exec /bin/sleep 300) &' \
+  'child=$!' \
+  'printf "%s %s\n" "$$" "$child" > "$TEST_LEGACY_PIDS"' \
+  'wait "$child"' > "$TMP/bin/fake-legacy-owner"
+chmod +x "$TMP/bin/fake-legacy-owner"
 
 printf '%s\n' '#!/usr/bin/env bash' \
   'cat >/dev/null' \
@@ -600,6 +643,106 @@ TMUX_RADAR_NEEDINPUT_FILE="$TMP/state/need-input" \
   exit 1
 }
 printf 'PASS: crash cleanup removes private captures without discarding ownership evidence\n'
+
+# A ready acknowledgement is not terminal proof: cleanup may race a native
+# watcher between process launch and pointer publication.
+ready_run='ready-native-owner'
+mkdir -p "$TMP/state/ai-runs/$ready_run"
+printf '{"schema_version":1,"run_id":"%s"}\n' "$ready_run" \
+  > "$TMP/state/ai-runs/$ready_run/ready.json"
+TEST_LEGACY_PIDS="$TMP/ready-owner.pids" "$TMP/bin/fake-legacy-owner" &
+LEGACY_PID=$!
+wait_for_file "$TMP/ready-owner.pids" || {
+  printf 'FAIL: ready native owner did not start\n' >&2
+  exit 1
+}
+read -r owner_pid LEGACY_CHILD_PID < "$TMP/ready-owner.pids"
+[ "$owner_pid" = "$LEGACY_PID" ] || {
+  printf 'FAIL: ready native owner PID mismatch\n' >&2
+  exit 1
+}
+PATH="$TMP/bin:$PATH" \
+BASH_ENV="$TMP/bashenv" \
+TEST_FAKE_TMUX="$TMP/bin/tmux" \
+TEST_PANE_ALIVE="$TMP/pane-alive" \
+TEST_CLEANUP_ORPHAN_PID="$LEGACY_PID" \
+TEST_CLEANUP_ORPHAN_RUN="$ready_run" \
+TEST_CLEANUP_AI="$ROOT/scripts/ai.sh" \
+TMUX_RADAR_STATE_DIR="$TMP/state" \
+TMUX_RADAR_NEEDINPUT_FILE="$TMP/state/need-input" \
+  bash "$ROOT/scripts/ai.sh" cleanup >/dev/null
+if ! process_effectively_alive "$LEGACY_PID" || ! process_effectively_alive "$LEGACY_CHILD_PID"; then
+  printf 'FAIL: cleanup reaped a ready native owner without terminal proof\n' >&2
+  exit 1
+fi
+kill -KILL "$LEGACY_CHILD_PID" "$LEGACY_PID" 2>/dev/null || true
+wait "$LEGACY_PID" 2>/dev/null || true
+LEGACY_PID=""; LEGACY_CHILD_PID=""
+printf 'PASS: cleanup preserves ready native owners without terminal proof\n'
+
+# Even a finalized run is protected when its pointer appears after cleanup's
+# initial snapshot. Once that pointer is removed, cleanup must reap the exact
+# TERM-resistant parent and child tree left by pre-v0.1.2 native owners.
+legacy_run='legacy-native-orphan'
+legacy_dir="$TMP/state/ai-runs/$legacy_run"
+legacy_pointer="$TMP/state/ai-watch/legacy-race.watch"
+mkdir -p "$legacy_dir"
+printf '{"schema_version":1,"run_id":"%s","outcome":"stopped","reason":"test final","finalized_epoch":1}\n' \
+  "$legacy_run" > "$legacy_dir/final.json"
+TEST_LEGACY_PIDS="$TMP/legacy-owner.pids" "$TMP/bin/fake-legacy-owner" &
+LEGACY_PID=$!
+wait_for_file "$TMP/legacy-owner.pids" || {
+  printf 'FAIL: finalized native owner did not start\n' >&2
+  exit 1
+}
+read -r owner_pid LEGACY_CHILD_PID < "$TMP/legacy-owner.pids"
+[ "$owner_pid" = "$LEGACY_PID" ] || {
+  printf 'FAIL: finalized native owner PID mismatch\n' >&2
+  exit 1
+}
+PATH="$TMP/bin:$PATH" \
+BASH_ENV="$TMP/bashenv" \
+TEST_FAKE_TMUX="$TMP/bin/tmux" \
+TEST_PANE_ALIVE="$TMP/pane-alive" \
+TEST_CLEANUP_ORPHAN_PID="$LEGACY_PID" \
+TEST_CLEANUP_ORPHAN_RUN="$legacy_run" \
+TEST_CLEANUP_ORPHAN_DIR="$legacy_dir" \
+TEST_CLEANUP_PUBLISH_POINTER="$legacy_pointer" \
+TEST_CLEANUP_AI="$ROOT/scripts/ai.sh" \
+TMUX_RADAR_STATE_DIR="$TMP/state" \
+TMUX_RADAR_NEEDINPUT_FILE="$TMP/state/need-input" \
+  bash "$ROOT/scripts/ai.sh" cleanup >/dev/null
+if ! process_effectively_alive "$LEGACY_PID" || ! process_effectively_alive "$LEGACY_CHILD_PID"; then
+  printf 'FAIL: cleanup ignored a pointer published after its initial snapshot\n' >&2
+  exit 1
+fi
+rm -f "$legacy_pointer"
+PATH="$TMP/bin:$PATH" \
+BASH_ENV="$TMP/bashenv" \
+TEST_FAKE_TMUX="$TMP/bin/tmux" \
+TEST_PANE_ALIVE="$TMP/pane-alive" \
+TEST_CLEANUP_ORPHAN_PID="$LEGACY_PID" \
+TEST_CLEANUP_ORPHAN_CHILD_PID="$LEGACY_CHILD_PID" \
+TEST_CLEANUP_ORPHAN_RUN="$legacy_run" \
+TEST_CLEANUP_ORPHAN_DIR="$legacy_dir" \
+TEST_CLEANUP_AI="$ROOT/scripts/ai.sh" \
+TMUX_RADAR_STATE_DIR="$TMP/state" \
+TMUX_RADAR_NEEDINPUT_FILE="$TMP/state/need-input" \
+  bash "$ROOT/scripts/ai.sh" cleanup >/dev/null
+legacy_parent_alive=0
+legacy_child_alive=0
+wait_for_effective_exit "$LEGACY_PID" || legacy_parent_alive=1
+wait_for_effective_exit "$LEGACY_CHILD_PID" || legacy_child_alive=1
+if [ "$legacy_parent_alive" -ne 0 ] || [ "$legacy_child_alive" -ne 0 ]; then
+  printf 'FAIL: cleanup left finalized native owner processes alive (parent=%s child=%s)\n' \
+    "$legacy_parent_alive" "$legacy_child_alive" >&2
+  /bin/ps -p "$LEGACY_PID" -o pid=,ppid=,state=,command= >&2 || true
+  /bin/ps -p "$LEGACY_CHILD_PID" -o pid=,ppid=,state=,command= >&2 || true
+  exit 1
+fi
+wait "$LEGACY_PID" 2>/dev/null || true
+LEGACY_PID=""; LEGACY_CHILD_PID=""
+printf 'PASS: cleanup closes pointer races and reaps finalized native owner trees\n'
 
 brain_temp_files="$(find "$TMP/model-tmp" -maxdepth 1 -type f -name 'tmuxai.*' -print)"
 if [ -n "$brain_temp_files" ]; then

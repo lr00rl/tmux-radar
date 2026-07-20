@@ -544,6 +544,11 @@ when the bar renders (≤30s), and whenever the AI status view opens.
     only under those explicit modes.
     `prompts/` only for full logging. Default retention is seven days and a run
     referenced by a live `.watch` pointer is never collected.
+  - `cleanup` also recognizes both current `_watch_loop` owners and native
+    `_watch_run <run-id>` owners from older releases. A native owner is reaped
+    only when its matching `final.json` proves the run finished and a fresh
+    pointer check finds no live owner; the bounded cleanup includes legacy
+    `tmux wait-for` children.
   - `ai.log` — the AI supervisor's audit log.
 - Environment overrides (mainly for scripting/tests): `TMUX_RADAR_STATE_DIR`,
   `TMUX_RADAR_MRU_FILE`, `TMUX_RADAR_NEEDINPUT_FILE`,

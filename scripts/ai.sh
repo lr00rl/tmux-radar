@@ -4734,8 +4734,48 @@ _cleanup_run_transients() {
   rm -f "$run_dir/.decision-capture" "$run_dir"/.fallback-*
 }
 
+_cleanup_pointer_protects_owner() {  # _cleanup_pointer_protects_owner <pid> [run-id] [run-dir]
+  local owner_pid="$1" run_id="${2:-}" run_dir="${3:-}" wf wf_pid wf_run wf_dir
+  for wf in "$WATCH_DIR"/*.watch; do
+    [ -r "$wf" ] || continue
+    wf_pid="$(_state_get "$wf" pid)"
+    case "$wf_pid" in ''|0|*[!0-9]*) continue ;; esac
+    _pid_effectively_alive "$wf_pid" || continue
+    [ "$wf_pid" = "$owner_pid" ] && return 0
+    [ -n "$run_id" ] || continue
+    wf_run="$(_state_get "$wf" run_id)"
+    wf_dir="$(_state_get "$wf" run_dir)"
+    [ "$wf_run" = "$run_id" ] && return 0
+    [ -n "$run_dir" ] && [ "$wf_dir" = "$run_dir" ] && return 0
+  done
+  return 1
+}
+
+_cleanup_native_run_finalized() {  # _cleanup_native_run_finalized <run-id> <run-dir>
+  local run_id="$1" run_dir="$2" final="$2/final.json"
+  command -v jq >/dev/null 2>&1 || return 1
+  [ -s "$final" ] || return 1
+  jq -e --arg run_id "$run_id" '
+    .schema_version == 1 and
+    .run_id == $run_id and
+    (.outcome | type == "string" and length > 0) and
+    (.reason | type == "string") and
+    (.finalized_epoch | type == "number" and . > 0)
+  ' "$final" >/dev/null 2>&1
+}
+
+_cleanup_process_matches_owner() {  # _cleanup_process_matches_owner <pid> <kind> [run-id]
+  local pid="$1" kind="$2" run_id="${3:-}" command
+  command="$(ps -p "$pid" -o command= 2>/dev/null | awk '{$1=$1; print; exit}')" || return 1
+  case "$kind" in
+    loop) [[ "$command" == *"$SELF _watch_loop"* ]] ;;
+    run)  [[ "$command" == *"$SELF _watch_run $run_id"* ]] ;;
+    *) return 1 ;;
+  esac
+}
+
 cmd_cleanup() {
-  local wf pid f base n=0 mon start watched live_pids orphan_pids opid run_dir
+  local wf pid f base n=0 mon start watched live_pids orphan_rows opid orphan_kind orphan_run run_dir
   for wf in "$WATCH_DIR"/*.watch; do
     [ -e "$wf" ] || continue
     pid="$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)"
@@ -4771,16 +4811,31 @@ cmd_cleanup() {
     pid="$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)"
     [ -n "$pid" ] && live_pids="$live_pids$pid"$'\034'
   done
-  orphan_pids="$(ps -axo pid=,command= 2>/dev/null | LC_ALL=C awk -v self="$SELF" -v live="$live_pids" '
-    index($0, self " _watch_loop") == 0 { next }
+  orphan_rows="$(ps -axo pid=,command= 2>/dev/null | LC_ALL=C awk -v self="$SELF" -v live="$live_pids" '
     {
       pid=$1
-      if (pid != "" && index("\034" live, "\034" pid "\034") == 0) print pid
+      if (pid == "" || index("\034" live, "\034" pid "\034") != 0) next
+      if (index($0, self " _watch_loop") != 0) {
+        print pid "\tloop\t-"
+      } else if (index($0, self " _watch_run") != 0) {
+        print pid "\trun\t" $NF
+      }
     }' || true)"
-  while IFS= read -r opid; do
+  while IFS=$'\t' read -r opid orphan_kind orphan_run; do
     [ -n "$opid" ] || continue
-    kill "$opid" 2>/dev/null && n=$((n+1)) || true
-  done <<< "$orphan_pids"
+    if [ "$orphan_kind" = run ]; then
+      case "$orphan_run" in ''|*/*|*..*) continue ;; esac
+      run_dir="$RADAR_RUNS_DIR/$orphan_run"
+      _cleanup_native_run_finalized "$orphan_run" "$run_dir" || continue
+    else
+      run_dir=""
+    fi
+    _cleanup_process_matches_owner "$opid" "$orphan_kind" "$orphan_run" || continue
+    # A watcher can publish its pointer after the process snapshot above.
+    # Re-read live ownership immediately before the destructive operation.
+    _cleanup_pointer_protects_owner "$opid" "$orphan_run" "$run_dir" && continue
+    _terminate_process_tree "$opid" "" && n=$((n+1)) || true
+  done <<< "$orphan_rows"
   if have_tmux; then
     tmux list-panes -a -F '#{pane_id}'$'\t''#{pane_start_command}' 2>/dev/null |
       while IFS=$'\t' read -r mon start; do

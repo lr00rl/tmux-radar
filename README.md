@@ -419,9 +419,14 @@ Every run is stored under `~/.local/state/tmux/ai-runs/<run-id>/`. Default
 `decision` logging persists config, state, events, structured decisions,
 metadata, and backend stderr, but not pane captures or prompts. `full` adds exact
 screen and prompt files, which may contain source code, paths, commands, or
-secrets. All run files are user-only. The global `ai.log` remains a compact
-cross-run index; `ai.sh report latest` prints the final duration, reason, goal,
-counts, and log location.
+secrets. With `full` logging or screen snapshots enabled, raw fallback samples
+are archived only after a new stable projection launches a model assessment;
+unchanged deduped polls and pre-launch cancellations do not create files.
+All run files are user-only. The `Logs` view lists at most 512 artifacts and
+shows an omission marker for larger runs without interrupting Timeline,
+Decision, or Screen updates. The global `ai.log` remains a compact cross-run
+index; `ai.sh report latest` prints the final duration, reason, goal, counts,
+and log location.
 
 On goal completion the DONE notification is emitted and the native report shows
 an explicit close countdown (12 seconds by default). Press `k` to durably keep
@@ -541,7 +546,7 @@ when the bar renders (≤30s), and whenever the AI status view opens.
     `final.json`. `monitors` records the overview/detail pane IDs or popup
     ownership before the compatibility pointer is rewritten. `screens/` is
     created only for snapshots/full logging; fallback raw samples are persisted
-    only under those explicit modes.
+    only for newly assessed stable projections under those explicit modes.
     `prompts/` only for full logging. Default retention is seven days and a run
     referenced by a live `.watch` pointer is never collected.
   - `cleanup` also recognizes both current `_watch_loop` owners and native
@@ -592,6 +597,10 @@ when the bar renders (≤30s), and whenever the AI status view opens.
   deliberately omits screen/prompt persistence. Set
   `@radar-ai-logging 'full'` only when you accept that exact prompts and pane
   captures may contain source code, paths, commands, or secrets.
+- **`Run reader: run contains more than 512 artifacts`** — update the plugin.
+  Older native consoles treated the bounded `Logs` file-list limit as a fatal
+  run error. Current consoles truncate only that presentation list, show an
+  omission marker, and keep Timeline/Decision/Screen live.
 - **The right console leaves too little room** — width is responsively clamped;
   targets with at least 121 columns keep at least 64 columns and receive a
   56–112-column right pane. Targets at 120 columns or below use a popup without

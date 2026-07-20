@@ -161,9 +161,13 @@ WATCH_OWNER_REASON=""
 WATCH_FALLBACK_CANDIDATE_HASH=""
 WATCH_FALLBACK_LAST_HASH=""
 WATCH_FALLBACK_ACTIVE_HASH=""
+WATCH_FALLBACK_DEDUPED_HASH=""
 WATCH_FALLBACK_CANDIDATE_FILE=""
 WATCH_FALLBACK_LAST_FILE=""
 WATCH_FALLBACK_ACTIVE_FILE=""
+WATCH_FALLBACK_PENDING_BEFORE=""
+WATCH_FALLBACK_PENDING_AFTER=""
+WATCH_FALLBACK_PENDING_SEQUENCE=""
 WATCH_DECISION_CAPTURE_FILE=""
 
 DELIVERY_GATE_HELD=0
@@ -1104,9 +1108,15 @@ _watch_state_snapshot() {
 
 _watch_phase() {
   local phase="$1" status="$2" next_kind="${3:-none}" next_at="${4:-0}" extra="${5:-}"
+  local previous_phase="$WATCH_PHASE" previous_status="$WATCH_STATUS" previous_next_kind="$WATCH_NEXT_KIND"
   [ -n "$extra" ] || extra='{}'
   WATCH_PHASE="$phase"; WATCH_STATUS="$status"; WATCH_NEXT_KIND="$next_kind"; WATCH_NEXT_AT="$next_at"
   _watch_state_snapshot "$extra"
+  if [ "$phase" = "$previous_phase" ] &&
+    [ "$status" = "$previous_status" ] &&
+    [ "$next_kind" = "$previous_next_kind" ]; then
+    return 0
+  fi
   radar_event_append phase watcher "$status" "$(jq -cn \
     --arg phase "$phase" --arg event_id "$WATCH_EVENT_ID" --argjson retry "$WATCH_RETRY" \
     '{record:"phase",phase:$phase,event_id:$event_id,retry:$retry}')"
@@ -2145,6 +2155,46 @@ _watch_record_fallback_samples() {
     "$dir/$(printf '%04d-after.txt' "$sequence")" 2>/dev/null || true
 }
 
+_watch_clear_pending_fallback_samples() {
+  [ -z "${WATCH_FALLBACK_PENDING_BEFORE:-}" ] || rm -f "$WATCH_FALLBACK_PENDING_BEFORE"
+  [ -z "${WATCH_FALLBACK_PENDING_AFTER:-}" ] || rm -f "$WATCH_FALLBACK_PENDING_AFTER"
+  WATCH_FALLBACK_PENDING_BEFORE=""
+  WATCH_FALLBACK_PENDING_AFTER=""
+  WATCH_FALLBACK_PENDING_SEQUENCE=""
+}
+
+_watch_stage_fallback_samples() {
+  local before="$1" after="$2" sequence="$3"
+  _watch_clear_pending_fallback_samples
+  if [ "${TMUX_RADAR_RUN_LOGGING:-decision}" != full ] &&
+    [ "${TMUX_RADAR_RUN_SCREEN_SNAPSHOTS:-off}" != on ]; then
+    rm -f "$before" "$after"
+    return 0
+  fi
+  WATCH_FALLBACK_PENDING_BEFORE="$RADAR_RUN_DIR/.fallback-pending-before"
+  WATCH_FALLBACK_PENDING_AFTER="$RADAR_RUN_DIR/.fallback-pending-after"
+  WATCH_FALLBACK_PENDING_SEQUENCE="$sequence"
+  mv "$before" "$WATCH_FALLBACK_PENDING_BEFORE"
+  mv "$after" "$WATCH_FALLBACK_PENDING_AFTER"
+  chmod 600 "$WATCH_FALLBACK_PENDING_BEFORE" "$WATCH_FALLBACK_PENDING_AFTER" 2>/dev/null || true
+}
+
+_watch_commit_fallback_assessment() {
+  if [ -n "${WATCH_FALLBACK_ACTIVE_HASH:-}" ]; then
+    WATCH_FALLBACK_LAST_HASH="$WATCH_FALLBACK_ACTIVE_HASH"
+    [ ! -r "$WATCH_FALLBACK_ACTIVE_FILE" ] ||
+      cp "$WATCH_FALLBACK_ACTIVE_FILE" "$WATCH_FALLBACK_LAST_FILE"
+  fi
+  if [ -n "${WATCH_FALLBACK_PENDING_SEQUENCE:-}" ] &&
+    [ -r "$WATCH_FALLBACK_PENDING_BEFORE" ] &&
+    [ -r "$WATCH_FALLBACK_PENDING_AFTER" ]; then
+    _watch_record_fallback_samples \
+      "$WATCH_FALLBACK_PENDING_BEFORE" "$WATCH_FALLBACK_PENDING_AFTER" \
+      "$WATCH_FALLBACK_PENDING_SEQUENCE"
+  fi
+  _watch_clear_pending_fallback_samples
+}
+
 _watch_kill_waiters() {
   WATCH_WAITER_PID=""; WATCH_TIMER_PID=""
   [ -n "${WATCH_WAITER_DONE:-}" ] && rm -f "$WATCH_WAITER_DONE"
@@ -2872,6 +2922,7 @@ _watch_finalize() {
     "$RADAR_RUN_DIR"/.fallback-before.* "$RADAR_RUN_DIR"/.fallback-after.* \
     "$RADAR_RUN_DIR"/.fallback-projection.* "$RADAR_RUN_DIR"/.fallback-guard.* \
     "$WATCH_FALLBACK_CANDIDATE_FILE" "$WATCH_FALLBACK_LAST_FILE" "$WATCH_FALLBACK_ACTIVE_FILE"
+  _watch_clear_pending_fallback_samples
   _watch_clear_decision_capture
 }
 
@@ -2889,6 +2940,7 @@ _watch_exit_cleanup() {
     [ -z "${WATCH_POINTER_TMP:-}" ] || rm -f "$WATCH_POINTER_TMP"
     WATCH_POINTER_TMP=""
   fi
+  _watch_clear_pending_fallback_samples
   _watch_clear_decision_capture
   return "$rc"
 }
@@ -2907,6 +2959,7 @@ _watch_signal_exit() {
     [ -n "${RADAR_RUN_DIR:-}" ] && rm -f \
       "$RADAR_RUN_DIR/paused" "$RADAR_RUN_DIR/resume-request" "$RADAR_RUN_DIR/keep-open"
   fi
+  _watch_clear_pending_fallback_samples
   _watch_clear_decision_capture
   exit "$rc"
 }
@@ -2999,7 +3052,7 @@ cmd_watch_loop() {
   WATCH_RETRY=0; WATCH_TRANSIENT_RETRIES=0; WATCH_REPAIR_ATTEMPTS=0
   WATCH_EVENT_ID=""; WATCH_LAST_DECISION=""; WATCH_FINALIZED=0
   WATCH_STABLE_COUNT=0; WATCH_IDLE_SEQ=0; WATCH_FALLBACK_CANDIDATE_HASH=""
-  WATCH_FALLBACK_LAST_HASH=""; WATCH_FALLBACK_ACTIVE_HASH=""
+  WATCH_FALLBACK_LAST_HASH=""; WATCH_FALLBACK_ACTIVE_HASH=""; WATCH_FALLBACK_DEDUPED_HASH=""
   if [ -n "$precreated_run" ]; then
     run_id="$(printf '%s' "$config" | jq -r '.run_id // empty')"
     generation="$(jq -r '.generation // empty' "$precreated_run/start.json" 2>/dev/null || true)"
@@ -3013,7 +3066,11 @@ cmd_watch_loop() {
   WATCH_FALLBACK_ACTIVE_FILE="$RADAR_RUN_DIR/.fallback-active"
   WATCH_DECISION_CAPTURE_FILE="$RADAR_RUN_DIR/.decision-capture"
   rm -f "$WATCH_FALLBACK_CANDIDATE_FILE" "$WATCH_FALLBACK_LAST_FILE" \
-    "$WATCH_FALLBACK_ACTIVE_FILE" "$WATCH_DECISION_CAPTURE_FILE"
+    "$WATCH_FALLBACK_ACTIVE_FILE" "$WATCH_DECISION_CAPTURE_FILE" \
+    "$RADAR_RUN_DIR/.fallback-pending-before" "$RADAR_RUN_DIR/.fallback-pending-after"
+  WATCH_FALLBACK_PENDING_BEFORE=""
+  WATCH_FALLBACK_PENDING_AFTER=""
+  WATCH_FALLBACK_PENDING_SEQUENCE=""
   WATCH_DECISION_CAPTURE_FILE=""
   WATCH_WF="$(radar_watch_file "$pane")"
   if [ "$BRAIN_BACKEND_OK" -ne 1 ]; then
@@ -3109,7 +3166,6 @@ cmd_watch_loop() {
         fi
         fallback_sequence=$(( ${WATCH_FALLBACK_SEQUENCE:-0} + 1 ))
         WATCH_FALLBACK_SEQUENCE="$fallback_sequence"
-        _watch_record_fallback_samples "$fallback_before" "$fallback_after" "$fallback_sequence"
         if ! _watch_stable_projection "$fallback_before" "$fallback_after" "$fallback_projection"; then
           rm -f "$fallback_before" "$fallback_after" "$fallback_projection"
           _watch_finalize paused_error PAUSED_ERROR "failed to compute fallback projection"
@@ -3125,7 +3181,6 @@ cmd_watch_loop() {
             '{record:"fallback_projection",sample:$sample,stable_lines:0,deduped:false}')"
           continue
         fi
-        rm -f "$fallback_before" "$fallback_after"
         projection_hash="$(_watch_file_hash "$fallback_projection")"
         if [ "$projection_hash" = "$WATCH_FALLBACK_CANDIDATE_HASH" ]; then
           WATCH_STABLE_COUNT=$((WATCH_STABLE_COUNT + 1))
@@ -3136,6 +3191,7 @@ cmd_watch_loop() {
           mv "$fallback_projection" "$WATCH_FALLBACK_CANDIDATE_FILE"
         fi
         if [ "$WATCH_STABLE_COUNT" -lt "$WATCH_STABLE_THRESHOLD" ]; then
+          rm -f "$fallback_before" "$fallback_after"
           radar_event_append fallback_candidate watcher "stable projection $WATCH_STABLE_COUNT/$WATCH_STABLE_THRESHOLD" "$(jq -cn \
             --arg hash "$projection_hash" --argjson lines "$stable_lines" \
             --argjson count "$WATCH_STABLE_COUNT" --argjson threshold "$WATCH_STABLE_THRESHOLD" \
@@ -3146,16 +3202,20 @@ cmd_watch_loop() {
         WATCH_STABLE_COUNT=0
         if [ -n "$WATCH_FALLBACK_LAST_HASH" ] &&
           [ "$projection_hash" = "$WATCH_FALLBACK_LAST_HASH" ]; then
-          radar_event_append fallback_deduped watcher "stable projection already assessed" "$(jq -cn \
-            --arg hash "$projection_hash" --arg previous "$WATCH_FALLBACK_LAST_HASH" \
-            --argjson lines "$stable_lines" \
-            '{record:"fallback_projection",projection_hash:$hash,
-              previous_projection_hash:$previous,stable_lines:$lines,deduped:true}')"
+          rm -f "$fallback_before" "$fallback_after"
+          if [ "$projection_hash" != "$WATCH_FALLBACK_DEDUPED_HASH" ]; then
+            WATCH_FALLBACK_DEDUPED_HASH="$projection_hash"
+            radar_event_append fallback_deduped watcher "stable projection already assessed" "$(jq -cn \
+              --arg hash "$projection_hash" --arg previous "$WATCH_FALLBACK_LAST_HASH" \
+              --argjson lines "$stable_lines" \
+              '{record:"fallback_projection",projection_hash:$hash,
+                previous_projection_hash:$previous,stable_lines:$lines,deduped:true}')"
+          fi
           continue
         fi
-        WATCH_FALLBACK_LAST_HASH="$projection_hash"
+        WATCH_FALLBACK_DEDUPED_HASH=""
+        _watch_stage_fallback_samples "$fallback_before" "$fallback_after" "$fallback_sequence"
         WATCH_FALLBACK_ACTIVE_HASH="$projection_hash"
-        cp "$WATCH_FALLBACK_CANDIDATE_FILE" "$WATCH_FALLBACK_LAST_FILE"
         cp "$WATCH_FALLBACK_CANDIDATE_FILE" "$WATCH_FALLBACK_ACTIVE_FILE"
         WATCH_IDLE_SEQ=$(( ${WATCH_IDLE_SEQ:-0} + 1 ))
         WATCH_EVENT_ID="idle-$RADAR_RUN_ID-$WATCH_IDLE_SEQ"
@@ -3182,12 +3242,21 @@ cmd_watch_loop() {
     set +e; _watch_coalesce_batch "$batch"; coalesce_rc=$?; set -e
     : > "$batch"
     case "$coalesce_rc" in
-      10) WATCH_EVENT_ID=""; _watch_phase ARMED "user resumed; idle timing reset" idle 0; continue ;;
-      11) WATCH_EVENT_ID=""; _watch_phase ARMED "replayed events ignored" idle 0; continue ;;
+      10)
+        _watch_clear_pending_fallback_samples
+        WATCH_EVENT_ID=""; _watch_phase ARMED "user resumed; idle timing reset" idle 0
+        continue
+        ;;
+      11)
+        _watch_clear_pending_fallback_samples
+        WATCH_EVENT_ID=""; _watch_phase ARMED "replayed events ignored" idle 0
+        continue
+        ;;
       0) : ;;
       *) _watch_finalize paused_error PAUSED_ERROR "failed to coalesce event batch"; _escalate "$pane" "AI 监控事件队列读取失败"; break ;;
     esac
     event_kind="$(printf '%s' "$WATCH_EVENT_JSON" | jq -r '.kind')"
+    [ "$event_kind" = screen_idle ] || _watch_clear_pending_fallback_samples
     _watch_phase CAPTURING "capturing pane for $event_kind" none 0
     if ! _watch_lifecycle_live; then
       _watch_finalize stopped STOPPED "$WATCH_LIFECYCLE_REASON"
@@ -3211,6 +3280,7 @@ cmd_watch_loop() {
     WATCH_RETRY=0; WATCH_TRANSIENT_RETRIES=0; WATCH_REPAIR_ATTEMPTS=0; retry_cancelled=0; repair_reason=""
     while :; do
       if [ "$WATCH_CALLS" -ge "$WATCH_MAX_CALLS" ]; then
+        _watch_clear_pending_fallback_samples
         _watch_phase PAUSED_ERROR "max_calls reached before model launch" none 0
         _escalate "$pane" "AI 监控达到调用上限($WATCH_MAX_CALLS),已暂停"
         radar_run_finalize paused "max_calls reached"
@@ -3241,6 +3311,9 @@ cmd_watch_loop() {
       set -e
       if [ "$DECISION_MODEL_LAUNCHED" -ne 1 ]; then
         WATCH_CALLS=$((WATCH_CALLS - 1))
+        [ "$event_kind" != screen_idle ] || _watch_clear_pending_fallback_samples
+      elif [ "$event_kind" = screen_idle ]; then
+        _watch_commit_fallback_assessment
       fi
       WATCH_LAST_DECISION="$(now)"
       valid=1; failure=""; failure_kind=""

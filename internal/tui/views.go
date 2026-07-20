@@ -220,6 +220,10 @@ func (model LiveModel) logLines() []string {
 		"Root  " + model.runDir,
 	}
 	for _, artifact := range model.details.Files {
+		if artifact.Path == artifactOmittedLabel {
+			lines = append(lines, setupStyles.muted.Render(artifact.Path))
+			continue
+		}
 		lines = append(lines, fmt.Sprintf("%-40s %8d B", artifact.Path, artifact.Size))
 	}
 	if model.details.StderrPath != "" {

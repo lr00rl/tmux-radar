@@ -89,8 +89,8 @@ Values in parentheses are validated ranges or allowed values.
 
 | Option | Default | Meaning and tradeoff |
 | --- | --- | --- |
-| `@radar-ai-logging` | `decision` | `decision` stores structured decision metadata and backend stderr. `full` also stores exact decision prompts and pane captures. Full logging can retain secrets visible in a pane. |
-| `@radar-ai-screen-snapshots` | `off` | Stores per-call pane captures without full prompt logging. Captures may still contain sensitive text. |
+| `@radar-ai-logging` | `decision` | `decision` stores structured decision metadata and backend stderr. `full` also stores exact decision prompts, pane captures, and raw fallback sample pairs for newly assessed stable projections. Unchanged deduped polls are not archived. Full logging can retain secrets visible in a pane. |
+| `@radar-ai-screen-snapshots` | `off` | Stores per-call pane captures without full prompt logging. For semantic fallback decisions, it also stores the raw before/after sample pair after the model call launches. Captures may contain sensitive text. |
 | `@radar-ai-retention-days` | `7` | Keeps finalized run directories for this many days (`0`–`3650`). Active runs are protected. `0` makes finalized runs eligible immediately. |
 
 ## Hooks first and semantic fallback

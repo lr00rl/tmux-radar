@@ -861,7 +861,82 @@ assert_contains "$(cat "$TEST_PROMPT_FILE")" 'Apply the second patch?' \
 stop_watch
 printf 'PASS: semantic fallback ignores volatile rows and deduplicates model cost\n'
 
-# 22. Containment is not identity: adding one stable choice while every old
+# 22. Full logging archives only the fallback pair that reached a model call,
+# not every unchanged idle sample forever. Repeated ARMED/dedupe states are
+# journaled once so a long blocked prompt remains inspectable without churn.
+reset_case bounded-fallback-full-log
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"static prompt assessed"}'
+write_static_approval_screen
+start_watch_config 0.1 1 on 'bound repeated fallback evidence' \
+  'fallback_capture_lines=20,logging=full,screen_snapshots=off'
+wait_until 'initial logged fallback decision' \
+  "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 1 ]" 400
+wait_until 'first deduped fallback event' \
+  "jq -e 'select(.kind == \"fallback_deduped\")' '$RUN_DIR/events.jsonl' >/dev/null" 400
+sleep 0.45
+assert_eq 2 "$(find "$RUN_DIR/fallback" -maxdepth 1 -type f | wc -l | tr -d ' ')" \
+  'full logging retains only the assessed fallback sample pair'
+assert_eq 1 "$(jq -s '[.[] | select(.kind == "fallback_deduped")] | length' "$RUN_DIR/events.jsonl")" \
+  'unchanged fallback projection journals one dedupe transition'
+assert_eq 2 "$(jq -s '[.[] | select(.kind == "phase" and .phase == "ARMED" and .label == "waiting for native event or idle fallback")] | length' "$RUN_DIR/events.jsonl")" \
+  'unchanged ARMED state is not journaled every poll'
+stop_watch
+printf 'PASS: full fallback logging and idle timeline remain bounded\n'
+
+# 23. Snapshot logging independently retains the assessed fallback pair.
+reset_case bounded-fallback-snapshots
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"snapshot prompt assessed"}'
+write_static_approval_screen
+start_watch_config 0.1 1 on 'retain assessed fallback snapshots' \
+  'fallback_capture_lines=20,logging=decision,screen_snapshots=on'
+wait_until 'snapshot fallback decision' \
+  "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 1 ]" 400
+wait_until 'snapshot fallback archive' \
+  "[ \"\$(find '$RUN_DIR/fallback' -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')\" = 2 ]" 400
+assert_eq 2 "$(find "$RUN_DIR/fallback" -maxdepth 1 -type f | wc -l | tr -d ' ')" \
+  'screen snapshots retain the assessed fallback sample pair'
+stop_watch
+printf 'PASS: screen snapshots retain assessed fallback evidence\n'
+
+# 24. Decision logging without snapshots leaves raw fallback evidence transient.
+reset_case bounded-fallback-decision-log
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"metadata-only prompt assessed"}'
+write_static_approval_screen
+start_watch_config 0.1 1 on 'avoid raw fallback retention' \
+  'fallback_capture_lines=20,logging=decision,screen_snapshots=off'
+wait_until 'metadata-only fallback decision' \
+  "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 1 ]" 400
+wait_until 'metadata-only fallback decision finished' \
+  "jq -e 'select(.kind == \"model_finished\")' '$RUN_DIR/events.jsonl' >/dev/null" 400
+assert_eq 0 "$(find "$RUN_DIR/fallback" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')" \
+  'decision logging without snapshots retains no raw fallback samples'
+stop_watch
+printf 'PASS: decision logging keeps fallback evidence transient\n'
+
+# 25. A stable fallback that cannot launch because the decision budget is
+# exhausted must not retain raw evidence or count as assessed.
+reset_case fallback-no-launch-no-archive
+write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"native event spends budget"}'
+start_watch_config 0.3 1 on 'do not archive unassessed fallback' \
+  'fallback_capture_lines=20,logging=full,screen_snapshots=on,max_decisions=1'
+emit_event max-call-native approval 'spend the only decision'
+wait_until 'native event spends max call' \
+  "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 1 ]" 400
+wait_until 'native max-call decision finished' \
+  "jq -e 'select(.kind == \"model_finished\")' '$RUN_DIR/events.jsonl' >/dev/null" 400
+write_static_approval_screen
+wait_until 'fallback reaches exhausted budget' \
+  "jq -e 'select(.kind == \"phase\" and .label == \"max_calls reached before model launch\")' '$RUN_DIR/events.jsonl' >/dev/null" 400
+assert_eq 0 "$(find "$RUN_DIR/fallback" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')" \
+  'fallback blocked before model launch retains no raw samples'
+assert_eq '' "$(find "$RUN_DIR" -maxdepth 1 -type f -name '.fallback-pending-*' -print)" \
+  'fallback blocked before model launch removes transient sample files'
+assert_eq 1 "$(wc -l < "$TEST_MODEL_CALLS" | tr -d ' ')" \
+  'exhausted fallback does not launch another model call'
+stop_watch
+printf 'PASS: unlaunched fallback evidence is not archived\n'
+
+# 26. Containment is not identity: adding one stable choice while every old
 # line remains must create a new fallback decision.
 reset_case fallback-appended-choice
 write_response 1 '{"action":"wait","text":"","keys":[],"safe":true,"reason":"old choices assessed"}'

@@ -407,6 +407,37 @@ func TestLivePollReadsCanonicalDecisionScreenAndLogsIncrementally(t *testing.T) 
 	}
 }
 
+func TestLivePollTruncatesLargeArtifactListsWithoutFailingTheRunReader(t *testing.T) {
+	dir := t.TempDir()
+	config := runmodel.DefaultConfig("%42", "long full-logging run")
+	writeRunConfig(t, dir, config)
+	artifactDir := filepath.Join(dir, "fallback")
+	if err := os.Mkdir(artifactDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for index := range 600 {
+		path := filepath.Join(artifactDir, fmt.Sprintf("%04d.txt", index))
+		if err := os.WriteFile(path, []byte("evidence\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reader, err := runmodel.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := pollRun(reader, dir)
+	if message.Err != nil {
+		t.Fatalf("large valid run stopped the canonical reader: %v", message.Err)
+	}
+	if message.Details == nil {
+		t.Fatal("large valid run omitted details")
+	}
+	files := message.Details.Files
+	if len(files) != 513 || files[len(files)-1].Path != "... additional artifacts omitted" {
+		t.Fatalf("artifact list was not bounded with an explicit marker: %#v", files)
+	}
+}
+
 func TestLiveReaderErrorsAreRateLimited(t *testing.T) {
 	dir := t.TempDir()
 	config := runmodel.DefaultConfig("%42", "rate limit reader errors")

@@ -135,6 +135,12 @@ Treat the following as compatibility requirements, not tuning suggestions.
 - **No silent partial delivery.** A failed model call, invalid output, blocked
   policy decision, send failure, or failed verification must be journaled and
   surfaced as an error/escalation/paused outcome rather than a successful run.
+- **Bound observability without disabling supervision.** A presentation limit
+  in Logs must truncate with an explicit marker, never fail the canonical run
+  reader. Full logging or screen snapshots may archive raw fallback samples
+  only after a new stable projection launches its model assessment; pre-launch
+  cancellations and repeated dedupe/ARMED states must not create an unbounded
+  file or journal stream.
 
 The one-second bounded waiter is deliberate: it removes the orphanable child
 process class at the cost of an explicit normal wake-latency ceiling of roughly

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,8 +22,10 @@ import (
 )
 
 const (
-	runPollInterval = 250 * time.Millisecond
-	maxDetailBytes  = 1 << 20
+	runPollInterval       = 250 * time.Millisecond
+	maxDetailBytes        = 1 << 20
+	maxListedRunArtifacts = 512
+	artifactOmittedLabel  = "... additional artifacts omitted"
 )
 
 type Surface string
@@ -726,12 +729,17 @@ func readBoundedFile(path string) ([]byte, error) {
 
 func listRunArtifacts(runDir string) ([]artifactInfo, error) {
 	artifacts := make([]artifactInfo, 0, 32)
+	truncated := false
 	err := filepath.WalkDir(runDir, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if entry.IsDir() {
 			return nil
+		}
+		if len(artifacts) == maxListedRunArtifacts {
+			truncated = true
+			return fs.SkipAll
 		}
 		info, err := entry.Info()
 		if err != nil {
@@ -742,11 +750,11 @@ func listRunArtifacts(runDir string) ([]artifactInfo, error) {
 			return err
 		}
 		artifacts = append(artifacts, artifactInfo{Path: relative, Size: info.Size()})
-		if len(artifacts) > 512 {
-			return errors.New("run contains more than 512 artifacts")
-		}
 		return nil
 	})
 	sort.Slice(artifacts, func(left, right int) bool { return artifacts[left].Path < artifacts[right].Path })
+	if truncated {
+		artifacts = append(artifacts, artifactInfo{Path: artifactOmittedLabel})
+	}
 	return artifacts, err
 }

@@ -30,7 +30,7 @@ func (model LiveModel) contentLines() []string {
 			"e                  expand a Timeline group",
 			"p                  pause or resume",
 			"r                  reassess now",
-			"k                  keep completed console open",
+			"K                  keep completed console open",
 			"c                  open Config",
 			"Enter              target focus; popup detach",
 			"q                  stop active run or close terminal run",
@@ -337,7 +337,7 @@ func (model LiveModel) nextLine() string {
 			if remaining < 0 {
 				remaining = 0
 			}
-			return fmt.Sprintf("Next  close console in %ds; k keeps it open", remaining)
+			return fmt.Sprintf("Next  close console in %ds; K keeps it open", remaining)
 		}
 		return "Next  terminal report available in Logs"
 	}
@@ -367,13 +367,13 @@ func (model LiveModel) renderTabs(width int) string {
 }
 
 func (model LiveModel) liveFooter(width int) []string {
-	controls := "1-5 views · j/k scroll · e expand · p pause · r reassess · k keep · Enter target · q stop · ? help"
+	controls := "1-5 views · j/k scroll · e expand · p pause · r reassess · K keep · Enter target · q stop · ? help"
 	if model.snapshot.Final != nil {
-		controls = "1-5 views · j/k scroll · e expand · k keep · Enter target · q close · ? help"
+		controls = "1-5 views · j/k scroll · e expand · K keep · Enter target · q close · ? help"
 		if width < 56 {
 			controls = "1-5 view · k · Enter · q · ?"
 		} else if width < 72 {
-			controls = "1-5 · k keep · Enter target · q close · ?"
+			controls = "1-5 · K keep · Enter target · q close · ?"
 		} else if width < 110 {
 			controls = "1-5 · j/k · e · k · Enter · q · ?"
 		}

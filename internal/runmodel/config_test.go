@@ -22,7 +22,7 @@ func TestDefaultConfigUsesLunaHighAndTracksProvenance(t *testing.T) {
 	if config.Values.Goal != (Value[string]{Value: goal, Source: SourceCustom}) {
 		t.Fatalf("goal value = %#v", config.Values.Goal)
 	}
-	if config.Values.Model != (Value[string]{Value: "gpt-5.6-luna", Source: SourceDefault}) {
+	if config.Values.Model != (Value[string]{Value: "gpt-5.3-codex-spark", Source: SourceDefault}) {
 		t.Fatalf("model value = %#v", config.Values.Model)
 	}
 	if config.Values.Effort != (Value[string]{Value: "high", Source: SourceDefault}) {
@@ -140,7 +140,7 @@ func TestDecodeConfigReadsLegacyV0AndIgnoresAdditiveFields(t *testing.T) {
 	if config.Values.MaxDecisions != (Value[int]{Value: 77, Source: SourceLegacy}) {
 		t.Fatalf("legacy max calls = %#v", config.Values.MaxDecisions)
 	}
-	if config.Values.Model.Value != "gpt-5.6-luna" || config.Values.Effort.Value != "high" {
+	if config.Values.Model.Value != "gpt-5.3-codex-spark" || config.Values.Effort.Value != "high" {
 		t.Fatalf("legacy defaults not filled: model=%#v effort=%#v", config.Values.Model, config.Values.Effort)
 	}
 }
@@ -167,7 +167,7 @@ func validCodexBackend() *BackendIdentity {
 		Version:         "0.144.4",
 		Identity:        "1:2:3:4",
 		Source:          "path",
-		Model:           "gpt-5.6-luna",
+		Model:           "gpt-5.3-codex-spark",
 		Effort:          "high",
 		ModelSource:     SourceDefault,
 		EffortSource:    SourceDefault,

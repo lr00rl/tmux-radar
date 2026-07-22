@@ -312,6 +312,10 @@ func (model SetupModel) updateControl(message tea.KeyPressMsg) (SetupModel, tea.
 		if spec, ok := fieldByID(id); ok && spec.Kind == kindToggle {
 			model.toggleField(id)
 		}
+	case "down", "j":
+		model.moveFocus(1)
+	case "up", "k":
+		model.moveFocus(-1)
 	}
 	return model, nil
 }

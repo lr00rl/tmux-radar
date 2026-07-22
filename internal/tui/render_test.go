@@ -27,7 +27,7 @@ func TestSetupRenderingFitsFixedTerminalSizes(t *testing.T) {
 					t.Fatalf("line %d width=%d > %d: %q", index+1, got, size.width, line)
 				}
 			}
-			if !strings.Contains(view, "SETUP") || !strings.Contains(view, "gpt-5.6-luna") {
+			if !strings.Contains(view, "SETUP") || !strings.Contains(view, "gpt-5.3-codex-spark") {
 				t.Fatalf("essential setup context missing at %dx%d\n%s", size.width, size.height, view)
 			}
 		})

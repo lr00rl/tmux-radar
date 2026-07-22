@@ -370,16 +370,19 @@ func (model LiveModel) handleKey(message tea.KeyPressMsg) (LiveModel, tea.Cmd) {
 	case "j", "down":
 		model.scroll(1)
 	case "k", "up":
-		if key == "k" && model.snapshot.Final != nil {
-			updated, command := model.startControl("keep")
-			if command != nil {
-				updated.completionKept = true
-				updated.completionTimerID++
-				updated.completionDeadline = time.Time{}
-			}
-			return updated, command
-		}
 		model.scroll(-1)
+	case "K":
+		if model.snapshot.Final == nil {
+			model.controlNotice = "Keep is available only after completion"
+			return model, nil
+		}
+		updated, command := model.startControl("keep")
+		if command != nil {
+			updated.completionKept = true
+			updated.completionTimerID++
+			updated.completionDeadline = time.Time{}
+		}
+		return updated, command
 	case "pgdown":
 		model.viewport.PageDown()
 	case "pgup":

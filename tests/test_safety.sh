@@ -10,6 +10,8 @@ export TMUX_RADAR_STATE_DIR="$T/state"
 MARKS="$TMUX_RADAR_STATE_DIR/need-input"
 REG="$TMUX_RADAR_STATE_DIR/agent-registry"
 LOCK="$TMUX_RADAR_STATE_DIR/.need-input.lock"
+SPOOL="$TMUX_RADAR_STATE_DIR/needinput-spool"
+export TMUX_RADAR_NO_SCHEDULE=1   # ticks are driven explicitly in this suite
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -104,8 +106,13 @@ LOCKED_MARK_RC=0
 "$N" tick >/dev/null 2>&1
 chk "live holder's lock NOT rmdir'd by a give-up path" "[ -d '$LOCK' ] && [ \"\$(cat '$LOCK/pid')\" = '$HOLDER' ]"
 chk "lock timeout never falls through to an unlocked write" "! grep -q 'k:lock-race' '$MARKS' 2>/dev/null"
-chk "state mutation reports lock exhaustion instead of false success" "[ '$LOCKED_MARK_RC' -eq 1 ]"
+chk "lock exhaustion spools the event instead of dropping it" \
+  "[ '$LOCKED_MARK_RC' -eq 0 ] && grep -q 'k:lock-race' '$SPOOL'"
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; rm -rf "$LOCK"
+"$N" tick >/dev/null 2>&1
+chk "next tick replays the spooled mark" \
+  "grep -q 'k:lock-race' '$MARKS' && [ ! -s '$SPOOL' ]"
+"$N" clear-all; rm -f "$SPOOL" "$TMUX_RADAR_STATE_DIR/.drain-at"
 # A legacy holder may be between mkdir and owner publication. Absence of an
 # owner is not proof of death, so the new implementation must fail closed.
 mkdir -p "$LOCK"
@@ -225,13 +232,14 @@ AGENT_LOCK_RC=0
 printf '%s' '{"session_id":"locked","pane":"%1","pid":1,"process":"demo"}' |
   "$N" agent-event demo approval >/dev/null 2>"$T/agent-event-lock.err" ||
   AGENT_LOCK_RC=$?
-chk "generic event reports lock exhaustion as an operational error" \
-  "[ '$AGENT_LOCK_RC' -eq 1 ]"
+chk "generic event lock exhaustion spools instead of dropping" \
+  "[ '$AGENT_LOCK_RC' -eq 0 ] && grep -q '^agent	demo	approval	' '$SPOOL'"
 chk "generic event lock failure leaves registry and marks untouched" \
   "[ ! -s '$REG' ] && [ ! -s '$MARKS' ]"
 kill "$AGENT_LOCK_HOLDER" 2>/dev/null
 wait "$AGENT_LOCK_HOLDER" 2>/dev/null
 rm -rf "$LOCK"
+rm -f "$SPOOL" "$TMUX_RADAR_STATE_DIR/.drain-at"   # do not replay into later cases
 
 KIMI_UNKNOWN_RC=0
 printf '%s' '{"hook_event_name":"Unknown","session_id":"kimi-unknown","cwd":"/tmp"}' |

@@ -30,6 +30,14 @@ NEEDINPUT="$(opt @radar-needinput on)"
 # changes take effect immediately without rebinding).
 tmux bind-key "$KEY" display-popup -E -w "$POPUP_W" -h "$POPUP_H" "$SCRIPTS/switcher.sh menu"
 
+# Global last-pane toggle: prefix + <@radar-last-key> (default Tab) jumps to
+# the most recently used other pane across windows AND sessions (tmux's own
+# last-pane only works inside one window). Set to `none` to skip binding.
+LAST_KEY="$(opt @radar-last-key Tab)"
+case "$LAST_KEY" in none|off|'') ;; *)
+  tmux bind-key "$LAST_KEY" run-shell "$SCRIPTS/switcher.sh last-pane" ;;
+esac
+
 # AI supervisor (Codex-driven), opt-in via `set -g @radar-ai on`. prefix +
 # <@radar-ai-key> (default `A` — capital, so a stray prefix+a can't launch
 # it by accident) opens a menu: arrange tmux from natural language,
@@ -59,12 +67,15 @@ fi
 # Hooks are appended (-ga) so we don't clobber other hooks; a version guard
 # avoids duplicate registration on config reload. On version bump we reset our
 # events with -gu first (removes any hook on those events) and re-register.
-HOOK_VERSION=2
+HOOK_VERSION=3
 if [ "$(tmux show-option -gqv @radar-hooked 2>/dev/null || true)" != "$HOOK_VERSION" ]; then
   tmux set-hook -gu session-window-changed 2>/dev/null || true
   tmux set-hook -gu client-session-changed 2>/dev/null || true
+  tmux set-hook -gu window-pane-changed 2>/dev/null || true
   tmux set-hook -ga session-window-changed "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_window}'\""
   tmux set-hook -ga client-session-changed "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_session_name}:'\""
+  # pane-level MRU: fires when the active pane changes inside a window
+  tmux set-hook -ga window-pane-changed "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_pane}'\""
   if [ "$NEEDINPUT" = "on" ]; then
     tmux set-hook -ga session-window-changed "run-shell -b \"$SCRIPTS/needinput-notify.sh clear-window '#{hook_window}'\""
     # session switches change which panes are on screen -> resync the bar
@@ -73,9 +84,14 @@ if [ "$(tmux show-option -gqv @radar-hooked 2>/dev/null || true)" != "$HOOK_VERS
   tmux set-option -g @radar-hooked "$HOOK_VERSION"
 fi
 
-# Toast line. @radar-bar: auto (default; notifier restores the exact previous
-# status setting) | pinned (always show line 2) | off (track marks only).
+# AI-status chips. The strip is pure option content (#{E:@radar-chips}) that
+# the notifier republishes on every event, so a notification never changes the
+# status line COUNT — toggling `status` resizes every pane and SIGWINCHes every
+# full-screen app. @radar-bar: auto (default; chips render inline inside the
+# existing status-right) | pinned (chips on a permanently reserved line 2) |
+# off (track marks only).
 if [ "$NEEDINPUT" = "on" ]; then
+  tmux set-option -g @radar-chips "" 2>/dev/null || true
   case "$(opt @radar-bar auto)" in
     off) ;;
     pinned)
@@ -84,12 +100,19 @@ if [ "$NEEDINPUT" = "on" ]; then
         2|[3-9]|[1-9][0-9]*) ;;
         *) tmux set-option -g status 2 ;;
       esac
-      tmux set-option -g status-format[1] "#[align=right]#($SCRIPTS/needinput-toast.sh render) "
+      tmux set-option -g status-format[1] "#[align=right]#{E:@radar-chips}"
       ;;
     *)
-      tmux set-option -g status-format[1] "#[align=right]#($SCRIPTS/needinput-toast.sh render) "
+      # inline: wrap the user's status-right once (config reload resets the
+      # option to the user's raw value, so re-wrapping stays idempotent)
+      CUR_RIGHT="$(tmux show-option -gv status-right 2>/dev/null || true)"
+      case "$CUR_RIGHT" in
+        *'@radar-chips'*) ;;
+        *) tmux set-option -g status-right "#{E:@radar-chips}$CUR_RIGHT" ;;
+      esac
       ;;
   esac
-  # prune marks left over from a previous server / restore on every (re)load
+  # prune marks left over from a previous server / restore on every (re)load;
+  # tick also republishes @radar-chips and heals a pre-inline raised bar
   tmux run-shell -b "$SCRIPTS/needinput-notify.sh tick" 2>/dev/null || true
 fi

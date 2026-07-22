@@ -115,7 +115,11 @@ case "$TARGET_WIDTH" in ''|*[!0-9]*) TARGET_WIDTH=120 ;; esac
 case "$TARGET_HEIGHT" in ''|*[!0-9]*) TARGET_HEIGHT=30 ;; esac
 
 BASE_COMMAND="exec $(shell_quote "$BINARY") supervisor setup --target-pane $(shell_quote "$TARGET_PANE") --entry $(shell_quote "$ENTRY") --engine-script $(shell_quote "$AI_SCRIPT") --state-root $(shell_quote "$STATE_ROOT")"
-if [ "$TARGET_WIDTH" -lt 121 ] || [ "$TARGET_HEIGHT" -lt 24 ]; then
+# @radar-ai-console: auto (right split when the target is wide enough, else
+# popup) | popup (always overlay; never take columns from the work pane).
+SURFACE_PREF="$(tmux show-option -gqv @radar-ai-console 2>/dev/null || true)"
+case "$SURFACE_PREF" in auto|popup) ;; *) SURFACE_PREF=auto ;; esac
+if [ "$SURFACE_PREF" = popup ] || [ "$TARGET_WIDTH" -lt 121 ] || [ "$TARGET_HEIGHT" -lt 24 ]; then
   POPUP_COMMAND="$BASE_COMMAND --surface popup"
   tmux display-popup -E -w 90% -h 85% -t "$TARGET_PANE" "$POPUP_COMMAND"
   exit $?

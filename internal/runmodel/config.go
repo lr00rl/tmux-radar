@@ -38,7 +38,7 @@ func DefaultConfig(pane, goal string) Config {
 			StableScreenThreshold: defaultInt(1),
 			Command:               defaultString(""),
 			Profile:               defaultString(""),
-			Model:                 defaultString("gpt-5.6-luna"),
+			Model:                 defaultString("gpt-5.3-codex-spark"),
 			Effort:                defaultString("high"),
 			Timeout:               defaultInt(120),
 			MaxDecisions:          defaultInt(40),

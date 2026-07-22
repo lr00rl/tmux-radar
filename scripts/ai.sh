@@ -25,7 +25,7 @@
 #
 # Config (tmux options, all optional):
 #   @radar-ai-key            A                     menu key (prefix + A)
-#   @radar-ai-model          gpt-5.6-luna          Codex model slug (fast tier)
+#   @radar-ai-model          gpt-5.3-codex-spark          Codex model slug (fast tier)
 #   @radar-ai-effort         high                  minimal|low|medium|high|xhigh
 #   @radar-ai-profile        (none)                codex config profile (-p); overrides model/effort
 #   @radar-ai-codex-path     (PATH)                absolute Codex executable override
@@ -106,7 +106,7 @@ BRAIN_BACKEND_IDENTITY=""
 BRAIN_BACKEND_SOURCE=""
 BRAIN_BACKEND_COMMAND=""
 BRAIN_BACKEND_PROFILE=""
-BRAIN_BACKEND_MODEL="gpt-5.6-luna"
+BRAIN_BACKEND_MODEL="gpt-5.3-codex-spark"
 BRAIN_BACKEND_EFFORT="high"
 BRAIN_BACKEND_WARNING=""
 BRAIN_BACKEND_JSON='{}'
@@ -399,7 +399,7 @@ cmd_build_watch_config() {
       stable_screen_threshold:{value:1,source:"default"},
       command:{value:"",source:"default"},
       profile:{value:"",source:"default"},
-      model:{value:"gpt-5.6-luna",source:"default"},
+      model:{value:"gpt-5.3-codex-spark",source:"default"},
       effort:{value:"high",source:"default"},
       timeout:{value:120,source:"default"},
       max_decisions:{value:40,source:"default"},
@@ -597,6 +597,7 @@ _version_ge() {
 _model_min_codex() {
   case "$1" in
     gpt-5.6-luna) printf '%s' '0.144.0' ;;
+    gpt-5.3-codex-spark) printf '%s' '0.144.0' ;;
     *) printf '%s' '0.0.0' ;;
   esac
 }
@@ -676,7 +677,7 @@ _freeze_backend() {
   if [ -n "$model_source" ]; then
     model="${TMUX_RADAR_RUN_MODEL:-}"
   else
-    model="$(opt @radar-ai-model gpt-5.6-luna)"
+    model="$(opt @radar-ai-model gpt-5.3-codex-spark)"
     if [ -n "$profile" ] && [ -z "$(_explicit_opt @radar-ai-model)" ]; then
       model=''; model_source='profile-managed'
     elif [ -n "$(_explicit_opt @radar-ai-model)" ]; then model_source='tmux'
@@ -2182,6 +2183,7 @@ _watch_stage_fallback_samples() {
 _watch_commit_fallback_assessment() {
   if [ -n "${WATCH_FALLBACK_ACTIVE_HASH:-}" ]; then
     WATCH_FALLBACK_LAST_HASH="$WATCH_FALLBACK_ACTIVE_HASH"
+    WATCH_FALLBACK_LAST_AT="$(now)"
     [ ! -r "$WATCH_FALLBACK_ACTIVE_FILE" ] ||
       cp "$WATCH_FALLBACK_ACTIVE_FILE" "$WATCH_FALLBACK_LAST_FILE"
   fi
@@ -2193,6 +2195,19 @@ _watch_commit_fallback_assessment() {
       "$WATCH_FALLBACK_PENDING_SEQUENCE"
   fi
   _watch_clear_pending_fallback_samples
+}
+
+_watch_reset_fallback_dedup() {
+  # The watcher acted (keys delivered) or the user took over: an assessment of
+  # a past screen no longer proves the next identical-looking screen was
+  # handled. A recurring approval prompt often renders byte-identically in the
+  # fallback capture window, so keeping the old hash here would silently skip
+  # every future recurrence — the watcher would wait forever while the agent
+  # is blocked. Dropping the memory costs at most one extra model call.
+  WATCH_FALLBACK_LAST_HASH=""
+  WATCH_FALLBACK_LAST_AT=0
+  WATCH_FALLBACK_DEDUPED_HASH=""
+  [ -z "${WATCH_FALLBACK_LAST_FILE:-}" ] || rm -f "$WATCH_FALLBACK_LAST_FILE"
 }
 
 _watch_kill_waiters() {
@@ -3053,6 +3068,9 @@ cmd_watch_loop() {
   WATCH_EVENT_ID=""; WATCH_LAST_DECISION=""; WATCH_FINALIZED=0
   WATCH_STABLE_COUNT=0; WATCH_IDLE_SEQ=0; WATCH_FALLBACK_CANDIDATE_HASH=""
   WATCH_FALLBACK_LAST_HASH=""; WATCH_FALLBACK_ACTIVE_HASH=""; WATCH_FALLBACK_DEDUPED_HASH=""
+  WATCH_FALLBACK_LAST_AT=0
+  WATCH_FALLBACK_REASSESS="$(opt @radar-ai-fallback-reassess 600)"
+  case "$WATCH_FALLBACK_REASSESS" in ''|*[!0-9]*) WATCH_FALLBACK_REASSESS=600 ;; esac
   if [ -n "$precreated_run" ]; then
     run_id="$(printf '%s' "$config" | jq -r '.run_id // empty')"
     generation="$(jq -r '.generation // empty' "$precreated_run/start.json" 2>/dev/null || true)"
@@ -3152,6 +3170,7 @@ cmd_watch_loop() {
           '{record:"control",request_id:$request_id}')"
         rm -f "$RADAR_RUN_DIR/resume-request"
         WATCH_STABLE_COUNT=0; WATCH_FALLBACK_CANDIDATE_HASH=""
+        _watch_reset_fallback_dedup
         continue
         ;;
       0)
@@ -3202,15 +3221,38 @@ cmd_watch_loop() {
         WATCH_STABLE_COUNT=0
         if [ -n "$WATCH_FALLBACK_LAST_HASH" ] &&
           [ "$projection_hash" = "$WATCH_FALLBACK_LAST_HASH" ]; then
-          rm -f "$fallback_before" "$fallback_after"
-          if [ "$projection_hash" != "$WATCH_FALLBACK_DEDUPED_HASH" ]; then
-            WATCH_FALLBACK_DEDUPED_HASH="$projection_hash"
-            radar_event_append fallback_deduped watcher "stable projection already assessed" "$(jq -cn \
-              --arg hash "$projection_hash" --arg previous "$WATCH_FALLBACK_LAST_HASH" \
-              --argjson lines "$stable_lines" \
-              '{record:"fallback_projection",projection_hash:$hash,
-                previous_projection_hash:$previous,stable_lines:$lines,deduped:true}')"
+          # Re-assess an unchanged projection after a bounded interval: with a
+          # small capture window two genuinely different prompts can hash the
+          # same, and "assessed once" must never become "ignored forever".
+          if [ "${WATCH_FALLBACK_REASSESS:-0}" -gt 0 ] &&
+            [ $(( $(now) - ${WATCH_FALLBACK_LAST_AT:-0} )) -ge "$WATCH_FALLBACK_REASSESS" ]; then
+            radar_event_append fallback_reassess watcher \
+              "unchanged projection re-assessed after ${WATCH_FALLBACK_REASSESS}s" "$(jq -cn \
+                --arg hash "$projection_hash" --argjson lines "$stable_lines" \
+                --argjson after "$WATCH_FALLBACK_REASSESS" \
+                '{record:"fallback_projection",projection_hash:$hash,
+                  stable_lines:$lines,deduped:false,reassessed_after:$after}')"
+          else
+            rm -f "$fallback_before" "$fallback_after"
+            if [ "$projection_hash" != "$WATCH_FALLBACK_DEDUPED_HASH" ]; then
+              WATCH_FALLBACK_DEDUPED_HASH="$projection_hash"
+              radar_event_append fallback_deduped watcher "stable projection already assessed" "$(jq -cn \
+                --arg hash "$projection_hash" --arg previous "$WATCH_FALLBACK_LAST_HASH" \
+                --argjson lines "$stable_lines" \
+                '{record:"fallback_projection",projection_hash:$hash,
+                  previous_projection_hash:$previous,stable_lines:$lines,deduped:true}')"
+            fi
+            continue
           fi
+        fi
+        if ! idle_event_order="$(_watch_next_event_order)"; then
+          # Contended order allocation: skip this tick visibly instead of
+          # feeding empty JSON into jq (which would drop the event silently).
+          rm -f "$fallback_before" "$fallback_after"
+          radar_event_append fallback_order_contention watcher \
+            "event order allocation contended; retrying next idle tick" "$(jq -cn \
+              --arg hash "$projection_hash" \
+              '{record:"fallback_projection",projection_hash:$hash,queued:false}')"
           continue
         fi
         WATCH_FALLBACK_DEDUPED_HASH=""
@@ -3221,7 +3263,7 @@ cmd_watch_loop() {
         WATCH_EVENT_ID="idle-$RADAR_RUN_ID-$WATCH_IDLE_SEQ"
         jq -cn --arg id "$WATCH_EVENT_ID" --arg pane "$pane" --arg timestamp "$(_radar_now_iso)" \
           --arg projection_hash "$projection_hash" --argjson stable_lines "$stable_lines" \
-          --argjson event_order "$(_watch_next_event_order)" \
+          --argjson event_order "$idle_event_order" \
           '{kind:"screen_idle",source:"watcher",label:"stable screen fallback",
             event_id:$id,pane:$pane,timestamp:$timestamp,event_order:$event_order,
             projection_hash:$projection_hash,stable_lines:$stable_lines}' > "$batch"
@@ -3244,6 +3286,7 @@ cmd_watch_loop() {
     case "$coalesce_rc" in
       10)
         _watch_clear_pending_fallback_samples
+        _watch_reset_fallback_dedup
         WATCH_EVENT_ID=""; _watch_phase ARMED "user resumed; idle timing reset" idle 0
         continue
         ;;
@@ -3508,6 +3551,7 @@ cmd_watch_loop() {
     radar_event_append sent watcher "${DECISION_REASON:-safe action sent}" "$(jq -cn --arg event_id "$WATCH_EVENT_ID" \
       --arg pre "$delivery_fingerprint" '{record:"execution",event_id:$event_id,sent:true,pre_send_fingerprint:$pre}')"
     _clearmark "$pane"
+    _watch_reset_fallback_dedup
     set +e; _watch_verify_send "$delivery_fingerprint" "$event_kind"; verify_rc=$?; set -e
     case "$verify_rc" in
       0) : ;;

@@ -97,7 +97,7 @@ func TestLiveSwitchesFiveViewsAndRendersCanonicalEvidence(t *testing.T) {
 		Decision: &runmodel.Decision{Action: "send", Text: "2", Keys: []string{"Enter"}, Safe: true,
 			Reason: "approval is narrow", PaneState: "blocked", GoalStatus: "working", Risk: "low",
 			Evidence: []string{"approval prompt visible"}},
-		DecisionMeta: &runmodel.DecisionMeta{SchemaVersion: 1, Call: 2, Model: "gpt-5.6-luna", Effort: "high", Elapsed: 4.2},
+		DecisionMeta: &runmodel.DecisionMeta{SchemaVersion: 1, Call: 2, Model: "gpt-5.3-codex-spark", Effort: "high", Elapsed: 4.2},
 		Screen:       "last target line\napproval prompt", ScreenPath: "/tmp/screens/0002.txt",
 		Stderr: "backend detail", StderrPath: "/tmp/backend/0002.stderr",
 	}
@@ -235,6 +235,11 @@ func TestLivePermanentErrorCompletionKeepAndHelp(t *testing.T) {
 	model.snapshot.Final = &runmodel.Final{SchemaVersion: 1, Outcome: "completed", Reason: "goal done"}
 	updated, command = model.Update(keyPress('k', "k"))
 	model = updated
+	if command != nil || model.pending != nil {
+		t.Fatalf("lowercase k must keep scrolling after completion, pending=%#v", model.pending)
+	}
+	updated, command = model.Update(keyPress('K', "K"))
+	model = updated
 	if command == nil || model.pending == nil || model.pending.Action != "keep" {
 		t.Fatalf("completion keep pending=%#v", model.pending)
 	}
@@ -287,7 +292,7 @@ func TestLiveKeepInvalidatesPendingCompletionTimer(t *testing.T) {
 	final := &runmodel.Final{SchemaVersion: 1, Outcome: "completed", Reason: "goal done", RunID: "run-1", Pane: "%42"}
 	updated, closeCommand := model.Update(runPollMsg{Snapshot: runmodel.Snapshot{Config: config, Final: final}, SnapshotChanged: true})
 	model = updated
-	updated, keepCommand := model.Update(keyPress('k', "k"))
+	updated, keepCommand := model.Update(keyPress('K', "K"))
 	model = updated
 	if keepCommand == nil || !model.completionKept {
 		t.Fatalf("keep did not hold completion: command=%v kept=%v", keepCommand, model.completionKept)
@@ -380,7 +385,7 @@ func TestLivePollReadsCanonicalDecisionScreenAndLogsIncrementally(t *testing.T) 
 		}
 	}
 	writeJSON(filepath.Join(dir, "decisions", "0001.meta.json"), runmodel.DecisionMeta{
-		SchemaVersion: 1, Call: 1, Model: "gpt-5.6-luna", Effort: "high", SchemaValid: true,
+		SchemaVersion: 1, Call: 1, Model: "gpt-5.3-codex-spark", Effort: "high", SchemaValid: true,
 	})
 	writeJSON(filepath.Join(dir, "decisions", "0001.json"), runmodel.Decision{
 		Action: "wait", Text: "", Keys: []string{}, Safe: true, Reason: "still working",

@@ -45,13 +45,13 @@ exit "${TEST_EXIT_CODE:-0}"
 func TestCheckerReadsDoctorJSONWithoutLaunchingAModel(t *testing.T) {
 	t.Parallel()
 	script, log := fakeDoctor(t)
-	payload := `{"ok":true,"backend":{"mode":"codex","path":"/Users/test/bin/codex","version":"0.144.4","identity":"1:2:3:4","source":"path","model":"gpt-5.6-luna","effort":"high","model_source":"default","effort_source":"default","compatible":true},"model":"gpt-5.6-luna","effort":"high","candidates":[]}`
+	payload := `{"ok":true,"backend":{"mode":"codex","path":"/Users/test/bin/codex","version":"0.144.4","identity":"1:2:3:4","source":"path","model":"gpt-5.3-codex-spark","effort":"high","model_source":"default","effort_source":"default","compatible":true},"model":"gpt-5.3-codex-spark","effort":"high","candidates":[]}`
 	checker := Checker{EngineScript: script, Env: []string{"TEST_CALL_LOG=" + log, "TEST_DOCTOR_JSON=" + payload}}
 	result, err := checker.Check(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.OK || result.Backend.Path != "/Users/test/bin/codex" || result.Model != "gpt-5.6-luna" {
+	if !result.OK || result.Backend.Path != "/Users/test/bin/codex" || result.Model != "gpt-5.3-codex-spark" {
 		t.Fatalf("result = %#v", result)
 	}
 	calls, err := os.ReadFile(log)

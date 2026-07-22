@@ -62,7 +62,7 @@ Values in parentheses are validated ranges or allowed values.
 
 | Option | Default | Meaning and tradeoff |
 | --- | --- | --- |
-| `@radar-ai-model` | `gpt-5.6-luna` | Codex model for decision calls. Larger/slower models can improve judgement but raise latency and cost. |
+| `@radar-ai-model` | `gpt-5.3-codex-spark` | Codex model for decision calls. Larger/slower models can improve judgement but raise latency and cost. |
 | `@radar-ai-effort` | `high` | `minimal`, `low`, `medium`, `high`, or `xhigh`. Higher effort can improve complex decisions at the cost of latency and usage. |
 | `@radar-ai-profile` | empty | Codex profile passed as `codex exec -p <profile>`. With no explicit model/effort, the profile manages both values. |
 | `@radar-ai-codex-path` | `PATH` lookup | Absolute Codex executable override. The selected binary is preflighted and identity-checked. |

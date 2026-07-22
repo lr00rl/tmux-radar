@@ -159,11 +159,11 @@ run_test() {
   while IFS= read -r line; do printf '  %s\n' "$line" >&2; done <<< "$output"
 }
 
-test_builtin_defaults_are_luna_high() {
+test_builtin_defaults_are_spark_high() {
   local config="$TMP/defaults.json"
   TEST_CASE_NAME=defaults run_ai _build-watch-config %1 '' > "$config"
   assert_json "$config" '
-    .values.model == {value:"gpt-5.6-luna",source:"default"} and
+    .values.model == {value:"gpt-5.3-codex-spark",source:"default"} and
     .values.effort == {value:"high",source:"default"}
   '
 }
@@ -177,7 +177,7 @@ test_inherited_path_order_is_preserved() {
     .backend.path == $expected and
     .backend.version == "0.144.3" and
     .backend.source == "path" and
-    .model == "gpt-5.6-luna" and
+    .model == "gpt-5.3-codex-spark" and
     .effort == "high"
   ' "$result" >/dev/null; then
     _fail_assert 'inherited PATH did not select the expected Codex' 'actual' "$(cat "$result")"
@@ -381,7 +381,7 @@ test_reviewed_config_drives_preflight_backend() {
 }
 
 write_fakes
-run_test 'built-in supervision defaults are Luna/high' test_builtin_defaults_are_luna_high
+run_test 'built-in supervision defaults are Spark/high' test_builtin_defaults_are_spark_high
 run_test 'inherited PATH order selects the user Codex' test_inherited_path_order_is_preserved
 run_test 'old explicit Codex reports a diagnostic-only newer candidate' test_old_explicit_backend_reports_newer_candidate_without_exec
 run_test 'custom command bypasses Codex preflight' test_custom_command_bypasses_codex_preflight

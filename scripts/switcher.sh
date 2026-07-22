@@ -595,7 +595,7 @@ do_menu() {
   fzf="$(command -v fzf || true)"
   [ -n "$fzf" ] || { tmux display-message "tmux-radar: fzf not found"; exit 1; }
 
-  VIEW="$(opt @radar-default-view tree)"; case "$VIEW" in tree|recent|needinput) ;; *) VIEW=tree ;; esac
+  VIEW="$(opt @radar-default-view recent)"; case "$VIEW" in tree|recent|needinput) ;; *) VIEW=recent ;; esac
   case "$(opt @radar-expand-panes off)" in on|1|true) EXPAND=1 ;; *) EXPAND=0 ;; esac
   preview_pos="$(opt @radar-preview right:62%)"
   follow="$(opt @radar-preview-follow on)"
@@ -625,9 +625,14 @@ do_menu() {
     "$SELF" list | "$fzf" \
       "${fzf_args[@]}" \
       --layout=reverse --prompt="$(_prompt)" \
-      --header='C-t tree · C-r recent · C-i AI status · C-e expand/collapse panes · A-p preview · S-↑/↓ PgUp/Dn scroll · Enter switch' \
+      --header='C-t tree · C-r recent · C-i AI status · C-e expand/collapse panes · A-1..9 jump · A-p preview · S-↑/↓ PgUp/Dn scroll · Enter switch' \
       --preview="$SELF preview {1}" --preview-window="$preview_win" \
       --bind='change:pos(1)' \
+      --bind='alt-1:pos(1)+accept' --bind='alt-2:pos(2)+accept' \
+      --bind='alt-3:pos(3)+accept' --bind='alt-4:pos(4)+accept' \
+      --bind='alt-5:pos(5)+accept' --bind='alt-6:pos(6)+accept' \
+      --bind='alt-7:pos(7)+accept' --bind='alt-8:pos(8)+accept' \
+      --bind='alt-9:pos(9)+accept' \
       --bind="ctrl-t:transform($SELF set-view tree)" \
       --bind="ctrl-r:transform($SELF set-view recent)" \
       --bind="ctrl-i:transform($SELF set-view needinput)" \

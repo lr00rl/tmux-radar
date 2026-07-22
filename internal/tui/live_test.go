@@ -235,6 +235,11 @@ func TestLivePermanentErrorCompletionKeepAndHelp(t *testing.T) {
 	model.snapshot.Final = &runmodel.Final{SchemaVersion: 1, Outcome: "completed", Reason: "goal done"}
 	updated, command = model.Update(keyPress('k', "k"))
 	model = updated
+	if command != nil || model.pending != nil {
+		t.Fatalf("lowercase k must keep scrolling after completion, pending=%#v", model.pending)
+	}
+	updated, command = model.Update(keyPress('K', "K"))
+	model = updated
 	if command == nil || model.pending == nil || model.pending.Action != "keep" {
 		t.Fatalf("completion keep pending=%#v", model.pending)
 	}
@@ -287,7 +292,7 @@ func TestLiveKeepInvalidatesPendingCompletionTimer(t *testing.T) {
 	final := &runmodel.Final{SchemaVersion: 1, Outcome: "completed", Reason: "goal done", RunID: "run-1", Pane: "%42"}
 	updated, closeCommand := model.Update(runPollMsg{Snapshot: runmodel.Snapshot{Config: config, Final: final}, SnapshotChanged: true})
 	model = updated
-	updated, keepCommand := model.Update(keyPress('k', "k"))
+	updated, keepCommand := model.Update(keyPress('K', "K"))
 	model = updated
 	if keepCommand == nil || !model.completionKept {
 		t.Fatalf("keep did not hold completion: command=%v kept=%v", keepCommand, model.completionKept)

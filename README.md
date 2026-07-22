@@ -119,6 +119,7 @@ windows and sessions (pane-level MRU is recorded by tmux hooks; see
 | `shift-↑` / `shift-↓` | scroll preview by line |
 | `PgUp` / `PgDn` | scroll preview by page |
 | `ctrl-n` / `ctrl-p` | move selection (fzf default) |
+| `alt-1` … `alt-9` | jump straight to row N and switch (recent view: `alt-2` = previous window) |
 | `Enter` | switch to the window (or pane, when a pane row is selected) |
 
 **Pane level.** Tree and recent start at window granularity. Press `ctrl-e` to
@@ -134,7 +135,8 @@ Set these **before** the plugin loads:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `@radar-default-view` | `tree` | Initial view: `tree`, `recent`, or `needinput`. |
+| `@radar-default-view` | `recent` | Initial view: `tree`, `recent`, or `needinput`. Recent (MRU) is the default: the panes you actually toggle between are one keystroke away. |
+| `@radar-ai-console` | `auto` | Supervisor console surface: `auto` (right split when the target pane is ≥121×24, else popup) or `popup` (always overlay — never takes columns away from the work pane). |
 | `@radar-expand-panes` | `off` | Start with panes expanded (`on`) or collapsed (`off`). Toggle live with `ctrl-e`. |
 | `@radar-key` | `C-w` | Prefix key that opens the picker. |
 | `@radar-last-key` | `Tab` | Prefix key that jumps to the most recently used **other pane**, across windows and sessions (tmux's own `last-pane` is window-local). Press repeatedly to toggle between your two most recent panes. `none` skips the binding. |
@@ -177,7 +179,7 @@ Set these **before** the plugin loads:
 | `@radar-ai-monitor-size-h` | `84` | Requested native right-console width, clamped to 56–112 columns while preserving at least 64 target columns. |
 | `@radar-ai-overview-ratio` | `25` | Effective-config field retained for compatibility; the native console uses a fixed summary header and the remaining rows for the selected evidence view. |
 | `@radar-ai-monitor-excerpt-lines` | `16` | Pane-capture lines shown in the monitor detail view. The detail header reports the actual decision budget: `capture_lines` for native events and `fallback_capture_lines` for semantic fallback. |
-| `@radar-ai-completion-close-delay` | `12` | Seconds to keep the final summary visible. Press `k` to keep it open or `q` to close now. |
+| `@radar-ai-completion-close-delay` | `12` | Seconds to keep the final summary visible. Press `K` to keep it open or `q` to close now. |
 | `@radar-ai-logging` | `decision` | `decision` stores structured decisions/metadata/stderr; `full` also stores exact prompts and pane captures. |
 | `@radar-ai-screen-snapshots` | `off` | Persist per-call pane captures without enabling full prompt logging. These files may contain sensitive text. |
 | `@radar-ai-retention-days` | `7` | Retain inactive structured run directories for this many days. Live runs are never removed. |
@@ -354,9 +356,10 @@ CLI, logged in, plus `jq`). Then `prefix + A` opens a menu:
 `w`, `W`, and `v` are presets for one native setup reducer, not three watcher
 implementations. The goal editor is active as soon as the console opens, so
 typing immediately after `w` enters the real goal. CJK editing is rune-aware:
-one Backspace removes one character. `Tab` / `Shift-Tab` commit and move between
+one Backspace removes one character. `Tab` / `Shift-Tab` (or `j` / `k` /
+`↑` / `↓` outside a text editor) commit and move between
 Goal, Preset, Policy, Autonomy, Advanced, and Start; `Enter` edits/selects;
-arrows change enum values; Space toggles booleans. A blank goal becomes the
+`←` / `→` change enum values; Space toggles booleans. A blank goal becomes the
 explicit `推进当前任务直到完成`. `W` starts with always-allow selected. `v` opens
 all advanced groups, and every field shows its effective value plus
 `default`, `tmux`, `custom`, `runtime`, `preset`, or `profile-managed`
@@ -386,7 +389,7 @@ remaining rows belong to the selected evidence view.
 | `e` | Expand/collapse a grouped Timeline event |
 | `p` | Pause/resume supervision |
 | `r` | Request one fresh assessment |
-| `k` | Keep a completed summary open past auto-close |
+| `K` | Keep a completed summary open past auto-close (`k` always scrolls) |
 | `c` | Open the complete effective configuration view |
 | `Enter` | Split: focus the target with one `tmux select-pane`. Popup: request durable detach, then close only after acknowledgement. |
 | `q` | Active run: ask for confirmation, then stop. Final report: close immediately. |
@@ -446,7 +449,7 @@ index; `ai.sh report latest` prints the final duration, reason, goal, counts,
 and log location.
 
 On goal completion the DONE notification is emitted and the native report shows
-an explicit close countdown (12 seconds by default). Press `k` to durably keep
+an explicit close countdown (12 seconds by default). Press `K` to durably keep
 it or `q` to close it. Closing the target, closing the visible split owner,
 killing an attached popup, pressing Ctrl-C, or stopping the run invalidates the
 owner lease; the watcher checks that lease during waits and backend polling and

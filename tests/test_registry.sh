@@ -180,29 +180,39 @@ jq -cn --arg sid generic-1 --arg pane "$PANE" --argjson pid "$$" \
 chk "generic session_end removes action and registry state" \
   "! grep -q 's:generic-1' '$REG' 2>/dev/null && ! grep -q 's:generic-1' '$MARKS' 2>/dev/null"
 
-# --- 7. bar exact-restore (baseline status off) ------------------------------
+# --- 7. inline chips never change the status line count ----------------------
 env -u CLAUDE_JOB_DIR "$N" mark "$PANE" claude "Claude needs your permission" s:bar1
-# the marked pane is on-screen (only pane) so bar may not raise; force paneless
+# the marked pane is on-screen (only pane) so its chip hides; force paneless
 "$N" mark - claude "Claude·x: Claude needs your permission" s:bar2
 ST="$(tmux show-option -gv status)"
-chk "bar raised to 2 while paneless action mark live" "[ '$ST' = '2' ]"
-PREV="$(tmux show-option -gqv @radar-prev-status)"
-chk "prev status value saved (off)" "[ '$PREV' = 'off' ]"
+chk "a live mark never raises the status line count" "[ '$ST' = 'off' ]"
+chk "chips are published while a paneless action mark is live" \
+  "[ -n \"\$(tmux show-option -gqv @radar-chips)\" ]"
+chk "inline mode never records a prev-status marker" \
+  "[ -z \"\$(tmux show-option -gqv @radar-prev-status)\" ]"
 "$N" clear-all
-ST2="$(tmux show-option -gv status)"
-chk "clear-all restores the EXACT prior status (off, not on)" "[ '$ST2' = 'off' ]"
+chk "clear-all empties the chip strip" "[ -z \"\$(tmux show-option -gqv @radar-chips)\" ]"
+chk "clear-all leaves the status line count untouched (off)" \
+  "[ \"\$(tmux show-option -gv status)\" = 'off' ]"
+
+# legacy self-heal: a bar raised by a pre-inline notifier version is restored
+tmux set -g status 2
+tmux set -g @radar-prev-status off
+"$N" tick
+chk "tick heals a pre-inline raised bar back to the saved value" \
+  "[ \"\$(tmux show-option -gv status)\" = 'off' ] && [ -z \"\$(tmux show-option -gqv @radar-prev-status)\" ]"
 
 tmux set -g status 2
 tmux set -gu @radar-prev-status 2>/dev/null || true
 "$N" mark - claude "Claude needs your permission" s:bar-two
-chk "auto bar preserves a user-owned status 2" \
+chk "a user-owned status 2 is preserved" \
   "[ \"\$(tmux show-option -gv status)\" = 2 ] && [ -z \"\$(tmux show-option -gqv @radar-prev-status)\" ]"
 "$N" clear-all
 chk "clear preserves user-owned status 2" "[ \"\$(tmux show-option -gv status)\" = 2 ]"
 
 tmux set -g status 3
 "$N" mark - claude "Claude needs your permission" s:bar-three
-chk "auto bar never reduces an existing status 3" \
+chk "a user-owned status 3 is preserved" \
   "[ \"\$(tmux show-option -gv status)\" = 3 ] && [ -z \"\$(tmux show-option -gqv @radar-prev-status)\" ]"
 "$N" clear-all
 tmux set -g @radar-bar pinned

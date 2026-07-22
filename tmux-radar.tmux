@@ -73,9 +73,14 @@ if [ "$(tmux show-option -gqv @radar-hooked 2>/dev/null || true)" != "$HOOK_VERS
   tmux set-option -g @radar-hooked "$HOOK_VERSION"
 fi
 
-# Toast line. @radar-bar: auto (default; notifier restores the exact previous
-# status setting) | pinned (always show line 2) | off (track marks only).
+# AI-status chips. The strip is pure option content (#{E:@radar-chips}) that
+# the notifier republishes on every event, so a notification never changes the
+# status line COUNT — toggling `status` resizes every pane and SIGWINCHes every
+# full-screen app. @radar-bar: auto (default; chips render inline inside the
+# existing status-right) | pinned (chips on a permanently reserved line 2) |
+# off (track marks only).
 if [ "$NEEDINPUT" = "on" ]; then
+  tmux set-option -g @radar-chips "" 2>/dev/null || true
   case "$(opt @radar-bar auto)" in
     off) ;;
     pinned)
@@ -84,12 +89,19 @@ if [ "$NEEDINPUT" = "on" ]; then
         2|[3-9]|[1-9][0-9]*) ;;
         *) tmux set-option -g status 2 ;;
       esac
-      tmux set-option -g status-format[1] "#[align=right]#($SCRIPTS/needinput-toast.sh render) "
+      tmux set-option -g status-format[1] "#[align=right]#{E:@radar-chips}"
       ;;
     *)
-      tmux set-option -g status-format[1] "#[align=right]#($SCRIPTS/needinput-toast.sh render) "
+      # inline: wrap the user's status-right once (config reload resets the
+      # option to the user's raw value, so re-wrapping stays idempotent)
+      CUR_RIGHT="$(tmux show-option -gv status-right 2>/dev/null || true)"
+      case "$CUR_RIGHT" in
+        *'@radar-chips'*) ;;
+        *) tmux set-option -g status-right "#{E:@radar-chips}$CUR_RIGHT" ;;
+      esac
       ;;
   esac
-  # prune marks left over from a previous server / restore on every (re)load
+  # prune marks left over from a previous server / restore on every (re)load;
+  # tick also republishes @radar-chips and heals a pre-inline raised bar
   tmux run-shell -b "$SCRIPTS/needinput-notify.sh tick" 2>/dev/null || true
 fi

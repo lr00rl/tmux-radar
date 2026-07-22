@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-# Render the persistent AI-status bar for the tmux status line.
-# (Filename kept for status-format compatibility; this used to render 3s toasts.)
+# Render the AI-status chip strip (pure: reads state, prints chips, changes
+# nothing). The notifier's _sync_bar publishes this output into the
+# @radar-chips tmux option, which the status line embeds via #{E:@radar-chips}
+# — inside the user's status-right (`auto`) or on a pinned line 2 (`pinned`).
 #
 # Reads the need-input state file (see needinput-notify.sh for the format) and
 # prints one styled chip per live mark whose pane is NOT currently on screen
 # (paneless background marks always show), newest first, capped at $MAX with a
-# "+N" overflow counter. Embedded in status-format[1] via #(...); the notifier
-# toggles `status 2` <-> `on` so this line only exists while a mark is visible.
-#
-# If everything visible got resolved without an event (e.g. the marked pane
-# died), rendering finds nothing and flips the status line back itself.
+# "+N" overflow counter.
 set -euo pipefail
 
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
@@ -83,35 +81,7 @@ case "${1:-render}" in
         }
         if (c > max) printf " #[fg=colour244]+%d#[default]", c - max
       }' "$STATE_FILE" 2>/dev/null || true)"
-    if [ -n "$out" ]; then
-      printf '%s' "$out"
-      # Self-heal: a chip whose agent TUI already closed only disappears via a
-      # GC pass, so while the bar is visible run one in the background at most
-      # every 30s (epoch stored IN the stamp file — stat flags aren't portable).
-      stamp="$STATE_DIR/.gc-stamp"; now="$(date +%s)"; last=0
-      read -r last < "$stamp" 2>/dev/null || true
-      case "$last" in ''|*[!0-9]*) last=0 ;; esac
-      if [ $((now - last)) -ge 30 ]; then
-        printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
-        ("$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/needinput-notify.sh" tick >/dev/null 2>&1 &)
-      fi
-    else
-      # nothing left to show: give the user back their exact status setting.
-      # pinned mode never touches the line count; only lower a bar WE raised
-      # (@radar-prev-status is set by the notifier's _bar_raise).
-      case "$(opt @radar-bar auto)" in
-        pinned) : ;;
-        *)
-          prev="$(tmux show-option -gqv @radar-prev-status 2>/dev/null || true)"
-          if [ -n "$prev" ]; then
-            if [ "$(tmux show-option -gv status 2>/dev/null || echo on)" = "2" ]; then
-              tmux set -g status "$prev" >/dev/null 2>&1 || true
-            fi
-            tmux set -gu @radar-prev-status >/dev/null 2>&1 || true
-          fi
-          ;;
-      esac
-    fi
+    printf '%s' "$out"
     ;;
   prune)  # legacy no-op kept for compatibility; state GC lives in the notifier
     exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/needinput-notify.sh" tick

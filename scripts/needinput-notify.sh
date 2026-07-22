@@ -461,18 +461,8 @@ _drop_rows() {  # _drop_rows <awk-condition-marking-rows-to-DROP> [extra -v args
   _rewrite "if ($cond) next" "$@"
 }
 
-_bar_raise() {  # remember the user's status value, then show line 2
-  local cur
-  cur="$(tmux show-option -gv status 2>/dev/null || echo on)"
-  # Two or more lines are already sufficient and user-owned unless the marker
-  # below proves radar raised them. Never reduce an existing multi-line status.
-  case "$cur" in 2|[3-9]|[1-9][0-9]*) return 0 ;; esac
-  tmux set -g @radar-prev-status "$cur" >/dev/null 2>&1 || true
-  tmux set -g status 2 >/dev/null 2>&1 || true
-}
-
-_bar_lower() {  # restore EXACTLY what the user had; never touch what we didn't set
-  local cur prev
+_bar_lower() {  # legacy self-heal: restore a status line raised by an older
+  local cur prev   # (pre-inline) version of the notifier; never touch what we didn't set
   prev="$(tmux show-option -gqv @radar-prev-status 2>/dev/null || true)"
   [ -n "$prev" ] || return 0                     # we never raised — not ours
   cur="$(tmux show-option -gv status 2>/dev/null || echo on)"
@@ -482,39 +472,57 @@ _bar_lower() {  # restore EXACTLY what the user had; never touch what we didn't 
   tmux set -gu @radar-prev-status >/dev/null 2>&1 || true
 }
 
-# Recompute bar visibility. A chip is bar-visible while its mark is off-screen
-# AND younger than @radar-bar-ttl seconds (0 = show until handled); the mark
-# itself persists in the AI status view / pane title until actually cleared.
-# @radar-bar: auto (default) toggles status 1<->2 saving/restoring the user's
-# exact prior value; pinned never touches the status line COUNT (toggling it
-# resizes every window and SIGWINCHes every app — users who keep `status 2`
-# themselves want this; the content line self-hides); off never raises.
+_refresh_status() {  # redraw every attached client's status line right now
+  local c
+  tmux list-clients -F '#{client_name}' 2>/dev/null | while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    tmux refresh-client -S -t "$c" >/dev/null 2>&1 || true
+  done
+}
+
+# While chips are visible, guarantee a future resync so TTL fade and the
+# agent-liveness GC keep running without any event: one tmux-owned sleeper at a
+# time (stamp-guarded), never a resident poller. The chip strip itself is pure
+# option content, so nothing redraws or forks between resyncs.
+_schedule_resync() {
+  local barttl delay stamp due now
+  barttl="$(opt @radar-bar-ttl 60)"
+  case "$barttl" in ''|*[!0-9]*) barttl=60 ;; esac
+  delay=$((barttl + 2))
+  { [ "$barttl" -gt 0 ] && [ "$delay" -lt 30 ]; } || delay=30
+  stamp="$STATE_DIR/.resync-at"
+  now="$(date +%s)"
+  read -r due < "$stamp" 2>/dev/null || due=0
+  case "$due" in ''|*[!0-9]*) due=0 ;; esac
+  [ "$due" -le "$now" ] || return 0              # a resync is already scheduled
+  printf '%s\n' "$((now + delay))" > "$stamp" 2>/dev/null || true
+  tmux run-shell -b "sleep $delay; '$SCRIPT_DIR/needinput-notify.sh' tick" \
+    >/dev/null 2>&1 || true
+}
+
+# Recompute and publish the chip strip. Chips live INSIDE an existing status
+# line — `auto` injects #{E:@radar-chips} into the user's status-right,
+# `pinned` renders it on a permanently reserved line 2. The status line COUNT
+# is never changed at runtime: toggling `status` resizes every pane and
+# SIGWINCHes every full-screen app, which is exactly the flicker the old
+# raise/lower design caused. A chip is visible while its mark is off-screen
+# AND younger than @radar-bar-ttl seconds (0 = until handled); the mark itself
+# persists in the AI status view / pane title until cleared.
 _sync_bar() {
   have_tmux || return 0
-  local mode n=0 barttl
+  local mode chips
   mode="$(opt @radar-bar auto)"
   case "$mode" in auto|pinned|off) ;; *) mode=auto ;; esac
-  barttl="$(opt @radar-bar-ttl 60)"
-  if [ "$mode" = auto ] && [ -r "$STATE_FILE" ]; then
-    n="$(awk -F '\t' -v panes="$(_pane_map)" -v now="$(date +%s)" -v barttl="$barttl" '
-      BEGIN {
-        m = split(panes, pl, "\001")
-        for (i = 1; i <= m; i++) { split(pl[i], f, " "); if (f[1] != "") { alive[f[1]] = 1; if (f[2] == 1) viewed[f[1]] = 1 } }
-      }
-      NF >= 4 {
-        pane = $1
-        if (barttl + 0 > 0 && now - $2 > barttl + 0) next
-        if (pane == "-") { c++; next }
-        if ((pane in alive) && !(pane in viewed)) c++
-      }
-      END { print c + 0 }' "$STATE_FILE" 2>/dev/null || echo 0)"
+  _bar_lower                                     # heal pre-inline leftovers
+  if [ "$mode" = off ]; then
+    tmux set -g @radar-chips "" >/dev/null 2>&1 || true
+    return 0
   fi
-  case "$mode" in
-    pinned) : ;;
-    off)    _bar_lower ;;
-    *)      if [ "${n:-0}" -gt 0 ]; then _bar_raise; else _bar_lower; fi ;;
-  esac
-  tmux refresh-client -S >/dev/null 2>&1 || true
+  chips="$("$SCRIPT_DIR/needinput-toast.sh" render 2>/dev/null || true)"
+  [ -z "$chips" ] || chips="$chips "
+  tmux set -g @radar-chips "$chips" >/dev/null 2>&1 || true
+  [ -z "$chips" ] || _schedule_resync
+  _refresh_status
 }
 
 cmd_mark() {  # cmd_mark <pane|-> <source> <label> [key]

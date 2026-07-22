@@ -141,7 +141,7 @@ Set these **before** the plugin loads:
 | `@radar-needinput-commands` | `codex claude opencode kimi` | Process names the AI status view treats as AI panes. Comma/space/colon separated. |
 | `@radar-retitle` | `on` | Rename a marked pane's title to a status label (`⚠` action required, `✓` finished, `!` notice), restored on clear. |
 | `@radar-claude-bg` | `on` | Also track Claude sessions running outside tmux panes (background/dashboard/cloud). |
-| `@radar-bar` | `auto` | `auto` raises line 2 only while needed and restores the exact previous `status`; `pinned` keeps line 2; `off` tracks marks without raising it. |
+| `@radar-bar` | `auto` | `auto` renders chips **inline inside your existing status-right** (`#{E:@radar-chips}` is injected once); `pinned` keeps a permanently reserved line 2; `off` tracks marks only. The status line **count never changes at runtime** — no pane resize, no SIGWINCH flicker. |
 | `@radar-bar-ttl` | `60` | Seconds a chip stays on the bar before fading (`0` = until handled). The mark itself persists in the AI status view / pane title until cleared. |
 | `@radar-claude-bg-ignore` | `~/.claude:~/.claude-mem` | Colon-separated path prefixes; background sessions whose cwd starts with one (plugin observers, SDK helpers) are not tracked. |
 | `@radar-ai` | `off` | Enable the **AI supervisor** (`prefix + A` menu). Needs the `codex` CLI + `jq`. |
@@ -158,6 +158,7 @@ Set these **before** the plugin loads:
 | `@radar-ai-hooks-first` | `on` | Let installed native Claude/Codex/Kimi/OpenCode lifecycle hooks wake the watcher immediately. `off` keeps only manual and semantic stable-screen fallback triggers. |
 | `@radar-ai-poll` | `5` | Idle-listen interval in whole seconds (`1`–`3600`). The next interval starts after a model decision/action returns, so slow decisions do not overlap. The one-second floor keeps production waits childless on macOS Bash 3.2. |
 | `@radar-ai-stable-screen-threshold` | `1` | Consecutive equal **stable projections** required before no-hook fallback asks the model. Changing spinners, elapsed timers, and footers are removed before comparison. |
+| `@radar-ai-fallback-reassess` | `600` | Seconds after which an **unchanged** stable projection is re-assessed anyway (`0` = never). Safety net for prompts whose visible tail collides with an earlier one; delivered keys always invalidate the dedup immediately. |
 | `@radar-ai-max-calls` | `40` | Cost cap: a watcher pauses after this many model calls. |
 | `@radar-ai-timeout` | `120` | Hard limit in seconds for one model call (minimum `5`). A timed-out Codex wrapper and all of its children are terminated as one process group. |
 | `@radar-ai-retry-limit` | `3` | Maximum retries after invalid JSON, backend failure, or timeout. |
@@ -264,7 +265,12 @@ removes changing spinners, elapsed counters, progress rows, and footers without
 matching prompt text. The model is called only when that stable semantic
 evidence reaches `@radar-ai-stable-screen-threshold`. Only the exact stable
 projection hash is deduplicated: adding, removing, or replacing a stable line
-creates a new decision identity. Semantic similarity never authorizes an
+creates a new decision identity. Dedup memory is **invalidated whenever the
+watcher acts**: after keys are delivered (or the user resumes/takes over), a
+byte-identical prompt that reappears is a *new* decision, not a handled one —
+recurring approval prompts therefore keep getting decisions instead of being
+silently skipped. As a final safety net, an unchanged projection is re-assessed
+after `@radar-ai-fallback-reassess` seconds (default 600, `0` disables). Semantic similarity never authorizes an
 automatic send: one immutable normalized fallback capture is supplied to the
 model and retained as delivery authority. Immediately before delivery,
 tmux-radar captures again and uses a byte-for-byte comparison; any changed byte
@@ -314,11 +320,17 @@ normalized event contract and a copyable adapter.
 
 ### Bar position note
 
-tmux has a single `status-position`, so the bar renders on a second status line
-adjacent to your main status bar. In `@radar-bar auto` mode the notifier records
-the exact prior `status` value, raises `status 2`, and restores only the setting
-it owns. `pinned` and `off` are available for explicit control. A bar strictly at
-the top while the main line stays at the bottom is not possible natively.
+The chip strip is plain option content (`#{E:@radar-chips}`), republished by
+the notifier on every state change and instantly redrawn via
+`refresh-client -S` — no `#()` job runs on your status line, and the `status`
+line **count** is never toggled at runtime (raising/lowering a status line
+resizes every pane and SIGWINCHes every full-screen app; older versions did
+this and it caused visible jitter). `auto` injects the strip at the left edge
+of your existing `status-right`; `pinned` reserves a second status line
+permanently so the strip gets a whole row without ever flapping. A bar
+strictly at the top while the main line stays at the bottom is not possible
+natively. If you previously used `auto`'s raised line, note the first `tick`
+after upgrading restores any still-raised `status` to your saved value.
 
 ## AI supervisor (Codex)
 

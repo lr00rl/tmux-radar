@@ -153,10 +153,11 @@ Set these **before** the plugin loads:
 | `@radar-claude-bg-ignore` | `~/.claude:~/.claude-mem` | Colon-separated path prefixes; background sessions whose cwd starts with one (plugin observers, SDK helpers) are not tracked. |
 | `@radar-ai` | `off` | Enable the **AI supervisor** (`prefix + A` menu). Needs the `codex` CLI + `jq`. |
 | `@radar-ai-key` | `A` | Prefix key that opens the AI supervisor menu (capital `A` so a stray `prefix + a` can't trigger it). |
-| `@radar-ai-model` | `gpt-5.6-luna` | Codex model slug used by the supervisor's read-only decision calls. |
+| `@radar-ai-model` | `gpt-5.3-codex-spark` | Codex model slug used by the supervisor's read-only decision calls. |
 | `@radar-ai-effort` | `high` | Reasoning effort per decision (`minimal`/`low`/`medium`/`high`/`xhigh`). |
 | `@radar-ai-profile` | *(none)* | Use a [codex config profile](https://github.com/openai/codex) (`codex exec -p <profile>`) instead of the model/effort options. Supervisor isolation still ignores the base interactive config and disables hooks/tools; the explicitly selected profile supplies the brain settings. |
-| `@radar-ai-cmd` | *(none)* | Replace Codex entirely: any shell command that reads the prompt on **stdin** and prints the decision **JSON** on stdout (another CLI, a local model, …). |
+| `@radar-ai-cmd` | *(none)* | Replace Codex entirely: any shell command that reads the prompt on **stdin** and prints the decision **JSON** on stdout (another CLI, a local model, …). A ready-made [pi](https://github.com/badlogic/pi-mono) adapter ships at `scripts/pi-brain.sh` — see *Using pi as the decision brain* below. |
+| `@radar-ai-pi-provider` | *(none)* | Provider name `scripts/pi-brain.sh` passes to `pi --provider` (e.g. `openai-codex`). Empty = pi's own default provider. |
 | `@radar-ai-rules` | *(none)* | **Your approval rules**: a file path (contents used) or a literal text block, appended to every decision prompt with top priority — e.g. "auto-approve npm test / file reads; ALWAYS escalate git push, deploys, anything touching prod". Falls back to `~/.config/tmux-radar/rules.md` when that file exists. |
 | `@radar-ai-prompt-dir` | *(none)* | Directory that **shadows** `scripts/prompts/` per file (`decide.md`, `control.md`, `*.schema.json`) — customize the default prompts without editing the plugin. |
 | `@radar-ai-autonomy` | `confirm` | One-shot `ask`/`decide`: `suggest` (print only), `confirm` (ask first), `auto`. |
@@ -455,6 +456,24 @@ killing an attached popup, pressing Ctrl-C, or stopping the run invalidates the
 owner lease; the watcher checks that lease during waits and backend polling and
 terminates its complete model process group. Prompt behavior is customizable
 through `@radar-ai-prompt-dir` and `@radar-ai-rules` without editing the plugin.
+
+### Using pi as the decision brain
+
+The supervisor's brain is pluggable via `@radar-ai-cmd`. If you run the same
+model through the [pi](https://github.com/badlogic/pi-mono) CLI (e.g. a
+`openai-codex` provider serving `gpt-5.3-codex-spark`), point the brain at the
+bundled adapter:
+
+```tmux
+set -g @radar-ai-cmd '~/.tmux/plugins/tmux-radar/scripts/pi-brain.sh'
+set -g @radar-ai-pi-provider 'openai-codex'   # omit to use pi's default provider
+```
+
+The adapter reuses `@radar-ai-model` for `pi --model` and maps
+`@radar-ai-effort` to `pi --thinking`. It runs pi non-interactively with
+`--no-tools --no-session` (no file/shell access, nothing persisted), so the
+engine remains the only actor exactly as with the Codex backend, including
+timeout process-group termination, JSON validation, and retries.
 
 ### CLI reference
 

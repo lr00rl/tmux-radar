@@ -97,7 +97,7 @@ func TestLiveSwitchesFiveViewsAndRendersCanonicalEvidence(t *testing.T) {
 		Decision: &runmodel.Decision{Action: "send", Text: "2", Keys: []string{"Enter"}, Safe: true,
 			Reason: "approval is narrow", PaneState: "blocked", GoalStatus: "working", Risk: "low",
 			Evidence: []string{"approval prompt visible"}},
-		DecisionMeta: &runmodel.DecisionMeta{SchemaVersion: 1, Call: 2, Model: "gpt-5.6-luna", Effort: "high", Elapsed: 4.2},
+		DecisionMeta: &runmodel.DecisionMeta{SchemaVersion: 1, Call: 2, Model: "gpt-5.3-codex-spark", Effort: "high", Elapsed: 4.2},
 		Screen:       "last target line\napproval prompt", ScreenPath: "/tmp/screens/0002.txt",
 		Stderr: "backend detail", StderrPath: "/tmp/backend/0002.stderr",
 	}
@@ -385,7 +385,7 @@ func TestLivePollReadsCanonicalDecisionScreenAndLogsIncrementally(t *testing.T) 
 		}
 	}
 	writeJSON(filepath.Join(dir, "decisions", "0001.meta.json"), runmodel.DecisionMeta{
-		SchemaVersion: 1, Call: 1, Model: "gpt-5.6-luna", Effort: "high", SchemaValid: true,
+		SchemaVersion: 1, Call: 1, Model: "gpt-5.3-codex-spark", Effort: "high", SchemaValid: true,
 	})
 	writeJSON(filepath.Join(dir, "decisions", "0001.json"), runmodel.Decision{
 		Action: "wait", Text: "", Keys: []string{}, Safe: true, Reason: "still working",

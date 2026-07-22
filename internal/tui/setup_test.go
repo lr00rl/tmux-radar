@@ -35,11 +35,11 @@ func compatiblePreflight() preflight.Result {
 		OK: true,
 		Backend: runmodel.BackendIdentity{
 			Mode: "codex", Path: "/Users/test/bin/codex", Version: "0.144.4",
-			Identity: "1:2:3:4", Source: "path", Model: "gpt-5.6-luna",
+			Identity: "1:2:3:4", Source: "path", Model: "gpt-5.3-codex-spark",
 			Effort: "high", ModelSource: runmodel.SourceDefault,
 			EffortSource: runmodel.SourceDefault, Compatible: true,
 		},
-		Model: "gpt-5.6-luna", Effort: "high",
+		Model: "gpt-5.3-codex-spark", Effort: "high",
 	}
 }
 
@@ -278,7 +278,7 @@ func TestSetupProfileManagesOnlyImplicitBrainFields(t *testing.T) {
 	}
 	model.setTextField(fieldProfile, "")
 	if model.config.Values.Model != (runmodel.Value[string]{
-		Value: "gpt-5.6-luna", Source: runmodel.SourceDefault,
+		Value: "gpt-5.3-codex-spark", Source: runmodel.SourceDefault,
 	}) || model.config.Values.Effort != (runmodel.Value[string]{
 		Value: "high", Source: runmodel.SourceDefault,
 	}) {

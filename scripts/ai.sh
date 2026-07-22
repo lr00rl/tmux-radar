@@ -25,7 +25,7 @@
 #
 # Config (tmux options, all optional):
 #   @radar-ai-key            A                     menu key (prefix + A)
-#   @radar-ai-model          gpt-5.6-luna          Codex model slug (fast tier)
+#   @radar-ai-model          gpt-5.3-codex-spark          Codex model slug (fast tier)
 #   @radar-ai-effort         high                  minimal|low|medium|high|xhigh
 #   @radar-ai-profile        (none)                codex config profile (-p); overrides model/effort
 #   @radar-ai-codex-path     (PATH)                absolute Codex executable override
@@ -106,7 +106,7 @@ BRAIN_BACKEND_IDENTITY=""
 BRAIN_BACKEND_SOURCE=""
 BRAIN_BACKEND_COMMAND=""
 BRAIN_BACKEND_PROFILE=""
-BRAIN_BACKEND_MODEL="gpt-5.6-luna"
+BRAIN_BACKEND_MODEL="gpt-5.3-codex-spark"
 BRAIN_BACKEND_EFFORT="high"
 BRAIN_BACKEND_WARNING=""
 BRAIN_BACKEND_JSON='{}'
@@ -399,7 +399,7 @@ cmd_build_watch_config() {
       stable_screen_threshold:{value:1,source:"default"},
       command:{value:"",source:"default"},
       profile:{value:"",source:"default"},
-      model:{value:"gpt-5.6-luna",source:"default"},
+      model:{value:"gpt-5.3-codex-spark",source:"default"},
       effort:{value:"high",source:"default"},
       timeout:{value:120,source:"default"},
       max_decisions:{value:40,source:"default"},
@@ -597,6 +597,7 @@ _version_ge() {
 _model_min_codex() {
   case "$1" in
     gpt-5.6-luna) printf '%s' '0.144.0' ;;
+    gpt-5.3-codex-spark) printf '%s' '0.144.0' ;;
     *) printf '%s' '0.0.0' ;;
   esac
 }
@@ -676,7 +677,7 @@ _freeze_backend() {
   if [ -n "$model_source" ]; then
     model="${TMUX_RADAR_RUN_MODEL:-}"
   else
-    model="$(opt @radar-ai-model gpt-5.6-luna)"
+    model="$(opt @radar-ai-model gpt-5.3-codex-spark)"
     if [ -n "$profile" ] && [ -z "$(_explicit_opt @radar-ai-model)" ]; then
       model=''; model_source='profile-managed'
     elif [ -n "$(_explicit_opt @radar-ai-model)" ]; then model_source='tmux'

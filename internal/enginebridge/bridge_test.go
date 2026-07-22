@@ -45,7 +45,7 @@ func validRequest(t *testing.T) StartRequest {
 	config := runmodel.DefaultConfig("%42", "允许所有操作\n直到测试完成")
 	config.Backend = &runmodel.BackendIdentity{
 		Mode: "codex", Path: "/Users/test/bin/codex", Version: "0.144.4", Identity: "1:2:3:4",
-		Source: "path", Model: "gpt-5.6-luna", Effort: "high", ModelSource: runmodel.SourceDefault,
+		Source: "path", Model: "gpt-5.3-codex-spark", Effort: "high", ModelSource: runmodel.SourceDefault,
 		EffortSource: runmodel.SourceDefault, Compatible: true,
 	}
 	return StartRequest{

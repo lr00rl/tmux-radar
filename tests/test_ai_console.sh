@@ -191,7 +191,7 @@ test_build_watch_config_contains_all_settings_and_provenance() {
       (.source | IN("default", "tmux", "custom", "runtime")))] | all) and
     (.values.goal == {value:"允许到测试全绿", source:"custom"}) and
     (.values.poll == {value:17, source:"tmux"}) and
-    (.values.model == {value:"gpt-5.6-luna", source:"default"}) and
+    (.values.model == {value:"gpt-5.3-codex-spark", source:"default"}) and
     (.values.effort == {value:"high", source:"default"}) and
     (.values.fallback_capture_lines == {value:20, source:"default"}) and
     (.values.completion_close_delay == {value:12, source:"default"}) and

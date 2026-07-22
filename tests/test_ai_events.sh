@@ -149,6 +149,11 @@ TMUXEOF
 
 prepare_env() {
   mkdir -p "$TMP/home/.claude" "$TMP/home/.codex" "$TMP/home/.kimi-code" "$TMP/state"
+  # When this suite itself runs under a Claude background job, CLAUDE_JOB_DIR
+  # leaks into the hook processes and flips claude-mark into the paneless
+  # branch (the fake tmux cannot satisfy the proc-ancestry resolver). Cases
+  # that need it set it explicitly via env.
+  unset CLAUDE_JOB_DIR
   export HOME="$TMP/home"
   export TEST_FAKE_TMUX="$TMP/bin/tmux"
   export BASH_ENV="$TMP/bashenv"

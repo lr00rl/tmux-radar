@@ -118,9 +118,17 @@ lock() {
   return 1
 }
 
+ERR_LOG="$STATE_DIR/notify-errors.log"
+SPOOL_FILE="$STATE_DIR/needinput-spool"
+
+_notify_err() {  # append a timestamped diagnostic; hooks discard stderr, this survives
+  printf '%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$ERR_LOG" 2>/dev/null || true
+}
+
 lock_or_error() {
   lock && return 0
   echo "tmux-radar: state lock unavailable: $LOCK" >&2
+  _notify_err "state lock unavailable (caller: ${FUNCNAME[1]:-?})"
   return 1
 }
 
@@ -155,6 +163,66 @@ opt() {  # opt <option> <default> (empty/no server -> default)
 }
 
 _san() { printf '%s' "${1:-}" | tr '\t\n' '  '; }
+
+_b64d() { printf '%s' "$1" | base64 -d 2>/dev/null || printf '%s' "$1" | base64 -D 2>/dev/null || true; }
+
+_schedule_tick() {  # _schedule_tick <delay-seconds> <stamp-file>
+  local delay="$1" stamp="$2" due now
+  [ "${TMUX_RADAR_NO_SCHEDULE:-0}" = 1 ] && return 0   # tests drive ticks themselves
+  now="$(date +%s)"
+  due="$(cat "$stamp" 2>/dev/null || true)"
+  case "$due" in ''|*[!0-9]*) due=0 ;; esac
+  [ "$due" -le "$now" ] || return 0               # one pending tick is enough
+  printf '%s\n' "$((now + delay))" > "$stamp" 2>/dev/null || true
+  # embed the state env: run-shell executes in the tmux server's environment,
+  # which does not carry a custom TMUX_RADAR_* setup
+  tmux run-shell -b "sleep $delay; TMUX_RADAR_STATE_DIR=$(printf '%q' "$STATE_DIR") TMUX_RADAR_NEEDINPUT_FILE=$(printf '%q' "$STATE_FILE") TMUX_RADAR_REGISTRY_FILE=$(printf '%q' "$REG_FILE") $(printf '%q' "$SCRIPT_DIR/needinput-notify.sh") tick" \
+    >/dev/null 2>&1 || true
+}
+
+# The spool is the no-event-left-behind fallback: when the state lock is
+# contended (a tick's GC holds it, several agent hooks fire at once) the event
+# is appended here instead of being dropped, and a near-term tick replays it.
+# Rows: "mark\t<pane>\t<epoch>\t<source>\t<key>\t<label>\t<title>" or
+#       "agent\t<kind>\t<event>\t<base64 JSON payload>".
+_spool_row() {
+  local IFS=$'\t'
+  printf '%s\n' "$*" >> "$SPOOL_FILE" 2>/dev/null || return 1
+  _notify_err "state lock contended; event spooled ($1 ${2:-})"
+  _schedule_tick 2 "$STATE_DIR/.drain-at"
+}
+
+_drain_spool() {  # replay spooled events; call WITHOUT the lock held
+  [ -s "$SPOOL_FILE" ] || return 0
+  [ "${RADAR_DRAINING:-0}" = 1 ] && return 0
+  RADAR_DRAINING=1
+  local spool_tmp="$SPOOL_FILE.drain.$$" rtype f1 f2 f3 f4 f5 f6 json
+  if ! mv "$SPOOL_FILE" "$spool_tmp" 2>/dev/null; then
+    RADAR_DRAINING=0
+    return 0
+  fi
+  while IFS=$'\t' read -r rtype f1 f2 f3 f4 f5 f6; do
+    case "$rtype" in
+      mark)
+        [ -n "$f4" ] || continue
+        if lock; then
+          _rewrite 'if (key == delkey || (mp != "-" && pane == mp)) next' \
+            -v delkey="$f4" -v mp="$f1"
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$f1" "$f2" "$f3" "$f4" "$f5" "$f6" >> "$STATE_FILE"
+          unlock
+        else
+          _spool_row mark "$f1" "$f2" "$f3" "$f4" "$f5" "$f6"
+        fi
+        ;;
+      agent)
+        json="$(_b64d "$f3")"
+        [ -n "$json" ] && _agent_event_apply "$f1" "$f2" "$json" || true
+        ;;
+    esac
+  done < "$spool_tmp"
+  rm -f "$spool_tmp"
+  RADAR_DRAINING=0
+}
 
 _watch_field() {
   awk -F= -v key="$2" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$1" 2>/dev/null || true
@@ -485,19 +553,12 @@ _refresh_status() {  # redraw every attached client's status line right now
 # time (stamp-guarded), never a resident poller. The chip strip itself is pure
 # option content, so nothing redraws or forks between resyncs.
 _schedule_resync() {
-  local barttl delay stamp due now
+  local barttl delay
   barttl="$(opt @radar-bar-ttl 60)"
   case "$barttl" in ''|*[!0-9]*) barttl=60 ;; esac
   delay=$((barttl + 2))
   { [ "$barttl" -gt 0 ] && [ "$delay" -lt 30 ]; } || delay=30
-  stamp="$STATE_DIR/.resync-at"
-  now="$(date +%s)"
-  read -r due < "$stamp" 2>/dev/null || due=0
-  case "$due" in ''|*[!0-9]*) due=0 ;; esac
-  [ "$due" -le "$now" ] || return 0              # a resync is already scheduled
-  printf '%s\n' "$((now + delay))" > "$stamp" 2>/dev/null || true
-  tmux run-shell -b "sleep $delay; '$SCRIPT_DIR/needinput-notify.sh' tick" \
-    >/dev/null 2>&1 || true
+  _schedule_tick "$delay" "$STATE_DIR/.resync-at"
 }
 
 # Recompute and publish the chip strip. Chips live INSIDE an existing status
@@ -545,7 +606,11 @@ cmd_mark() {  # cmd_mark <pane|-> <source> <label> [key]
     [ -n "$key" ] || exit 0
   fi
 
-  lock_or_error || return 1
+  if ! lock_or_error; then
+    # never lose the event: spool it and let a near-term tick replay it
+    _spool_row mark "$pane" "$now" "$source" "$key" "$label" "$saved_title"
+    return 0
+  fi
   # replace any previous mark with the same key or same pane (a pane waits for
   # at most one thing); keep the earliest saved title across re-marks
   local prev_title=""
@@ -592,6 +657,17 @@ cmd_clear_all() { lock_or_error || return 1; _drop_rows '1'; unlock; _sync_bar; 
 # snapshot and the pane scan failed we only do the plain prune.
 cmd_tick() {
   local snapshot verdicts dead_specs="" dead_keys="" registry_keys="" agents tmp reg_ok=""
+  # replay events that hook processes spooled under lock contention
+  _drain_spool
+  # GC atomic-write temp files orphaned by killed hook processes (mktemp->mv
+  # interrupted by a hook timeout), and keep the diagnostics log bounded
+  find "$STATE_DIR" -maxdepth 1 \
+    \( -name "$(basename "$STATE_FILE").??????" -o -name "$(basename "$REG_FILE").??????" \) \
+    -mmin +10 -delete 2>/dev/null || true
+  if [ -r "$ERR_LOG" ] && [ "$(wc -l < "$ERR_LOG" 2>/dev/null || echo 0)" -gt 1000 ]; then
+    tmp="$(mktemp "$ERR_LOG.XXXXXX")" 2>/dev/null &&
+      { tail -n 500 "$ERR_LOG" > "$tmp" && mv "$tmp" "$ERR_LOG" || rm -f "$tmp"; }
+  fi
   snapshot="$("$PS_BIN" -axo pid=,ppid=,tty=,command= 2>/dev/null || true)"
   # reg_ok = "the registry answered". Without it (ps failed, or the registry
   # was never created — pre-upgrade, hooks not installed) we must NOT infer
@@ -1181,7 +1257,13 @@ _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
   detail="$(_json_field label "$json")"
   display="$(_agent_display_name "$kind")"
 
-  lock_or_error || return 1
+  if ! lock_or_error; then
+    # Never lose the event: spool it for a near-term tick. Replay is slightly
+    # delayed (~2s) and, in the rare contended burst, may reorder against a
+    # direct event; registry generation ordering and mark GC self-heal that.
+    _spool_row agent "$kind" "$event" "$(printf '%s' "$json" | base64 | tr -d '\n')"
+    return 0
+  fi
   case "$event" in
     session_start)
       _reg_upsert_locked "$kind" "$key" "$pid" "$pane" working "$cwd" "$proc"
@@ -1354,6 +1436,19 @@ cmd_doctor() {  # one-stop "why is this row (not) showing?"
     echo
     echo "-- hooks --"
     "$SCRIPT_DIR/install-hooks.sh" status 2>/dev/null | sed 's/^/  /' || echo "  (status unavailable)"
+  fi
+  echo
+  echo "-- delivery diagnostics --"
+  if [ -s "$SPOOL_FILE" ]; then
+    printf '  spooled events waiting for replay: %s\n' "$(wc -l < "$SPOOL_FILE" | tr -d ' ')"
+  else
+    echo "  spool empty (no events waiting)"
+  fi
+  if [ -s "$ERR_LOG" ]; then
+    printf '  recent delivery errors (%s):\n' "$ERR_LOG"
+    tail -n 10 "$ERR_LOG" | sed 's/^/    /'
+  else
+    echo "  no recorded delivery errors"
   fi
 }
 

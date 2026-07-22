@@ -596,6 +596,12 @@ when the bar renders (≤30s), and whenever the AI status view opens.
   default) via the pane's tty and process tree. `pane_current_command` showing
   a version number (`2.1.199`) is normal and does not matter. If you renamed
   the binary, add that name to `@radar-needinput-commands`.
+- **A hook event seems to have vanished** — run
+  `scripts/needinput-notify.sh doctor` and read the `delivery diagnostics`
+  section: lock-contended events are spooled to `needinput-spool` and replayed
+  by the next tick (never dropped), and every delivery error is recorded with
+  a timestamp in `notify-errors.log` in the state dir. Orphaned atomic-write
+  temp files (a hook process killed mid-update) are GC'd by `tick`.
 - **Hooks don't fire** — run `scripts/install-hooks.sh status`. It reports
   Claude, Codex, Kimi, and OpenCode coverage separately, including Kimi's seven
   managed events and Codex's legacy notify fallback. Re-run `install`, then

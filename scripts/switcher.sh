@@ -18,6 +18,7 @@ SELF="$SCRIPT_DIR/switcher.sh"
 
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
 MRU_FILE="${TMUX_RADAR_MRU_FILE:-${TMUX_SWITCHER_MRU_FILE:-$STATE_DIR/window-mru}}"
+PANE_MRU_FILE="${TMUX_RADAR_PANE_MRU_FILE:-$STATE_DIR/pane-mru}"
 NEEDINPUT_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
 # agent-session registry written by needinput-notify.sh hooks (TSV, 9 fields:
 # kind key pid pane started last_event state cwd proc); readers need no lock
@@ -664,10 +665,34 @@ do_menu() {
   case "$target" in *.*) tmux select-pane -t "$target" 2>/dev/null || true ;; esac
 }
 
+cmd_last_pane() {  # jump to the most recently used *other* pane, cross-session
+  local cur pane loc sess winid
+  cur="$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)"
+  if [ ! -r "$PANE_MRU_FILE" ]; then
+    tmux display-message "tmux-radar: no pane history yet" 2>/dev/null || true
+    exit 0
+  fi
+  # newest first; skip the current pane and panes that no longer exist
+  while IFS= read -r pane; do
+    [ -n "$pane" ] || continue
+    [ "$pane" != "$cur" ] || continue
+    loc="$(tmux display-message -p -t "$pane" '#{session_id} #{window_id}' 2>/dev/null || true)"
+    [ -n "$loc" ] || continue
+    sess="${loc%% *}"; winid="${loc##* }"
+    tmux switch-client -t "$sess" 2>/dev/null || true
+    tmux select-window -t "$winid" 2>/dev/null || true
+    tmux select-pane -t "$pane" 2>/dev/null || true
+    exit 0
+  done < <(awk -F '\t' '{ ids[NR] = $1 } END { for (i = NR; i >= 1; i--) print ids[i] }' \
+    "$PANE_MRU_FILE" 2>/dev/null)
+  tmux display-message "tmux-radar: no other live pane in history" 2>/dev/null || true
+}
+
 case "${1:-menu}" in
   list)          do_list "${2:-}" "${3:-}" ;;
   preview)       do_preview "${2:-}" ;;
   set-view)      cmd_set_view "${2:-tree}" ;;
   toggle-expand) cmd_toggle_expand "${2:-}" ;;
+  last-pane)     cmd_last_pane ;;
   menu | *)      do_menu ;;
 esac

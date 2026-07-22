@@ -102,6 +102,10 @@ installed, the one-release rollback is explicit:
 
 ## Usage
 
+`prefix + Tab` toggles between your two most recently used panes — across
+windows and sessions (pane-level MRU is recorded by tmux hooks; see
+`@radar-last-key`).
+
 `prefix + C-w` opens the picker. Inside:
 
 | Key | Action |
@@ -133,6 +137,7 @@ Set these **before** the plugin loads:
 | `@radar-default-view` | `tree` | Initial view: `tree`, `recent`, or `needinput`. |
 | `@radar-expand-panes` | `off` | Start with panes expanded (`on`) or collapsed (`off`). Toggle live with `ctrl-e`. |
 | `@radar-key` | `C-w` | Prefix key that opens the picker. |
+| `@radar-last-key` | `Tab` | Prefix key that jumps to the most recently used **other pane**, across windows and sessions (tmux's own `last-pane` is window-local). Press repeatedly to toggle between your two most recent panes. `none` skips the binding. |
 | `@radar-popup-width` | `100%` | Popup width. |
 | `@radar-popup-height` | `100%` | Popup height. |
 | `@radar-preview` | `right:62%` | fzf preview position/size. |

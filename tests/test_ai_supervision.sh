@@ -861,6 +861,32 @@ assert_contains "$(cat "$TEST_PROMPT_FILE")" 'Apply the second patch?' \
 stop_watch
 printf 'PASS: semantic fallback ignores volatile rows and deduplicates model cost\n'
 
+# 21b. Acting on a fallback assessment invalidates its dedup memory: after the
+# watcher delivers keys, a byte-identical approval prompt that reappears must
+# trigger a fresh model call instead of being deduplicated forever.
+reset_case recurring-prompt
+write_response 1 '{"action":"send","text":"1","keys":["Enter"],"safe":true,"reason":"approve first occurrence"}'
+write_response 2 '{"action":"send","text":"1","keys":["Enter"],"safe":true,"reason":"approve recurrence"}'
+write_static_approval_screen
+start_watch_config 0.12 1 on 'approve recurring prompts'
+wait_until 'first recurring decision' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 1 ]"
+wait_until 'first recurring delivery' "[ \"\$(wc -l < '$TEST_SENDS' | tr -d ' ')\" -ge 1 ]"
+# The agent accepts and works for a bit: every frame differs, so verification
+# sees the change and no intermediate projection is stable enough to assess.
+gen=1
+while [ "$gen" -le 8 ]; do
+  write_fully_dynamic_screen "$gen"
+  sleep 0.04
+  gen=$((gen + 1))
+done
+# The SAME approval prompt returns, byte-identical to the first occurrence.
+write_static_approval_screen
+wait_until 'recurring identical prompt re-assessed' "[ \"\$(wc -l < '$TEST_MODEL_CALLS' | tr -d ' ')\" = 2 ]"
+wait_until 'recurring delivery' "[ \"\$(wc -l < '$TEST_SENDS' | tr -d ' ')\" -ge 2 ]"
+write_fully_dynamic_screen 99
+stop_watch
+printf 'PASS: delivered keys invalidate fallback dedup for recurring prompts\n'
+
 # 22. Full logging archives only the fallback pair that reached a model call,
 # not every unchanged idle sample forever. Repeated ARMED/dedupe states are
 # journaled once so a long blocked prompt remains inspectable without churn.

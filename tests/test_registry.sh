@@ -46,13 +46,18 @@ chk "pid alive but argv!=proc counts as dead (no fake liveness)" "! grep -q 's:r
 kill "$S2" 2>/dev/null
 
 # --- 3. SessionEnd selective clear ------------------------------------------
+tmux select-pane -t "$PANE" -T 'session-action-title'
 env -u CLAUDE_JOB_DIR "$N" mark "$PANE" claude "Claude needs your permission" s:end1
 printf '{"session_id":"end1"}' | "$N" claude-end
 chk "SessionEnd clears action mark instantly" "! grep -q 's:end1' '$MARKS'"
+chk "SessionEnd restores the action pane title" \
+  "[ \"\$(tmux display-message -p -t '$PANE' '#{pane_title}')\" = 'session-action-title' ]"
+tmux select-pane -t "$PANE" -T 'session-done-title'
 env -u CLAUDE_JOB_DIR "$N" mark "$PANE" claude "Claude finished — your turn" s:end2
 printf '{"session_id":"end2"}' | "$N" claude-end
-chk "SessionEnd keeps finished-your-turn mark" "grep -q 's:end2' '$MARKS'"
-"$N" clear-key s:end2
+chk "SessionEnd clears finished-your-turn mark" "! grep -q 's:end2' '$MARKS'"
+chk "SessionEnd restores the completed pane title" \
+  "[ \"\$(tmux display-message -p -t '$PANE' '#{pane_title}')\" = 'session-done-title' ]"
 
 # --- 4. THE user bug: paneless zombie action mark, no liveness source -------
 "$N" mark - claude "Claude·lattice: Claude is waiting for your input" s:zombie
@@ -61,9 +66,86 @@ chk "paneless zombie ACTION mark GCd by tick (the C-i stale bug)" \
   "! grep -q 's:zombie' '$MARKS'"
 "$N" mark - claude "Claude·lattice: finished — your turn" s:done-bg
 "$N" tick
-chk "paneless DONE mark survives tick (announcement semantics)" \
-  "grep -q 's:done-bg' '$MARKS'"
-"$N" clear-key s:done-bg
+chk "paneless DONE mark without live AI evidence is GCd by tick" \
+  "! grep -q 's:done-bg' '$MARKS'"
+
+# A legacy/stale six-field row can lack the saved title. Cleanup still removes
+# the notifier prefix instead of leaving it stuck: window name first, then the
+# pane's current command when the window name is empty.
+NOW="$(date +%s)"
+tmux rename-window -t smoke:0 'fallback-window'
+tmux select-pane -t "$PANE" -T '✓ stale completion'
+printf '%s\t%s\tclaude\ts:fallback-window\tClaude finished — your turn\t\n' \
+  "$PANE" "$NOW" > "$MARKS"
+"$N" tick
+chk "dead DONE with empty saved title is removed" "! grep -q 's:fallback-window' '$MARKS'"
+chk "empty saved title falls back to the user window name" \
+  "[ \"\$(tmux display-message -p -t '$PANE' '#{pane_title}')\" = 'fallback-window' ]"
+
+tmux set-window-option -t smoke:0 automatic-rename off >/dev/null
+tmux rename-window -t smoke:0 ''
+CURRENT_CMD="$(tmux display-message -p -t "$PANE" '#{pane_current_command}')"
+tmux select-pane -t "$PANE" -T '✓ stale completion'
+printf '%s\t%s\tclaude\ts:fallback-command\tClaude finished — your turn\t\n' \
+  "$PANE" "$NOW" > "$MARKS"
+"$N" tick
+chk "empty saved title falls back to current command when window name is empty" \
+  "[ \"\$(tmux display-message -p -t '$PANE' '#{pane_title}')\" = '$CURRENT_CMD' ]"
+tmux rename-window -t smoke:0 'smoke'
+
+# A user may intentionally start a title with the same glyphs used by the
+# notifier. Prefix shape alone is not ownership and tick must not rewrite it.
+: > "$MARKS"
+: > "$REG"
+tmux select-pane -t "$PANE" -T '✓ user-owned release title'
+"$N" tick
+chk "tick preserves a user-owned notifier-like title" \
+  "[ \"\$(tmux display-message -p -t '$PANE' '#{pane_title}')\" = '✓ user-owned release title' ]"
+
+# Attention qualification is liveness-based, not mark-based. Run the same
+# synchronous tick used by the picker with one stale marked pane and one pane
+# backed by a live registry process.
+PANE_STALE="$(tmux split-window -d -P -F '#{pane_id}' -t smoke:0)"
+sleep 300 & ATT_LIVE=$!
+"$N" agent-register sleep s:att-live "$ATT_LIVE" "$PANE" /tmp/att-live
+env -u CLAUDE_JOB_DIR "$N" mark "$PANE" claude 'Claude needs your permission' s:att-live
+env -u CLAUDE_JOB_DIR "$N" mark "$PANE_STALE" claude 'Claude needs your permission' s:att-stale
+"$N" tick
+# shellcheck disable=SC2034 # consumed by chk's evaluated assertion strings below
+ATT_ROWS="$("$SW" list attention 2>"$T/attention-qualification.err")"
+chk "Attention excludes a marked pane with no live process or registry" \
+  "! printf '%s\n' \"\$ATT_ROWS\" | cut -f1 | grep -qx '$PANE_STALE'"
+chk "Attention preserves a marked pane backed by a live registry process" \
+  "printf '%s\n' \"\$ATT_ROWS\" | cut -f1 | grep -qx '$PANE'"
+kill "$ATT_LIVE" 2>/dev/null; wait "$ATT_LIVE" 2>/dev/null
+"$N" clear-all
+
+# An unresolved PID is not live evidence. Once a process/pane scan succeeds
+# and finds no matching agent, tick removes the row, mark, and notifier title.
+tmux select-pane -t "$PANE" -T 'pid-zero-original'
+"$N" agent-register claude s:pid-zero 0 "$PANE" /tmp/pid-zero
+env -u CLAUDE_JOB_DIR "$N" mark "$PANE" claude 'Claude needs your permission' s:pid-zero
+"$N" tick
+chk "PID-0 registry row without a live pane agent is GCd" "! grep -q 's:pid-zero' '$REG'"
+chk "PID-0 registry mark without a live pane agent is GCd" "! grep -q 's:pid-zero' '$MARKS'"
+chk "PID-0 cleanup restores the pane title" \
+  "[ \"\$(tmux display-message -p -t '$PANE' '#{pane_title}')\" = 'pid-zero-original' ]"
+# shellcheck disable=SC2034 # consumed by chk's evaluated assertion string below
+PID_ZERO_ROWS="$("$SW" list attention 2>"$T/pid-zero-attention.err")"
+chk "PID-0 stale registry does not appear in Attention" \
+  "! printf '%s\n' \"\$PID_ZERO_ROWS\" | cut -f1 | grep -qx '$PANE'"
+
+# Dead registry liveness also clears DONE and restores the original title.
+sleep 300 & DEAD_DONE=$!
+tmux select-pane -t "$PANE" -T 'dead-done-title'
+"$N" agent-register sleep s:dead-done "$DEAD_DONE" "$PANE" /tmp/dead-done
+env -u CLAUDE_JOB_DIR "$N" mark "$PANE" claude 'Claude finished — your turn' s:dead-done
+kill "$DEAD_DONE" 2>/dev/null; wait "$DEAD_DONE" 2>/dev/null
+"$N" tick
+chk "dead registry liveness clears DONE mark" "! grep -q 's:dead-done' '$MARKS'"
+chk "dead registry liveness restores the pane title" \
+  "[ \"\$(tmux display-message -p -t '$PANE' '#{pane_title}')\" = 'dead-done-title' ]"
+"$N" clear-all
 
 # --- 5. claude-register / SessionStart stale-ask cleanup --------------------
 env -u CLAUDE_JOB_DIR "$N" mark "$PANE" claude "Claude needs your permission" s:rs1
@@ -159,8 +241,8 @@ KIMI_MARK_KEY="$(awk -F '\t' '$3=="kimi" && $4=="s:kimi-a" { print $4; exit }' "
 chk "Kimi Stop creates a done mark with registry-key identity" \
   "[ '$KIMI_REG_KEY' = 's:kimi-a' ] && [ '$KIMI_MARK_KEY' = '$KIMI_REG_KEY' ] && grep -q 'Kimi finished' '$MARKS'"
 kimi_event SessionEnd kimi-a
-chk "Kimi SessionEnd removes registry/action state but retains completion notice" \
-  "! awk -F'\t' '\$1==\"kimi\" && \$2==\"s:kimi-a\"' '$REG' | grep -q . && grep -q 's:kimi-a.*Kimi finished' '$MARKS'"
+chk "Kimi SessionEnd removes registry and completion state" \
+  "! awk -F'\t' '\$1==\"kimi\" && \$2==\"s:kimi-a\"' '$REG' | grep -q . && ! grep -q 's:kimi-a.*Kimi finished' '$MARKS'"
 kimi_event SessionEnd kimi-b
 "$N" clear-all
 

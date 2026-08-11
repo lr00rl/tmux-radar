@@ -4,10 +4,10 @@
 
 Find one live pane, understand enough context to choose it, and switch to that
 exact pane. tmux-radar gives every pane the same searchable row contract across
-three scopes—Recent, Attention, and All—with a live preview for supporting
+three views—Recent, Attention, and Tree—with a live preview for supporting
 context.
 
-![views: Recent | Attention | All](https://img.shields.io/badge/views-Recent%20%7C%20Attention%20%7C%20All-blue)
+![views: Recent | Attention | Tree](https://img.shields.io/badge/views-Recent%20%7C%20Attention%20%7C%20Tree-blue)
 
 ## Why not `choose-tree`?
 
@@ -25,15 +25,15 @@ long-running agents.
 
 ## Features
 
-- **One pane model, three scopes** — Recent orders live panes by pane MRU,
-  Attention prioritizes detected AI panes by semantic state, and All scans the
-  server in canonical session/window/pane order.
-- **Search visible identity and context** — type to match the pane's location,
-  window/pane title, command, path, or Attention metadata.
+- **Three focused views** — Recent contains only live pane-MRU entries,
+  Attention prioritizes panes with current AI process/registry evidence, and
+  Tree shows the fully expanded session/window/pane hierarchy.
+- **Window-name-first search** — type to match the user-assigned window name
+  before location/title, with command, path, and Attention state as metadata.
 - **Exact-pane switching** — every selectable row targets one pane. Selection
   is revalidated before switching and fails explicitly if that pane closed.
-- **Useful Recent behavior** — the current pane remains visible in true MRU
-  order while the initial cursor may prefer the first other pane.
+- **Useful Recent behavior** — newest recorded panes come first, duplicates and
+  closed panes disappear, and an empty pane MRU produces an empty view.
 - **Live preview** — the selected pane's content, no wrap, anchored to the
   bottom (current prompt/state visible), with line/page scroll.
 - **AI status alerts** — Claude/Codex/Kimi/OpenCode flag their pane for action-required
@@ -117,9 +117,9 @@ row keeps the current `session:window.pane` location searchable:
 | Key | Action |
 |-----|--------|
 | type | search visible identity and metadata |
-| `ctrl-r` | **Recent**: pane MRU, newest first; remaining panes follow in canonical order |
+| `ctrl-r` | **Recent**: live recorded pane MRU only, newest first |
 | `ctrl-i` | **Attention**: ACTION, DONE, NOTICE, then ACTIVE detected AI panes |
-| `ctrl-t` | **All**: every pane in canonical session/window/pane order |
+| `ctrl-t` | **Tree**: fully expanded session → window → pane hierarchy |
 | `alt-p` | toggle preview |
 | `shift-↑` / `shift-↓` | scroll preview by line |
 | `PgUp` / `PgDn` | scroll preview by page |
@@ -127,10 +127,12 @@ row keeps the current `session:window.pane` location searchable:
 | `Enter` | revalidate the stable pane ID and switch with one tmux client operation |
 | `Esc` | cancel without switching |
 
-All three scopes share the same pane-first row model; there is no window-row
-mode to expand. Attention includes only panes that can be switched to. Paneless
-background sessions remain available in the notification and supervisor
-surfaces instead of becoming nonfunctional picker rows.
+All three views emit exactly three TSV fields. Recent and Attention contain
+selectable pane rows. Tree adds non-accepting session/window context rows around
+stable pane-ID leaves and is always fully expanded. Paneless background
+sessions remain available in notification/supervisor surfaces instead of
+becoming nonfunctional picker rows. `all` is accepted only as a compatibility
+input alias for Tree.
 
 ## Configuration
 
@@ -138,7 +140,7 @@ Set these **before** the plugin loads:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `@radar-default-view` | `recent` | Initial scope: `recent`, `attention`, or `all`. Invalid values fall back to Recent. |
+| `@radar-default-view` | `recent` | Initial view: `recent`, `attention`, or `tree` (`all` is a compatibility alias). Invalid values fall back to Recent. |
 | `@radar-ai-console` | `auto` | Supervisor console surface: `auto` (right split when the target pane is ≥121×24, else popup) or `popup` (always overlay — never takes columns away from the work pane). |
 | `@radar-key` | `C-w` | Prefix key that opens the picker. |
 | `@radar-last-key` | `Tab` | Prefix key that jumps to the most recently used **other pane**, across windows and sessions (tmux's own `last-pane` is window-local). Press repeatedly to toggle between your two most recent panes. `none` skips the binding. |
@@ -240,8 +242,8 @@ pane, install the hooks once:
 It edits `~/.claude/settings.json` with five lifecycle hooks:
 `SessionStart` registers a live session, `Notification` marks input,
 `Stop` marks a finished turn, `UserPromptSubmit` clears the handled mark, and
-`SessionEnd` removes the live registry row plus stale action notices while
-deliberately preserving the preceding finished-turn mark. Native Codex handlers
+`SessionEnd` removes the live registry row and every automatic mark for that
+session, including a preceding finished-turn mark. Native Codex handlers
 are merged into `~/.codex/hooks.json`; the managed block in
 `~/.codex/config.toml` contains matching trust state plus the wrapped legacy
 `notify` fallback. Kimi receives one owned marker block in the active
@@ -315,15 +317,20 @@ normalized event contract and a copyable adapter.
   pane is alive but the **agent TUI exited** and the shell got reused.
   Native events maintain `agent-registry` rows containing session key, PID,
   pane, state, cwd, and process identity. GC requires both the recorded PID and
-  argv identity to match, so PID reuse cannot keep a dead session alive.
+  argv identity to match, so PID reuse cannot keep a dead session alive. An
+  unresolved PID (`0`) is shown only when the pane process scan independently
+  finds a configured AI process; otherwise a successful tick removes it.
   Pre-upgrade/unhooked sessions retain the process-tree fallback. Detection
   matches ps **argv0 path components**, never
   `pane_current_command`: Claude Code's foreground binary is a bare version
   number (e.g. `2.1.199`), so the naive match would miss it. The GC runs on
-  plugin load, while the bar is visible (every ≤30s), and whenever the
-  Attention opens; a failed scan skips GC rather than guessing. A marked
-  pane you are currently looking at is kept out of the bar (no need to nag)
-  but stays in Attention until cleared.
+  plugin load, while the bar is visible (every ≤30s), and synchronously
+  before the picker first renders or reloads any view. An unavailable process
+  scan skips destructive GC rather than guessing, while a notifier transaction
+  failure aborts the picker render explicitly. Dead marks are removed without
+  killing panes, and their saved titles are restored (empty saved titles fall
+  back to window name, then current command). Prefix glyphs alone never imply
+  notifier ownership, so user-authored titles are preserved.
 
 ### Bar position note
 
@@ -550,13 +557,14 @@ set -g @resurrect-hook-post-restore-all 'run-shell -b "~/.tmux/plugins/tmux-rada
 
 Stale AI-status marks self-heal in general: any mark whose agent TUI has exited
 (the pane is back to a plain shell) is dropped automatically — on plugin load,
-when the bar renders (≤30s), and whenever Attention opens.
+when the bar renders (≤30s), and before every picker render/reload.
 
 ## How it works
 
-- Rows are `%pane-id ⇥ search-display ⇥ meta-display`; fzf hides the stable
-  pane ID, displays the other fields (including `session:window.pane`), and
-  searches both visible fields.
+- Rows are `target ⇥ search-display ⇥ meta-display`; pane targets are
+  stable `%pane-id` values while Tree context rows are non-accepting. Search
+  starts with the sanitized user window name and uses beginning-position then
+  input-order tie breaks before considering later metadata.
 - Preview uses `--preview-window '<pos>,nowrap,follow'`; `follow` tails to the
   bottom so the current state is visible.
 - Colors are applied **shell/awk-side after** every tmux round-trip, never

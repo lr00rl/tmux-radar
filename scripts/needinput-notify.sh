@@ -49,11 +49,6 @@ BG_TTL="${TMUX_RADAR_BG_TTL:-${TMUX_SWITCHER_BG_TTL:-86400}}"   # paneless marks
 LOCK="$STATE_DIR/.need-input.lock"    # one lock guards need-input AND agent-registry
 PS_BIN="${TMUX_RADAR_TEST_PS_BIN:-ps}"
 
-# labels that mean "turn finished": these marks survive session end / GC so
-# short-lived and background runs still surface. Keep in sync with level_for
-# in switcher.sh / needinput-toast.sh.
-DONE_RE='(finished|your turn|turn complete|task complete|done|任务完成|完成)'
-
 [ "${TMUX_RADAR_INTERNAL:-0}" = 1 ] && exit 0
 
 mkdir -p "$STATE_DIR"
@@ -402,12 +397,11 @@ _reg_remove() {  # _reg_remove <key>
   unlock
 }
 
-# Drop a dead session's marks but keep unseen "finished — your turn" notices:
-# an action/notice mark for a session that can no longer take input is a lie.
+# Drop every mark for a session whose lifecycle has ended.
 _drop_session_marks() {  # _drop_session_marks <key>
   [ -n "${1:-}" ] || return 0
   lock_or_error || return 1
-  _drop_rows '$4 == k && tolower($5) !~ donere' -v k="$1" -v donere="$DONE_RE"
+  _drop_rows '$4 == k' -v k="$1"
   unlock
 }
 
@@ -490,10 +484,15 @@ _rewrite() {  # _rewrite <awk-filter-body> [extra awk -v args...]
 }
 
 _restore_title() {  # _restore_title <pane> <saved_title>
-  local pane="$1" saved="$2" cur
+  local pane="$1" saved="$2" cur fallback
   [ "$pane" = "-" ] || [ -z "$pane" ] && return 0
   [ "$(opt @radar-retitle on)" = "off" ] && return 0
   cur="$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)"
+  if [ -z "$saved" ]; then
+    fallback="$(tmux display-message -p -t "$pane" '#{window_name}'$'\037''#{pane_current_command}' 2>/dev/null || true)"
+    saved="$(_san "${fallback%%$'\037'*}")"
+    [ -n "$saved" ] || saved="$(_san "${fallback#*$'\037'}")"
+  fi
   case "$cur" in "⚠ "*|"✓ "*|"! "*|"· "*) tmux select-pane -t "$pane" -T "$saved" 2>/dev/null || true ;; esac
 }
 
@@ -527,7 +526,7 @@ _drop_rows() {  # _drop_rows <awk-condition-marking-rows-to-DROP> [extra -v args
     local victims pane title
     victims="$(awk -F '\t' "$@" "NF >= 6 && ($cond) { print \$1 \"\t\" \$6 }" "$STATE_FILE" 2>/dev/null || true)"
     while IFS=$'\t' read -r pane title; do
-      [ -n "$pane" ] && [ -n "$title" ] && _restore_title "$pane" "$title"
+      [ -n "$pane" ] && _restore_title "$pane" "$title"
     done <<< "$victims"
   fi
   _rewrite "if ($cond) next" "$@"
@@ -658,11 +657,10 @@ cmd_clear_all() { lock_or_error || return 1; _drop_rows '1'; unlock; _sync_bar; 
 #   1. registry rows: pid alive AND argv still matching the recorded proc
 #      (one ps snapshot for all rows; reused pids don't count as alive)
 #   2. pane agent scan (_agent_panes): fallback for marks with no registry row
-# Dead registry rows are removed and their action/notice marks dropped; done
-# marks stay until handled (or BG_TTL for paneless ones). If both the ps
+# Dead registry rows and all of their marks are removed. If both the ps
 # snapshot and the pane scan failed we only do the plain prune.
 cmd_tick() {
-  local snapshot verdicts dead_specs="" dead_keys="" registry_keys="" agents tmp reg_ok=""
+  local snapshot verdicts dead_specs="" dead_keys="" registry_keys="" agents agent_scan="" tmp reg_ok=""
   # replay events that hook processes spooled under lock contention
   _drain_spool
   # GC atomic-write temp files orphaned by killed hook processes (mktemp->mv
@@ -678,12 +676,15 @@ cmd_tick() {
     fi
   fi
   snapshot="$("$PS_BIN" -axo pid=,ppid=,tty=,command= 2>/dev/null || true)"
+  agents="$(_agent_panes "$snapshot" || true)"
+  case "$agents" in OK$'\001'*) agent_scan=1 ;; esac
   # reg_ok = "the registry answered". Without it (ps failed, or the registry
   # was never created — pre-upgrade, hooks not installed) we must NOT infer
   # death from a missing row: absence of evidence isn't evidence of absence.
   if [ -n "$snapshot" ] && [ -r "$REG_FILE" ]; then
     reg_ok=1
-    verdicts="$({ printf '__PS__\n%s\n__REG__\n' "$snapshot"; cat "$REG_FILE"; } | LC_ALL=C awk -F '\t' '
+    verdicts="$({ printf '__PS__\n%s\n__REG__\n' "$snapshot"; cat "$REG_FILE"; } |
+      LC_ALL=C awk -F '\t' -v agent_panes="${agents#OK}" -v scan_ok="$agent_scan" '
       function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
       function argmatch(argv0, name,    low, n, parts, i, c) {
         low = tolower(argv0); gsub(/\\/, "/", low)
@@ -704,7 +705,10 @@ cmd_tick() {
       mode == 2 && NF >= 9 {
         pid = $3 + 0
         alive = 0
-        if (pid <= 0) alive = 1            # unresolved pid: GC via pane scan only
+        if (pid <= 0) {
+          if (scan_ok == "") { print "U\t" $0; next }
+          if (index(agent_panes, "\001" $4 "\001") > 0) alive = 1
+        }
         else if ((pid in argv) && argmatch(argv[pid], tolower($9))) alive = 1
         print (alive ? "L" : "D") "\t" $0
       }')"
@@ -732,13 +736,12 @@ cmd_tick() {
         awk -F '\t' -v dk="$(printf '\001%s' "$dead_keys")" \
           'NF >= 9 && index(dk, "\001" $2 "\001") == 0' "$REG_FILE" > "$tmp" 2>/dev/null || true
         mv "$tmp" "$REG_FILE"
-        _drop_rows 'index(dk, "\001" $4 "\001") > 0 && tolower($5) !~ donere' \
-          -v dk="$(printf '\001%s' "$dead_keys")" -v donere="$DONE_RE"
+        _drop_rows 'index(dk, "\001" $4 "\001") > 0' \
+          -v dk="$(printf '\001%s' "$dead_keys")"
       fi
       unlock
     fi
   fi
-  agents="$(_agent_panes "$snapshot" || true)"
   lock_or_error || return 1
   [ -r "$REG_FILE" ] &&
     registry_keys="$(awk -F '\t' 'NF >= 9 { printf "%s\001", $2 }' "$REG_FILE" 2>/dev/null || true)"
@@ -750,9 +753,9 @@ cmd_tick() {
     #    regok, and only touches agent sources — a `mark - tool ...` from a
     #    user script has no registry row by design and must survive.
     _drop_rows '( $1 != "-" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "kimi" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 && ag != "" && index(ag, "\001" $1 "\001") == 0 ) ||
-      ( $1 == "-" && regok != "" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "kimi" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 && tolower($5) !~ donere )' \
+      ( $1 == "-" && regok != "" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "kimi" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 )' \
       -v rk="$(printf '\001%s' "$registry_keys")" -v ag="${agents#OK}" \
-      -v donere="$DONE_RE" -v regok="$reg_ok"
+      -v regok="$reg_ok"
   else
     _rewrite ''
   fi
@@ -1141,7 +1144,7 @@ _opencode_event() {  # _opencode_event <one JSON object>
       ;;
     end)
       _reg_remove_locked "$key"
-      _drop_rows '$4 == k && tolower($5) !~ donere' -v k="$key" -v donere="$DONE_RE"
+      _drop_rows '$4 == k' -v k="$key"
       ;;
   esac
   unlock
@@ -1276,7 +1279,7 @@ _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
   case "$event" in
     session_start)
       _reg_upsert_locked "$kind" "$key" "$pid" "$pane" working "$cwd" "$proc"
-      _drop_rows '$4 == k && tolower($5) !~ donere' -v k="$key" -v donere="$DONE_RE"
+      _drop_rows '$4 == k' -v k="$key"
       ;;
     approval)
       _reg_upsert_locked "$kind" "$key" "$pid" "$pane" waiting "$cwd" "$proc"
@@ -1311,7 +1314,7 @@ _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
       ;;
     session_end)
       _reg_remove_locked "$key"
-      _drop_rows '$4 == k && tolower($5) !~ donere' -v k="$key" -v donere="$DONE_RE"
+      _drop_rows '$4 == k' -v k="$key"
       ;;
   esac
   unlock
@@ -1427,7 +1430,7 @@ cmd_doctor() {  # one-stop "why is this row (not) showing?"
       if [ -r "$REG_FILE" ] && awk -F '\t' -v k="$key" 'NF >= 9 && $2 == k { found=1 } END { exit !found }' "$REG_FILE" 2>/dev/null; then
         why="registry row exists (see verdict above)"
       elif [ "$lvl" = "done" ]; then
-        why="done-level: kept until handled${pane:+ / pane dies}"
+        why="done-level without live evidence — GC candidate"
       fi
       printf '  %-8s %-7s %-9s %-40s %ss old · %s\n    %s\n' "$pane" "$lvl" "$src" "$key" "$(( now - ${epoch:-now} ))" "$why" "$label"
     done < "$STATE_FILE"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tmux-radar — pane-first picker with Recent / Attention / All scopes and a
+# tmux-radar — pane-first picker with Recent / Attention / Tree scopes and a
 # live bottom-anchored preview.
 #
 # Subcommands (the script calls itself for fzf reload/preview/binds):
@@ -61,7 +61,7 @@ needinput_commands() {  # newline-separated process names watched by AI status
 # ---- shared view state ------------------------------------------------------
 normalize_view() {
   case "${1:-}" in
-    all|tree) printf all ;;
+    all|tree) printf tree ;;
     attention|needinput) printf attention ;;
     recent) printf recent ;;
     *) printf recent ;;
@@ -81,12 +81,13 @@ write_state() { [ -n "${SW_STATE:-}" ] && printf '%s\n' "$VIEW" > "$SW_STATE"; }
 
 # ---- row builders ----------------------------------------------------------
 # Each public row is exactly "<target>\t<search-display>\t<meta-display>".
-# live_pane_records prepends pane_id for internal MRU joining; every display
-# field is flattened before tabs are introduced.
-live_pane_records() {
+# live_pane_snapshot is the one canonical server snapshot used to build pane
+# rows and the fully expanded Tree. User-derived fields are flattened before
+# tabs are introduced.
+live_pane_snapshot() {
   local raw
   raw="$(tmux list-panes -a -F \
-    "#{pane_id}${SEP}#{session_name}:#{window_index}.#{pane_index}${SEP}#{window_name}${SEP}#{pane_title}${SEP}#{pane_current_command}${SEP}#{pane_current_path}" 2>/dev/null)" || return 1
+    "#{pane_id}${SEP}#{session_name}${SEP}#{window_id}${SEP}#{window_index}${SEP}#{pane_index}${SEP}#{window_name}${SEP}#{pane_title}${SEP}#{pane_current_command}${SEP}#{pane_current_path}" 2>/dev/null)" || return 1
   printf '%s\n' "$raw" |
     LC_ALL=C awk -v FS="$SEP" -v OFS='\t' -v home="$HOME" '
       function clean(s) {
@@ -101,16 +102,39 @@ live_pane_records() {
         return p
       }
       {
-        id=$1; target=$2; window=clean($3); title=clean($4)
-        cmd=clean($5); path=spath(clean($6))
+        id=$1; session=clean($2); wid=$3; widx=clean($4); pidx=clean($5)
+        window=clean($6); title=clean($7); cmd=clean($8); path=spath(clean($9))
         if (title == "") title=cmd
-        print id, target, target " · " window "/" title, cmd " · " path
+        print id, session, wid, widx, pidx, window, title, cmd, path
       }
     '
 }
 
-list_all() {
-  live_pane_records | cut -f1,3-
+pane_rows() {
+  LC_ALL=C awk -F '\t' -v OFS='\t' '
+    { location=$2 ":" $4 "." $5; print $1, $6 " " location "/" $7, $9 " · " $8 }
+  '
+}
+
+live_pane_records() {
+  live_pane_snapshot | pane_rows
+}
+
+list_tree() {
+  live_pane_snapshot | LC_ALL=C awk -F '\t' -v OFS='\t' '
+    {
+      location=$2 ":" $4 "." $5
+      if ($2 != last_session) {
+        print "@session:" $2, $2, "session"
+        last_session=$2; last_window=""
+      }
+      if ($3 != last_window) {
+        print "@window:" $3, "  " $6 " " $2 ":" $4, "window"
+        last_window=$3
+      }
+      print $1, $6 " " location "/" $7, $9 " · " $8
+    }
+  '
 }
 
 list_recent() {
@@ -118,11 +142,10 @@ list_recent() {
   [ -r "$mfile" ] || mfile=/dev/null
   live="$(live_pane_records)" || return 1
   awk -F '\t' '
-    NR==FNR { row[$1]=$1 FS $3 FS $4; order[++m]=$1; next }
+    NR==FNR { row[$1]=$0; next }
     { recent[++n]=$1 }
     END {
       for (i=n; i>=1; i--) { id=recent[i]; if ((id in row) && !seen[id]++) print row[id] }
-      for (i=1; i<=m; i++) { id=order[i]; if (!seen[id]++) print row[id] }
     }
   ' <(printf '%s\n' "$live") "$mfile"
 }
@@ -180,12 +203,28 @@ list_attention() {  # pane-level AI-status process view; hook-marked panes float
         }
         return ""
       }
+      function proc_identity_match(argv0, wanted,    raw, n, a, i, c) {
+        raw=tolower(argv0); wanted=tolower(wanted)
+        gsub(/\\/, "/", raw)
+        if (wanted == "") return 0
+        n=split(raw, a, "/")
+        for (i=1; i<=n; i++) {
+          c=a[i]
+          sub(/\.app$/, "", c)
+          if (c == wanted) return 1
+        }
+        return 0
+      }
       function add_match(pane, cmd) {
         if (pane == "" || cmd == "") return
         if (!(pane in ai)) ai[pane]=1
         ai_cmd[pane SUBSEP cmd]=1
         # registry kinds outside the watch list must still show in cmds_for
         if (!(cmd in cmd_known)) { cmd_known[cmd]=1; cmd_order[++cmd_n]=cmd }
+      }
+      function add_process_match(pane, cmd) {
+        add_match(pane, cmd)
+        if (pane != "" && cmd != "") process_ai[pane]=1
       }
       function emit_pane(pane, level,    is_flagged, display_title, title, matched, hint, tail) {
         is_flagged=(pane in flagged)
@@ -217,9 +256,9 @@ list_attention() {  # pane-level AI-status process view; hook-marked panes float
         } else if (pane in reg_state) {
           tail=" " D "· " reg_kind[pane] " " reg_state[pane] " · " age_str(now - reg_started[pane]) R
         }
-        printf "%s\t%s%s%s%s %s%s%s\t%s%s · %s · %s%s%s\n", \
-          pane_target[pane], badge(level), C, wt[pane] "." pidx[pane], R, wn[pane], title, R, \
-          D, matched, cm[pane], pa[pane], R, hint tail
+        printf "%s\t%s %s%s.%s%s%s\t%s%s%s · %s · %s%s%s\n", \
+          pane_target[pane], wn[pane], C, wt[pane], pidx[pane], title, R, \
+          badge(level), D, matched, cm[pane], pa[pane], R, hint tail
       }
       function cmds_for(pane,    i, out, cmd) {
         out=""
@@ -237,6 +276,7 @@ list_attention() {  # pane-level AI-status process view; hook-marked panes float
         argv0=first_word(rest)
         proc_parent[pid]=ppid
         proc_tty[pid]=tty
+        proc_argv[pid]=argv0
         matched=proc_match(argv0)
         if (matched != "") proc_cmd[pid]=matched
       }
@@ -277,14 +317,19 @@ list_attention() {  # pane-level AI-status process view; hook-marked panes float
       }
       mode == "ps" && $0 != "" { read_ps($0); next }
       mode == "reg" && $0 != "" {
-        # kind key pid pane started last_event state cwd proc — authoritative
-        # AI-pane detector; pid must be in the ps snapshot (0 = unresolved,
-        # trust tick GC); newest last_event wins when a pane has two rows
+        # Positive PIDs require current argv identity. Unresolved PIDs are
+        # accepted later only with independent pane-process evidence.
         if (NF < 9 || $4 == "" || $4 == "-") next
-        if ($3 + 0 > 0 && !($3 in proc_parent)) next
+        pid=$3 + 0
+        proc=clean_user($9)
+        if (pid > 0 && (!(pid in proc_parent) || !proc_identity_match(proc_argv[pid], proc))) next
         if (($4 in reg_last) && reg_last[$4] > $6 + 0) next
         reg_last[$4]=$6 + 0
         kind=clean_user($1); state=clean_user($7)
+        if (pid <= 0) {
+          unresolved_kind[$4]=kind; unresolved_started[$4]=$5 + 0; unresolved_state[$4]=state
+          next
+        }
         reg_kind[$4]=kind; reg_started[$4]=$5 + 0; reg_state[$4]=state
         add_match($4, kind)
         next
@@ -294,17 +339,25 @@ list_attention() {  # pane-level AI-status process view; hook-marked panes float
           tty=proc_tty[pid]
           if (tty in panes_on_tty) {
             c=split(panes_on_tty[tty], tty_panes, "\034")
-            for (i=1; i<=c; i++) add_match(tty_panes[i], proc_cmd[pid])
+            for (i=1; i<=c; i++) add_process_match(tty_panes[i], proc_cmd[pid])
           }
 
           seen=""
           cur=pid
           for (hops=0; hops<80 && cur != ""; hops++) {
-            if (cur in pane_by_pid) { add_match(pane_by_pid[cur], proc_cmd[pid]); break }
+            if (cur in pane_by_pid) { add_process_match(pane_by_pid[cur], proc_cmd[pid]); break }
             if (index("\034" seen "\034", "\034" cur "\034") > 0) break
             seen=seen "\034" cur
             cur=proc_parent[cur]
           }
+        }
+
+        for (pane in unresolved_kind) {
+          if (!(pane in process_ai)) continue
+          reg_kind[pane]=unresolved_kind[pane]
+          reg_started[pane]=unresolved_started[pane]
+          reg_state[pane]=unresolved_state[pane]
+          add_match(pane, unresolved_kind[pane])
         }
 
         # Marked live panes first, split by meaning: real action requests before
@@ -312,7 +365,7 @@ list_attention() {  # pane-level AI-status process view; hook-marked panes float
         need_n=0
         for (i=1; i<=n; i++) {
           pane=order[i]
-          if (pane in flagged) {
+          if ((pane in flagged) && (pane in ai)) {
             need_n++; nr[need_n]=level_rank(flag_level[pane]); ne[need_n]=flag_epoch[pane]; nv[need_n]=pane
           }
         }
@@ -344,7 +397,7 @@ do_list() {  # do_list [view]
   case "$VIEW" in
     recent) list_fn=list_recent ;;
     attention) list_fn=list_attention ;;
-    all) list_fn=list_all ;;
+    tree) list_fn=list_tree ;;
   esac
   if ! rows="$("$list_fn")"; then
     printf '%s\n' 'unable to list panes; reopen the switcher' >&2
@@ -448,17 +501,21 @@ _prompt() {
   case "$VIEW" in
     recent) printf 'Recent> ' ;;
     attention) printf 'Attention> ' ;;
-    all) printf 'All> ' ;;
+    tree) printf 'Tree> ' ;;
   esac
 }
 
 cmd_set_view() {  # fzf transform: switch view, reload, repoint prompt
-  local next_view pos sort_action rows_tmp reload_cmd
+  local next_view rows_tmp reload_cmd
   read_state
   next_view="$(normalize_view "${1:-recent}")"
-  # GC stale marks before the AI status list renders (~50ms, one keystroke)
-  [ "$next_view" = attention ] && "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 || true
   if [ -z "${SW_ROWS:-}" ] || [ -z "${SW_ERROR:-}" ]; then
+    printf abort
+    return 0
+  fi
+  # Every reload observes a completed cleanup pass before publishing its rows.
+  if ! "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1; then
+    : > "$SW_ERROR"
     printf abort
     return 0
   fi
@@ -475,12 +532,8 @@ cmd_set_view() {  # fzf transform: switch view, reload, repoint prompt
   fi
   VIEW="$next_view"
   write_state
-  pos=1
-  [ "$VIEW" = recent ] && pos=2
-  sort_action=disable-sort
-  [ "$VIEW" = all ] && sort_action=enable-sort
   printf -v reload_cmd 'cat %q' "$SW_ROWS"
-  printf '%s+reload-sync(%s)+change-prompt(%s)+pos(%s)' "$sort_action" "$reload_cmd" "$(_prompt)" "$pos"
+  printf 'enable-sort+reload-sync(%s)+change-prompt(%s)+pos(1)' "$reload_cmd" "$(_prompt)"
 }
 
 do_menu() {
@@ -499,21 +552,17 @@ do_menu() {
   SW_STATE="$(mktemp "${STATE_DIR}/.sw.XXXXXX")"; export SW_STATE
   write_state
 
-  # GC stale AI-status marks so the view opens clean; synchronous only when
-  # Attention is the first view shown (elsewhere the C-i transform re-GCs).
-  if [ "$VIEW" = attention ]; then "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 || true
-  else ("$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 &)
+  # Complete stale AI cleanup before fzf reads its first list in every view.
+  if ! "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1; then
+    rm -f "$SW_STATE" 2>/dev/null || true
+    printf '%s\n' 'unable to refresh AI state; reopen the switcher' >&2
+    tmux display-message 'tmux-radar: unable to refresh AI state; reopen the switcher' >/dev/null 2>&1 || true
+    return 1
   fi
 
-  # Recent opens with the cursor on row 2 (row 1 is the current pane), both
-  # on initial popup open and when switching back into the recent view.
-  # All/Attention view switches and query changes reset to row 1.
-  # --sync is required so the list is loaded before 'start' fires.
-  fzf_args=(--ansi --delimiter=$'\t' --with-nth=2.. --nth=2.. --cycle)
-  [ "$VIEW" = recent ] && fzf_args+=(--sync '--bind=start:pos(2)')
-  # Recent and Attention have semantic ordering; All may relevance-sort once
-  # the query is nonempty while preserving the server order at rest.
-  [ "$VIEW" != all ] && fzf_args+=(--no-sort)
+  # Relevance applies consistently; input order is the final tie break, which
+  # preserves each view's canonical order for an empty query.
+  fzf_args=(--ansi --delimiter=$'\t' --with-nth=2.. --cycle '--tiebreak=begin,index')
 
   list_file="$(mktemp "${STATE_DIR}/.rows.XXXXXX")"
   SW_ROWS="$list_file"; export SW_ROWS
@@ -529,10 +578,10 @@ do_menu() {
     "$fzf" \
       "${fzf_args[@]}" \
       --layout=reverse --prompt="$(_prompt)" \
-      --header='C-r Recent · C-i Attention (0/0 = no detected AI pane) · C-t All · A-p preview · Enter switch' \
+      --header='C-r Recent · C-i Attention (0/0 = no detected AI pane) · C-t Tree · A-p preview · Enter switch' \
       --preview="$SELF preview {1}" --preview-window="$preview_win" \
       --bind='change:pos(1)' \
-      --bind="ctrl-t:transform($SELF set-view all)" \
+      --bind="ctrl-t:transform($SELF set-view tree)" \
       --bind="ctrl-r:transform($SELF set-view recent)" \
       --bind="ctrl-i:transform($SELF set-view attention)" \
       --bind='alt-p:toggle-preview' \
@@ -566,10 +615,7 @@ do_menu() {
 
   [ -n "$selected" ] || exit 0
   target="${selected%%$'\t'*}"
-  if [[ ! "$target" =~ ^%[0-9]+$ ]]; then
-      tmux display-message "tmux-radar: invalid target '$target'; no switch performed" 2>/dev/null || true
-      return 1
-  fi
+  [[ "$target" =~ ^%[0-9]+$ ]] || return 0
 
   if [ "$(tmux display-message -p -t "$target" '#{pane_id}' 2>/dev/null || true)" != "$target" ]; then
     printf '%s\n' 'pane closed; reopen the switcher' >&2

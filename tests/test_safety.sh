@@ -178,8 +178,8 @@ kill "$FRESH" 2>/dev/null; wait "$FRESH" 2>/dev/null
 
 echo
 echo "### #9/#10 follow-ups"
-chk "DONE_RE includes bare 'done' (matches switcher level_for)" \
-  "grep -q \"DONE_RE='(finished|your turn|turn complete|task complete|done|\" '$N'"
+chk "completion marks have no lifecycle-cleanup exemption" \
+  "! grep -Eq 'DONE_RE|donere' '$N'"
 sleep 30 & OC=$!
 printf '{"event":"start","session_id":"realsid","pane":"%s","pid":%s,"cwd":"/tmp/oc"}' "$PANE" "$OC" | "$N" opencode-hook
 printf '{"event":"permission","session_id":"realsid","pane":"%s","pid":%s,"cwd":"/tmp/oc","message":"y?"}' "$PANE" "$OC" | "$N" opencode-hook

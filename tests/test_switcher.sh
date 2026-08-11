@@ -4,18 +4,22 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SWITCHER="$ROOT/scripts/switcher.sh"
 NOTIFY="$ROOT/scripts/needinput-notify.sh"
+REAL_FZF="$(command -v fzf || true)"
 TMP="$(mktemp -d /tmp/radar-sw.XXXXXX)"
 SOCKET="rs$$"
 FAKE_BIN="$TMP/bin"
 FZF_CALLED="$TMP/fzf-called"
 
 cleanup() {
+  [ -z "${ATT_REG_PID:-}" ] || kill "$ATT_REG_PID" >/dev/null 2>&1 || true
+  [ -z "${TICK_HOLDER_PID:-}" ] || kill "$TICK_HOLDER_PID" >/dev/null 2>&1 || true
   tmux -L "$SOCKET" kill-server >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
 
 mkdir -p "$FAKE_BIN" "$TMP/state"
+[ -n "$REAL_FZF" ] || { printf 'FAIL: fzf is required for search integration tests\n' >&2; exit 1; }
 export TMUX_TMPDIR="$TMP"
 cat > "$FAKE_BIN/fzf" <<'SH'
 #!/usr/bin/env bash
@@ -138,27 +142,34 @@ tmux -L "$SOCKET" split-window -d -t beta:0
 # create a fourth field or a physical extra line in the public row protocol.
 tmux -L "$SOCKET" select-pane -t alpha:0.0 -T $'unsafe\ttitle\rcontrol'
 
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list all > "$TMP/all.rows"
-strip_ansi < "$TMP/all.rows" > "$TMP/all.plain"
-assert_pane_rows 'All' "$TMP/all.plain"
-all_count="$(wc -l < "$TMP/all.plain" | tr -d ' ')"
-[ "$all_count" -eq 5 ] || fail "All should emit all 5 panes exactly once (got $all_count)"
-if LC_ALL=C grep -q $'\r' "$TMP/all.plain"; then
-  fail 'All left a carriage return in user-derived display content'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree > "$TMP/tree.rows"
+strip_ansi < "$TMP/tree.rows" > "$TMP/tree.plain"
+awk -F '\t' '
+  NF != 3 { bad=1 }
+  $1 ~ /^%[0-9]+$/ { panes++; next }
+  $2 ~ /alpha|beta/ { structural++ }
+  END { exit !(bad == 0 && panes == 5 && structural == 5) }
+' "$TMP/tree.plain" || fail 'Tree is not a canonical 2-session/3-window/5-pane hierarchy'
+awk -F '\t' '$1 ~ /^%[0-9]+$/ { print $1 }' "$TMP/tree.plain" > "$TMP/tree-pane.targets"
+tmux -L "$SOCKET" list-panes -a -F '#{pane_id}' > "$TMP/live-pane.targets"
+cmp -s "$TMP/tree-pane.targets" "$TMP/live-pane.targets" ||
+  fail 'Tree pane leaves are not stable pane IDs in canonical server order'
+TREE_STRUCT_TARGET="$(awk -F '\t' '$1 !~ /^%[0-9]+$/ { print $1; exit }' "$TMP/tree.plain")"
+[ -n "$TREE_STRUCT_TARGET" ] || fail 'Tree omitted non-accepting structural session/window rows'
+if LC_ALL=C grep -q $'\r' "$TMP/tree.plain"; then
+  fail 'Tree left a carriage return in user-derived display content'
 fi
-printf 'PASS: All emits canonical sanitized live-pane rows\n'
 
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree > "$TMP/tree-alias.rows"
-# Detached panes can populate pane_current_path between consecutive tmux scans;
-# the compatibility contract is the same ordered target set, not a frozen copy
-# of inherently live display metadata.
-cut -f1 "$TMP/all.rows" > "$TMP/all.targets"
-cut -f1 "$TMP/tree-alias.rows" > "$TMP/tree-alias.targets"
-cmp -s "$TMP/all.targets" "$TMP/tree-alias.targets" || fail 'legacy tree alias does not resolve to All'
-printf 'PASS: legacy tree alias resolves to All\n'
+# `all` is accepted for old callers, but resolves to the Tree product surface.
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list all > "$TMP/all-alias.rows"
+strip_ansi < "$TMP/all-alias.rows" > "$TMP/all-alias.plain"
+cut -f1 "$TMP/tree.plain" > "$TMP/tree.targets"
+cut -f1 "$TMP/all-alias.plain" > "$TMP/all-alias.targets"
+cmp -s "$TMP/tree.targets" "$TMP/all-alias.targets" || fail 'all compatibility alias does not resolve to Tree'
+printf 'PASS: Tree emits canonical structural hierarchy and all is only its compatibility alias\n'
 
-# Recent is pane-MRU, not window-MRU: newest live pane IDs lead, duplicates and
-# dead IDs are ignored, then remaining panes retain canonical server order.
+# Recent is pane-MRU, not window-MRU: only recorded live pane IDs appear;
+# newest wins, duplicates collapse, and dead IDs are ignored.
 P_ALPHA_0="$(tmux -L "$SOCKET" display-message -p -t alpha:0.0 '#{pane_id}')"
 P_ALPHA_1="$(tmux -L "$SOCKET" display-message -p -t alpha:0.1 '#{pane_id}')"
 P_BETA_1="$(tmux -L "$SOCKET" display-message -p -t beta:0.1 '#{pane_id}')"
@@ -175,13 +186,30 @@ recent_first="$(sed -n '1s/\t.*//p' "$TMP/recent.plain")"
 recent_second="$(sed -n '2s/\t.*//p' "$TMP/recent.plain")"
 [ "$recent_first" = "$P_ALPHA_0" ] || fail "Recent did not put newest live pane first (got $recent_first)"
 [ "$recent_second" = "$P_BETA_1" ] || fail "Recent did not preserve the next deduplicated MRU pane (got $recent_second)"
-[ "$(wc -l < "$TMP/recent.plain" | tr -d ' ')" -eq 5 ] || fail 'Recent omitted or duplicated live panes'
-printf 'PASS: Recent is pane-level, deduplicated, and MRU ordered\n'
+[ "$(wc -l < "$TMP/recent.plain" | tr -d ' ')" -eq 2 ] || fail 'Recent appended live panes that were not recorded in pane MRU'
+
+# Search identity starts with the user-assigned window name. Location, cwd,
+# command, pane title, and AI metadata may follow but cannot outrank it.
+tmux -L "$SOCKET" rename-window -t alpha:0 'user-search-name'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent > "$TMP/recent-search.rows"
+strip_ansi < "$TMP/recent-search.rows" > "$TMP/recent-search.plain"
+awk -F '\t' -v pane="$P_ALPHA_0" '$1 == pane { exit !($2 ~ /^user-search-name([[:space:]\/]|$)/) } END { if (NR == 0) exit 1 }' \
+  "$TMP/recent-search.plain" || fail 'pane search text does not begin with the user window name'
+
+: > "$TMP/state/pane-mru"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent > "$TMP/recent-empty.rows"
+[ ! -s "$TMP/recent-empty.rows" ] || fail 'empty pane MRU emitted Recent rows'
+rm -f "$TMP/state/pane-mru"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent > "$TMP/recent-missing.rows"
+[ ! -s "$TMP/recent-missing.rows" ] || fail 'missing pane MRU emitted Recent rows'
+printf '%s\t1\n%s\t2\n' "$P_ALPHA_0" "$P_BETA_1" > "$TMP/state/pane-mru"
+printf 'PASS: Recent contains only live recorded panes and window name leads search text\n'
 
 # --- Attention ordering, Kimi detection, and empty state -------------------
 now="$(date +%s)"
 P_ALPHA_W1="$(tmux -L "$SOCKET" display-message -p -t alpha:1.0 '#{pane_id}')"
 P_BETA_0="$(tmux -L "$SOCKET" display-message -p -t beta:0.0 '#{pane_id}')"
+sleep 300 & ATT_REG_PID=$!
 cat > "$TMP/state/need-input" <<EOF
 $P_BETA_1	$((now - 20))	test	new-action	needs approval
 $P_ALPHA_1	$((now - 20))	test	other-action	needs input
@@ -189,9 +217,20 @@ $P_ALPHA_W1	$((now - 30))	test	done	turn complete
 $P_BETA_0	$((now - 40))	test	notice	informational update
 -	$((now - 5))	claude	background	needs input
 EOF
-# pid 0 is an intentionally unresolved but authoritative hook registry row.
-printf 'codex\ta:active\t0\t%s\t%s\t%s\tactive\t/tmp\tcodex\n' \
-  "$P_ALPHA_0" "$((now - 100))" "$((now - 1))" > "$TMP/state/agent-registry"
+# Every marked pane gets positive PID + argv identity evidence: a mark alone
+# must never make a pane eligible for Attention.
+{
+  printf 'codex\ta:action-1\t%s\t%s\t%s\t%s\twaiting\t/tmp\tsleep\n' \
+    "$ATT_REG_PID" "$P_BETA_1" "$((now - 100))" "$((now - 1))"
+  printf 'codex\ta:action-2\t%s\t%s\t%s\t%s\twaiting\t/tmp\tsleep\n' \
+    "$ATT_REG_PID" "$P_ALPHA_1" "$((now - 100))" "$((now - 1))"
+  printf 'codex\ta:done\t%s\t%s\t%s\t%s\tdone\t/tmp\tsleep\n' \
+    "$ATT_REG_PID" "$P_ALPHA_W1" "$((now - 100))" "$((now - 1))"
+  printf 'codex\ta:notice\t%s\t%s\t%s\t%s\tactive\t/tmp\tsleep\n' \
+    "$ATT_REG_PID" "$P_BETA_0" "$((now - 100))" "$((now - 1))"
+  printf 'codex\ta:active\t%s\t%s\t%s\t%s\tactive\t/tmp\tsleep\n' \
+    "$ATT_REG_PID" "$P_ALPHA_0" "$((now - 100))" "$((now - 1))"
+} > "$TMP/state/agent-registry"
 
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention.rows"
 strip_ansi < "$TMP/attention.rows" > "$TMP/attention.plain"
@@ -210,15 +249,33 @@ cut -f1 "$TMP/needinput-alias.rows" > "$TMP/needinput-alias.targets"
 cmp -s "$TMP/attention.targets" "$TMP/needinput-alias.targets" || fail 'legacy needinput alias does not resolve to Attention'
 printf 'PASS: Attention ordering, paneless omission, and legacy alias are stable\n'
 
+# Registry rows are evidence only when their process identity is current.
+printf '%s\t%s\ttest\ts:pid-zero\tneeds input\t\n' \
+  "$P_ALPHA_1" "$((now - 10))" > "$TMP/state/need-input"
+printf 'codex\ts:pid-zero\t0\t%s\t%s\t%s\twaiting\t/tmp\tcodex\n' \
+  "$P_ALPHA_1" "$((now - 100))" "$((now - 1))" > "$TMP/state/agent-registry"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention-pid-zero.rows"
+[ ! -s "$TMP/attention-pid-zero.rows" ] || fail 'unresolved PID-0 registry row created false Attention liveness'
+printf 'codex\ts:pid-reuse\t%s\t%s\t%s\t%s\twaiting\t/tmp\tcodex\n' \
+  "$ATT_REG_PID" "$P_ALPHA_1" "$((now - 100))" "$((now - 1))" > "$TMP/state/agent-registry"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention-pid-reuse.rows"
+[ ! -s "$TMP/attention-pid-reuse.rows" ] || fail 'PID reuse with mismatched argv created false Attention liveness'
+printf 'PASS: Attention rejects unresolved and argv-mismatched registry liveness\n'
+
 # Attention mark fields are user-controlled. Strip CR/ESC/control bytes from
 # source, label, saved title, and session keys while retaining renderer-owned
 # ANSI badges.
 printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
   "$P_ALPHA_1" "$((now - 10))" $'hook\rsource\033X' $'s:mark\rkey\033X' \
   $'your\r turn\033Y' $'saved\rtitle\033Z' > "$TMP/state/need-input"
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-  $'co\033dex' $'s:reg\rkey\033X' 0 "$P_ALPHA_0" "$((now - 100))" "$((now - 1))" \
-  $'active\rstate\033X' '/tmp' 'codex' > "$TMP/state/agent-registry"
+{
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    'codex' $'s:mark\rkey\033X' "$ATT_REG_PID" "$P_ALPHA_1" "$((now - 100))" "$((now - 1))" \
+    'waiting' '/tmp' 'sleep'
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    $'co\033dex' $'s:reg\rkey\033X' "$ATT_REG_PID" "$P_ALPHA_0" "$((now - 100))" "$((now - 1))" \
+    $'active\rstate\033X' '/tmp' 'sleep'
+} > "$TMP/state/agent-registry"
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention-controls.rows"
 grep -q $'\033\[' "$TMP/attention-controls.rows" || fail 'Attention sanitization removed renderer-owned ANSI'
 strip_ansi < "$TMP/attention-controls.rows" > "$TMP/attention-controls.plain"
@@ -274,6 +331,8 @@ IFS=$'\t' read -r _mark_pane _mark_epoch mark_source mark_key mark_label mark_ti
 [ "$mark_key" = 's:mark key Z' ] || fail "public mark API normalized key incorrectly: $mark_key"
 [ "$mark_label" = 'your turn Y' ] || fail "public mark API normalized label incorrectly: $mark_label"
 [ "$mark_title" = 'saved title control X' ] || fail "public mark API normalized saved title incorrectly: $mark_title"
+printf 'codex\t%s\t%s\t%s\t%s\t%s\tdone\t/tmp\tsleep\n' \
+  "$mark_key" "$ATT_REG_PID" "$P_ALPHA_1" "$((now - 100))" "$((now - 1))" > "$TMP/state/agent-registry"
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/public-mark.rows"
 strip_ansi < "$TMP/public-mark.rows" > "$TMP/public-mark.plain"
 assert_pane_rows 'public mark Attention fixture' "$TMP/public-mark.plain"
@@ -295,7 +354,12 @@ cat > "$TMP/state/need-input" <<EOF
 $P_AARDVARK_0	$((now - 20))	test	tie-action	needs input
 $P_BETA_1	$((now - 20))	test	tie-action	needs input
 EOF
-: > "$TMP/state/agent-registry"
+{
+  printf 'codex\ta:tie-a\t%s\t%s\t%s\t%s\twaiting\t/tmp\tsleep\n' \
+    "$ATT_REG_PID" "$P_AARDVARK_0" "$((now - 100))" "$((now - 1))"
+  printf 'codex\ta:tie-b\t%s\t%s\t%s\t%s\twaiting\t/tmp\tsleep\n' \
+    "$ATT_REG_PID" "$P_BETA_1" "$((now - 100))" "$((now - 1))"
+} > "$TMP/state/agent-registry"
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention-ties.rows"
 tie_targets="$(cut -f1 "$TMP/attention-ties.rows" | paste -sd ' ' -)"
 [ "$tie_targets" = "$P_AARDVARK_0 $P_BETA_1" ] ||
@@ -337,6 +401,80 @@ grep -qi 'attention' "$TMP/fzf.args" || fail 'menu attention did not open Attent
 grep -Eq '0/0|no detected AI pane' "$TMP/fzf.args" || fail 'empty Attention menu omitted its persistent 0/0 explanation'
 [ ! -s "$TMP/fzf.input" ] || fail 'empty Attention menu passed a synthetic row to fzf'
 printf 'PASS: menu attention opens directly with a nonselectable empty explanation\n'
+
+grep -Eq -- '--tiebreak(=|$).*begin,index|--tiebreak=begin,index' "$TMP/fzf.args" ||
+  fail 'fzf does not tie-break relevance by beginning position then input order'
+! grep -qx -- '--nth=2..' "$TMP/fzf.args" ||
+  fail 'fzf excludes the window-name search field after applying with-nth'
+grep -q 'C-t Tree' "$TMP/fzf.args" || fail 'picker header does not advertise C-t Tree'
+grep -Eq 'ctrl-t:transform\([^)]*set-view tree\)' "$TMP/fzf.args" ||
+  fail 'C-t does not switch to the Tree view'
+search_order="$(
+  printf '%%1\tpriority-window alpha:0.0/title\t/tmp · zsh\n%%2\tother-window alpha:0.1/title\t/tmp/priority-window · zsh\n' |
+    "$REAL_FZF" --filter='priority-window' --delimiter=$'\t' --with-nth=2.. --tiebreak=begin,index |
+    cut -f1 | paste -sd ' ' -
+)"
+[ "$search_order" = '%1 %2' ] || fail "window-name match did not outrank metadata-only match: $search_order"
+printf 'PASS: picker binds C-t to Tree and ranks beginning matches before input-order ties\n'
+
+# Cleanup must complete before fzf sees its first row, even when Recent/Tree is
+# the initial view. A deliberately slow ps snapshot makes the old background
+# tick race deterministic.
+tmux -L "$SOCKET" select-pane -t "$P_ALPHA_1" -T 'title-before-picker'
+: > "$TMP/state/agent-registry"
+env -u CLAUDE_JOB_DIR "$NOTIFY" mark "$P_ALPHA_1" claude 'Claude finished — your turn' s:first-render
+cat > "$FAKE_BIN/slow-ps" <<'SH'
+#!/usr/bin/env bash
+sleep 1
+exec /bin/ps "$@"
+SH
+chmod +x "$FAKE_BIN/slow-ps"
+cat > "$FAKE_BIN/fzf" <<'SH'
+#!/usr/bin/env bash
+if grep -q 's:first-render' "$TMUX_RADAR_STATE_DIR/need-input" 2>/dev/null; then
+  : > "$TMUX_RADAR_FIRST_RENDER_STALE"
+fi
+cat >/dev/null
+SH
+chmod +x "$FAKE_BIN/fzf"
+export TMUX_RADAR_FIRST_RENDER_STALE="$TMP/first-render-stale"
+PATH="$FAKE_BIN:$PATH" TMUX_RADAR_TEST_PS_BIN="$FAKE_BIN/slow-ps" \
+  bash "$SWITCHER" menu recent >/dev/null 2>"$TMP/menu-first-render.err" ||
+  fail 'Recent menu failed during synchronous-cleanup fixture'
+[ ! -e "$TMUX_RADAR_FIRST_RENDER_STALE" ] || fail 'picker first render raced ahead of stale AI cleanup'
+sleep 1.1
+printf 'PASS: picker first render observes completed stale-AI cleanup\n'
+
+# A synchronous cleanup failure must fail the render/reload transaction rather
+# than publishing stale rows as if cleanup succeeded.
+sleep 30 & TICK_HOLDER_PID=$!
+mkdir -p "$TMP/state/.need-input.lock"
+printf '%s' "$TICK_HOLDER_PID" > "$TMP/state/.need-input.lock/pid"
+cat > "$FAKE_BIN/fzf" <<'SH'
+#!/usr/bin/env bash
+: > "$TMUX_RADAR_FZF_CALLED"
+cat >/dev/null
+SH
+chmod +x "$FAKE_BIN/fzf"
+rm -f "$TMUX_RADAR_FZF_CALLED"
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu recent >"$TMP/tick-fail.out" 2>"$TMP/tick-fail.err"
+tick_menu_rc=$?
+set -e
+[ "$tick_menu_rc" -ne 0 ] || fail 'initial cleanup failure was reported as a successful menu render'
+[ ! -e "$TMUX_RADAR_FZF_CALLED" ] || fail 'fzf opened after initial cleanup failed'
+grep -q 'unable to refresh AI state' "$TMP/tick-fail.err" || fail 'initial cleanup failure omitted its concise diagnostic'
+printf 'recent\n' > "$TMP/tick-fail.state"
+: > "$TMP/tick-fail.rows"
+rm -f "$TMP/tick-fail.error"
+tick_action="$(SW_STATE="$TMP/tick-fail.state" SW_ROWS="$TMP/tick-fail.rows" SW_ERROR="$TMP/tick-fail.error" \
+  PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" set-view tree)"
+[ "$tick_action" = abort ] || fail 'reload cleanup failure did not abort the fzf transform'
+[ -e "$TMP/tick-fail.error" ] || fail 'reload cleanup failure omitted the producer error marker'
+kill "$TICK_HOLDER_PID" 2>/dev/null; wait "$TICK_HOLDER_PID" 2>/dev/null || true
+unset TICK_HOLDER_PID
+rm -rf "$TMP/state/.need-input.lock"
+printf 'PASS: cleanup failures abort initial and reload rendering\n'
 
 # --- exact switch, disappearing target, and switch-command failure ----------
 export TMUX_RADAR_TEST_TMUX_LOG="$TMP/tmux.log"
@@ -401,7 +539,7 @@ chmod +x "$FAKE_BIN/fzf"
 # sanitized, and fzf is never invoked on a failed initial list.
 export TMUX_RADAR_TEST_FZF_MARKER="$TMP/fzf-invoked"
 export TMUX_RADAR_TEST_FAIL_LIST=1
-for view in all recent attention; do
+for view in tree all recent attention; do
   set +e
   PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list "$view" >"$TMP/list-$view.out" 2>"$TMP/list-$view.err"
   list_rc=$?
@@ -498,6 +636,17 @@ cmp -s "$TMP/fzf.mru.before" "$TMP/state/pane-mru" || fail 'fzf exit 2 mutated M
 unset TMUX_RADAR_TEST_FZF_EXIT
 printf 'PASS: only fzf cancel/no-match exits are successful\n'
 
+# Structural Tree rows are context only: even a picker implementation that
+# returns one defensively must not switch, mutate MRU, or report an error.
+export TMUX_RADAR_TEST_SELECT="$TREE_STRUCT_TARGET"
+: > "$TMUX_RADAR_TEST_TMUX_LOG"
+cp "$TMP/state/pane-mru" "$TMP/tree-struct.mru.before" 2>/dev/null || : > "$TMP/tree-struct.mru.before"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu tree >"$TMP/tree-struct.out" 2>"$TMP/tree-struct.err" ||
+  fail 'selecting a structural Tree row was not a clean no-op'
+! [ -s "$TMUX_RADAR_TEST_TMUX_LOG" ] || fail 'structural Tree row attempted a tmux switch'
+cmp -s "$TMP/tree-struct.mru.before" "$TMP/state/pane-mru" || fail 'structural Tree row mutated pane MRU'
+printf 'PASS: structural Tree rows are non-accepting\n'
+
 export TMUX_RADAR_TEST_SELECT="$P_ALPHA_1"
 unset TMUX_RADAR_TEST_CLOSE_BEFORE_SELECT TMUX_RADAR_TEST_FAIL_SWITCH
 : > "$TMUX_RADAR_TEST_TMUX_LOG"
@@ -564,10 +713,15 @@ for win in 0 1 2; do
 done
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list all > "$TMP/large.rows"
 strip_ansi < "$TMP/large.rows" > "$TMP/large.plain"
-assert_pane_rows 'large All fixture' "$TMP/large.plain"
-scale_count="$(awk -F '\t' '$2 ~ /^scale:/ { n++ } END { print n+0 }' "$TMP/large.plain")"
-[ "$scale_count" -eq 30 ] || fail "large All scan lost or duplicated panes (got $scale_count, want 30)"
-scale_targets="$(awk -F '\t' '$2 ~ /^scale:/ { split($2, a, " · "); print a[1] }' "$TMP/large.plain")"
+awk -F '\t' '$1 ~ /^%[0-9]+$/ { print }' "$TMP/large.plain" > "$TMP/large-pane.plain"
+assert_pane_rows 'large Tree pane leaves' "$TMP/large-pane.plain"
+scale_count="$(awk -F '\t' '$1 ~ /^%[0-9]+$/ && $2 ~ /scale:[0-9]+\.[0-9]+/ { n++ } END { print n+0 }' "$TMP/large.plain")"
+[ "$scale_count" -eq 30 ] || fail "large Tree scan lost or duplicated panes (got $scale_count, want 30)"
+scale_targets="$(awk -F '\t' '
+  $1 ~ /^%[0-9]+$/ && match($2, /scale:[0-9]+\.[0-9]+/) {
+    print substr($2, RSTART, RLENGTH)
+  }
+' "$TMP/large.plain")"
 expected_targets="$(for win in 0 1 2; do for pane in $(seq 0 9); do printf 'scale:%s.%s\n' "$win" "$pane"; done; done)"
-[ "$scale_targets" = "$expected_targets" ] || fail 'large All fixture ordering is not canonical session/window/pane order'
-printf 'PASS: 30-pane fixture scans completely in stable canonical order\n'
+[ "$scale_targets" = "$expected_targets" ] || fail 'large Tree pane ordering is not canonical session/window/pane order'
+printf 'PASS: 30-pane Tree fixture scans completely in stable canonical order\n'

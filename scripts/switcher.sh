@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
-# tmux-radar — full-screen window/pane picker with tree / recent / AI-status
-# views, an expand/collapse pane level, and a live bottom-anchored preview.
+# tmux-radar — pane-first picker with Recent / Attention / All scopes and a
+# live bottom-anchored preview.
 #
 # Subcommands (the script calls itself for fzf reload/preview/binds):
 #   menu (default)                  launch the fzf popup
-#   list [view] [expand]            print TAB rows "<target>\t<name>\t<meta>"
+#   list [view]                     print TAB rows "<target>\t<name>\t<meta>"
 #   preview <target>                render the right-hand preview for one row
 #   set-view <view>                 (fzf transform) switch view, emit actions
-#   toggle-expand <curline>         (fzf transform) flip expand, keep cursor
 #
-# View + expand state is shared with the fzf bind subprocesses via $SW_STATE.
-# fzf shows name+meta but fuzzy-searches the NAME field (window + pane titles).
+# View state is shared with the fzf bind subprocesses via $SW_STATE. fzf hides
+# the target field, searches the two display fields, and returns the full row.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$SCRIPT_DIR/switcher.sh"
 
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
-MRU_FILE="${TMUX_RADAR_MRU_FILE:-${TMUX_SWITCHER_MRU_FILE:-$STATE_DIR/window-mru}}"
 PANE_MRU_FILE="${TMUX_RADAR_PANE_MRU_FILE:-$STATE_DIR/pane-mru}"
 NEEDINPUT_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
 # agent-session registry written by needinput-notify.sh hooks (TSV, 9 fields:
@@ -56,149 +54,84 @@ short_path() {  # short_path <path> -> compact display path
 
 needinput_commands() {  # newline-separated process names watched by AI status
   local configured
-  configured="${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude opencode')}}"
+  configured="${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude opencode kimi')}}"
   printf '%s\n' "$configured" | tr ',:' '  '
 }
 
-# ---- shared view/expand state (VIEW: tree|recent|needinput, EXPAND: 0|1) -----
-VIEW=tree; EXPAND=0
-read_state() {  # read_state [view-override] [expand-override]
-  VIEW=tree; EXPAND=0
+# ---- shared view state ------------------------------------------------------
+normalize_view() {
+  case "${1:-}" in
+    all|tree) printf all ;;
+    attention|needinput) printf attention ;;
+    recent) printf recent ;;
+    *) printf recent ;;
+  esac
+}
+
+VIEW=recent
+read_state() {  # read_state [view-override]
+  VIEW=recent
   if [ -n "${SW_STATE:-}" ] && [ -r "${SW_STATE:-/nonexistent}" ]; then
-    { IFS= read -r VIEW; IFS= read -r EXPAND; } < "$SW_STATE" 2>/dev/null || true
+    IFS= read -r VIEW < "$SW_STATE" 2>/dev/null || true
   fi
   [ -n "${1:-}" ] && VIEW="$1"
-  [ -n "${2:-}" ] && EXPAND="$2"
-  case "$VIEW" in tree|recent|needinput) ;; *) VIEW=tree ;; esac
-  case "$EXPAND" in 0|1) ;; *) EXPAND=0 ;; esac
+  VIEW="$(normalize_view "$VIEW")"
 }
-write_state() { [ -n "${SW_STATE:-}" ] && printf '%s\n%s\n' "$VIEW" "$EXPAND" > "$SW_STATE"; }
+write_state() { [ -n "${SW_STATE:-}" ] && printf '%s\n' "$VIEW" > "$SW_STATE"; }
 
 # ---- row builders ----------------------------------------------------------
-# Each row is "<target>\t<name>\t<meta>". <name> (field 2) is what fzf searches.
-# Pane rows put "<window_name>/<index> <pane_title>" in <name> so a window-title
-# search keeps a window and its panes together, and a pane-title search finds it.
-
-win_row() {  # $1 = sess:win  -> one window row (active pane drives the meta)
-  local target="$1" info name idx panes cmd cur_path
-  info="$(tmux display-message -p -t "$target" \
-    "#{window_name}${SEP}#{window_index}${SEP}#{window_panes}${SEP}#{pane_current_command}${SEP}#{pane_current_path}" 2>/dev/null)" || return 0
-  IFS="$SEP" read -r name idx panes cmd cur_path <<< "$info"
-  printf '%s\t%s\t%s%s%s %s%s · %s · %s%s\n' \
-    "$target" "$name" "$Y" "$idx" "$R" "$D" "${panes}p" "$cmd" "$(short_path "$cur_path")" "$R"
-}
-
-tree_win_row() {  # $1 = sess:win, $2 = visual tree prefix
-  local target="$1" prefix="$2" info name idx panes cmd cur_path idx_label
-  info="$(tmux display-message -p -t "$target" \
-    "#{window_name}${SEP}#{window_index}${SEP}#{window_panes}${SEP}#{pane_current_command}${SEP}#{pane_current_path}" 2>/dev/null)" || return 0
-  IFS="$SEP" read -r name idx panes cmd cur_path <<< "$info"
-  printf -v idx_label '%2s' "$idx"
-  printf '%s\t%s%s%s %s%s%s %s\t%s%s · %s · %s%s\n' \
-    "$target" "$D" "$prefix" "$R" "$Y" "$idx_label" "$R" "$name" "$D" "${panes}p" "$cmd" "$(short_path "$cur_path")" "$R"
-}
-
-pane_rows() {  # $1 = sess:win, $2 = tree stem, $3 = include window name (0/1)
-  local target="$1" stem="${2:-  }" include_window="${3:-1}"
-  local total i idx title cmd cur_path win_name branch pane_label label
-  total="$(tmux list-panes -t "$target" -F x 2>/dev/null | wc -l | tr -d ' ')"
-  [ "${total:-0}" -gt 0 ] || return 0
-  i=0
-  tmux list-panes -t "$target" -F \
-    "#{pane_index}${SEP}#{pane_title}${SEP}#{pane_current_command}${SEP}#{pane_current_path}${SEP}#{window_name}" 2>/dev/null |
-    while IFS="$SEP" read -r idx title cmd cur_path win_name; do
-      i=$((i + 1))
-      if [ "$i" -eq "$total" ]; then branch="└─"; else branch="├─"; fi
-      if [ -n "$title" ]; then
-        pane_label="${idx} ${title}"
-      else
-        pane_label="${idx} ${cmd}"
-      fi
-      if [ "$include_window" = 1 ]; then
-        label="${win_name}/${pane_label}"
-      else
-        label="$pane_label"
-      fi
-      printf '%s.%s\t%s%s%s %s\t%s%s · %s%s\n' \
-        "$target" "$idx" "$D" "${stem}${branch}" "$R" "$label" "$D" "$cmd" "$(short_path "$cur_path")" "$R"
-    done
-}
-
-list_tree() {  # $1 = expand
-  local expand="$1" s wc t i win_prefix pane_stem
-  tmux list-sessions -F '#{session_name}' 2>/dev/null | while IFS= read -r s; do
-    wc="$(tmux list-windows -t "$s" -F x 2>/dev/null | wc -l | tr -d ' ')"
-    printf '__hdr__:%s\t%s▾ %s%s\t%s%s windows%s\n' "$s" "$C" "$s" "$R" "$D" "$wc" "$R"
-    i=0
-    tmux list-windows -t "$s" -F '#{session_name}:#{window_index}' 2>/dev/null | while IFS= read -r t; do
-      i=$((i + 1))
-      if [ "$i" -eq "$wc" ]; then
-        win_prefix="  └─"; pane_stem="     "
-      else
-        win_prefix="  ├─"; pane_stem="  │  "
-      fi
-      tree_win_row "$t" "$win_prefix"
-      if [ "$expand" = 1 ]; then
-        pane_rows "$t" "$pane_stem" 0
-      fi
-    done
-  done
-}
-
-list_recent() {  # $1 = expand
-  local expand="$1" rows pairs ordered mfile tgt
-  if [ "$expand" != 1 ]; then
-    # Ask tmux for PLAIN fields only and colorize afterwards: some tmux builds
-    # (Linux distros) vis-escape control characters in command output, so a raw
-    # ESC embedded in the -F format comes back as a literal "\033[1;32m".
-    rows="$(tmux list-windows -a -F \
-      '#{window_id}'$'\t''#{session_name}:#{window_index}'$'\t''#{window_name}'$'\t''#{pane_current_command}'$'\t''#{pane_current_path}' 2>/dev/null)"
-    mfile="$MRU_FILE"; [ -r "$mfile" ] || mfile=/dev/null
-    awk -F '\t' -v G="$G" -v D="$D" -v R="$R" -v home="$HOME" '
+# Each public row is exactly "<target>\t<search-display>\t<meta-display>".
+# live_pane_records prepends pane_id for internal MRU joining; every display
+# field is flattened before tabs are introduced.
+live_pane_records() {
+  tmux list-panes -a -F \
+    "#{pane_id}${SEP}#{session_name}:#{window_index}.#{pane_index}${SEP}#{window_name}${SEP}#{pane_title}${SEP}#{pane_current_command}${SEP}#{pane_current_path}" 2>/dev/null |
+    LC_ALL=C awk -v FS="$SEP" -v OFS='\t' -v home="$HOME" '
+      function clean(s) {
+        gsub(/[[:cntrl:]]/, " ", s)
+        gsub(/[[:space:]][[:space:]]+/, " ", s)
+        sub(/^ /, "", s); sub(/ $/, "", s)
+        return s
+      }
       function spath(p) {
         if (p == home) return "~"
         if (index(p, home "/") == 1) return "~" substr(p, length(home) + 1)
         return p
       }
-      function emit(id,    name) {
-        name = nm[id]
-        while (length(name) < w) name = name " "   # align the meta column
-        printf "%s\t%s\t%s%s%s %s%s · %s%s\n", \
-          tgt[id], name, G, tgt[id], R, D, cmd[id], spath(path[id]), R
+      {
+        id=$1; target=$2; window=clean($3); title=clean($4)
+        cmd=clean($5); path=spath(clean($6))
+        if (title == "") title=cmd
+        print id, target, target " · " window "/" title, cmd " · " path
       }
-      NR==FNR {
-        tgt[$1]=$2; nm[$1]=$3; cmd[$1]=$4; path[$1]=$5; ord[++m]=$1
-        if (length($3) > w) w = length($3)
-        next
-      }
-      { mru[++n]=$1 }
-      END {
-        if (w > 24) w = 24
-        for (i=n;i>=1;i--){id=mru[i]; if((id in tgt) && !seen[id]++) emit(id)}
-        for (j=1;j<=m;j++){id=ord[j];  if(!seen[id]++)               emit(id)}
-      }' <(printf '%s\n' "$rows") "$mfile"
-    return 0
-  fi
-  # expanded: order windows by MRU, then nest panes under each
-  pairs="$(tmux list-windows -a -F '#{window_id}'$'\t''#{session_name}:#{window_index}' 2>/dev/null)"
-  mfile="$MRU_FILE"; [ -r "$mfile" ] || mfile=/dev/null
-  ordered="$(awk -F '\t' '
-    NR==FNR { tgt[$1]=$2; ord[++m]=$1; next }
-    { mru[++n]=$1 }
-    END {
-      for (i=n;i>=1;i--){id=mru[i]; if((id in tgt) && !seen[id]++) print tgt[id]}
-      for (j=1;j<=m;j++){id=ord[j];  if(!seen[id]++)             print tgt[id]}
-    }' <(printf '%s\n' "$pairs") "$mfile")"
-  while IFS= read -r tgt; do
-    [ -n "$tgt" ] || continue
-    win_row "$tgt"; pane_rows "$tgt"
-  done <<< "$ordered"
+    '
 }
 
-list_needinput() {  # pane-level AI-status process view; hook-marked panes float first
+list_all() {
+  live_pane_records | cut -f2-
+}
+
+list_recent() {
+  local mfile="$PANE_MRU_FILE"
+  [ -r "$mfile" ] || mfile=/dev/null
+  awk -F '\t' '
+    NR==FNR { row[$1]=$2 FS $3 FS $4; order[++m]=$1; next }
+    { recent[++n]=$1 }
+    END {
+      for (i=n; i>=1; i--) { id=recent[i]; if ((id in row) && !seen[id]++) print row[id] }
+      for (i=1; i<=m; i++) { id=order[i]; if (!seen[id]++) print row[id] }
+    }
+  ' <(live_pane_records) "$mfile"
+}
+
+list_attention() {  # pane-level AI-status process view; hook-marked panes float first
   local live flags ps_rows commands reg now
   live="$(tmux list-panes -a -F \
-    '#{pane_id}'$'\t''#{session_name}:#{window_index}'$'\t''#{pane_index}'$'\t''#{window_name}'$'\t''#{pane_title}'$'\t''#{pane_current_command}'$'\t''#{pane_current_path}'$'\t''#{pane_pid}'$'\t''#{pane_tty}' 2>/dev/null)"
+    "#{pane_id}${SEP}#{session_name}:#{window_index}${SEP}#{pane_index}${SEP}#{window_name}${SEP}#{pane_title}${SEP}#{pane_current_command}${SEP}#{pane_current_path}${SEP}#{pane_pid}${SEP}#{pane_tty}" 2>/dev/null |
+    LC_ALL=C awk -v FS="$SEP" -v OFS='\t' '
+      function clean(s) { gsub(/[[:cntrl:]]/, " ", s); gsub(/[[:space:]][[:space:]]+/, " ", s); return s }
+      { for (i=1; i<=NF; i++) $i=clean($i); print }
+    ')"
   [ -n "$live" ] || return 0
   flags=""; [ -r "$NEEDINPUT_FILE" ] && flags="$(cat "$NEEDINPUT_FILE" 2>/dev/null || true)"
   reg=""; [ -r "$REGISTRY_FILE" ] && reg="$(cat "$REGISTRY_FILE" 2>/dev/null || true)"
@@ -329,14 +262,7 @@ list_needinput() {  # pane-level AI-status process view; hook-marked panes float
         next
       }
       mode == "flags" && $0 != "" {
-        if ($1 == "-") {                     # paneless background-session mark
-          bg_n++
-          bg_epoch[bg_n]=$2 + 0
-          bg_src[bg_n]=$3
-          bg_label[bg_n]=(NF >= 5 ? $5 : $4)
-          bg_level[bg_n]=level_for(bg_src[bg_n], bg_label[bg_n])
-          next
-        }
+        if ($1 == "-") next                   # paneless marks are not pane targets
         flagged[$1]=1
         flag_epoch[$1]=$2 + 0
         flag_source[$1]=$3
@@ -386,24 +312,15 @@ list_needinput() {  # pane-level AI-status process view; hook-marked panes float
             need_n++; nr[need_n]=level_rank(flag_level[pane]); ne[need_n]=flag_epoch[pane]; nk[need_n]="p"; nv[need_n]=pane
           }
         }
-        for (b=1; b<=bg_n; b++) {
-          need_n++; nr[need_n]=level_rank(bg_level[b]); ne[need_n]=bg_epoch[b]; nk[need_n]="b"; nv[need_n]=b
-        }
-        for (i=2; i<=need_n; i++) {          # insertion sort: severity, then epoch descending
-          r=nr[i]; e=ne[i]; k=nk[i]; v=nv[i]
-          for (j=i-1; j>=1 && (nr[j] > r || (nr[j] == r && ne[j] < e)); j--) {
+        for (i=2; i<=need_n; i++) {          # severity, event recency, then canonical target
+          r=nr[i]; e=ne[i]; k=nk[i]; v=nv[i]; t=pane_target[v]
+          for (j=i-1; j>=1 && (nr[j] > r || (nr[j] == r && (ne[j] < e || (ne[j] == e && pane_target[nv[j]] > t)))); j--) {
             nr[j+1]=nr[j]; ne[j+1]=ne[j]; nk[j+1]=nk[j]; nv[j+1]=nv[j]
           }
           nr[j+1]=r; ne[j+1]=e; nk[j+1]=k; nv[j+1]=v
         }
         for (i=1; i<=need_n; i++) {
-          if (nk[i] == "b") {
-            b=nv[i]
-            printf "%s\t%s%s\t%s%s · background session · not a tmux pane%s\n", \
-              "__bg__:" b, badge(bg_level[b]), bg_label[b], D, bg_src[b], R
-          } else {
-            emit_pane(nv[i], flag_level[nv[i]])
-          }
+          emit_pane(nv[i], flag_level[nv[i]])
         }
 
         # Then every other detected AI pane, in pane order. These are context,
@@ -417,12 +334,12 @@ list_needinput() {  # pane-level AI-status process view; hook-marked panes float
     '
 }
 
-do_list() {  # do_list [view] [expand]
-  read_state "${1:-}" "${2:-}"
+do_list() {  # do_list [view]
+  read_state "${1:-}"
   case "$VIEW" in
-    recent)    list_recent "$EXPAND" ;;
-    needinput) list_needinput "$EXPAND" ;;
-    *)         list_tree "$EXPAND" ;;
+    recent)    list_recent ;;
+    attention) list_attention ;;
+    all)       list_all ;;
   esac
 }
 
@@ -492,45 +409,9 @@ _pane_status_header() {  # $1 = pane %id; tech header + separator when the pane 
   printf '%s────────────────────────────────────────%s\n' "$D" "$R"
 }
 
-_preview_bg() {  # $1 = 1-based index among paneless (-) marks, need-input file order
-  local idx="$1" line="" reg="" verdict
-  local epoch="" src="" key="" label="" r_kind="" r_pid="" r_state="" r_cwd=""
-  [ -r "$NEEDINPUT_FILE" ] && line="$(awk -F '\t' -v n="$idx" \
-    '$1 == "-" { if (++c == n + 0) { print; exit } }' "$NEEDINPUT_FILE" 2>/dev/null || true)"
-  if [ -z "$line" ]; then
-    printf 'Background AI session\n\nThis mark is no longer in the state file (handled or GCd since the list rendered).\nReload the view (C-i) to refresh.\n'
-    return 0
-  fi
-  IFS=$'\037' read -r epoch src key label <<< "$(printf '%s' "$line" |
-    awk -F '\t' '{ printf "%s\037%s\037%s\037%s", $2, $3, $4, (NF >= 5 ? $5 : $4) }')"
-  [ -n "$key" ] && [ -r "$REGISTRY_FILE" ] && reg="$(awk -F '\t' -v k="$key" \
-    '$2 == k { r=$0 } END { if (r != "") print r }' "$REGISTRY_FILE" 2>/dev/null || true)"
-  printf 'Background AI session (no tmux pane)\n\n'
-  printf '  label:  %s\n' "$label"
-  printf '  source: %s\n' "$src"
-  printf '  key:    %s\n' "${key:-—}"
-  printf '  age:    %s\n' "$(_age_since "$epoch")"
-  if [ -n "$reg" ]; then
-    IFS=$'\037' read -r r_kind r_pid r_state r_cwd <<< "$(printf '%s' "$reg" |
-      awk -F '\t' '{ printf "%s\037%s\037%s\037%s", $1, $3, $7, $8 }')"
-    verdict='dead (cleared on next tick)'
-    if [ "${r_pid:-0}" -gt 0 ] 2>/dev/null && kill -0 "$r_pid" 2>/dev/null; then verdict='alive'; fi
-    printf '  agent:  %s · %s · pid %s %s' "$r_kind" "$r_state" "${r_pid:-?}" "$verdict"
-    [ -n "$r_cwd" ] && printf ' · %s' "$(short_path "$r_cwd")"
-    printf '\n'
-  else
-    printf '  agent:  no registry row (session ended, or started before hooks were installed)\n'
-  fi
-  printf '\nNo pane to switch to. Run needinput-notify.sh doctor for the full diagnostic.\n'
-}
-
 do_preview() {
   local t="${1:-}" out pane_id capture
   case "$t" in
-    __bg__:*)  _preview_bg "${t#__bg__:}" ;;
-    __noop__:*) printf 'This row is informational and has no tmux target.\n' ;;
-    __hdr__:*) tmux list-windows -t "${t#__hdr__:}" \
-                 -F '  #{window_index}: #{window_name}  (#{window_panes} panes · #{pane_current_command})' 2>/dev/null ;;
     '')        : ;;
     *)
       # one tmux client call: pane id (line 1) then the capture
@@ -545,58 +426,36 @@ do_preview() {
   esac
 }
 
-_prompt() {  # echo "label[+]> " for current VIEW/EXPAND
-  local label="$VIEW"; [ "$VIEW" = needinput ] && label="AI status"
-  local ind=""; [ "$EXPAND" = 1 ] && ind="+"
-  printf '%s%s> ' "$label" "$ind"
+_prompt() {
+  case "$VIEW" in
+    recent) printf 'Recent> ' ;;
+    attention) printf 'Attention> ' ;;
+    all) printf 'All> ' ;;
+  esac
 }
 
 cmd_set_view() {  # fzf transform: switch view, reload, repoint prompt
-  local pos
+  local pos sort_action
   read_state
-  VIEW="${1:-tree}"; case "$VIEW" in tree|recent|needinput) ;; *) VIEW=tree ;; esac
+  VIEW="$(normalize_view "${1:-recent}")"
   # GC stale marks before the AI status list renders (~50ms, one keystroke)
-  [ "$VIEW" = needinput ] && "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 || true
+  [ "$VIEW" = attention ] && "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 || true
   write_state
   pos=1
   [ "$VIEW" = recent ] && pos=2
-  printf 'reload-sync(%s list)+change-prompt(%s)+pos(%s)' "$SELF" "$(_prompt)" "$pos"
-}
-
-cmd_toggle_expand() {  # fzf transform: flip expand, keep cursor on the window
-  local curline="${1:-}" ctgt cwin idx actions
-  read_state
-  EXPAND=$((1 - EXPAND)); write_state
-  ctgt="${curline%%$'\t'*}"
-  case "$ctgt" in
-    __bg__:*|__noop__:*) cwin="" ;;
-    __hdr__:*) cwin="$ctgt" ;;
-    *.*)       cwin="${ctgt%.*}" ;;   # strip ".pane"
-    *)         cwin="$ctgt" ;;
-  esac
-  # 1-based row index of the window (or header) the cursor belonged to
-  # read the whole list (no early awk exit -> no SIGPIPE killing do_list under
-  # set -e); prefer the exact window-row match, else first row in that window.
-  idx="$(do_list 2>/dev/null | awk -F '\t' -v w="$cwin" '
-    { t=$1; sub(/\.[0-9]+$/,"",t)
-      if (!ex && $1==w) ex=NR
-      if (!fb && t==w) fb=NR }
-    END { print (ex ? ex : (fb ? fb : "")) }' 2>/dev/null || true)"
-  [ -n "$idx" ] || idx=1
-  # sort flips with expand (relevance when collapsed, grouped order when expanded)
-  actions="toggle-sort+reload-sync($SELF list)+change-prompt($(_prompt))"
-  [ -z "${FZF_QUERY:-}" ] && actions="$actions+pos($idx)"
-  printf '%s' "$actions"
+  sort_action=disable-sort
+  [ "$VIEW" = all ] && sort_action=enable-sort
+  printf '%s+reload-sync(%s list)+change-prompt(%s)+pos(%s)' "$sort_action" "$SELF" "$(_prompt)" "$pos"
 }
 
 do_menu() {
+  local initial_view="${1:-}"
   local fzf preview_pos follow preview_win selected target session win
   local -a fzf_args
   fzf="$(command -v fzf || true)"
   [ -n "$fzf" ] || { tmux display-message "tmux-radar: fzf not found"; exit 1; }
 
-  VIEW="$(opt @radar-default-view recent)"; case "$VIEW" in tree|recent|needinput) ;; *) VIEW=recent ;; esac
-  case "$(opt @radar-expand-panes off)" in on|1|true) EXPAND=1 ;; *) EXPAND=0 ;; esac
+  VIEW="$(normalize_view "${initial_view:-$(opt @radar-default-view recent)}")"
   preview_pos="$(opt @radar-preview right:62%)"
   follow="$(opt @radar-preview-follow on)"
   preview_win="${preview_pos},nowrap"
@@ -606,37 +465,31 @@ do_menu() {
   write_state
 
   # GC stale AI-status marks so the view opens clean; synchronous only when
-  # AI status is the first view shown (elsewhere the C-i transform re-GCs).
-  if [ "$VIEW" = needinput ]; then "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 || true
+  # Attention is the first view shown (elsewhere the C-i transform re-GCs).
+  if [ "$VIEW" = attention ]; then "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 || true
   else ("$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 &)
   fi
 
-  # Recent opens with the cursor on row 2 (row 1 is the current window), both
+  # Recent opens with the cursor on row 2 (row 1 is the current pane), both
   # on initial popup open and when switching back into the recent view.
-  # Tree/AI-status view switches and query changes reset to row 1.
+  # All/Attention view switches and query changes reset to row 1.
   # --sync is required so the list is loaded before 'start' fires.
-  fzf_args=(--ansi --delimiter=$'\t' --with-nth=2.. --nth=1 --cycle)
+  fzf_args=(--ansi --delimiter=$'\t' --with-nth=2.. --nth=2.. --cycle)
   [ "$VIEW" = recent ] && fzf_args+=(--sync '--bind=start:pos(2)')
-  # sort: relevance when collapsed; preserve window/pane grouping when expanded.
-  # AI status is already pane-level and floats hook-marked panes first.
-  { [ "$EXPAND" = 1 ] || [ "$VIEW" = needinput ]; } && fzf_args+=(--no-sort)
+  # Recent and Attention have semantic ordering; All may relevance-sort once
+  # the query is nonempty while preserving the server order at rest.
+  [ "$VIEW" != all ] && fzf_args+=(--no-sort)
 
   selected="$(
     "$SELF" list | "$fzf" \
       "${fzf_args[@]}" \
       --layout=reverse --prompt="$(_prompt)" \
-      --header='C-t tree · C-r recent · C-i AI status · C-e expand/collapse panes · A-1..9 jump · A-p preview · S-↑/↓ PgUp/Dn scroll · Enter switch' \
+      --header='C-r Recent · C-i Attention (0/0 = no detected AI pane) · C-t All · A-p preview · Enter switch' \
       --preview="$SELF preview {1}" --preview-window="$preview_win" \
       --bind='change:pos(1)' \
-      --bind='alt-1:pos(1)+accept' --bind='alt-2:pos(2)+accept' \
-      --bind='alt-3:pos(3)+accept' --bind='alt-4:pos(4)+accept' \
-      --bind='alt-5:pos(5)+accept' --bind='alt-6:pos(6)+accept' \
-      --bind='alt-7:pos(7)+accept' --bind='alt-8:pos(8)+accept' \
-      --bind='alt-9:pos(9)+accept' \
-      --bind="ctrl-t:transform($SELF set-view tree)" \
+      --bind="ctrl-t:transform($SELF set-view all)" \
       --bind="ctrl-r:transform($SELF set-view recent)" \
-      --bind="ctrl-i:transform($SELF set-view needinput)" \
-      --bind="ctrl-e:transform($SELF toggle-expand {})" \
+      --bind="ctrl-i:transform($SELF set-view attention)" \
       --bind='alt-p:toggle-preview' \
       --bind='shift-up:preview-up,shift-down:preview-down' \
       --bind='pgup:preview-page-up,pgdn:preview-page-down' \
@@ -646,28 +499,27 @@ do_menu() {
 
   [ -n "$selected" ] || exit 0
   target="${selected%%$'\t'*}"
-  case "$target" in
-    __bg__:* | __noop__:* | __hdr__:* | '')
-      tmux display-message "tmux-radar: status-only row; no tmux pane to switch to" 2>/dev/null || true
-      exit 0
-      ;;
-    __*)
-      tmux display-message "tmux-radar: unknown internal row; no switch performed" 2>/dev/null || true
-      exit 0
-      ;;
-    *:*) ;;
-    *)
+  if [[ ! "$target" =~ ^[^:[:cntrl:]]+:[0-9]+\.[0-9]+$ ]]; then
       tmux display-message "tmux-radar: invalid target '$target'; no switch performed" 2>/dev/null || true
-      exit 0
-      ;;
-  esac
+      return 1
+  fi
+
+  if [ "$(tmux display-message -p -t "$target" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || true)" != "$target" ]; then
+    printf '%s\n' 'pane closed; reopen the switcher' >&2
+    tmux display-message 'tmux-radar: pane closed; reopen the switcher' >/dev/null 2>&1 || true
+    return 1
+  fi
 
   session="${target%%:*}"
   win="${target%.*}"            # sess:win (drops ".pane" if present)
-  [ -x "$MRU_RECORD" ] && "$MRU_RECORD" "$win" >/dev/null 2>&1 || true
-  tmux switch-client -t "$session"
-  tmux select-window -t "$win"
-  case "$target" in *.*) tmux select-pane -t "$target" 2>/dev/null || true ;; esac
+  [ -x "$MRU_RECORD" ] && "$MRU_RECORD" "$target" >/dev/null 2>&1 || true
+  if ! tmux switch-client -t "$session" 2>/dev/null ||
+     ! tmux select-window -t "$win" 2>/dev/null ||
+     ! tmux select-pane -t "$target" 2>/dev/null; then
+    printf '%s\n' 'unable to switch pane; reopen the switcher' >&2
+    tmux display-message 'tmux-radar: unable to switch pane; reopen the switcher' >/dev/null 2>&1 || true
+    return 1
+  fi
 }
 
 cmd_last_pane() {  # jump to the most recently used *other* pane, cross-session
@@ -694,10 +546,9 @@ cmd_last_pane() {  # jump to the most recently used *other* pane, cross-session
 }
 
 case "${1:-menu}" in
-  list)          do_list "${2:-}" "${3:-}" ;;
+  list)          do_list "${2:-}" ;;
   preview)       do_preview "${2:-}" ;;
-  set-view)      cmd_set_view "${2:-tree}" ;;
-  toggle-expand) cmd_toggle_expand "${2:-}" ;;
+  set-view)      cmd_set_view "${2:-recent}" ;;
   last-pane)     cmd_last_pane ;;
-  menu | *)      do_menu ;;
+  menu | *)      do_menu "${2:-}" ;;
 esac

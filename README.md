@@ -1,12 +1,13 @@
 # tmux-radar
 
-**Mission Control for busy tmux workspaces.**
+**A pane-first switcher for busy tmux workspaces.**
 
-Stop hunting through dozens of sessions, windows, and panes. tmux-radar gives
-you a full-screen workspace navigator with live previews, recent context, and
-AI-aware status so you can jump straight to the pane that needs you.
+Find one live pane, understand enough context to choose it, and switch to that
+exact pane. tmux-radar gives every pane the same searchable row contract across
+three scopes—Recent, Attention, and All—with a live preview for supporting
+context.
 
-![view: tree | recent | AI status](https://img.shields.io/badge/views-tree%20%7C%20recent%20%7C%20AI--status-blue)
+![views: Recent | Attention | All](https://img.shields.io/badge/views-Recent%20%7C%20Attention%20%7C%20All-blue)
 
 ## Why not `choose-tree`?
 
@@ -16,34 +17,37 @@ long-running agents.
 
 | Problem | tmux-radar gives you |
 |---------|----------------------|
-| "Where was I just working?" | MRU recent view |
-| "Which pane is waiting for me?" | AI status view |
+| "Where was I just working?" | Pane-MRU Recent scope |
+| "Which pane is waiting for me?" | Prioritized Attention scope |
 | "What is happening in that pane?" | Bottom-anchored live preview |
-| "I know the pane title, not the session" | Title-focused fuzzy search |
+| "I know its title, command, or path" | Search across visible identity and metadata |
 | "Claude/Codex/Kimi finished while I was elsewhere" | Status marks and bar |
 
 ## Features
 
-- **Workspace command palette** — session tree, recent (MRU), and AI status,
-  switchable live inside the popup. Pick which one opens by default.
-- **Title-only fuzzy search** — type to match the window name, not the path or
-  running command. Results rank by match score as you type, recency order at rest.
-- **Smart cursor in recent view** — opens with the cursor on the 2nd entry,
-  since row 1 is always the current window (you won't switch back to yourself).
-  The current window stays in the list, one `↑` away.
-- **Live preview** — the selected window's content, no wrap, anchored to the
+- **One pane model, three scopes** — Recent orders live panes by pane MRU,
+  Attention prioritizes detected AI panes by semantic state, and All scans the
+  server in canonical session/window/pane order.
+- **Search visible identity and context** — type to match the pane's location,
+  window/pane title, command, path, or Attention metadata.
+- **Exact-pane switching** — every selectable row targets one pane. Selection
+  is revalidated before switching and fails explicitly if that pane closed.
+- **Useful Recent behavior** — the current pane remains visible in true MRU
+  order while the initial cursor may prefer the first other pane.
+- **Live preview** — the selected pane's content, no wrap, anchored to the
   bottom (current prompt/state visible), with line/page scroll.
 - **AI status alerts** — Claude/Codex/Kimi/OpenCode flag their pane for action-required
   prompts and finished-turn notices; a **persistent bar** appears on a second
   status line while an off-screen mark is fresh,
   the pane's **title flips to a status label** (`⚠` action required, `✓`
-  finished, `!` notice), and the pane shows up in the AI status view.
+  finished, `!` notice), and the pane shows up in Attention.
   Everything clears when you focus the window or reply — and
   **stale marks self-heal**: a mark whose agent TUI has exited is dropped
   automatically.
 - **Background Claude sessions covered** — Claude Code sessions that run outside
   any tmux pane (dashboard / background jobs / cloud) are tracked per
-  `session_id` and surface on the bar and in the AI status view too. Sessions
+  `session_id` and surface on notification/supervisor surfaces. They are not
+  exposed as fake switcher targets. Sessions
   that *do* live in a pane but lost `$TMUX_PANE` (env-scrubbing launchers,
   agent runners) are resolved back to their real pane via the process tree or
   Claude's hook/job cwd.
@@ -106,28 +110,26 @@ installed, the one-release rollback is explicit:
 windows and sessions (pane-level MRU is recorded by tmux hooks; see
 `@radar-last-key`).
 
-`prefix + C-w` opens the picker. Inside:
+`prefix + C-w` opens the picker. Every view contains only exact live-pane
+destinations:
 
 | Key | Action |
 |-----|--------|
-| type | fuzzy search **window + pane title** |
-| `ctrl-t` | session **tree** view |
-| `ctrl-r` | **recent** (MRU) view |
-| `ctrl-i` | **AI status** view: action-required marks first, finished-turn notices next, then other detected AI panes as context |
-| `ctrl-e` | **expand / collapse panes** (nest panes under each window) |
+| type | search visible identity and metadata |
+| `ctrl-r` | **Recent**: pane MRU, newest first; remaining panes follow in canonical order |
+| `ctrl-i` | **Attention**: ACTION, DONE, NOTICE, then ACTIVE detected AI panes |
+| `ctrl-t` | **All**: every pane in canonical session/window/pane order |
 | `alt-p` | toggle preview |
 | `shift-↑` / `shift-↓` | scroll preview by line |
 | `PgUp` / `PgDn` | scroll preview by page |
 | `ctrl-n` / `ctrl-p` | move selection (fzf default) |
-| `alt-1` … `alt-9` | jump straight to row N and switch (recent view: `alt-2` = previous window) |
-| `Enter` | switch to the window (or pane, when a pane row is selected) |
+| `Enter` | revalidate and switch to the selected exact pane |
+| `Esc` | cancel without switching |
 
-**Pane level.** Tree and recent start at window granularity. Press `ctrl-e` to
-expand panes nested under their window; press it again to collapse. The cursor
-stays on the same window group across the toggle. When expanded, search matches
-**both** window and pane titles and keeps the window→pane grouping (only matching
-rows are shown). The AI status view is always pane-level so you can jump to the
-exact AI TUI pane for real pane rows.
+All three scopes share the same pane-first row model; there is no window-row
+mode to expand. Attention includes only panes that can be switched to. Paneless
+background sessions remain available in the notification and supervisor
+surfaces instead of becoming nonfunctional picker rows.
 
 ## Configuration
 
@@ -135,9 +137,8 @@ Set these **before** the plugin loads:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `@radar-default-view` | `recent` | Initial view: `tree`, `recent`, or `needinput`. Recent (MRU) is the default: the panes you actually toggle between are one keystroke away. |
+| `@radar-default-view` | `recent` | Initial scope: `recent`, `attention`, or `all`. Invalid values fall back to Recent. |
 | `@radar-ai-console` | `auto` | Supervisor console surface: `auto` (right split when the target pane is ≥121×24, else popup) or `popup` (always overlay — never takes columns away from the work pane). |
-| `@radar-expand-panes` | `off` | Start with panes expanded (`on`) or collapsed (`off`). Toggle live with `ctrl-e`. |
 | `@radar-key` | `C-w` | Prefix key that opens the picker. |
 | `@radar-last-key` | `Tab` | Prefix key that jumps to the most recently used **other pane**, across windows and sessions (tmux's own `last-pane` is window-local). Press repeatedly to toggle between your two most recent panes. `none` skips the binding. |
 | `@radar-popup-width` | `100%` | Popup width. |
@@ -145,11 +146,11 @@ Set these **before** the plugin loads:
 | `@radar-preview` | `right:62%` | fzf preview position/size. |
 | `@radar-preview-follow` | `on` | Anchor preview to the bottom (tail-style). |
 | `@radar-needinput` | `on` | Enable the AI-status system (hooks/bar). |
-| `@radar-needinput-commands` | `codex claude opencode kimi` | Process names the AI status view treats as AI panes. Comma/space/colon separated. |
+| `@radar-needinput-commands` | `codex claude opencode kimi` | Process names Attention treats as AI panes. Comma/space/colon separated. |
 | `@radar-retitle` | `on` | Rename a marked pane's title to a status label (`⚠` action required, `✓` finished, `!` notice), restored on clear. |
 | `@radar-claude-bg` | `on` | Also track Claude sessions running outside tmux panes (background/dashboard/cloud). |
 | `@radar-bar` | `auto` | `auto` renders chips **inline inside your existing status-right** (`#{E:@radar-chips}` is injected once); `pinned` keeps a permanently reserved line 2; `off` tracks marks only. The status line **count never changes at runtime** — no pane resize, no SIGWINCH flicker. |
-| `@radar-bar-ttl` | `60` | Seconds a chip stays on the bar before fading (`0` = until handled). The mark itself persists in the AI status view / pane title until cleared. |
+| `@radar-bar-ttl` | `60` | Seconds a chip stays on the bar before fading (`0` = until handled). The mark itself persists in Attention / the pane title until cleared. |
 | `@radar-claude-bg-ignore` | `~/.claude:~/.claude-mem` | Colon-separated path prefixes; background sessions whose cwd starts with one (plugin observers, SDK helpers) are not tracked. |
 | `@radar-ai` | `off` | Enable the **AI supervisor** (`prefix + A` menu). Needs the `codex` CLI + `jq`. |
 | `@radar-ai-key` | `A` | Prefix key that opens the AI supervisor menu (capital `A` so a stray `prefix + a` can't trigger it). |
@@ -185,9 +186,6 @@ Set these **before** the plugin loads:
 | `@radar-ai-screen-snapshots` | `off` | Persist per-call pane captures without enabling full prompt logging. These files may contain sensitive text. |
 | `@radar-ai-retention-days` | `7` | Retain inactive structured run directories for this many days. Live runs are never removed. |
 
-Legacy `@switcher-*` options are still honored as fallbacks, but new
-configuration should use `@radar-*`.
-
 Example:
 
 ```tmux
@@ -217,16 +215,16 @@ For focused walkthroughs, see [configuration](docs/guides/configuration.md),
 [agent hooks](docs/guides/agent-hooks.md), and
 [development](docs/guides/development.md).
 
-## AI status view + alerts (Claude Code / Codex / Kimi / OpenCode)
+## Attention + alerts (Claude Code / Codex / Kimi / OpenCode)
 
-The `ctrl-i` view scans live tmux panes for configured AI processes, defaulting
+Attention (`ctrl-i`) scans live tmux panes for configured AI processes, defaulting
 to `codex`, `claude`, `opencode`, and `kimi`, and lists matching panes directly. Matching is based on
 the pane process tree and processes attached to the pane TTY, not on tmux window
 or pane names. Rows are labeled by meaning: **ACTION** for permissions/input that
 really need a decision, **DONE** for finished-turn notifications that are useful
 to review but are not approvals, and **ACTIVE** for other detected AI panes shown
-only as context. Background Claude sessions are shown as non-jumpable status rows
-instead of pretending to be a tmux pane.
+only as context. Background Claude sessions remain visible on notification and
+supervisor surfaces instead of pretending to be selectable tmux panes.
 
 The plugin sets up the tmux side automatically (AI-status bar status line +
 clear on window focus). To let Claude Code, Codex, Kimi, and OpenCode flag their
@@ -309,8 +307,8 @@ normalized event contract and a copyable adapter.
   (`$CLAUDE_JOB_DIR` set: the dashboard, background jobs, cloud) get a
   **paneless mark keyed by `session_id`**, labelled `Claude·<project>`. It
   clears when you reply to that session (`UserPromptSubmit`) and is removed by
-  `SessionEnd` or process-identity GC. In the AI status view these rows
-  are non-jumpable status rows, because there is no real tmux pane to select.
+  `SessionEnd` or process-identity GC. They do not appear in Attention because
+  there is no real tmux pane to select.
 - **Stale marks (agent-liveness GC)** — a pane mark is stale in two ways, and
   both self-heal: the **pane died** (dropped on every state change), or the
   pane is alive but the **agent TUI exited** and the shell got reused.
@@ -322,9 +320,9 @@ normalized event contract and a copyable adapter.
   `pane_current_command`: Claude Code's foreground binary is a bare version
   number (e.g. `2.1.199`), so the naive match would miss it. The GC runs on
   plugin load, while the bar is visible (every ≤30s), and whenever the
-  AI status view opens; a failed scan skips GC rather than guessing. A marked
+  Attention opens; a failed scan skips GC rather than guessing. A marked
   pane you are currently looking at is kept out of the bar (no need to nag)
-  but stays in the AI status view until cleared.
+  but stays in Attention until cleared.
 
 ### Bar position note
 
@@ -510,7 +508,7 @@ ai.sh keep <pane>              # cancel a completed console's auto-close
 ai.sh report [run-id|latest]   # final outcome, goal, counts, duration, logs
 ai.sh stop <pane|all>          # stop watcher(s)
 ai.sh status                   # active watchers + recent decisions
-ai.sh list                     # AI panes with ⚠ action / ✓ done / ● watching state
+ai.sh list                     # deprecated alias that opens the Attention picker
 ai.sh cleanup                  # GC watcher files, monitor panes, stale marks
 ```
 
@@ -551,12 +549,12 @@ set -g @resurrect-hook-post-restore-all 'run-shell -b "~/.tmux/plugins/tmux-rada
 
 Stale AI-status marks self-heal in general: any mark whose agent TUI has exited
 (the pane is back to a plain shell) is dropped automatically — on plugin load,
-when the bar renders (≤30s), and whenever the AI status view opens.
+when the bar renders (≤30s), and whenever Attention opens.
 
 ## How it works
 
-- Rows are `target ⇥ name ⇥ meta`; fzf uses `--with-nth=2.. --nth=1` to display
-  name+meta while searching only the name.
+- Rows are `target ⇥ search-display ⇥ meta-display`; fzf hides the target,
+  displays the other fields, and searches both visible fields.
 - Preview uses `--preview-window '<pos>,nowrap,follow'`; `follow` tails to the
   bottom so the current state is visible.
 - Colors are applied **shell/awk-side after** every tmux round-trip, never
@@ -564,7 +562,8 @@ when the bar renders (≤30s), and whenever the AI status view opens.
   control characters in command output, which would render a raw ESC as a
   literal `\033[1;32m`.
 - State lives in `~/.local/state/tmux/`:
-  - `window-mru` — window ids, most recent last (drives the recent view).
+  - `pane-mru` — pane ids, most recent last (drives Recent and the
+    cross-session `prefix + Tab` toggle).
   - `need-input` — one TAB-separated AI-status mark per line:
     `pane ⇥ epoch ⇥ source ⇥ key ⇥ label ⇥ saved_title` (`pane` is `-` for
     background-session marks; `key` is `s:<claude session_id>` or the pane id).
@@ -599,7 +598,7 @@ when the bar renders (≤30s), and whenever the AI status view opens.
   `TMUX_RADAR_NEEDINPUT_COMMANDS`, `TMUX_RADAR_BG_TTL` (bg-mark expiry,
   default 86400s), `TMUX_RADAR_BAR_MAX` (bar chips, default 3),
   `TMUX_RADAR_AI_LOG`, and `TMUX_RADAR_AI_CMD` (test seam for the brain,
-  overrides `@radar-ai-cmd`). Legacy `TMUX_SWITCHER_*` names remain accepted.
+  overrides `@radar-ai-cmd`).
 
 ## Troubleshooting
 

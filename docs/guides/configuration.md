@@ -1,4 +1,42 @@
-# AI supervisor configuration
+# Configuration
+
+Set tmux-radar options before the plugin loads. The core picker is pane-first:
+Recent, Attention, and All are scopes over the same live-pane list, not
+different navigation modes.
+
+```tmux
+set -g @radar-default-view 'recent'
+set -g @radar-key 'C-w'
+set -g @radar-last-key 'Tab'
+set -g @radar-preview 'right:62%'
+set -g @radar-preview-follow 'on'
+```
+
+## Picker options
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `@radar-default-view` | `recent` | Initial scope: `recent`, `attention`, or `all`. Invalid values fall back to Recent. |
+| `@radar-key` | `C-w` | Prefix key that opens the picker. Reload tmux after changing it. |
+| `@radar-last-key` | `Tab` | Prefix key for the cross-session most-recent-other-pane toggle. Use `none` to leave it unbound. |
+| `@radar-popup-width` | `100%` | Picker popup width. |
+| `@radar-popup-height` | `100%` | Picker popup height. |
+| `@radar-preview` | `right:62%` | fzf preview position and size. |
+| `@radar-preview-follow` | `on` | Keep preview anchored to the selected pane's newest visible content. |
+| `@radar-needinput` | `on` | Enable lifecycle marks, Attention prioritization, pane retitles, and the status strip. |
+| `@radar-needinput-commands` | `codex claude opencode kimi` | Process names detected as AI panes, separated by spaces, commas, or colons. |
+| `@radar-retitle` | `on` | Prefix marked pane titles with a textual status label and restore them when cleared. |
+| `@radar-claude-bg` | `on` | Track paneless Claude sessions on notification/supervisor surfaces; they never become selectable picker rows. |
+| `@radar-bar` | `auto` | `auto` adds chips to `status-right`, `pinned` reserves a stable second line, and `off` hides chips while retaining marks. |
+| `@radar-bar-ttl` | `60` | Seconds before a chip fades (`0` keeps it until handled); the underlying mark remains. |
+
+The picker keys are intentionally fixed around its three scopes: `Ctrl-r`
+opens Recent, `Ctrl-i` opens Attention, and `Ctrl-t` opens All. `Alt-p` toggles
+preview, the usual fzf navigation keys move selection, and `Enter` switches to
+the exact revalidated pane. See the interaction contract in
+[`DESIGN.md`](../../DESIGN.md).
+
+## Optional AI supervisor
 
 Configure the optional supervisor with tmux global options before tmux-radar
 loads:
@@ -32,9 +70,7 @@ and its source.
 For current runs, precedence is built-in default, explicit tmux option,
 setup/custom value, then runtime override. A nonempty `@radar-ai-profile`
 replaces the default model and effort with `profile-managed`; explicit model
-or effort options retain `tmux` provenance and win for that field. Legacy
-`@switcher-ai-*` names remain fallback-only; use `@radar-ai-*` for new
-configuration.
+or effort options retain `tmux` provenance and win for that field.
 
 ## Options
 

@@ -210,12 +210,13 @@ cmp -s "$TMP/attention.targets" "$TMP/needinput-alias.targets" || fail 'legacy n
 printf 'PASS: Attention ordering, paneless omission, and legacy alias are stable\n'
 
 # Attention mark fields are user-controlled. Strip CR/ESC/control bytes from
-# source, label, and saved title while retaining renderer-owned ANSI badges.
+# source, label, saved title, and session keys while retaining renderer-owned
+# ANSI badges.
 printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-  "$P_ALPHA_1" "$((now - 10))" $'hook\rsource\033X' 'unsafe-mark' \
+  "$P_ALPHA_1" "$((now - 10))" $'hook\rsource\033X' $'s:mark\rkey\033X' \
   $'your\r turn\033Y' $'saved\rtitle\033Z' > "$TMP/state/need-input"
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-  $'co\033dex' 'control:active' 0 "$P_ALPHA_0" "$((now - 100))" "$((now - 1))" \
+  $'co\033dex' $'s:reg\rkey\033X' 0 "$P_ALPHA_0" "$((now - 100))" "$((now - 1))" \
   $'active\rstate\033X' '/tmp' 'codex' > "$TMP/state/agent-registry"
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention-controls.rows"
 grep -q $'\033\[' "$TMP/attention-controls.rows" || fail 'Attention sanitization removed renderer-owned ANSI'
@@ -236,7 +237,31 @@ if LC_ALL=C grep -q $'\r\|\033' "$TMP/preview-controls.plain"; then
   fail 'preview leaked CR/ESC from Attention metadata'
 fi
 grep -q '^✓' "$TMP/preview-controls.plain" || fail 'preview semantics diverged from sanitized Attention completion label'
+grep -q 'sid mark key' "$TMP/preview-controls.plain" || fail 'preview lost the sanitized mark session key'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" preview "$P_ALPHA_0" > "$TMP/preview-registry-controls.out"
+strip_ansi < "$TMP/preview-registry-controls.out" > "$TMP/preview-registry-controls.plain"
+if LC_ALL=C grep -q $'\r\|\033' "$TMP/preview-registry-controls.plain"; then
+  fail 'preview leaked CR/ESC from the registry session key'
+fi
+grep -q 'sid reg key ' "$TMP/preview-registry-controls.plain" || fail 'preview lost the sanitized registry session key'
 printf 'PASS: Attention and preview sanitize user control bytes while retaining renderer ANSI\n'
+
+# Equal-severity/equal-epoch marks retain canonical tmux server order. Create a
+# lexically earlier session after the existing panes so pane-id creation order
+# is deliberately the opposite of server order.
+tmux -L "$SOCKET" new-session -d -s aardvark -n zero -x 120 -y 40
+P_AARDVARK_0="$(tmux -L "$SOCKET" display-message -p -t aardvark:0.0 '#{pane_id}')"
+cat > "$TMP/state/need-input" <<EOF
+$P_AARDVARK_0	$((now - 20))	test	tie-action	needs input
+$P_BETA_1	$((now - 20))	test	tie-action	needs input
+EOF
+: > "$TMP/state/agent-registry"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention-ties.rows"
+tie_targets="$(cut -f1 "$TMP/attention-ties.rows" | paste -sd ' ' -)"
+[ "$tie_targets" = "$P_AARDVARK_0 $P_BETA_1" ] ||
+  fail "equal-epoch Attention ties did not preserve canonical server order: $tie_targets"
+tmux -L "$SOCKET" kill-session -t aardvark
+printf 'PASS: equal-epoch Attention ties preserve canonical server order\n'
 
 # Default command detection includes Kimi without requiring a configuration
 # override. Use a real pane process so this exercises the detector, not registry.

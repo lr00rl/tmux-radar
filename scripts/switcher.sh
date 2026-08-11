@@ -307,22 +307,21 @@ list_attention() {  # pane-level AI-status process view; hook-marked panes float
           }
         }
 
-        # Marked rows first, but split by meaning: real action requests before
-        # finished/notice marks. Background rows are not pane-jumpable; they are
-        # status rows for external Claude sessions.
+        # Marked live panes first, split by meaning: real action requests before
+        # finished/notice marks. Paneless marks were omitted during flag input.
         need_n=0
         for (i=1; i<=n; i++) {
           pane=order[i]
           if (pane in flagged) {
-            need_n++; nr[need_n]=level_rank(flag_level[pane]); ne[need_n]=flag_epoch[pane]; nk[need_n]="p"; nv[need_n]=pane
+            need_n++; nr[need_n]=level_rank(flag_level[pane]); ne[need_n]=flag_epoch[pane]; nv[need_n]=pane
           }
         }
-        for (i=2; i<=need_n; i++) {          # severity, event recency, then canonical target
-          r=nr[i]; e=ne[i]; k=nk[i]; v=nv[i]; t=pane_target[v]
-          for (j=i-1; j>=1 && (nr[j] > r || (nr[j] == r && (ne[j] < e || (ne[j] == e && pane_target[nv[j]] > t)))); j--) {
-            nr[j+1]=nr[j]; ne[j+1]=ne[j]; nk[j+1]=nk[j]; nv[j+1]=nv[j]
+        for (i=2; i<=need_n; i++) {          # severity, event recency; exact ties stay in pane order
+          r=nr[i]; e=ne[i]; v=nv[i]
+          for (j=i-1; j>=1 && (nr[j] > r || (nr[j] == r && ne[j] < e)); j--) {
+            nr[j+1]=nr[j]; ne[j+1]=ne[j]; nv[j+1]=nv[j]
           }
-          nr[j+1]=r; ne[j+1]=e; nk[j+1]=k; nv[j+1]=v
+          nr[j+1]=r; ne[j+1]=e; nv[j+1]=v
         }
         for (i=1; i<=need_n; i++) {
           emit_pane(nv[i], flag_level[nv[i]])
@@ -413,7 +412,7 @@ _pane_status_header() {  # $1 = pane %id; tech header + separator when the pane 
   parts="$icon ${kind:-?}"
   [ -n "$r_state" ] && parts="$parts · $r_state"
   [ -n "$m_epoch" ] && parts="$parts · mark $(_age_since "$m_epoch") ago"
-  sid="${r_key:-$m_key}"
+  sid="$(printf '%s' "${r_key:-$m_key}" | sanitize_text)"
   case "$sid" in
     s:*) sid="${sid#s:}"; parts="$parts · sid $(printf '%.8s' "$sid")…" ;;
   esac

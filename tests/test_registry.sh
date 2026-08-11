@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Smoke tests for tmux-radar precise AI tracking, on an isolated tmux server
-# (-L radartest) + isolated state dir. Never touches the user's live server.
+# with a per-process socket. Never touches the user's live server.
 set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 N="$WT/scripts/needinput-notify.sh"
@@ -9,15 +9,16 @@ T="$(mktemp -d /tmp/radar-smoke.XXXXXX)"
 export TMUX_RADAR_STATE_DIR="$T/state"
 MARKS="$TMUX_RADAR_STATE_DIR/need-input"
 REG="$TMUX_RADAR_STATE_DIR/agent-registry"
+SOCKET="radarreg$$"
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "PASS: $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 chk()  { if eval "$2"; then ok "$1"; else bad "$1 -- [$2]"; fi; }
 
-tmux -L radartest -f /dev/null kill-server 2>/dev/null || true
-tmux -L radartest -f /dev/null new-session -d -s smoke 2>/dev/null
-SOCK="$(tmux -L radartest display-message -p '#{socket_path}')"
+tmux -L "$SOCKET" -f /dev/null kill-server 2>/dev/null || true
+tmux -L "$SOCKET" -f /dev/null new-session -d -s smoke 2>/dev/null
+SOCK="$(tmux -L "$SOCKET" display-message -p '#{socket_path}')"
 export TMUX="$SOCK,99999,0"
 unset TMUX_PANE CLAUDE_JOB_DIR 2>/dev/null || true
 PANE="$(tmux list-panes -a -F '#{pane_id}' | head -1)"
@@ -102,20 +103,32 @@ tmux select-pane -t "$PANE" -T '✓ user-owned release title'
 chk "tick preserves a user-owned notifier-like title" \
   "[ \"\$(tmux display-message -p -t '$PANE' '#{pane_title}')\" = '✓ user-owned release title' ]"
 
-# Attention qualification is liveness-based, not mark-based. Run the same
+# Read handling is pane-specific. Resolving a window/pane target must clear the
+# pane that gained focus without consuming a sibling agent's unread event.
+PANE_SIBLING="$(tmux split-window -d -P -F '#{pane_id}' -t smoke:0)"
+env -u CLAUDE_JOB_DIR "$N" mark "$PANE" claude 'Claude needs your permission' s:focus-a
+env -u CLAUDE_JOB_DIR "$N" mark "$PANE_SIBLING" codex 'Codex finished — your turn' s:focus-b
+"$N" clear 'smoke:0.0'
+chk "focus clear resolves a tmux target to one exact pane" \
+  "! grep -q 's:focus-a' '$MARKS'"
+chk "focus clear preserves an unread sibling in the same window" \
+  "grep -q 's:focus-b' '$MARKS'"
+"$N" clear "$PANE_SIBLING"
+
+# Inbox consumes the coherent post-cleanup mark snapshot. Run the same
 # synchronous tick used by the picker with one stale marked pane and one pane
 # backed by a live registry process.
-PANE_STALE="$(tmux split-window -d -P -F '#{pane_id}' -t smoke:0)"
+PANE_STALE="$PANE_SIBLING"
 sleep 300 & ATT_LIVE=$!
 "$N" agent-register sleep s:att-live "$ATT_LIVE" "$PANE" /tmp/att-live
 env -u CLAUDE_JOB_DIR "$N" mark "$PANE" claude 'Claude needs your permission' s:att-live
 env -u CLAUDE_JOB_DIR "$N" mark "$PANE_STALE" claude 'Claude needs your permission' s:att-stale
 "$N" tick
 # shellcheck disable=SC2034 # consumed by chk's evaluated assertion strings below
-ATT_ROWS="$("$SW" list attention 2>"$T/attention-qualification.err")"
-chk "Attention excludes a marked pane with no live process or registry" \
+ATT_ROWS="$("$SW" list inbox 2>"$T/inbox-qualification.err")"
+chk "Inbox excludes a mark removed by liveness cleanup" \
   "! printf '%s\n' \"\$ATT_ROWS\" | cut -f1 | grep -qx '$PANE_STALE'"
-chk "Attention preserves a marked pane backed by a live registry process" \
+chk "Inbox preserves a marked pane backed by a live registry process" \
   "printf '%s\n' \"\$ATT_ROWS\" | cut -f1 | grep -qx '$PANE'"
 kill "$ATT_LIVE" 2>/dev/null; wait "$ATT_LIVE" 2>/dev/null
 "$N" clear-all
@@ -131,8 +144,8 @@ chk "PID-0 registry mark without a live pane agent is GCd" "! grep -q 's:pid-zer
 chk "PID-0 cleanup restores the pane title" \
   "[ \"\$(tmux display-message -p -t '$PANE' '#{pane_title}')\" = 'pid-zero-original' ]"
 # shellcheck disable=SC2034 # consumed by chk's evaluated assertion string below
-PID_ZERO_ROWS="$("$SW" list attention 2>"$T/pid-zero-attention.err")"
-chk "PID-0 stale registry does not appear in Attention" \
+PID_ZERO_ROWS="$("$SW" list inbox 2>"$T/pid-zero-inbox.err")"
+chk "PID-0 stale registry does not appear in Inbox" \
   "! printf '%s\n' \"\$PID_ZERO_ROWS\" | cut -f1 | grep -qx '$PANE'"
 
 # Dead registry liveness also clears DONE and restores the original title.
@@ -317,12 +330,44 @@ chk "preview shows technical header (sid + pid)" \
 printf '%s\n' "$PREV_OUT" | head -4
 kill "$S3" 2>/dev/null
 
-# --- 9. doctor runs clean -----------------------------------------------------
+# --- 9. indexed hook upgrade preserves foreign hooks ------------------------
+# Plugin focus hooks must use the exact selected pane and never the broad
+# clear-window operation that consumes unrelated sibling events.
+tmux set -g @radar-needinput on
+# Model an upgrade from the append-based v3 hooks while another plugin owns
+# independent indexed hooks on the same events.
+tmux set-hook -g 'session-window-changed[77]' 'display-message foreign-session-hook'
+tmux set-hook -g 'client-session-changed[77]' 'display-message foreign-client-hook'
+tmux set-hook -g 'window-pane-changed[77]' 'display-message foreign-pane-hook'
+tmux set-hook -g 'session-window-changed[78]' 'run-shell -b "/opt/foreign/scripts/mru-record.sh foreign"'
+tmux set-hook -g 'session-window-changed[0]' "run-shell -b \"$WT/scripts/needinput-notify.sh clear-window '#{hook_window}'\""
+tmux set-hook -g 'client-session-changed[0]' "run-shell -b \"$WT/scripts/mru-record.sh '#{hook_session_name}:'\""
+tmux set-hook -g 'window-pane-changed[0]' "run-shell -b \"$WT/scripts/mru-record.sh '#{hook_pane}'\""
+tmux set -g @radar-hooked 3
+bash "$WT/tmux-radar.tmux"
+# shellcheck disable=SC2034 # consumed by chk's evaluated assertions below
+HOOK_TEXT="$( { tmux show-hooks -g 2>/dev/null; tmux show-hooks -gw 2>/dev/null; } )"
+chk "focus hooks never auto-clear an entire window" \
+  "! printf '%s\n' \"\$HOOK_TEXT\" | grep -q 'needinput-notify.sh clear-window'"
+chk "hook upgrade preserves foreign session/client/pane hooks" \
+  "printf '%s\n' \"\$HOOK_TEXT\" | grep -q 'foreign-session-hook' && printf '%s\n' \"\$HOOK_TEXT\" | grep -q 'foreign-client-hook' && printf '%s\n' \"\$HOOK_TEXT\" | grep -q 'foreign-pane-hook'"
+chk "hook upgrade preserves a foreign script with radar's basename" \
+  "printf '%s\n' \"\$HOOK_TEXT\" | grep -q '/opt/foreign/scripts/mru-record.sh foreign'"
+chk "hook upgrade removes only legacy radar append slots" \
+  "! printf '%s\n' \"\$HOOK_TEXT\" | grep -E '\\[(0)\\].*(mru-record|needinput-notify)'"
+chk "radar hook slots are singular and indexed" \
+  "[ \"\$(printf '%s\n' \"\$HOOK_TEXT\" | grep -c '\\[9000\\].*mru-record.sh')\" -eq 3 ] && [ \"\$(printf '%s\n' \"\$HOOK_TEXT\" | grep -c '\\[9001\\].*needinput-notify.sh clear')\" -eq 3 ]"
+chk "pane-change hook clears the selected pane" \
+  "printf '%s\n' \"\$HOOK_TEXT\" | grep 'window-pane-changed' | grep -q \"needinput-notify.sh clear '#{hook_pane}'\""
+chk "window-change hook resolves only the newly active pane" \
+  "printf '%s\n' \"\$HOOK_TEXT\" | grep 'session-window-changed' | grep -q \"needinput-notify.sh clear '#{hook_window}'\""
+
+# --- 10. doctor runs clean ----------------------------------------------------
 "$N" doctor > "$T/doctor.out" 2>"$T/doctor.err"
 chk "doctor exits 0 with output, no stderr" "[ -s '$T/doctor.out' ] && ! [ -s '$T/doctor.err' ]"
 sed -n '1,12p' "$T/doctor.out"
 
-tmux -L radartest kill-server 2>/dev/null || true
+tmux -L "$SOCKET" kill-server 2>/dev/null || true
 echo
 echo "=============================="
 echo "PASS=$PASS FAIL=$FAIL"

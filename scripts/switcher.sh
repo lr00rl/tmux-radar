@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# tmux-radar — pane-first picker with Recent / Attention / Tree scopes and a
-# live bottom-anchored preview.
+# tmux-radar — window-first tmux switcher with Recent / Inbox / Tree views and
+# a live pane preview.
 #
 # Subcommands (the script calls itself for fzf reload/preview/binds):
 #   menu (default)                  launch the fzf popup
 #   list [view]                     print TAB rows "%pane-id\t<name>\t<meta>"
 #   preview <target>                render the right-hand preview for one row
 #   set-view <view>                 (fzf transform) switch view, emit actions
+#   toggle-expand                   (fzf transform) show/hide pane leaves
+#   jump <1..9>                     (fzf transform) safe visible-row jump
 #
 # View state is shared with the fzf bind subprocesses via $SW_STATE. fzf hides
 # the target field, searches the two display fields, and returns the full row.
@@ -16,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$SCRIPT_DIR/switcher.sh"
 
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
+WINDOW_MRU_FILE="${TMUX_RADAR_MRU_FILE:-${TMUX_SWITCHER_MRU_FILE:-$STATE_DIR/window-mru}}"
 PANE_MRU_FILE="${TMUX_RADAR_PANE_MRU_FILE:-$STATE_DIR/pane-mru}"
 NEEDINPUT_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
 # agent-session registry written by needinput-notify.sh hooks (TSV, 9 fields:
@@ -52,42 +55,43 @@ short_path() {  # short_path <path> -> compact display path
   esac
 }
 
-needinput_commands() {  # newline-separated process names watched by AI status
-  local configured
-  configured="${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude opencode kimi')}}"
-  printf '%s\n' "$configured" | tr ',:' '  '
-}
-
 # ---- shared view state ------------------------------------------------------
 normalize_view() {
   case "${1:-}" in
     all|tree) printf tree ;;
-    attention|needinput) printf attention ;;
+    attention|needinput|inbox) printf inbox ;;
     recent) printf recent ;;
     *) printf recent ;;
   esac
 }
 
 VIEW=recent
-read_state() {  # read_state [view-override]
+EXPANDED=0
+read_state() {  # read_state [view-override] [expanded-override]
+  local stored=""
   VIEW=recent
+  EXPANDED=0
   if [ -n "${SW_STATE:-}" ] && [ -r "${SW_STATE:-/nonexistent}" ]; then
-    IFS= read -r VIEW < "$SW_STATE" 2>/dev/null || true
+    IFS= read -r stored < "$SW_STATE" 2>/dev/null || true
+    VIEW="${stored%%$'\t'*}"
+    case "$stored" in *$'\t'*) EXPANDED="${stored#*$'\t'}" ;; esac
   fi
   [ -n "${1:-}" ] && VIEW="$1"
+  [ -n "${2:-}" ] && EXPANDED="$2"
   VIEW="$(normalize_view "$VIEW")"
+  case "$EXPANDED" in 1|on|yes|true) EXPANDED=1 ;; *) EXPANDED=0 ;; esac
 }
-write_state() { [ -n "${SW_STATE:-}" ] && printf '%s\n' "$VIEW" > "$SW_STATE"; }
+write_state() { [ -n "${SW_STATE:-}" ] && printf '%s\t%s\n' "$VIEW" "$EXPANDED" > "$SW_STATE"; }
 
 # ---- row builders ----------------------------------------------------------
 # Each public row is exactly "<target>\t<search-display>\t<meta-display>".
-# live_pane_snapshot is the one canonical server snapshot used to build pane
-# rows and the fully expanded Tree. User-derived fields are flattened before
-# tabs are introduced.
+# One list-panes call is the canonical server snapshot for a render. It includes
+# the render-time active pane for every window/session so structural rows never
+# need late-bound coordinates or per-window tmux calls.
 live_pane_snapshot() {
   local raw
   raw="$(tmux list-panes -a -F \
-    "#{pane_id}${SEP}#{session_name}${SEP}#{window_id}${SEP}#{window_index}${SEP}#{pane_index}${SEP}#{window_name}${SEP}#{pane_title}${SEP}#{pane_current_command}${SEP}#{pane_current_path}" 2>/dev/null)" || return 1
+    "#{pane_id}${SEP}#{session_name}${SEP}#{session_id}${SEP}#{window_id}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{window_active}${SEP}#{pane_index}${SEP}#{pane_active}${SEP}#{pane_title}${SEP}#{pane_current_command}${SEP}#{pane_current_path}" 2>/dev/null)" || return 1
   printf '%s\n' "$raw" |
     LC_ALL=C awk -v FS="$SEP" -v OFS='\t' -v home="$HOME" '
       function clean(s) {
@@ -102,301 +106,166 @@ live_pane_snapshot() {
         return p
       }
       {
-        id=$1; session=clean($2); wid=$3; widx=clean($4); pidx=clean($5)
-        window=clean($6); title=clean($7); cmd=clean($8); path=spath(clean($9))
+        id=$1; session=clean($2); sid=$3; wid=$4; widx=clean($5)
+        window=clean($6); winactive=$7; pidx=clean($8); paneactive=$9
+        title=clean($10); cmd=clean($11); path=spath(clean($12))
         if (title == "") title=cmd
-        print id, session, wid, widx, pidx, window, title, cmd, path
+        print id, session, sid, wid, widx, window, winactive, pidx, paneactive, title, cmd, path
       }
     '
 }
 
-pane_rows() {
-  LC_ALL=C awk -F '\t' -v OFS='\t' '
-    { location=$2 ":" $4 "." $5; print $1, $6 " " location "/" $7, $9 " · " $8 }
-  '
-}
-
-live_pane_records() {
-  live_pane_snapshot | pane_rows
-}
-
 list_tree() {
-  live_pane_snapshot | LC_ALL=C awk -F '\t' -v OFS='\t' '
+  local live
+  live="$(live_pane_snapshot)" || return 1
+  printf '%s\n' "$live" | LC_ALL=C awk -F '\t' -v OFS='\t' -v expanded="$EXPANDED" -v C="$C" -v D="$D" -v R="$R" '
+    function window_row(link, branch) {
+      return wname[link] "  " branch " " C session[link] ":" widx[link] R
+    }
+    function pane_row(pk, branch,    title) {
+      title=(ptitle[pk] != "" ? "/" ptitle[pk] : "")
+      return pname[pk] "     " branch " " C psession[pk] ":" pwidx[pk] "." pidx[pk] title R
+    }
     {
-      location=$2 ":" $4 "." $5
-      if ($2 != last_session) {
-        print "@session:" $2, $2, "session"
-        last_session=$2; last_window=""
+      p=$1; s=$2; sk=$3; w=$4; link=sk SUBSEP w; pk=link SUBSEP p
+      if (!(sk in seen_s)) {
+        seen_s[sk]=1; sorder[++sn]=sk; sname[sk]=s; starget[sk]=p
       }
-      if ($3 != last_window) {
-        print "@window:" $3, "  " $6 " " $2 ":" $4, "window"
-        last_window=$3
+      if ($7 == 1 && $9 == 1) starget[sk]=p
+      if (!(link in seen_link)) {
+        seen_link[link]=1; worder[sk, ++wn[sk]]=link
+        session[link]=s; widx[link]=$5; wname[link]=$6; wtarget[link]=p
       }
-      print $1, $6 " " location "/" $7, $9 " · " $8
+      if ($9 == 1) wtarget[link]=p
+      if (pk in seen_pane_link) next
+      seen_pane_link[pk]=1; porder[link, ++pn[link]]=pk; ptarget[pk]=p
+      pname[pk]=$6; psession[pk]=s; pwidx[pk]=$5; pidx[pk]=$8
+      ptitle[pk]=$10; pcmd[pk]=$11; ppath[pk]=$12
+    }
+    END {
+      for (si=1; si<=sn; si++) {
+        sk=sorder[si]
+        print starget[sk], "▾ " sname[sk], D wn[sk] " window" (wn[sk] == 1 ? "" : "s") R
+        for (wi=1; wi<=wn[sk]; wi++) {
+          link=worder[sk, wi]; wb=(wi == wn[sk] ? "└─" : "├─")
+          print wtarget[link], window_row(link, wb), D "window · " pn[link] " pane" (pn[link] == 1 ? "" : "s") R
+          if (expanded != 1) continue
+          for (pi=1; pi<=pn[link]; pi++) {
+            pk=porder[link, pi]; pb=(pi == pn[link] ? "└─" : "├─")
+            print ptarget[pk], pane_row(pk, pb), D pcmd[pk] " · " ppath[pk] R
+          }
+        }
+      }
     }
   '
 }
 
 list_recent() {
-  local mfile="$PANE_MRU_FILE" live
+  local live mfile="$WINDOW_MRU_FILE"
+  live="$(live_pane_snapshot)" || return 1
   [ -r "$mfile" ] || mfile=/dev/null
-  live="$(live_pane_records)" || return 1
-  awk -F '\t' '
-    NR==FNR { row[$1]=$0; next }
-    { recent[++n]=$1 }
+  LC_ALL=C awk -F '\t' -v OFS='\t' -v expanded="$EXPANDED" -v C="$C" -v D="$D" -v R="$R" '
+    function emit_window(w,    title, p, i) {
+      if (shown[w]++) return
+      p=wtarget[w]; title=(ptitle[p] != "" && ptitle[p] != wname[w] ? "/" ptitle[p] : "")
+      print p, wname[w] " " C session[w] ":" widx[w] title R, D pcmd[p] " · " ppath[p] R
+      if (expanded != 1) return
+      for (i=1; i<=pn[w]; i++) {
+        p=porder[w, i]; title=(ptitle[p] != "" ? "/" ptitle[p] : "")
+        print p, "   " wname[w] " " C session[w] ":" widx[w] "." pidx[p] title R, D pcmd[p] " · " ppath[p] R
+      }
+    }
+    NR==FNR {
+      p=$1; w=$4
+      if (!(w in seen_w)) {
+        seen_w[w]=1; canonical[++walln]=w
+        chosen_session[w]=$3; session[w]=$2; widx[w]=$5; wname[w]=$6; wtarget[w]=p
+      }
+      if ($3 != chosen_session[w]) next
+      if ($9 == 1) wtarget[w]=p
+      if (seen_window_pane[w, p]++) next
+      porder[w, ++pn[w]]=p; pidx[p]=$8; ptitle[p]=$10; pcmd[p]=$11; ppath[p]=$12
+      next
+    }
+    NF >= 1 && $1 != "" { recent[++rn]=$1 }
     END {
-      for (i=n; i>=1; i--) { id=recent[i]; if ((id in row) && !seen[id]++) print row[id] }
+      for (i=rn; i>=1; i--) if (recent[i] in seen_w) emit_window(recent[i])
+      for (i=1; i<=walln; i++) emit_window(canonical[i])
     }
   ' <(printf '%s\n' "$live") "$mfile"
 }
 
-list_attention() {  # pane-level AI-status process view; hook-marked panes float first
-  local live live_raw flags ps_rows commands reg now
-  live_raw="$(tmux list-panes -a -F \
-    "#{pane_id}${SEP}#{session_name}:#{window_index}${SEP}#{pane_index}${SEP}#{window_name}${SEP}#{pane_title}${SEP}#{pane_current_command}${SEP}#{pane_current_path}${SEP}#{pane_pid}${SEP}#{pane_tty}" 2>/dev/null)" || return 1
-  live="$(printf '%s\n' "$live_raw" | LC_ALL=C awk -v FS="$SEP" -v OFS='\t' '
-      function clean(s) { gsub(/[[:cntrl:]]/, " ", s); gsub(/[[:space:]][[:space:]]+/, " ", s); return s }
-      { for (i=1; i<=NF; i++) $i=clean($i); print }
-    ')"
-  [ -n "$live" ] || return 0
-  flags=""; [ -r "$NEEDINPUT_FILE" ] && flags="$(cat "$NEEDINPUT_FILE" 2>/dev/null || true)"
-  reg=""; [ -r "$REGISTRY_FILE" ] && reg="$(cat "$REGISTRY_FILE" 2>/dev/null || true)"
-  ps_rows="$(ps -axo pid=,ppid=,tty=,command= 2>/dev/null || true)"
-  commands="$(needinput_commands)"
+list_inbox() {
+  local live marks=/dev/null now
+  live="$(live_pane_snapshot)" || return 1
+  [ -r "$NEEDINPUT_FILE" ] && marks="$NEEDINPUT_FILE"
   now="$(date +%s)"
-
-  # __REG__ must come after __PS__: registry liveness checks the ps snapshot
-  { printf '__PANES__\n%s\n__FLAGS__\n%s\n__PS__\n%s\n__REG__\n%s\n' "$live" "$flags" "$ps_rows" "$reg"; } |
-    LC_ALL=C awk -F '\t' -v cmds="$commands" -v now="$now" -v C="$C" -v Y="$Y" -v G="$G" -v M="$M" -v D="$D" -v R="$R" '
-      function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-      function clean_user(s) { gsub(/[[:cntrl:]]/, " ", s); gsub(/[[:space:]][[:space:]]+/, " ", s); return trim(s) }
-      function clean_tty(t) { sub(/^\/dev\//, "", t); return t }
-      function first_word(s, x) { x=trim(s); sub(/[[:space:]].*/, "", x); return x }
-      function level_for(src, label,    l) {
-        l=tolower(src " " label)
-        if (l ~ /(finished|your turn|turn complete|task complete|done|任务完成|完成)/) return "done"
-        if (l ~ /(needs approval|needs your permission|needs input|waiting.*input|waiting on you|wait.*input|permission|approval|action required|approve|拿不准|需要你|需要.*许可|需要.*批准|等待.*输入)/) return "action"
-        return "notice"
+  LC_ALL=C awk -F '\t' -v OFS='\t' -v now="$now" -v C="$C" -v Y="$Y" -v G="$G" -v M="$M" -v D="$D" -v R="$R" '
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    function clean(s) { gsub(/[[:cntrl:]]/, " ", s); gsub(/[[:space:]][[:space:]]+/, " ", s); return trim(s) }
+    function level_for(src, label,    l) {
+      l=tolower(src " " label)
+      if (l ~ /(finished|your turn|turn complete|task complete|done|任务完成|完成)/) return "done"
+      if (l ~ /(needs approval|needs your permission|needs input|waiting.*input|waiting on you|wait.*input|permission|approval|action required|approve|拿不准|需要你|需要.*许可|需要.*批准|等待.*输入)/) return "action"
+      return "notice"
+    }
+    function rank(l) { return (l == "action" ? 1 : (l == "done" ? 2 : 3)) }
+    function word(l) { return (l == "action" ? "ACTION" : (l == "done" ? "DONE" : "NOTICE")) }
+    function icon(l) { return (l == "action" ? "⚠" : (l == "done" ? "✓" : "!")) }
+    function color(l) { return (l == "action" ? M : (l == "done" ? G : Y)) }
+    function age(sec) {
+      if (sec < 0) sec=0
+      if (sec < 60) return sec "s"
+      if (sec < 3600) return int(sec/60) "m"
+      if (sec < 86400) return int(sec/3600) "h"
+      return int(sec/86400) "d"
+    }
+    NR==FNR {
+      p=$1
+      if (p in live) next
+      live[p]=1; order[++n]=p
+      session[p]=$2; widx[p]=$5; wname[p]=$6; pidx[p]=$8
+      ptitle[p]=$10; pcmd[p]=$11; ppath[p]=$12
+      next
+    }
+    NF >= 5 && $1 ~ /^%[0-9]+$/ {
+      p=$1
+      if (!(p in live)) next
+      marked[p]=1; epoch[p]=$2+0; source[p]=clean($3); label[p]=clean($5)
+      saved[p]=(NF >= 6 ? clean($6) : ""); level[p]=level_for(source[p], label[p])
+    }
+    END {
+      cn=0
+      for (i=1; i<=n; i++) {
+        p=order[i]; if (!(p in marked)) continue
+        cn++; cr[cn]=rank(level[p]); ce[cn]=epoch[p]; cp[cn]=p
       }
-      function level_rank(level) { return (level == "action" ? 1 : (level == "done" ? 2 : (level == "notice" ? 3 : 4))) }
-      function level_color(level) { return (level == "action" ? M : (level == "done" ? G : (level == "notice" ? Y : D))) }
-      function level_word(level) { return (level == "action" ? "ACTION" : (level == "done" ? "DONE" : (level == "notice" ? "NOTICE" : "ACTIVE"))) }
-      function level_icon(level) { return (level == "action" ? "⚠" : (level == "done" ? "✓" : (level == "notice" ? "!" : "·"))) }
-      function badge(level) { return level_color(level) level_icon(level) " " level_word(level) " " R }
-      function age_str(sec) {
-        sec += 0
-        if (sec < 0) sec = 0
-        if (sec < 60) return sec "s"
-        if (sec < 3600) return int(sec / 60) "m"
-        if (sec < 86400) return int(sec / 3600) "h"
-        return int(sec / 86400) "d"
+      for (i=2; i<=cn; i++) {
+        r=cr[i]; e=ce[i]; p=cp[i]
+        for (j=i-1; j>=1 && (cr[j] > r || (cr[j] == r && ce[j] < e)); j--) {
+          cr[j+1]=cr[j]; ce[j+1]=ce[j]; cp[j+1]=cp[j]
+        }
+        cr[j+1]=r; ce[j+1]=e; cp[j+1]=p
       }
-      function proc_match(argv0, raw, n, a, i, c, wanted) {
-        raw=tolower(argv0); gsub(/\\/, "/", raw)
-        n=split(raw, a, "/")
-        for (wanted in want) {
-          for (i=1; i<=n; i++) {
-            c=a[i]
-            sub(/\.app$/, "", c)
-            if (c == wanted) return want[wanted]
-          }
-        }
-        return ""
+      for (i=1; i<=cn; i++) {
+        p=cp[i]; title=(saved[p] != "" ? saved[p] : ptitle[p])
+        sub(/^(⚠|✓|!|·) /, "", title)
+        title=(title != "" && title != wname[p] ? "/" title : "")
+        badge=color(level[p]) icon(level[p]) " " word(level[p]) R
+        hint=source[p] (source[p] != "" && label[p] != "" ? ": " : "") label[p]
+        tail=(epoch[p] > 0 ? " · " age(now-epoch[p]) : "")
+        print p, wname[p] " " C session[p] ":" widx[p] "." pidx[p] title R, badge " " hint " " D "· " pcmd[p] " · " ppath[p] tail R
       }
-      function proc_identity_match(argv0, wanted,    raw, n, a, i, c) {
-        raw=tolower(argv0); wanted=tolower(wanted)
-        gsub(/\\/, "/", raw)
-        if (wanted == "") return 0
-        n=split(raw, a, "/")
-        for (i=1; i<=n; i++) {
-          c=a[i]
-          sub(/\.app$/, "", c)
-          if (c == wanted) return 1
-        }
-        return 0
-      }
-      function add_match(pane, cmd) {
-        if (pane == "" || cmd == "") return
-        if (!(pane in ai)) ai[pane]=1
-        ai_cmd[pane SUBSEP cmd]=1
-        # registry kinds outside the watch list must still show in cmds_for
-        if (!(cmd in cmd_known)) { cmd_known[cmd]=1; cmd_order[++cmd_n]=cmd }
-      }
-      function add_process_match(pane, cmd) {
-        add_match(pane, cmd)
-        if (pane != "" && cmd != "") process_ai[pane]=1
-      }
-      function emit_pane(pane, level,    is_flagged, display_title, title, matched, hint, tail) {
-        is_flagged=(pane in flagged)
-        if (level == "") level=(is_flagged ? flag_level[pane] : "active")
-        display_title=ti[pane]
-        if (is_flagged) {
-          if (flag_saved[pane] != "") display_title=flag_saved[pane]
-          else {
-            sub(/^⚠ /, "", display_title)
-            sub(/^✓ /, "", display_title)
-            sub(/^! /, "", display_title)
-            sub(/^· /, "", display_title)
-          }
-        } else {
-          if (display_title ~ /^(⚠|✓|!|·) /) display_title=""
-        }
-        title=(display_title != "" && display_title != wn[pane] ? "/" display_title : "")
-        matched=cmds_for(pane)
-        hint=""
-        if (is_flagged) {
-          hint=flag_label[pane]
-          if (flag_source[pane] != "") hint=flag_source[pane] ": " hint
-          if (hint != "") hint=" · " level_color(level) level_word(level) ": " hint R
-        }
-        # trailing dim age: mark age when flagged, registry kind/state/uptime otherwise
-        tail=""
-        if (is_flagged) {
-          if (flag_epoch[pane] > 0) tail=" " D "· " age_str(now - flag_epoch[pane]) R
-        } else if (pane in reg_state) {
-          tail=" " D "· " reg_kind[pane] " " reg_state[pane] " · " age_str(now - reg_started[pane]) R
-        }
-        printf "%s\t%s %s%s.%s%s%s\t%s%s%s · %s · %s%s%s\n", \
-          pane_target[pane], wn[pane], C, wt[pane], pidx[pane], title, R, \
-          badge(level), D, matched, cm[pane], pa[pane], R, hint tail
-      }
-      function cmds_for(pane,    i, out, cmd) {
-        out=""
-        for (i=1; i<=cmd_n; i++) {
-          cmd=cmd_order[i]
-          if (ai_cmd[pane SUBSEP cmd]) out=(out == "" ? cmd : out "," cmd)
-        }
-        return out
-      }
-      function read_ps(line,    rest, pid, ppid, tty, argv0, matched) {
-        rest=trim(line)
-        pid=first_word(rest); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
-        ppid=first_word(rest); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
-        tty=clean_tty(first_word(rest)); sub(/^[^[:space:]]+[[:space:]]*/, "", rest)
-        argv0=first_word(rest)
-        proc_parent[pid]=ppid
-        proc_tty[pid]=tty
-        proc_argv[pid]=argv0
-        matched=proc_match(argv0)
-        if (matched != "") proc_cmd[pid]=matched
-      }
-      BEGIN {
-        cmd_n=split(cmds, raw_cmds, /[[:space:],:]+/)
-        for (i=1; i<=cmd_n; i++) {
-          c=tolower(raw_cmds[i])
-          if (c == "") continue
-          want[c]=raw_cmds[i]
-          cmd_order[++real_cmd_n]=raw_cmds[i]
-          cmd_known[raw_cmds[i]]=1
-        }
-        cmd_n=real_cmd_n
-      }
-      $0 == "__PANES__" { mode="panes"; next }
-      $0 == "__FLAGS__" { mode="flags"; next }
-      $0 == "__PS__" { mode="ps"; next }
-      $0 == "__REG__" { mode="reg"; next }
-      mode == "panes" && $0 != "" {
-        pane=$1
-        wt[pane]=$2; pidx[pane]=$3; wn[pane]=$4; ti[pane]=$5; cm[pane]=$6; pa[pane]=$7
-        pane_shell=$8; pane_tty[pane]=clean_tty($9)
-        pane_target[pane]=pane
-        pane_by_pid[pane_shell]=pane
-        panes_on_tty[pane_tty[pane]]=panes_on_tty[pane_tty[pane]] pane "\034"
-        order[++n]=pane
-        next
-      }
-      mode == "flags" && $0 != "" {
-        if ($1 == "-") next                   # paneless marks are not pane targets
-        flagged[$1]=1
-        flag_epoch[$1]=$2 + 0
-        flag_source[$1]=clean_user($3)
-        flag_label[$1]=clean_user(NF >= 5 ? $5 : $4)
-        flag_saved[$1]=clean_user(NF >= 6 ? $6 : "")
-        flag_level[$1]=level_for(flag_source[$1], flag_label[$1])
-        next
-      }
-      mode == "ps" && $0 != "" { read_ps($0); next }
-      mode == "reg" && $0 != "" {
-        # Positive PIDs require current argv identity. Unresolved PIDs are
-        # accepted later only with independent pane-process evidence.
-        if (NF < 9 || $4 == "" || $4 == "-") next
-        pid=$3 + 0
-        proc=clean_user($9)
-        if (pid > 0 && (!(pid in proc_parent) || !proc_identity_match(proc_argv[pid], proc))) next
-        if (($4 in reg_last) && reg_last[$4] > $6 + 0) next
-        reg_last[$4]=$6 + 0
-        kind=clean_user($1); state=clean_user($7)
-        if (pid <= 0) {
-          unresolved_kind[$4]=kind; unresolved_started[$4]=$5 + 0; unresolved_state[$4]=state
-          next
-        }
-        reg_kind[$4]=kind; reg_started[$4]=$5 + 0; reg_state[$4]=state
-        add_match($4, kind)
-        next
-      }
-      END {
-        for (pid in proc_cmd) {
-          tty=proc_tty[pid]
-          if (tty in panes_on_tty) {
-            c=split(panes_on_tty[tty], tty_panes, "\034")
-            for (i=1; i<=c; i++) add_process_match(tty_panes[i], proc_cmd[pid])
-          }
-
-          seen=""
-          cur=pid
-          for (hops=0; hops<80 && cur != ""; hops++) {
-            if (cur in pane_by_pid) { add_process_match(pane_by_pid[cur], proc_cmd[pid]); break }
-            if (index("\034" seen "\034", "\034" cur "\034") > 0) break
-            seen=seen "\034" cur
-            cur=proc_parent[cur]
-          }
-        }
-
-        for (pane in unresolved_kind) {
-          if (!(pane in process_ai)) continue
-          reg_kind[pane]=unresolved_kind[pane]
-          reg_started[pane]=unresolved_started[pane]
-          reg_state[pane]=unresolved_state[pane]
-          add_match(pane, unresolved_kind[pane])
-        }
-
-        # Marked live panes first, split by meaning: real action requests before
-        # finished/notice marks. Paneless marks were omitted during flag input.
-        need_n=0
-        for (i=1; i<=n; i++) {
-          pane=order[i]
-          if ((pane in flagged) && (pane in ai)) {
-            need_n++; nr[need_n]=level_rank(flag_level[pane]); ne[need_n]=flag_epoch[pane]; nv[need_n]=pane
-          }
-        }
-        for (i=2; i<=need_n; i++) {          # severity, event recency; exact ties stay in pane order
-          r=nr[i]; e=ne[i]; v=nv[i]
-          for (j=i-1; j>=1 && (nr[j] > r || (nr[j] == r && ne[j] < e)); j--) {
-            nr[j+1]=nr[j]; ne[j+1]=ne[j]; nv[j+1]=nv[j]
-          }
-          nr[j+1]=r; ne[j+1]=e; nv[j+1]=v
-        }
-        for (i=1; i<=need_n; i++) {
-          emit_pane(nv[i], flag_level[nv[i]])
-        }
-
-        # Then every other detected AI pane, in pane order. These are context,
-        # not action-required rows.
-        for (i=1; i<=n; i++) {
-          pane=order[i]
-          if (!(pane in ai) || (pane in flagged)) continue
-          emit_pane(pane, "active")
-        }
-      }
-    '
+    }
+  ' <(printf '%s\n' "$live") "$marks"
 }
 
-do_list() {  # do_list [view]
+do_list() {  # do_list [view] [expanded]
   local rows list_fn
-  read_state "${1:-}"
+  read_state "${1:-}" "${2:-}"
   case "$VIEW" in
     recent) list_fn=list_recent ;;
-    attention) list_fn=list_attention ;;
+    inbox) list_fn=list_inbox ;;
     tree) list_fn=list_tree ;;
   esac
   if ! rows="$("$list_fn")"; then
@@ -499,51 +368,102 @@ do_preview() {
 
 _prompt() {
   case "$VIEW" in
-    recent) printf 'Recent> ' ;;
-    attention) printf 'Attention> ' ;;
-    tree) printf 'Tree> ' ;;
+    recent) [ "$EXPANDED" = 1 ] && printf 'Recent+> ' || printf 'Recent> ' ;;
+    inbox) printf 'Inbox> ' ;;
+    tree) [ "$EXPANDED" = 1 ] && printf 'Tree+> ' || printf 'Tree> ' ;;
   esac
 }
 
-cmd_set_view() {  # fzf transform: switch view, reload, repoint prompt
-  local next_view rows_tmp reload_cmd
-  read_state
-  next_view="$(normalize_view "${1:-recent}")"
+_header() {
+  if [ "$VIEW" = inbox ] && [ -n "${SW_ROWS:-}" ] && [ ! -s "$SW_ROWS" ]; then
+    printf '%s · ' 'Inbox clear — no unread AI event needs you.'
+  fi
+  printf '%s' 'C-r Recent · C-i Inbox · C-t Tree'
+  printf '%s' ' · C-e panes · A-1..9 jump · A-p preview · Enter switch'
+}
+
+_fzf_version_supported() {
+  local raw version major minor
+  raw="$($1 --version 2>/dev/null || true)"
+  version="${raw%% *}"
+  case "$version" in [0-9]*.[0-9]*|[0-9]*.[0-9]*.[0-9]*) ;; *) return 0 ;; esac
+  major="${version%%.*}"
+  minor="${version#*.}"; minor="${minor%%.*}"
+  case "$major:$minor" in *[!0-9:]*|:*) return 0 ;; esac
+  [ "$major" -gt 0 ] || [ "$minor" -ge 59 ]
+}
+
+_reload_picker() {  # publish VIEW/EXPANDED as one coherent fzf transaction
+  local rows_tmp reload_cmd header
   if [ -z "${SW_ROWS:-}" ] || [ -z "${SW_ERROR:-}" ]; then
-    printf abort
+    printf 'abort\n'
     return 0
   fi
   # Every reload observes a completed cleanup pass before publishing its rows.
   if ! "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1; then
     : > "$SW_ERROR"
-    printf abort
+    printf 'abort\n'
     return 0
   fi
   rows_tmp="$(mktemp "${SW_ROWS}.XXXXXX")" || {
     : > "$SW_ERROR"
-    printf abort
+    printf 'abort\n'
     return 0
   }
-  if ! "$SELF" list "$next_view" > "$rows_tmp" 2>/dev/null || ! mv "$rows_tmp" "$SW_ROWS"; then
+  if ! "$SELF" list "$VIEW" "$EXPANDED" > "$rows_tmp" 2>/dev/null || ! mv "$rows_tmp" "$SW_ROWS"; then
     rm -f "$rows_tmp" 2>/dev/null || true
     : > "$SW_ERROR"
-    printf abort
+    printf 'abort\n'
     return 0
   fi
-  VIEW="$next_view"
   write_state
   printf -v reload_cmd 'cat %q' "$SW_ROWS"
-  printf 'enable-sort+reload-sync(%s)+change-prompt(%s)+pos(1)' "$reload_cmd" "$(_prompt)"
+  header="$(_header)"
+  # fzf reads transform actions line-by-line and ignores a final unterminated
+  # record even when the producer command itself succeeded.
+  printf 'reload-sync(%s)+change-prompt(%s)+change-header(%s)+pos(1)\n' \
+    "$reload_cmd" "$(_prompt)" "$header"
+}
+
+cmd_set_view() {  # fzf transform: switch view, reload, repoint prompt
+  read_state
+  VIEW="$(normalize_view "${1:-recent}")"
+  _reload_picker
+}
+
+cmd_toggle_expand() {  # fzf transform: toggle pane leaves in Recent/Tree
+  read_state
+  if [ "$VIEW" = inbox ]; then
+    printf 'bell\n'
+    return 0
+  fi
+  [ "$EXPANDED" = 1 ] && EXPANDED=0 || EXPANDED=1
+  _reload_picker
+}
+
+cmd_jump() {  # fzf transform: accept only an existing visible result
+  local n="${1:-0}" count="${FZF_MATCH_COUNT:-0}"
+  case "$n" in [1-9]) ;; *) printf 'bell\n'; return 0 ;; esac
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  if [ "$count" -ge "$n" ]; then
+    printf 'pos(%s)+accept\n' "$n"
+  else
+    printf 'bell\n'
+  fi
 }
 
 do_menu() {
   local initial_view="${1:-}"
-  local fzf preview_pos follow preview_win selected target list_file fzf_rc reload_failed
+  local fzf preview_pos follow preview_win selected target list_file fzf_rc reload_failed header
   local -a fzf_args
   fzf="$(command -v fzf || true)"
-  [ -n "$fzf" ] || { tmux display-message "tmux-radar: fzf not found"; exit 1; }
-
+  if [ -z "$fzf" ]; then
+    printf '%s\n' 'fzf not found; install fzf and reopen tmux-radar' >&2
+    tmux display-message 'tmux-radar: fzf not found' >/dev/null 2>&1 || true
+    return 1
+  fi
   VIEW="$(normalize_view "${initial_view:-$(opt @radar-default-view recent)}")"
+  case "$(opt @radar-expand-panes off)" in on|yes|true|1) EXPANDED=1 ;; *) EXPANDED=0 ;; esac
   preview_pos="$(opt @radar-preview right:62%)"
   follow="$(opt @radar-preview-follow on)"
   preview_win="${preview_pos},nowrap"
@@ -557,6 +477,12 @@ do_menu() {
     rm -f "$SW_STATE" 2>/dev/null || true
     printf '%s\n' 'unable to refresh AI state; reopen the switcher' >&2
     tmux display-message 'tmux-radar: unable to refresh AI state; reopen the switcher' >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! _fzf_version_supported "$fzf"; then
+    rm -f "$SW_STATE" 2>/dev/null || true
+    printf '%s\n' 'fzf 0.59 or newer is required; upgrade fzf and reopen tmux-radar' >&2
+    tmux display-message 'tmux-radar: fzf 0.59+ required' >/dev/null 2>&1 || true
     return 1
   fi
 
@@ -573,17 +499,28 @@ do_menu() {
     tmux display-message 'tmux-radar: unable to list panes; reopen the switcher' >/dev/null 2>&1 || true
     return 1
   fi
+  header="$(_header)"
 
   if selected="$(
     "$fzf" \
       "${fzf_args[@]}" \
       --layout=reverse --prompt="$(_prompt)" \
-      --header='C-r Recent · C-i Attention (0/0 = no detected AI pane) · C-t Tree · A-p preview · Enter switch' \
+      --header="$header" \
       --preview="$SELF preview {1}" --preview-window="$preview_win" \
       --bind='change:pos(1)' \
       --bind="ctrl-t:transform($SELF set-view tree)" \
       --bind="ctrl-r:transform($SELF set-view recent)" \
-      --bind="ctrl-i:transform($SELF set-view attention)" \
+      --bind="ctrl-i:transform($SELF set-view inbox)" \
+      --bind="ctrl-e:transform($SELF toggle-expand)" \
+      --bind="alt-1:transform($SELF jump 1)" \
+      --bind="alt-2:transform($SELF jump 2)" \
+      --bind="alt-3:transform($SELF jump 3)" \
+      --bind="alt-4:transform($SELF jump 4)" \
+      --bind="alt-5:transform($SELF jump 5)" \
+      --bind="alt-6:transform($SELF jump 6)" \
+      --bind="alt-7:transform($SELF jump 7)" \
+      --bind="alt-8:transform($SELF jump 8)" \
+      --bind="alt-9:transform($SELF jump 9)" \
       --bind='alt-p:toggle-preview' \
       --bind='shift-up:preview-up,shift-down:preview-down' \
       --bind='pgup:preview-page-up,pgdn:preview-page-down' \
@@ -652,9 +589,11 @@ cmd_last_pane() {  # jump to the most recently used *other* pane, cross-session
 }
 
 case "${1:-menu}" in
-  list)          do_list "${2:-}" ;;
+  list)          do_list "${2:-}" "${3:-}" ;;
   preview)       do_preview "${2:-}" ;;
   set-view)      cmd_set_view "${2:-recent}" ;;
+  toggle-expand) cmd_toggle_expand ;;
+  jump)          cmd_jump "${2:-}" ;;
   last-pane)     cmd_last_pane ;;
   menu | *)      do_menu "${2:-}" ;;
 esac

@@ -58,31 +58,60 @@ if [ "$(opt @radar-ai off)" = "on" ]; then
     "" \
     "状态 / 最近决策"                  s "$POP \"TMUX_RADAR_AI_PAUSE=1 $SCRIPTS/ai.sh status\"" \
     "停止全部监控"                     S "run-shell \"$SCRIPTS/ai.sh stop all\"" \
-    "列出 AI pane"                    l "$POP \"$SCRIPTS/switcher.sh menu attention\""
+    "打开 AI Inbox"                   l "$POP \"$SCRIPTS/switcher.sh menu inbox\""
   # housekeeping on every (re)load: GC stale watcher files / monitor panes /
   # AI-status marks — also what a tmux-resurrect post-restore hook should run
   tmux run-shell -b "$SCRIPTS/ai.sh cleanup >/dev/null 2>&1" 2>/dev/null || true
 fi
 
-# Hooks are appended (-ga) so we don't clobber other hooks; a version guard
-# avoids duplicate registration on config reload. On version bump we reset our
-# events with -gu first (removes any hook on those events) and re-register.
-HOOK_VERSION=3
-if [ "$(tmux show-option -gqv @radar-hooked 2>/dev/null || true)" != "$HOOK_VERSION" ]; then
-  tmux set-hook -gu session-window-changed 2>/dev/null || true
-  tmux set-hook -gu client-session-changed 2>/dev/null || true
-  tmux set-hook -gu window-pane-changed 2>/dev/null || true
-  tmux set-hook -ga session-window-changed "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_window}'\""
-  tmux set-hook -ga client-session-changed "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_session_name}:'\""
-  # pane-level MRU: fires when the active pane changes inside a window
-  tmux set-hook -ga window-pane-changed "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_pane}'\""
-  if [ "$NEEDINPUT" = "on" ]; then
-    tmux set-hook -ga session-window-changed "run-shell -b \"$SCRIPTS/needinput-notify.sh clear-window '#{hook_window}'\""
-    # session switches change which panes are on screen -> resync the bar
-    tmux set-hook -ga client-session-changed "run-shell -b \"$SCRIPTS/needinput-notify.sh tick\""
+# Hooks use reserved high array indexes so reloads replace only tmux-radar's
+# entries and never clobber another plugin or a user hook on the same event.
+# The one-time migration removes only legacy entries whose command points at a
+# tmux-radar-owned script.
+HOOK_VERSION=4
+_remove_legacy_hooks() {  # remove pre-v4 append slots owned by tmux-radar only
+  local event="$1" scope="$2" line spec hooks
+  if [ "$scope" = window ]; then
+    hooks="$(tmux show-hooks -gw 2>/dev/null || true)"
+  else
+    hooks="$(tmux show-hooks -g 2>/dev/null || true)"
   fi
-  tmux set-option -g @radar-hooked "$HOOK_VERSION"
+  while IFS= read -r line; do
+    case "$line" in "$event"'['*) ;; *) continue ;; esac
+    case "$line" in
+      *"$SCRIPTS/mru-record.sh"*|*"$SCRIPTS/needinput-notify.sh"*)
+        spec="${line%% *}"
+        tmux set-hook -gu "$spec" 2>/dev/null || true
+        ;;
+    esac
+  done <<< "$hooks"
+}
+
+if [ "$(tmux show-option -gqv @radar-hooked 2>/dev/null || true)" != "$HOOK_VERSION" ]; then
+  _remove_legacy_hooks session-window-changed server
+  _remove_legacy_hooks client-session-changed server
+  _remove_legacy_hooks window-pane-changed window
 fi
+
+tmux set-hook -g 'session-window-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_window}'\""
+tmux set-hook -g 'client-session-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_session_name}:'\""
+# pane-level MRU: fires when the active pane changes inside a window
+tmux set-hook -g 'window-pane-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_pane}'\""
+if [ "$NEEDINPUT" = "on" ]; then
+  # Read handling is pane-specific. Resolve session/window targets once to
+  # their newly active pane; never consume unread sibling panes.
+  tmux set-hook -g 'session-window-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{hook_window}'\""
+  tmux set-hook -g 'window-pane-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{hook_pane}'\""
+  tmux set-hook -g 'client-session-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{hook_session_name}:'\""
+  # Session switches change which panes are on screen -> resync the bar.
+  tmux set-hook -g 'client-session-changed[9002]' "run-shell -b \"$SCRIPTS/needinput-notify.sh tick\""
+else
+  tmux set-hook -gu 'session-window-changed[9001]' 2>/dev/null || true
+  tmux set-hook -gu 'window-pane-changed[9001]' 2>/dev/null || true
+  tmux set-hook -gu 'client-session-changed[9001]' 2>/dev/null || true
+  tmux set-hook -gu 'client-session-changed[9002]' 2>/dev/null || true
+fi
+tmux set-option -g @radar-hooked "$HOOK_VERSION"
 
 # AI-status chips. The strip is pure option content (#{E:@radar-chips}) that
 # the notifier republishes on every event, so a notification never changes the

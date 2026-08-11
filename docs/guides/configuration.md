@@ -1,8 +1,8 @@
 # Configuration
 
-Set tmux-radar options before the plugin loads. The core picker is pane-first:
-Recent, Attention, and Tree are the canonical picker views. Recent and
-Attention are pane-only; Tree is a fully expanded session/window/pane hierarchy.
+Set tmux-radar options before the plugin loads. The core picker is window-first:
+Recent, Inbox, and Tree are the canonical views. Recent and Tree rest at window
+granularity and reveal exact panes with `Ctrl-e`; Inbox is already pane-level.
 
 ```tmux
 set -g @radar-default-view 'recent'
@@ -16,28 +16,30 @@ set -g @radar-preview-follow 'on'
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `@radar-default-view` | `recent` | Initial view: `recent`, `attention`, or `tree`. `all` is accepted only as a compatibility alias for Tree. Invalid values fall back to Recent. |
+| `@radar-default-view` | `recent` | Initial view: `recent`, `inbox`, or `tree`. `needinput` aliases Inbox and `all` aliases Tree for compatibility. Invalid values fall back to Recent. |
 | `@radar-key` | `C-w` | Prefix key that opens the picker. Reload tmux after changing it. |
 | `@radar-last-key` | `Tab` | Prefix key for the cross-session most-recent-other-pane toggle. Use `none` to leave it unbound. |
 | `@radar-popup-width` | `100%` | Picker popup width. |
 | `@radar-popup-height` | `100%` | Picker popup height. |
 | `@radar-preview` | `right:62%` | fzf preview position and size. |
 | `@radar-preview-follow` | `on` | Keep preview anchored to the selected pane's newest visible content. |
-| `@radar-needinput` | `on` | Enable lifecycle marks, Attention prioritization, pane retitles, and the status strip. |
-| `@radar-needinput-commands` | `codex claude opencode kimi` | Process names detected as AI panes, separated by spaces, commas, or colons. |
+| `@radar-expand-panes` | `off` | Open Recent/Tree with pane leaves expanded; `Ctrl-e` toggles the state. |
+| `@radar-needinput` | `on` | Enable lifecycle marks, Inbox events, pane retitles, and the status strip. |
+| `@radar-needinput-commands` | `codex claude opencode kimi` | Process identities used for liveness GC and diagnostics; process detection alone never creates an Inbox row. |
 | `@radar-retitle` | `on` | Prefix marked pane titles with a textual status label and restore the mark-owned saved title when cleared. A matching glyph prefix alone is never treated as ownership. |
 | `@radar-claude-bg` | `on` | Track paneless Claude sessions on notification/supervisor surfaces; they never become selectable picker rows. |
 | `@radar-bar` | `auto` | `auto` adds chips to `status-right`, `pinned` reserves a stable second line, and `off` hides chips while retaining marks. |
 | `@radar-bar-ttl` | `60` | Seconds before a chip fades (`0` keeps it until handled); the underlying mark remains. |
 
 The picker keys are intentionally fixed around its three views: `Ctrl-r`
-opens Recent, `Ctrl-i` opens Attention, and `Ctrl-t` opens Tree. `Alt-p` toggles
-preview, the usual fzf navigation keys move selection, and `Enter` switches to
-the exact revalidated stable pane ID (`%N`) with one tmux client operation.
-Pane search text starts with the sanitized user window name, followed by the
-mutable `session:window.pane` coordinate and title; cwd, command, and AI state
-remain secondary metadata. Tree session/window rows are context-only clean
-no-ops, while pane leaves switch by exact `%N`. See the interaction contract in
+opens Recent, `Ctrl-i` opens Inbox, and `Ctrl-t` opens Tree. `Ctrl-e` toggles
+pane leaves in Recent/Tree; `Alt-1`…`Alt-9` safely jumps to an existing visible
+result; `Alt-p` toggles preview. `Enter` switches to the exact revalidated stable
+pane ID (`%N`) with one tmux client operation. Search text starts with the
+sanitized user window name, followed by the snapshot location/title; cwd,
+command, and event state remain secondary metadata. Session/window hierarchy
+rows also carry real render-time pane IDs, so no selectable row is a no-op. See
+the interaction contract in
 [`DESIGN.md`](../../DESIGN.md).
 
 ## Optional AI supervisor

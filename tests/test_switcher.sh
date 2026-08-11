@@ -23,6 +23,7 @@ mkdir -p "$FAKE_BIN" "$TMP/state"
 export TMUX_TMPDIR="$TMP"
 cat > "$FAKE_BIN/fzf" <<'SH'
 #!/usr/bin/env bash
+[ "${1:-}" != --version ] || { printf '0.70.0\n'; exit 0; }
 cat >/dev/null
 : > "$TMUX_RADAR_FZF_CALLED"
 SH
@@ -105,7 +106,7 @@ if [ "$ACTIVE" != "$P_W1" ]; then
 fi
 printf 'PASS: last-pane toggles between the two most recent panes\n'
 
-# --- pane-first list contract -----------------------------------------------
+# --- window-first switcher contract -----------------------------------------
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
   exit 1
@@ -115,15 +116,14 @@ strip_ansi() {
   LC_ALL=C sed $'s/\033\\[[0-9;]*m//g'
 }
 
-assert_pane_rows() { # assert_pane_rows <label> <file>
+assert_live_rows() { # assert_live_rows <label> <file>
   local label="$1" file="$2"
-  [ -s "$file" ] || fail "$label emitted no pane rows"
+  [ -s "$file" ] || fail "$label emitted no rows"
   awk -F '\t' '
     NF != 3 { printf "row %d has %d fields: %s\n", NR, NF, $0 > "/dev/stderr"; bad=1 }
     $1 !~ /^%[0-9]+$/ { printf "row %d has non-pane-id target: %s\n", NR, $1 > "/dev/stderr"; bad=1 }
-    $2 !~ /[^:[:space:]]+:[0-9]+\.[0-9]+/ { printf "row %d hides the visible pane location: %s\n", NR, $2 > "/dev/stderr"; bad=1 }
     END { exit bad }
-  ' "$file" || fail "$label violated the canonical three-field live-pane row contract"
+  ' "$file" || fail "$label violated the three-field live-target row contract"
   while IFS=$'\t' read -r target _; do
     [ "$(tmux -L "$SOCKET" display-message -p -t "$target" '#{pane_id}' 2>/dev/null)" = "$target" ] ||
       fail "$label emitted dead target $target"
@@ -142,73 +142,140 @@ tmux -L "$SOCKET" split-window -d -t beta:0
 # create a fourth field or a physical extra line in the public row protocol.
 tmux -L "$SOCKET" select-pane -t alpha:0.0 -T $'unsafe\ttitle\rcontrol'
 
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree > "$TMP/tree.rows"
+# Tree rests at session/window granularity. Session and window rows still carry
+# a real active-pane target, so Enter never lands on a synthetic/no-op row.
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 0 > "$TMP/tree.rows"
 strip_ansi < "$TMP/tree.rows" > "$TMP/tree.plain"
+assert_live_rows 'collapsed Tree' "$TMP/tree.plain"
 awk -F '\t' '
-  NF != 3 { bad=1 }
-  $1 ~ /^%[0-9]+$/ { panes++; next }
-  $2 ~ /alpha|beta/ { structural++ }
-  END { exit !(bad == 0 && panes == 5 && structural == 5) }
-' "$TMP/tree.plain" || fail 'Tree is not a canonical 2-session/3-window/5-pane hierarchy'
-awk -F '\t' '$1 ~ /^%[0-9]+$/ { print $1 }' "$TMP/tree.plain" > "$TMP/tree-pane.targets"
-tmux -L "$SOCKET" list-panes -a -F '#{pane_id}' > "$TMP/live-pane.targets"
-cmp -s "$TMP/tree-pane.targets" "$TMP/live-pane.targets" ||
-  fail 'Tree pane leaves are not stable pane IDs in canonical server order'
-TREE_STRUCT_TARGET="$(awk -F '\t' '$1 !~ /^%[0-9]+$/ { print $1; exit }' "$TMP/tree.plain")"
-[ -n "$TREE_STRUCT_TARGET" ] || fail 'Tree omitted non-accepting structural session/window rows'
+  $2 ~ /^▾ (alpha|beta)([[:space:]]|$)/ { sessions++ }
+  $2 ~ /^[^[:space:]].*[[:space:]][├└]─ (alpha|beta):[0-9]+/ { windows++ }
+  $2 ~ /:[0-9]+\.[0-9]+/ { panes++ }
+  END { exit !(NR == 5 && sessions == 2 && windows == 3 && panes == 0) }
+' "$TMP/tree.plain" || fail 'Tree does not rest as a canonical 2-session/3-window hierarchy'
+TREE_SESSION_TARGET="$(awk -F '\t' '$2 ~ /^▾ beta([[:space:]]|$)/ { print $1; exit }' "$TMP/tree.plain")"
+[ -n "$TREE_SESSION_TARGET" ] || fail 'Tree omitted the switchable beta session row'
 if LC_ALL=C grep -q $'\r' "$TMP/tree.plain"; then
   fail 'Tree left a carriage return in user-derived display content'
 fi
 
-# `all` is accepted for old callers, but resolves to the Tree product surface.
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list all > "$TMP/all-alias.rows"
-strip_ansi < "$TMP/all-alias.rows" > "$TMP/all-alias.plain"
-cut -f1 "$TMP/tree.plain" > "$TMP/tree.targets"
-cut -f1 "$TMP/all-alias.plain" > "$TMP/all-alias.targets"
-cmp -s "$TMP/tree.targets" "$TMP/all-alias.targets" || fail 'all compatibility alias does not resolve to Tree'
-printf 'PASS: Tree emits canonical structural hierarchy and all is only its compatibility alias\n'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 1 > "$TMP/tree-expanded.rows"
+strip_ansi < "$TMP/tree-expanded.rows" > "$TMP/tree-expanded.plain"
+assert_live_rows 'expanded Tree' "$TMP/tree-expanded.plain"
+awk -F '\t' '
+  $2 ~ /^▾ (alpha|beta)([[:space:]]|$)/ { sessions++ }
+  $2 ~ /^[^[:space:]].*[[:space:]][├└]─ (alpha|beta):[0-9]+/ && $2 !~ /:[0-9]+\.[0-9]+/ { windows++ }
+  $2 ~ /:[0-9]+\.[0-9]+/ { panes++ }
+  END { exit !(NR == 10 && sessions == 2 && windows == 3 && panes == 5) }
+' "$TMP/tree-expanded.plain" || fail 'Ctrl-e expansion model is not a canonical 2-session/3-window/5-pane hierarchy'
 
-# Recent is pane-MRU, not window-MRU: only recorded live pane IDs appear;
-# newest wins, duplicates collapse, and dead IDs are ignored.
+# `all` is accepted for old callers, but resolves to the Tree product surface.
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list all 0 > "$TMP/all-alias.rows"
+strip_ansi < "$TMP/all-alias.rows" > "$TMP/all-alias.plain"
+cmp -s "$TMP/tree.plain" "$TMP/all-alias.plain" || fail 'all compatibility alias does not resolve to Tree'
+printf 'PASS: Tree rests at window level, expands exact panes, and every row is switchable\n'
+
+# A tmux window may be linked into multiple sessions. Tree represents each
+# session/window link once with that link's own coordinate; Recent represents
+# the underlying window once and must not duplicate its pane leaves.
+tmux -L "$SOCKET" link-window -s alpha:1 -t beta:1
+LINKED_PANE="$(tmux -L "$SOCKET" display-message -p -t alpha:1.0 '#{pane_id}')"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 0 > "$TMP/tree-linked.rows"
+strip_ansi < "$TMP/tree-linked.rows" > "$TMP/tree-linked.plain"
+assert_live_rows 'linked-window collapsed Tree' "$TMP/tree-linked.plain"
+[ "$(awk -F '\t' '$2 ~ /^one / { n++ } END { print n+0 }' "$TMP/tree-linked.plain")" -eq 2 ] ||
+  fail 'linked window was not represented once under each session in Tree'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 1 > "$TMP/tree-linked-expanded.rows"
+strip_ansi < "$TMP/tree-linked-expanded.rows" > "$TMP/tree-linked-expanded.plain"
+[ "$(grep -c 'alpha:1\.0' "$TMP/tree-linked-expanded.plain")" -eq 1 ] ||
+  fail 'linked Tree duplicated or lost the alpha link pane coordinate'
+[ "$(grep -c 'beta:1\.0' "$TMP/tree-linked-expanded.plain")" -eq 1 ] ||
+  fail 'linked Tree duplicated or lost the beta link pane coordinate'
+[ "$(awk -F '\t' -v p="$LINKED_PANE" '$1 == p && $2 ~ /^one / { n++ } END { print n+0 }' "$TMP/tree-linked-expanded.plain")" -eq 4 ] ||
+  fail 'linked Tree did not emit two window rows plus two pane leaves for the shared pane'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent 1 > "$TMP/recent-linked.rows"
+strip_ansi < "$TMP/recent-linked.rows" > "$TMP/recent-linked.plain"
+[ "$(wc -l < "$TMP/recent-linked.plain" | tr -d ' ')" -eq 8 ] ||
+  fail 'Recent duplicated a linked window or its pane leaves'
+[ "$(awk -F '\t' -v p="$LINKED_PANE" '$1 == p { n++ } END { print n+0 }' "$TMP/recent-linked.plain")" -eq 2 ] ||
+  fail 'Recent did not keep one window row plus one pane leaf for a linked window'
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$LINKED_PANE" "$(date +%s)" claude linked-window 'Claude is waiting for your input' one \
+  > "$TMP/state/need-input"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/inbox-linked.rows"
+strip_ansi < "$TMP/inbox-linked.rows" > "$TMP/inbox-linked.plain"
+assert_live_rows 'linked-window Inbox' "$TMP/inbox-linked.plain"
+[ "$(awk -F '\t' -v p="$LINKED_PANE" '$1 == p { n++ } END { print n+0 }' "$TMP/inbox-linked.plain")" -eq 1 ] ||
+  fail 'Inbox duplicated one unread event through multiple session links'
+: > "$TMP/state/need-input"
+tmux -L "$SOCKET" unlink-window -t beta:1
+printf 'PASS: linked windows preserve Tree links and stay deduplicated in Recent and Inbox\n'
+
+# The rendered Tree shape must honor the same window-name-first search contract
+# as Recent/Inbox, even when a session has the identical name.
+tmux -L "$SOCKET" new-session -d -s priority-window -n neutral -x 120 -y 40
+tmux -L "$SOCKET" rename-window -t alpha:1 priority-window
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 0 > "$TMP/tree-search-priority.rows"
+tree_search_first="$(
+  "$REAL_FZF" --ansi --filter='priority-window' --delimiter=$'\t' --with-nth=2.. --tiebreak=begin,index \
+    < "$TMP/tree-search-priority.rows" | cut -f1 | head -1
+)"
+[ "$tree_search_first" = "$LINKED_PANE" ] ||
+  fail 'Tree session metadata outranked an identical user window-name match'
+tmux -L "$SOCKET" rename-window -t alpha:1 one
+tmux -L "$SOCKET" kill-session -t priority-window
+printf 'PASS: Tree search ranks an identical window-name match before session metadata\n'
+
+# Recent contains every live window. Window MRU changes order but never changes
+# membership; missing/dead/duplicate history falls back to canonical windows.
 P_ALPHA_0="$(tmux -L "$SOCKET" display-message -p -t alpha:0.0 '#{pane_id}')"
 P_ALPHA_1="$(tmux -L "$SOCKET" display-message -p -t alpha:0.1 '#{pane_id}')"
+P_ALPHA_W1="$(tmux -L "$SOCKET" display-message -p -t alpha:1.0 '#{pane_id}')"
+P_BETA_0="$(tmux -L "$SOCKET" display-message -p -t beta:0.0 '#{pane_id}')"
 P_BETA_1="$(tmux -L "$SOCKET" display-message -p -t beta:0.1 '#{pane_id}')"
-cat > "$TMP/state/pane-mru" <<EOF
-$P_ALPHA_0	1
-%999999	2
-$P_BETA_1	3
-$P_ALPHA_0	4
+W_ALPHA_0="$(tmux -L "$SOCKET" display-message -p -t alpha:0 '#{window_id}')"
+W_ALPHA_1="$(tmux -L "$SOCKET" display-message -p -t alpha:1 '#{window_id}')"
+W_BETA_0="$(tmux -L "$SOCKET" display-message -p -t beta:0 '#{window_id}')"
+cat > "$TMP/state/window-mru" <<EOF
+$W_ALPHA_1	1
+@999999	2
+$W_BETA_0	3
+$W_ALPHA_0	4
 EOF
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent > "$TMP/recent.rows"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent 0 > "$TMP/recent.rows"
 strip_ansi < "$TMP/recent.rows" > "$TMP/recent.plain"
-assert_pane_rows 'Recent' "$TMP/recent.plain"
-recent_first="$(sed -n '1s/\t.*//p' "$TMP/recent.plain")"
-recent_second="$(sed -n '2s/\t.*//p' "$TMP/recent.plain")"
-[ "$recent_first" = "$P_ALPHA_0" ] || fail "Recent did not put newest live pane first (got $recent_first)"
-[ "$recent_second" = "$P_BETA_1" ] || fail "Recent did not preserve the next deduplicated MRU pane (got $recent_second)"
-[ "$(wc -l < "$TMP/recent.plain" | tr -d ' ')" -eq 2 ] || fail 'Recent appended live panes that were not recorded in pane MRU'
+assert_live_rows 'Recent' "$TMP/recent.plain"
+recent_targets="$(cut -f1 "$TMP/recent.plain" | paste -sd ' ' -)"
+[ "$recent_targets" = "$P_ALPHA_0 $P_BETA_0 $P_ALPHA_W1" ] ||
+  fail "Recent is not all windows in MRU-then-canonical order: $recent_targets"
+[ "$(wc -l < "$TMP/recent.plain" | tr -d ' ')" -eq 3 ] || fail 'Recent is not one row per live window'
 
 # Search identity starts with the user-assigned window name. Location, cwd,
 # command, pane title, and AI metadata may follow but cannot outrank it.
 tmux -L "$SOCKET" rename-window -t alpha:0 'user-search-name'
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent > "$TMP/recent-search.rows"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent 0 > "$TMP/recent-search.rows"
 strip_ansi < "$TMP/recent-search.rows" > "$TMP/recent-search.plain"
 awk -F '\t' -v pane="$P_ALPHA_0" '$1 == pane { exit !($2 ~ /^user-search-name([[:space:]\/]|$)/) } END { if (NR == 0) exit 1 }' \
-  "$TMP/recent-search.plain" || fail 'pane search text does not begin with the user window name'
+  "$TMP/recent-search.plain" || fail 'window search text does not begin with the user-assigned name'
 
-: > "$TMP/state/pane-mru"
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent > "$TMP/recent-empty.rows"
-[ ! -s "$TMP/recent-empty.rows" ] || fail 'empty pane MRU emitted Recent rows'
-rm -f "$TMP/state/pane-mru"
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent > "$TMP/recent-missing.rows"
-[ ! -s "$TMP/recent-missing.rows" ] || fail 'missing pane MRU emitted Recent rows'
-printf '%s\t1\n%s\t2\n' "$P_ALPHA_0" "$P_BETA_1" > "$TMP/state/pane-mru"
-printf 'PASS: Recent contains only live recorded panes and window name leads search text\n'
+: > "$TMP/state/window-mru"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent 0 > "$TMP/recent-empty.rows"
+[ "$(wc -l < "$TMP/recent-empty.rows" | tr -d ' ')" -eq 3 ] || fail 'empty window MRU hid live windows'
+rm -f "$TMP/state/window-mru"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent 0 > "$TMP/recent-missing.rows"
+[ "$(wc -l < "$TMP/recent-missing.rows" | tr -d ' ')" -eq 3 ] || fail 'missing window MRU hid live windows'
+printf '%s\t1\n%s\t2\n' "$W_BETA_0" "$W_ALPHA_0" > "$TMP/state/window-mru"
 
-# --- Attention ordering, Kimi detection, and empty state -------------------
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent 1 > "$TMP/recent-expanded.rows"
+strip_ansi < "$TMP/recent-expanded.rows" > "$TMP/recent-expanded.plain"
+assert_live_rows 'expanded Recent' "$TMP/recent-expanded.plain"
+[ "$(wc -l < "$TMP/recent-expanded.plain" | tr -d ' ')" -eq 8 ] || fail 'expanded Recent is not 3 windows plus 5 panes'
+[ "$(awk -F '\t' '$2 ~ /:[0-9]+\.[0-9]+/ { n++ } END { print n+0 }' "$TMP/recent-expanded.plain")" -eq 5 ] ||
+  fail 'expanded Recent did not reveal every pane'
+printf 'PASS: Recent is window-first, complete, MRU-ordered, and pane-expandable\n'
+
+# --- Inbox ordering, noise rejection, and empty state -----------------------
 now="$(date +%s)"
-P_ALPHA_W1="$(tmux -L "$SOCKET" display-message -p -t alpha:1.0 '#{pane_id}')"
-P_BETA_0="$(tmux -L "$SOCKET" display-message -p -t beta:0.0 '#{pane_id}')"
 sleep 300 & ATT_REG_PID=$!
 cat > "$TMP/state/need-input" <<EOF
 $P_BETA_1	$((now - 20))	test	new-action	needs approval
@@ -216,9 +283,12 @@ $P_ALPHA_1	$((now - 20))	test	other-action	needs input
 $P_ALPHA_W1	$((now - 30))	test	done	turn complete
 $P_BETA_0	$((now - 40))	test	notice	informational update
 -	$((now - 5))	claude	background	needs input
+malformed-state-row-without-tabs
+%999999	$((now - 5))	test	dead-pane	needs input
 EOF
-# Every marked pane gets positive PID + argv identity evidence: a mark alone
-# must never make a pane eligible for Attention.
+# Registry/process evidence may enrich a marked row, but never creates an Inbox
+# row by itself. The last two registry rows deliberately model long-lived
+# working/done Claude shells with no unread lifecycle mark.
 {
   printf 'codex\ta:action-1\t%s\t%s\t%s\t%s\twaiting\t/tmp\tsleep\n' \
     "$ATT_REG_PID" "$P_BETA_1" "$((now - 100))" "$((now - 1))"
@@ -228,41 +298,35 @@ EOF
     "$ATT_REG_PID" "$P_ALPHA_W1" "$((now - 100))" "$((now - 1))"
   printf 'codex\ta:notice\t%s\t%s\t%s\t%s\tactive\t/tmp\tsleep\n' \
     "$ATT_REG_PID" "$P_BETA_0" "$((now - 100))" "$((now - 1))"
-  printf 'codex\ta:active\t%s\t%s\t%s\t%s\tactive\t/tmp\tsleep\n' \
+  printf 'claude\ta:unmarked-working\t%s\t%s\t%s\t%s\tworking\t/tmp\tsleep\n' \
+    "$ATT_REG_PID" "$P_ALPHA_0" "$((now - 100))" "$((now - 1))"
+  printf 'claude\ta:unmarked-done\t%s\t%s\t%s\t%s\tdone\t/tmp\tsleep\n' \
     "$ATT_REG_PID" "$P_ALPHA_0" "$((now - 100))" "$((now - 1))"
 } > "$TMP/state/agent-registry"
 
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention.rows"
-strip_ansi < "$TMP/attention.rows" > "$TMP/attention.plain"
-assert_pane_rows 'Attention' "$TMP/attention.plain"
-attention_targets="$(cut -f1 "$TMP/attention.plain" | paste -sd ' ' -)"
-[ "$attention_targets" = "$P_ALPHA_1 $P_BETA_1 $P_ALPHA_W1 $P_BETA_0 $P_ALPHA_0" ] ||
-  fail "Attention ordering is not ACTION/DONE/NOTICE/ACTIVE with canonical tie breaks: $attention_targets"
-grep -q $'ACTION\|DONE\|NOTICE\|ACTIVE' "$TMP/attention.plain" ||
-  fail 'Attention display does not lead with semantic state'
-if grep -q '__bg__\|background session\|not a tmux pane' "$TMP/attention.plain"; then
-  fail 'Attention exposed a paneless/background mark as a selectable row'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/inbox.rows"
+strip_ansi < "$TMP/inbox.rows" > "$TMP/inbox.plain"
+assert_live_rows 'Inbox' "$TMP/inbox.plain"
+inbox_targets="$(cut -f1 "$TMP/inbox.plain" | paste -sd ' ' -)"
+[ "$inbox_targets" = "$P_ALPHA_1 $P_BETA_1 $P_ALPHA_W1 $P_BETA_0" ] ||
+  fail "Inbox is not marked ACTION/DONE/NOTICE only: $inbox_targets"
+if ! grep -q 'ACTION' "$TMP/inbox.plain" ||
+   ! grep -q 'DONE' "$TMP/inbox.plain" ||
+   ! grep -q 'NOTICE' "$TMP/inbox.plain"; then
+  fail 'Inbox lost semantic ACTION/DONE/NOTICE labels'
 fi
+if grep -q 'ACTIVE\|__bg__\|background session\|not a tmux pane' "$TMP/inbox.plain"; then
+  fail 'Inbox exposed an unmarked ACTIVE or paneless/background row'
+fi
+grep -q 'malformed-state-row\|dead-pane' "$TMP/inbox.plain" &&
+  fail 'Inbox exposed malformed or dead-target mark input'
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list needinput > "$TMP/needinput-alias.rows"
-cut -f1 "$TMP/attention.rows" > "$TMP/attention.targets"
+cut -f1 "$TMP/inbox.rows" > "$TMP/inbox.targets"
 cut -f1 "$TMP/needinput-alias.rows" > "$TMP/needinput-alias.targets"
-cmp -s "$TMP/attention.targets" "$TMP/needinput-alias.targets" || fail 'legacy needinput alias does not resolve to Attention'
-printf 'PASS: Attention ordering, paneless omission, and legacy alias are stable\n'
+cmp -s "$TMP/inbox.targets" "$TMP/needinput-alias.targets" || fail 'legacy needinput alias does not resolve to Inbox'
+printf 'PASS: Inbox contains unread pane events and rejects unmarked AI shells\n'
 
-# Registry rows are evidence only when their process identity is current.
-printf '%s\t%s\ttest\ts:pid-zero\tneeds input\t\n' \
-  "$P_ALPHA_1" "$((now - 10))" > "$TMP/state/need-input"
-printf 'codex\ts:pid-zero\t0\t%s\t%s\t%s\twaiting\t/tmp\tcodex\n' \
-  "$P_ALPHA_1" "$((now - 100))" "$((now - 1))" > "$TMP/state/agent-registry"
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention-pid-zero.rows"
-[ ! -s "$TMP/attention-pid-zero.rows" ] || fail 'unresolved PID-0 registry row created false Attention liveness'
-printf 'codex\ts:pid-reuse\t%s\t%s\t%s\t%s\twaiting\t/tmp\tcodex\n' \
-  "$ATT_REG_PID" "$P_ALPHA_1" "$((now - 100))" "$((now - 1))" > "$TMP/state/agent-registry"
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention-pid-reuse.rows"
-[ ! -s "$TMP/attention-pid-reuse.rows" ] || fail 'PID reuse with mismatched argv created false Attention liveness'
-printf 'PASS: Attention rejects unresolved and argv-mismatched registry liveness\n'
-
-# Attention mark fields are user-controlled. Strip CR/ESC/control bytes from
+# Inbox mark fields are user-controlled. Strip CR/ESC/control bytes from
 # source, label, saved title, and session keys while retaining renderer-owned
 # ANSI badges.
 printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -276,25 +340,24 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
     $'co\033dex' $'s:reg\rkey\033X' "$ATT_REG_PID" "$P_ALPHA_0" "$((now - 100))" "$((now - 1))" \
     $'active\rstate\033X' '/tmp' 'sleep'
 } > "$TMP/state/agent-registry"
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention-controls.rows"
-grep -q $'\033\[' "$TMP/attention-controls.rows" || fail 'Attention sanitization removed renderer-owned ANSI'
-strip_ansi < "$TMP/attention-controls.rows" > "$TMP/attention-controls.plain"
-assert_pane_rows 'Attention control fixture' "$TMP/attention-controls.plain"
-if LC_ALL=C grep -q $'\r\|\033' "$TMP/attention-controls.plain"; then
-  fail 'Attention leaked CR/ESC from mark source, label, or saved title'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/inbox-controls.rows"
+grep -q $'\033\[' "$TMP/inbox-controls.rows" || fail 'Inbox sanitization removed renderer-owned ANSI'
+strip_ansi < "$TMP/inbox-controls.rows" > "$TMP/inbox-controls.plain"
+assert_live_rows 'Inbox control fixture' "$TMP/inbox-controls.plain"
+if LC_ALL=C grep -q $'\r\|\033' "$TMP/inbox-controls.plain"; then
+  fail 'Inbox leaked CR/ESC from mark source, label, or saved title'
 fi
-grep -q 'hook source' "$TMP/attention-controls.plain" || fail 'Attention lost sanitized source text'
-grep -q 'your turn' "$TMP/attention-controls.plain" || fail 'Attention lost sanitized label text'
-grep -q 'saved title' "$TMP/attention-controls.plain" || fail 'Attention lost sanitized saved-title text'
-grep -q 'co dex' "$TMP/attention-controls.plain" || fail 'Attention lost sanitized registry kind'
-grep -q 'active state X' "$TMP/attention-controls.plain" || fail 'Attention lost sanitized registry state'
-grep -q 'DONE' "$TMP/attention-controls.plain" || fail 'Attention classified sanitized completion label incorrectly'
+grep -q 'hook source' "$TMP/inbox-controls.plain" || fail 'Inbox lost sanitized source text'
+grep -q 'your turn' "$TMP/inbox-controls.plain" || fail 'Inbox lost sanitized label text'
+grep -q 'saved title' "$TMP/inbox-controls.plain" || fail 'Inbox lost sanitized saved-title text'
+grep -q 'DONE' "$TMP/inbox-controls.plain" || fail 'Inbox classified sanitized completion label incorrectly'
+[ "$(wc -l < "$TMP/inbox-controls.plain" | tr -d ' ')" -eq 1 ] || fail 'unmarked registry metadata created an Inbox row'
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" preview "$P_ALPHA_1" > "$TMP/preview-controls.out"
 strip_ansi < "$TMP/preview-controls.out" > "$TMP/preview-controls.plain"
 if LC_ALL=C grep -q $'\r\|\033' "$TMP/preview-controls.plain"; then
-  fail 'preview leaked CR/ESC from Attention metadata'
+  fail 'preview leaked CR/ESC from Inbox metadata'
 fi
-grep -q '^✓' "$TMP/preview-controls.plain" || fail 'preview semantics diverged from sanitized Attention completion label'
+grep -q '^✓' "$TMP/preview-controls.plain" || fail 'preview semantics diverged from sanitized Inbox completion label'
 grep -q 'sid mark key' "$TMP/preview-controls.plain" || fail 'preview lost the sanitized mark session key'
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" preview "$P_ALPHA_0" > "$TMP/preview-registry-controls.out"
 strip_ansi < "$TMP/preview-registry-controls.out" > "$TMP/preview-registry-controls.plain"
@@ -302,7 +365,7 @@ if LC_ALL=C grep -q $'\r\|\033' "$TMP/preview-registry-controls.plain"; then
   fail 'preview leaked CR/ESC from the registry session key'
 fi
 grep -q 'sid reg key ' "$TMP/preview-registry-controls.plain" || fail 'preview lost the sanitized registry session key'
-printf 'PASS: Attention and preview sanitize user control bytes while retaining renderer ANSI\n'
+printf 'PASS: Inbox and preview sanitize control bytes without promoting registry-only rows\n'
 
 # The public notifier API must keep its persisted TSV safe, not merely rely on
 # the switcher renderer to repair unsafe hook data on read.
@@ -331,19 +394,20 @@ IFS=$'\t' read -r _mark_pane _mark_epoch mark_source mark_key mark_label mark_ti
 [ "$mark_key" = 's:mark key Z' ] || fail "public mark API normalized key incorrectly: $mark_key"
 [ "$mark_label" = 'your turn Y' ] || fail "public mark API normalized label incorrectly: $mark_label"
 [ "$mark_title" = 'saved title control X' ] || fail "public mark API normalized saved title incorrectly: $mark_title"
-printf 'codex\t%s\t%s\t%s\t%s\t%s\tdone\t/tmp\tsleep\n' \
-  "$mark_key" "$ATT_REG_PID" "$P_ALPHA_1" "$((now - 100))" "$((now - 1))" > "$TMP/state/agent-registry"
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/public-mark.rows"
+# DONE remains reviewable after the agent process/registry row exits; the unread
+# pane-backed mark and live pane are sufficient until focus handles it.
+: > "$TMP/state/agent-registry"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/public-mark.rows"
 strip_ansi < "$TMP/public-mark.rows" > "$TMP/public-mark.plain"
-assert_pane_rows 'public mark Attention fixture' "$TMP/public-mark.plain"
-grep -q 'DONE' "$TMP/public-mark.plain" || fail 'public mark API normalization changed Attention semantics'
+assert_live_rows 'public mark Inbox fixture' "$TMP/public-mark.plain"
+grep -q 'DONE' "$TMP/public-mark.plain" || fail 'public mark API normalization changed Inbox semantics'
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" preview "$P_ALPHA_1" > "$TMP/public-mark-preview.out"
 strip_ansi < "$TMP/public-mark-preview.out" > "$TMP/public-mark-preview.plain"
 if { cat "$TMP/public-mark.plain" "$TMP/public-mark-preview.plain" | LC_ALL=C tr -d '\t\n' | LC_ALL=C grep -q '[[:cntrl:]]'; }; then
-  fail 'public mark API leaked unsafe controls into Attention or preview'
+  fail 'public mark API leaked unsafe controls into Inbox or preview'
 fi
 grep -q 'sid mark key' "$TMP/public-mark-preview.plain" || fail 'preview lost the normalized public mark session key'
-printf 'PASS: public mark API persists normalized six-field Attention metadata\n'
+printf 'PASS: public DONE marks survive agent exit with safe six-field metadata\n'
 
 # Equal-severity/equal-epoch marks retain canonical tmux server order. Create a
 # lexically earlier session after the existing panes so pane-id creation order
@@ -360,62 +424,189 @@ EOF
   printf 'codex\ta:tie-b\t%s\t%s\t%s\t%s\twaiting\t/tmp\tsleep\n' \
     "$ATT_REG_PID" "$P_BETA_1" "$((now - 100))" "$((now - 1))"
 } > "$TMP/state/agent-registry"
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention-ties.rows"
-tie_targets="$(cut -f1 "$TMP/attention-ties.rows" | paste -sd ' ' -)"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/inbox-ties.rows"
+tie_targets="$(cut -f1 "$TMP/inbox-ties.rows" | paste -sd ' ' -)"
 [ "$tie_targets" = "$P_AARDVARK_0 $P_BETA_1" ] ||
-  fail "equal-epoch Attention ties did not preserve canonical server order: $tie_targets"
+  fail "equal-epoch Inbox ties did not preserve canonical server order: $tie_targets"
 tmux -L "$SOCKET" kill-session -t aardvark
-printf 'PASS: equal-epoch Attention ties preserve canonical server order\n'
+printf 'PASS: equal-epoch Inbox ties preserve canonical server order\n'
 
-# Default command detection includes Kimi without requiring a configuration
-# override. Use a real pane process so this exercises the detector, not registry.
+# A real Kimi process and a live working registry row are still not unread
+# events. Process detection belongs to GC/doctor, not to Inbox membership.
 ln -sf /bin/sleep "$FAKE_BIN/kimi"
 tmux -L "$SOCKET" respawn-pane -k -t beta:0.0 "$FAKE_BIN/kimi 120"
 : > "$TMP/state/need-input"
-: > "$TMP/state/agent-registry"
+printf 'kimi\ts:kimi-working\t0\t%s\t%s\t%s\tworking\t/tmp\tkimi\n' \
+  "$P_BETA_0" "$((now - 100))" "$((now - 1))" > "$TMP/state/agent-registry"
 sleep 0.1
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/kimi.rows"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/kimi.rows"
 strip_ansi < "$TMP/kimi.rows" > "$TMP/kimi.plain"
-grep -qi 'kimi' "$TMP/kimi.plain" || fail 'default Attention command set did not detect a live Kimi pane'
-printf 'PASS: default Attention detection includes Kimi\n'
+[ ! -s "$TMP/kimi.plain" ] || fail 'process-only Kimi session polluted Inbox'
+printf 'PASS: live unmarked AI processes remain outside Inbox\n'
 
-# Empty Attention has no synthetic selectable row; the menu carries the
-# explanatory 0/0 state in its persistent header.
+# Empty Inbox has no synthetic row and explains unread-event semantics.
 : > "$TMP/state/need-input"
 : > "$TMP/state/agent-registry"
 tmux -L "$SOCKET" respawn-pane -k -t beta:0.0 'sleep 120'
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/empty-attention.rows"
-[ ! -s "$TMP/empty-attention.rows" ] || fail 'empty Attention emitted a selectable or synthetic row'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/empty-inbox.rows"
+[ ! -s "$TMP/empty-inbox.rows" ] || fail 'empty Inbox emitted a selectable or synthetic row'
 
 cat > "$FAKE_BIN/fzf" <<'SH'
 #!/usr/bin/env bash
+[ "${1:-}" != --version ] || { printf '0.70.0\n'; exit 0; }
 printf '%s\n' "$@" > "$TMUX_RADAR_FZF_ARGS"
 cat > "$TMUX_RADAR_FZF_INPUT"
 SH
 chmod +x "$FAKE_BIN/fzf"
 export TMUX_RADAR_FZF_ARGS="$TMP/fzf.args"
 export TMUX_RADAR_FZF_INPUT="$TMP/fzf.input"
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu attention >/dev/null 2>"$TMP/menu-attention.err" ||
-  fail 'menu attention failed while rendering its empty state'
-grep -qi 'attention' "$TMP/fzf.args" || fail 'menu attention did not open Attention as the initial scope'
-grep -Eq '0/0|no detected AI pane' "$TMP/fzf.args" || fail 'empty Attention menu omitted its persistent 0/0 explanation'
-[ ! -s "$TMP/fzf.input" ] || fail 'empty Attention menu passed a synthetic row to fzf'
-printf 'PASS: menu attention opens directly with a nonselectable empty explanation\n'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu inbox >/dev/null 2>"$TMP/menu-inbox.err" ||
+  fail 'menu inbox failed while rendering its empty state'
+grep -q 'Inbox>' "$TMP/fzf.args" || fail 'menu inbox did not open with the Inbox prompt'
+grep -Eqi 'Inbox clear|no unread AI event' "$TMP/fzf.args" || fail 'empty Inbox omitted its unread-event explanation'
+[ ! -s "$TMP/fzf.input" ] || fail 'empty Inbox passed a synthetic row to fzf'
+printf 'PASS: menu Inbox opens directly with a truthful nonselectable empty state\n'
+
+mkdir -p "$TMP/old-fzf-bin"
+cat > "$TMP/old-fzf-bin/fzf" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then printf '0.58.0\n'; exit 0; fi
+: > "$TMUX_RADAR_OLD_FZF_OPENED"
+SH
+chmod +x "$TMP/old-fzf-bin/fzf"
+export TMUX_RADAR_OLD_FZF_OPENED="$TMP/old-fzf-opened"
+set +e
+PATH="$TMP/old-fzf-bin:$PATH" bash "$SWITCHER" menu recent >"$TMP/old-fzf.out" 2>"$TMP/old-fzf.err"
+old_fzf_rc=$?
+set -e
+[ "$old_fzf_rc" -ne 0 ] || fail 'unsupported fzf version opened the picker'
+[ ! -e "$TMUX_RADAR_OLD_FZF_OPENED" ] || fail 'unsupported fzf version reached interactive mode'
+grep -q 'fzf 0.59 or newer is required' "$TMP/old-fzf.err" ||
+  fail 'unsupported fzf version omitted the upgrade diagnostic'
+
+mkdir -p "$TMP/min-fzf-bin"
+cat > "$TMP/min-fzf-bin/fzf" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then printf '0.59.0\n'; exit 0; fi
+: > "$TMUX_RADAR_MIN_FZF_OPENED"
+cat >/dev/null
+SH
+chmod +x "$TMP/min-fzf-bin/fzf"
+export TMUX_RADAR_MIN_FZF_OPENED="$TMP/min-fzf-opened"
+PATH="$TMP/min-fzf-bin:$PATH" bash "$SWITCHER" menu recent >/dev/null 2>"$TMP/min-fzf.err" ||
+  fail 'minimum supported fzf version failed to open the picker'
+[ -e "$TMUX_RADAR_MIN_FZF_OPENED" ] || fail 'fzf 0.59 did not reach interactive mode'
+printf 'PASS: unsupported fzf versions fail before interactive mode\n'
 
 grep -Eq -- '--tiebreak(=|$).*begin,index|--tiebreak=begin,index' "$TMP/fzf.args" ||
   fail 'fzf does not tie-break relevance by beginning position then input order'
 ! grep -qx -- '--nth=2..' "$TMP/fzf.args" ||
   fail 'fzf excludes the window-name search field after applying with-nth'
 grep -q 'C-t Tree' "$TMP/fzf.args" || fail 'picker header does not advertise C-t Tree'
+grep -q 'C-i Inbox' "$TMP/fzf.args" || fail 'picker header does not advertise C-i Inbox'
+grep -q 'C-e panes' "$TMP/fzf.args" || fail 'picker header does not advertise C-e pane drill-down'
+grep -q 'A-1..9' "$TMP/fzf.args" || fail 'picker header does not advertise direct row jumps'
 grep -Eq 'ctrl-t:transform\([^)]*set-view tree\)' "$TMP/fzf.args" ||
   fail 'C-t does not switch to the Tree view'
+grep -Eq 'ctrl-e:transform\([^)]*toggle-expand' "$TMP/fzf.args" ||
+  fail 'C-e does not toggle pane drill-down'
+grep -Eq 'alt-1:transform\([^)]*jump 1\)' "$TMP/fzf.args" || fail 'Alt-1 safe row jump is not bound'
+grep -Eq 'alt-9:transform\([^)]*jump 9\)' "$TMP/fzf.args" || fail 'Alt-9 safe row jump is not bound'
+in_range_jump="$(FZF_MATCH_COUNT=2 bash "$SWITCHER" jump 2)"
+[ "$in_range_jump" = 'pos(2)+accept' ] || fail "in-range Alt-N action is unsafe: $in_range_jump"
+out_of_range_jump="$(FZF_MATCH_COUNT=2 bash "$SWITCHER" jump 9)"
+[ "$out_of_range_jump" = 'bell' ] || fail "out-of-range Alt-N action accepted or moved: $out_of_range_jump"
 search_order="$(
   printf '%%1\tpriority-window alpha:0.0/title\t/tmp · zsh\n%%2\tother-window alpha:0.1/title\t/tmp/priority-window · zsh\n' |
     "$REAL_FZF" --filter='priority-window' --delimiter=$'\t' --with-nth=2.. --tiebreak=begin,index |
     cut -f1 | paste -sd ' ' -
 )"
 [ "$search_order" = '%1 %2' ] || fail "window-name match did not outrank metadata-only match: $search_order"
-printf 'PASS: picker binds C-t to Tree and ranks beginning matches before input-order ties\n'
+printf 'PASS: picker exposes the restored controls and ranks window names first\n'
+
+# Exercise the real fzf transform protocol through a real tmux key event. fzf
+# ignores unterminated output and rejects a transform containing an unknown
+# action even when the state/row producer itself ran successfully.
+REAL_FZF_BIN="$TMP/real-fzf-bin"
+mkdir -p "$REAL_FZF_BIN" "$TMP/keyboard-state"
+ln -sf "$REAL_FZF" "$REAL_FZF_BIN/fzf"
+tmux -L "$SOCKET" select-pane -t "$P_ALPHA_1" -T 'keyboard-pane-leaf'
+tmux -L "$SOCKET" new-window -d -t alpha: -n ct-keyboard
+KEYBOARD_TARGET='alpha:ct-keyboard.0'
+KEYBOARD_PATH="$REAL_FZF_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" -l -- \
+  "PATH='$KEYBOARD_PATH' TMUX_RADAR_STATE_DIR='$TMP/keyboard-state' bash '$SWITCHER' menu"
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" Enter
+for _ in $(seq 1 50); do
+  tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-before"
+  grep -q '^Recent>' "$TMP/keyboard-before" && break
+  sleep 0.1
+done
+grep -q '^Recent>' "$TMP/keyboard-before" || fail 'real picker did not reach its initial Recent prompt'
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-t
+for _ in $(seq 1 50); do
+  tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-after"
+  grep -q '^Tree>' "$TMP/keyboard-after" && break
+  sleep 0.1
+done
+grep -q '^Tree>' "$TMP/keyboard-after" || fail 'real Ctrl-t key event did not change the picker to Tree'
+grep -q 'alpha:0\.1' "$TMP/keyboard-after" && fail 'collapsed Tree exposed pane rows before Ctrl-e'
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-e
+for _ in $(seq 1 50); do
+  tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-expanded"
+  grep -q '^Tree+>' "$TMP/keyboard-expanded" && grep -q 'alpha:0\.1' "$TMP/keyboard-expanded" && break
+  sleep 0.1
+done
+grep -q '^Tree+>' "$TMP/keyboard-expanded" || fail 'real Ctrl-e key event did not enter expanded Tree state'
+grep -q 'alpha:0\.1' "$TMP/keyboard-expanded" || fail 'real Ctrl-e key event did not reveal pane rows'
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-i
+for _ in $(seq 1 50); do
+  tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-inbox"
+  grep -q '^Inbox>' "$TMP/keyboard-inbox" && break
+  sleep 0.1
+done
+grep -q '^Inbox>' "$TMP/keyboard-inbox" || fail 'real Ctrl-i key event did not change the picker to Inbox'
+grep -q 'Inbox clear.*no unread AI event' "$TMP/keyboard-inbox" ||
+  fail 'switching into an empty Inbox did not publish its truthful empty state'
+# Inbox is already pane-level. Ctrl-e is a no-op here and must not mutate the
+# remembered Tree expansion state behind the current view.
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-e
+sleep 0.2
+tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-inbox-after-expand"
+grep -q '^Inbox>' "$TMP/keyboard-inbox-after-expand" || fail 'Ctrl-e escaped or reloaded the pane-level Inbox'
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-t
+for _ in $(seq 1 50); do
+  tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-tree-restored"
+  grep -q '^Tree+>' "$TMP/keyboard-tree-restored" && break
+  sleep 0.1
+done
+grep -q '^Tree+>' "$TMP/keyboard-tree-restored" || fail 'Ctrl-e inside Inbox mutated the remembered Tree expansion'
+grep -q 'Inbox clear.*no unread AI event' "$TMP/keyboard-tree-restored" &&
+  fail 'leaving Inbox retained a stale empty-state header'
+# Collapse back to the six structural results. fzf must not clamp Alt-9 to the
+# last visible row and accept it.
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-e
+for _ in $(seq 1 50); do
+  tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-tree-collapsed"
+  grep -q '^Tree>' "$TMP/keyboard-tree-collapsed" && break
+  sleep 0.1
+done
+grep -q '^Tree>' "$TMP/keyboard-tree-collapsed" || fail 'real Ctrl-e did not collapse Tree before numeric jump'
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" M-9
+sleep 0.2
+tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-alt9"
+grep -q '^Tree>' "$TMP/keyboard-alt9" || fail 'out-of-range Alt-9 exited the real picker'
+# Filtering to one result must keep the same safe behavior.
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" -l -- 'ct-keyboard'
+sleep 0.2
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" M-9
+sleep 0.2
+tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-alt9-filtered"
+grep -q '^Tree>' "$TMP/keyboard-alt9-filtered" || fail 'filtered out-of-range Alt-9 exited the real picker'
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-u
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" Escape
+tmux -L "$SOCKET" kill-window -t alpha:ct-keyboard
+printf 'PASS: real view keys, Inbox no-op expansion, and safe Alt-N transforms work\n'
 
 # Cleanup must complete before fzf sees its first row, even when Recent/Tree is
 # the initial view. A deliberately slow ps snapshot makes the old background
@@ -431,6 +622,7 @@ SH
 chmod +x "$FAKE_BIN/slow-ps"
 cat > "$FAKE_BIN/fzf" <<'SH'
 #!/usr/bin/env bash
+[ "${1:-}" != --version ] || { printf '0.70.0\n'; exit 0; }
 if grep -q 's:first-render' "$TMUX_RADAR_STATE_DIR/need-input" 2>/dev/null; then
   : > "$TMUX_RADAR_FIRST_RENDER_STALE"
 fi
@@ -452,6 +644,7 @@ mkdir -p "$TMP/state/.need-input.lock"
 printf '%s' "$TICK_HOLDER_PID" > "$TMP/state/.need-input.lock/pid"
 cat > "$FAKE_BIN/fzf" <<'SH'
 #!/usr/bin/env bash
+[ "${1:-}" != --version ] || { printf '0.70.0\n'; exit 0; }
 : > "$TMUX_RADAR_FZF_CALLED"
 cat >/dev/null
 SH
@@ -480,6 +673,11 @@ printf 'PASS: cleanup failures abort initial and reload rendering\n'
 export TMUX_RADAR_TEST_TMUX_LOG="$TMP/tmux.log"
 cat > "$FAKE_BIN/tmux" <<'SH'
 #!/usr/bin/env bash
+if [ "${TMUX_RADAR_TEST_COUNT_LIST_CALLS:-0}" = 1 ]; then
+  case "${1:-}" in
+    list-panes|list-windows) printf '%s\n' "$*" >> "$TMUX_RADAR_TEST_LIST_CALLS" ;;
+  esac
+fi
 if [ "${1:-}" = list-panes ] && [ "${TMUX_RADAR_TEST_FAIL_RELOAD:-0}" = 1 ]; then
   count="$(cat "$TMUX_RADAR_TEST_LIST_COUNT" 2>/dev/null || printf 0)"
   count=$((count + 1))
@@ -515,6 +713,7 @@ SH
 chmod +x "$FAKE_BIN/tmux"
 cat > "$FAKE_BIN/fzf" <<'SH'
 #!/usr/bin/env bash
+[ "${1:-}" != --version ] || { printf '0.70.0\n'; exit 0; }
 input="$(cat)"
 [ -n "${TMUX_RADAR_TEST_FZF_MARKER:-}" ] && : > "$TMUX_RADAR_TEST_FZF_MARKER"
 if [ -n "${TMUX_RADAR_TEST_FZF_EXIT:-}" ]; then
@@ -531,6 +730,9 @@ if [ "${TMUX_RADAR_TEST_CLOSE_BEFORE_SELECT:-0}" = 1 ]; then
   fi
   printf '%s\t%s\n' "$old_coord" "$replacement" > "$TMUX_RADAR_TEST_REUSE_PROOF"
 fi
+if [ "${TMUX_RADAR_TEST_CHANGE_ACTIVE_BEFORE_SELECT:-0}" = 1 ]; then
+  "$REAL_TMUX" select-pane -t "$TMUX_RADAR_TEST_CHANGE_ACTIVE_TARGET" >/dev/null 2>&1 || exit 44
+fi
 printf '%s\n' "$row"
 SH
 chmod +x "$FAKE_BIN/fzf"
@@ -539,7 +741,7 @@ chmod +x "$FAKE_BIN/fzf"
 # sanitized, and fzf is never invoked on a failed initial list.
 export TMUX_RADAR_TEST_FZF_MARKER="$TMP/fzf-invoked"
 export TMUX_RADAR_TEST_FAIL_LIST=1
-for view in tree all recent attention; do
+for view in tree all recent inbox attention; do
   set +e
   PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list "$view" >"$TMP/list-$view.out" 2>"$TMP/list-$view.err"
   list_rc=$?
@@ -569,8 +771,9 @@ export TMUX_RADAR_TEST_SWITCHER="$SWITCHER"
 rm -f "$TMUX_RADAR_TEST_LIST_COUNT"
 cat > "$FAKE_BIN/fzf" <<'SH'
 #!/usr/bin/env bash
+[ "${1:-}" != --version ] || { printf '0.70.0\n'; exit 0; }
 cat >/dev/null
-action="$(bash "$TMUX_RADAR_TEST_SWITCHER" set-view attention)"
+action="$(bash "$TMUX_RADAR_TEST_SWITCHER" set-view inbox)"
 [ "$action" = abort ] && exit 130
 printf 'unexpected transform action: %s\n' "$action" >&2
 exit 2
@@ -591,6 +794,7 @@ printf 'PASS: scope reload producer failures abort the menu explicitly\n'
 # Restore the selection-capable fake picker for the remaining menu scenarios.
 cat > "$FAKE_BIN/fzf" <<'SH'
 #!/usr/bin/env bash
+[ "${1:-}" != --version ] || { printf '0.70.0\n'; exit 0; }
 input="$(cat)"
 [ -n "${TMUX_RADAR_TEST_FZF_MARKER:-}" ] && : > "$TMUX_RADAR_TEST_FZF_MARKER"
 if [ -n "${TMUX_RADAR_TEST_FZF_EXIT:-}" ]; then
@@ -606,6 +810,9 @@ if [ "${TMUX_RADAR_TEST_CLOSE_BEFORE_SELECT:-0}" = 1 ]; then
     replacement="$("$REAL_TMUX" split-window -d -P -F '#{pane_id}' -t "${old_coord%.*}")"
   fi
   printf '%s\t%s\n' "$old_coord" "$replacement" > "$TMUX_RADAR_TEST_REUSE_PROOF"
+fi
+if [ "${TMUX_RADAR_TEST_CHANGE_ACTIVE_BEFORE_SELECT:-0}" = 1 ]; then
+  "$REAL_TMUX" select-pane -t "$TMUX_RADAR_TEST_CHANGE_ACTIVE_TARGET" >/dev/null 2>&1 || exit 44
 fi
 printf '%s\n' "$row"
 SH
@@ -636,19 +843,37 @@ cmp -s "$TMP/fzf.mru.before" "$TMP/state/pane-mru" || fail 'fzf exit 2 mutated M
 unset TMUX_RADAR_TEST_FZF_EXIT
 printf 'PASS: only fzf cancel/no-match exits are successful\n'
 
-# Structural Tree rows are context only: even a picker implementation that
-# returns one defensively must not switch, mutate MRU, or report an error.
-export TMUX_RADAR_TEST_SELECT="$TREE_STRUCT_TARGET"
+# Session rows provide hierarchy and remain useful destinations: selecting one
+# switches atomically to its active pane and records that exact pane in MRU.
+export TMUX_RADAR_TEST_SELECT="$TREE_SESSION_TARGET"
 : > "$TMUX_RADAR_TEST_TMUX_LOG"
-cp "$TMP/state/pane-mru" "$TMP/tree-struct.mru.before" 2>/dev/null || : > "$TMP/tree-struct.mru.before"
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu tree >"$TMP/tree-struct.out" 2>"$TMP/tree-struct.err" ||
-  fail 'selecting a structural Tree row was not a clean no-op'
-! [ -s "$TMUX_RADAR_TEST_TMUX_LOG" ] || fail 'structural Tree row attempted a tmux switch'
-cmp -s "$TMP/tree-struct.mru.before" "$TMP/state/pane-mru" || fail 'structural Tree row mutated pane MRU'
-printf 'PASS: structural Tree rows are non-accepting\n'
+  fail 'selecting a Tree session row returned failure'
+[ "$(cat "$TMUX_RADAR_TEST_TMUX_LOG")" = "switch-client -t $TREE_SESSION_TARGET" ] ||
+  fail 'Tree session row was not one exact pane switch'
+[ "$(tail -1 "$TMP/state/pane-mru" | cut -f1)" = "$TREE_SESSION_TARGET" ] ||
+  fail 'Tree session row did not record its exact active pane'
+printf 'PASS: Tree session rows are hierarchy plus real pane destinations\n'
+
+# Window/session rows are pane snapshots, not late-bound coordinates. Change
+# the active pane after fzf receives the rendered row; the accepted target must
+# remain the original stable pane ID carried by that row.
+tmux -L "$SOCKET" select-pane -t "$P_ALPHA_0"
+WINDOW_SNAPSHOT_TARGET="$P_ALPHA_0"
+export TMUX_RADAR_TEST_SELECT="$WINDOW_SNAPSHOT_TARGET"
+export TMUX_RADAR_TEST_CHANGE_ACTIVE_BEFORE_SELECT=1
+export TMUX_RADAR_TEST_CHANGE_ACTIVE_TARGET="$P_ALPHA_1"
+: > "$TMUX_RADAR_TEST_TMUX_LOG"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu tree >"$TMP/window-snapshot.out" 2>"$TMP/window-snapshot.err" ||
+  fail 'render-time window target failed after its active pane changed'
+[ "$(cat "$TMUX_RADAR_TEST_TMUX_LOG")" = "switch-client -t $WINDOW_SNAPSHOT_TARGET" ] ||
+  fail 'window row redirected to a later active pane instead of its rendered target'
+unset TMUX_RADAR_TEST_CHANGE_ACTIVE_BEFORE_SELECT TMUX_RADAR_TEST_CHANGE_ACTIVE_TARGET
+printf 'PASS: window rows keep their render-time stable pane target\n'
 
 export TMUX_RADAR_TEST_SELECT="$P_ALPHA_1"
 unset TMUX_RADAR_TEST_CLOSE_BEFORE_SELECT TMUX_RADAR_TEST_FAIL_SWITCH
+tmux -L "$SOCKET" set-option -g @radar-expand-panes on
 : > "$TMUX_RADAR_TEST_TMUX_LOG"
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu all >"$TMP/exact.out" 2>"$TMP/exact.err" ||
   fail 'selecting an exact All pane returned failure'
@@ -704,24 +929,31 @@ printf 'PASS: injected switch failure is explicit, nonzero, and non-partial\n'
 
 # --- larger fixture: stable complete pane scan ------------------------------
 unset TMUX_RADAR_TEST_FAIL_SWITCH TMUX_RADAR_TEST_SELECT
-tmux -L "$SOCKET" new-session -d -s scale -n w0 -x 200 -y 60
-for win in 0 1 2; do
+tmux -L "$SOCKET" new-session -d -s scale -n w0 -x 240 -y 80
+for win in $(seq 0 9); do
   if [ "$win" -gt 0 ]; then tmux -L "$SOCKET" new-window -d -t "scale:$win" -n "w$win"; fi
   # Give each added pane a fixed one-column slice so repeated splits do not
-  # exhaust tmux's minimum size before reaching the 30-pane scale fixture.
+  # exhaust tmux's minimum size before reaching the 100-pane scale fixture.
   for _ in $(seq 1 9); do tmux -L "$SOCKET" split-window -d -h -l 1 -t "scale:$win"; done
 done
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list all > "$TMP/large.rows"
+: > "$TMP/tmux-list-calls"
+export TMUX_RADAR_TEST_LIST_CALLS="$TMP/tmux-list-calls"
+export TMUX_RADAR_TEST_COUNT_LIST_CALLS=1
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list all 1 > "$TMP/large.rows"
+unset TMUX_RADAR_TEST_COUNT_LIST_CALLS
 strip_ansi < "$TMP/large.rows" > "$TMP/large.plain"
-awk -F '\t' '$1 ~ /^%[0-9]+$/ { print }' "$TMP/large.plain" > "$TMP/large-pane.plain"
-assert_pane_rows 'large Tree pane leaves' "$TMP/large-pane.plain"
+assert_live_rows 'large expanded Tree' "$TMP/large.plain"
 scale_count="$(awk -F '\t' '$1 ~ /^%[0-9]+$/ && $2 ~ /scale:[0-9]+\.[0-9]+/ { n++ } END { print n+0 }' "$TMP/large.plain")"
-[ "$scale_count" -eq 30 ] || fail "large Tree scan lost or duplicated panes (got $scale_count, want 30)"
+[ "$scale_count" -eq 100 ] || fail "large Tree scan lost or duplicated panes (got $scale_count, want 100)"
 scale_targets="$(awk -F '\t' '
   $1 ~ /^%[0-9]+$/ && match($2, /scale:[0-9]+\.[0-9]+/) {
     print substr($2, RSTART, RLENGTH)
   }
 ' "$TMP/large.plain")"
-expected_targets="$(for win in 0 1 2; do for pane in $(seq 0 9); do printf 'scale:%s.%s\n' "$win" "$pane"; done; done)"
+expected_targets="$(for win in $(seq 0 9); do for pane in $(seq 0 9); do printf 'scale:%s.%s\n' "$win" "$pane"; done; done)"
 [ "$scale_targets" = "$expected_targets" ] || fail 'large Tree pane ordering is not canonical session/window/pane order'
-printf 'PASS: 30-pane Tree fixture scans completely in stable canonical order\n'
+pane_calls="$(grep -c '^list-panes ' "$TMP/tmux-list-calls" 2>/dev/null || true)"
+window_calls="$(grep -c '^list-windows ' "$TMP/tmux-list-calls" 2>/dev/null || true)"
+[ "$pane_calls" -le 1 ] && [ "$window_calls" -le 1 ] ||
+  fail "100-pane render used N+1 tmux calls (panes=$pane_calls windows=$window_calls)"
+printf 'PASS: 100-pane Tree is complete, canonical, and bulk-snapshotted\n'

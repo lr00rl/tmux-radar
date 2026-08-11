@@ -630,8 +630,18 @@ cmd_mark() {  # cmd_mark <pane|-> <source> <label> [key]
 
 cmd_clear_key()  { [ -n "${1:-}" ] || exit 0; lock_or_error || return 1; _drop_rows '$4 == k' -v k="$1"; unlock; _sync_bar; }
 cmd_clear_pane() {
-  local pane="${1:-${TMUX_PANE:-}}"
-  [ -n "$pane" ] || exit 0
+  local target="${1:-${TMUX_PANE:-}}" pane="" resolved=""
+  [ -n "$target" ] || exit 0
+  # Hooks may provide a pane, window, or session target. Resolve it once to the
+  # currently focused pane, then clear that exact unread item. Never broaden a
+  # focus event to every pane in the window.
+  if have_tmux; then
+    resolved="$(tmux display-message -p -t "$target" '#{pane_id}' 2>/dev/null || true)"
+  fi
+  case "$resolved" in %*) pane="$resolved" ;; esac
+  if [ -z "$pane" ]; then
+    case "$target" in %*) pane="$target" ;; *) exit 0 ;; esac
+  fi
   lock_or_error || return 1
   _drop_rows '$1 == p' -v p="$pane"
   unlock

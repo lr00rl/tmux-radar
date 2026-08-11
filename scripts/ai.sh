@@ -19,7 +19,7 @@
 #   report [run-id|latest] print the final structured run summary
 #   stop  <pane|all>    stop a resident watcher
 #   status              list active watchers + recent decisions
-#   list                open the deprecated Attention picker alias
+#   list                open the compatibility Inbox picker alias
 #   cleanup             GC stale watcher files / monitor panes / AI-status marks
 #   menu                tmux display-menu entry point (prefix + <@radar-ai-key>)
 #
@@ -4781,10 +4781,10 @@ cmd_ask() {
 }
 
 # ---------------------------------------------------------------------------
-# list: deprecated compatibility entry point for the pane-first Attention view.
+# list: compatibility entry point for the lifecycle-event Inbox view.
 # ---------------------------------------------------------------------------
 cmd_list() {
-  exec "$SCRIPT_DIR/switcher.sh" menu attention
+  exec "$SCRIPT_DIR/switcher.sh" menu inbox
 }
 
 # ---------------------------------------------------------------------------
@@ -4947,7 +4947,7 @@ cmd_menu() {
     "" \
     "状态 / 最近决策"                   s "$pop \"TMUX_RADAR_AI_PAUSE=1 $SELF status\"" \
     "停止全部监控"                      S "run-shell \"$SELF stop all\"" \
-    "列出 AI pane"                     l "$pop \"$SCRIPT_DIR/switcher.sh menu attention\""
+    "打开 AI Inbox"                    l "$pop \"$SCRIPT_DIR/switcher.sh menu inbox\""
 }
 
 _event_kind_valid() {

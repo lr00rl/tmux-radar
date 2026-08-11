@@ -41,9 +41,9 @@ Each producer emits exactly three tab-separated fields:
 <target>\t<search-display>\t<meta-display>
 ```
 
-1. **Target** is a hidden machine field in canonical
-   `session:window-index.pane-index` form. It identifies one live pane when the
-   row is emitted.
+1. **Target** is the hidden stable tmux pane ID (`%N`). It identifies one live
+   pane when the row is emitted and does not change when pane coordinates are
+   reused.
 2. **Search display** is the primary readable identity. It includes the
    session/window/pane location and window/pane title. Attention leads with the
    semantic state and agent kind.
@@ -51,8 +51,8 @@ Each producer emits exactly three tab-separated fields:
    reason.
 
 fzf hides field 1, searches fields 2–3, and returns the untouched complete row.
-Selection extracts only field 1. Display text never participates in target
-parsing.
+Selection extracts only field 1. Display text and mutable pane coordinates
+never participate in target parsing.
 
 Tabs, newlines, carriage returns, and unsafe control characters originating in
 tmux or user-controlled display values are normalized to spaces before rows are
@@ -114,7 +114,7 @@ switcher.
 
 ### Pane disappears before selection
 
-Immediately before switching, tmux-radar revalidates the exact target with
+Immediately before switching, tmux-radar revalidates the exact pane ID with
 tmux. If it is gone:
 
 - show one concise message: `pane closed; reopen the switcher`;
@@ -173,8 +173,8 @@ not removed.
 
 - fzf remains available as the picker dependency and can preserve the hidden
   target field while searching visible fields.
-- Canonical `session:window.pane` targets are sufficient for the lifetime of a
-  single picker interaction when paired with final revalidation.
+- Stable `%N` pane IDs remain authoritative for a picker interaction even when
+  tmux reuses a visible `session:window.pane` coordinate.
 - Pane MRU is a better match for the product job than legacy window MRU.
 - Removing direct numeric jumps and expand/collapse reduces interaction cost
   without removing an essential accessibility path; ordinary fzf navigation

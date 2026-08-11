@@ -54,6 +54,20 @@ fi
 printf 'PASS: default Recent menu invokes fzf under nounset\n'
 
 # --- last-pane: cross-window MRU toggle --------------------------------------
+REAL_TMUX="$(command -v tmux)"
+export REAL_TMUX
+mkdir -p "$TMP/last-bin"
+cat > "$TMP/last-bin/tmux" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = switch-client ]; then
+  target="${3:-}"
+  "$REAL_TMUX" select-window -t "$target" >/dev/null 2>&1 || exit 1
+  "$REAL_TMUX" select-pane -t "$target" >/dev/null 2>&1 || exit 1
+  exit 0
+fi
+exec "$REAL_TMUX" "$@"
+SH
+chmod +x "$TMP/last-bin/tmux"
 tmux -L "$SOCKET" kill-server >/dev/null 2>&1 || true
 tmux -L "$SOCKET" -f /dev/null new-session -d -s mru -x 80 -y 24
 TMUX="$(tmux -L "$SOCKET" display-message -p '#{socket_path}'),$$,0"
@@ -69,7 +83,7 @@ if ! grep -q "^$P_W0	" "$TMP/state/pane-mru" || ! grep -q "^$P_W1	" "$TMP/state/
   exit 1
 fi
 
-bash "$SWITCHER" last-pane >/dev/null 2>&1
+PATH="$TMP/last-bin:$PATH" bash "$SWITCHER" last-pane >/dev/null 2>&1
 ACTIVE="$(tmux -L "$SOCKET" display-message -p -t mru '#{pane_id}')"
 if [ "$ACTIVE" != "$P_W0" ]; then
   printf 'FAIL: last-pane did not jump to the previous pane (want %s got %s)\n' "$P_W0" "$ACTIVE" >&2
@@ -78,7 +92,7 @@ fi
 printf 'PASS: last-pane jumps to the most recent other pane across windows\n'
 
 bash "$ROOT/scripts/mru-record.sh" "$P_W0"   # what the pane hook records after the jump
-bash "$SWITCHER" last-pane >/dev/null 2>&1
+PATH="$TMP/last-bin:$PATH" bash "$SWITCHER" last-pane >/dev/null 2>&1
 ACTIVE="$(tmux -L "$SOCKET" display-message -p -t mru '#{pane_id}')"
 if [ "$ACTIVE" != "$P_W1" ]; then
   printf 'FAIL: last-pane did not toggle back (want %s got %s)\n' "$P_W1" "$ACTIVE" >&2
@@ -93,7 +107,7 @@ fail() {
 }
 
 strip_ansi() {
-  LC_ALL=C sed $'s/\\033\\[[0-9;]*m//g'
+  LC_ALL=C sed $'s/\033\\[[0-9;]*m//g'
 }
 
 assert_pane_rows() { # assert_pane_rows <label> <file>
@@ -101,11 +115,12 @@ assert_pane_rows() { # assert_pane_rows <label> <file>
   [ -s "$file" ] || fail "$label emitted no pane rows"
   awk -F '\t' '
     NF != 3 { printf "row %d has %d fields: %s\n", NR, NF, $0 > "/dev/stderr"; bad=1 }
-    $1 !~ /^[^:]+:[0-9]+\.[0-9]+$/ { printf "row %d has non-pane target: %s\n", NR, $1 > "/dev/stderr"; bad=1 }
+    $1 !~ /^%[0-9]+$/ { printf "row %d has non-pane-id target: %s\n", NR, $1 > "/dev/stderr"; bad=1 }
+    $2 !~ /[^:[:space:]]+:[0-9]+\.[0-9]+/ { printf "row %d hides the visible pane location: %s\n", NR, $2 > "/dev/stderr"; bad=1 }
     END { exit bad }
   ' "$file" || fail "$label violated the canonical three-field live-pane row contract"
   while IFS=$'\t' read -r target _; do
-    tmux -L "$SOCKET" display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1 ||
+    [ "$(tmux -L "$SOCKET" display-message -p -t "$target" '#{pane_id}' 2>/dev/null)" = "$target" ] ||
       fail "$label emitted dead target $target"
   done < "$file"
 }
@@ -157,8 +172,8 @@ strip_ansi < "$TMP/recent.rows" > "$TMP/recent.plain"
 assert_pane_rows 'Recent' "$TMP/recent.plain"
 recent_first="$(sed -n '1s/\t.*//p' "$TMP/recent.plain")"
 recent_second="$(sed -n '2s/\t.*//p' "$TMP/recent.plain")"
-[ "$recent_first" = 'alpha:0.0' ] || fail "Recent did not put newest live pane first (got $recent_first)"
-[ "$recent_second" = 'beta:0.1' ] || fail "Recent did not preserve the next deduplicated MRU pane (got $recent_second)"
+[ "$recent_first" = "$P_ALPHA_0" ] || fail "Recent did not put newest live pane first (got $recent_first)"
+[ "$recent_second" = "$P_BETA_1" ] || fail "Recent did not preserve the next deduplicated MRU pane (got $recent_second)"
 [ "$(wc -l < "$TMP/recent.plain" | tr -d ' ')" -eq 5 ] || fail 'Recent omitted or duplicated live panes'
 printf 'PASS: Recent is pane-level, deduplicated, and MRU ordered\n'
 
@@ -181,7 +196,7 @@ PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention.rows"
 strip_ansi < "$TMP/attention.rows" > "$TMP/attention.plain"
 assert_pane_rows 'Attention' "$TMP/attention.plain"
 attention_targets="$(cut -f1 "$TMP/attention.plain" | paste -sd ' ' -)"
-[ "$attention_targets" = 'alpha:0.1 beta:0.1 alpha:1.0 beta:0.0 alpha:0.0' ] ||
+[ "$attention_targets" = "$P_ALPHA_1 $P_BETA_1 $P_ALPHA_W1 $P_BETA_0 $P_ALPHA_0" ] ||
   fail "Attention ordering is not ACTION/DONE/NOTICE/ACTIVE with canonical tie breaks: $attention_targets"
 grep -q $'ACTION\|DONE\|NOTICE\|ACTIVE' "$TMP/attention.plain" ||
   fail 'Attention display does not lead with semantic state'
@@ -193,6 +208,35 @@ cut -f1 "$TMP/attention.rows" > "$TMP/attention.targets"
 cut -f1 "$TMP/needinput-alias.rows" > "$TMP/needinput-alias.targets"
 cmp -s "$TMP/attention.targets" "$TMP/needinput-alias.targets" || fail 'legacy needinput alias does not resolve to Attention'
 printf 'PASS: Attention ordering, paneless omission, and legacy alias are stable\n'
+
+# Attention mark fields are user-controlled. Strip CR/ESC/control bytes from
+# source, label, and saved title while retaining renderer-owned ANSI badges.
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$P_ALPHA_1" "$((now - 10))" $'hook\rsource\033X' 'unsafe-mark' \
+  $'your\r turn\033Y' $'saved\rtitle\033Z' > "$TMP/state/need-input"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  $'co\033dex' 'control:active' 0 "$P_ALPHA_0" "$((now - 100))" "$((now - 1))" \
+  $'active\rstate\033X' '/tmp' 'codex' > "$TMP/state/agent-registry"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/attention-controls.rows"
+grep -q $'\033\[' "$TMP/attention-controls.rows" || fail 'Attention sanitization removed renderer-owned ANSI'
+strip_ansi < "$TMP/attention-controls.rows" > "$TMP/attention-controls.plain"
+assert_pane_rows 'Attention control fixture' "$TMP/attention-controls.plain"
+if LC_ALL=C grep -q $'\r\|\033' "$TMP/attention-controls.plain"; then
+  fail 'Attention leaked CR/ESC from mark source, label, or saved title'
+fi
+grep -q 'hook source' "$TMP/attention-controls.plain" || fail 'Attention lost sanitized source text'
+grep -q 'your turn' "$TMP/attention-controls.plain" || fail 'Attention lost sanitized label text'
+grep -q 'saved title' "$TMP/attention-controls.plain" || fail 'Attention lost sanitized saved-title text'
+grep -q 'co dex' "$TMP/attention-controls.plain" || fail 'Attention lost sanitized registry kind'
+grep -q 'active state X' "$TMP/attention-controls.plain" || fail 'Attention lost sanitized registry state'
+grep -q 'DONE' "$TMP/attention-controls.plain" || fail 'Attention classified sanitized completion label incorrectly'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" preview "$P_ALPHA_1" > "$TMP/preview-controls.out"
+strip_ansi < "$TMP/preview-controls.out" > "$TMP/preview-controls.plain"
+if LC_ALL=C grep -q $'\r\|\033' "$TMP/preview-controls.plain"; then
+  fail 'preview leaked CR/ESC from Attention metadata'
+fi
+grep -q '^✓' "$TMP/preview-controls.plain" || fail 'preview semantics diverged from sanitized Attention completion label'
+printf 'PASS: Attention and preview sanitize user control bytes while retaining renderer ANSI\n'
 
 # Default command detection includes Kimi without requiring a configuration
 # override. Use a real pane process so this exercises the detector, not registry.
@@ -230,61 +274,146 @@ grep -Eq '0/0|no detected AI pane' "$TMP/fzf.args" || fail 'empty Attention menu
 printf 'PASS: menu attention opens directly with a nonselectable empty explanation\n'
 
 # --- exact switch, disappearing target, and switch-command failure ----------
-REAL_TMUX="$(command -v tmux)"
-export REAL_TMUX
+export TMUX_RADAR_TEST_TMUX_LOG="$TMP/tmux.log"
 cat > "$FAKE_BIN/tmux" <<'SH'
 #!/usr/bin/env bash
-if [ "${TMUX_RADAR_TEST_FAIL_SWITCH:-0}" = 1 ]; then
-  case "${1:-}" in
-    switch-client|select-window|select-pane)
-      printf 'INJECTED_RAW_TMUX_ERROR\n' >&2
-      exit 42
-      ;;
-  esac
+if [ "${1:-}" = list-panes ] && [ "${TMUX_RADAR_TEST_FAIL_LIST:-0}" = 1 ]; then
+  printf 'INJECTED_RAW_LIST_ERROR\n' >&2
+  exit 41
 fi
-# Detached fixtures have no client. Treat switch-client as successful; window
-# and pane selection still run against the isolated server and are observable.
-[ "${1:-}" = switch-client ] && exit 0
+case "${1:-}" in
+  switch-client|select-window|select-pane)
+    printf '%s\n' "$*" >> "$TMUX_RADAR_TEST_TMUX_LOG"
+    ;;
+esac
+if [ "${1:-}" = switch-client ]; then
+  if [ "${TMUX_RADAR_TEST_FAIL_SWITCH:-0}" = 1 ]; then
+    printf 'INJECTED_RAW_TMUX_ERROR\n' >&2
+    exit 42
+  fi
+  target="${3:-}"
+  # Detached fixtures have no client. Model a successful atomic client switch
+  # by selecting the target window/pane on the isolated server.
+  "$REAL_TMUX" select-window -t "$target" >/dev/null 2>&1 || exit 43
+  "$REAL_TMUX" select-pane -t "$target" >/dev/null 2>&1 || exit 43
+  exit 0
+fi
 exec "$REAL_TMUX" "$@"
 SH
 chmod +x "$FAKE_BIN/tmux"
 cat > "$FAKE_BIN/fzf" <<'SH'
 #!/usr/bin/env bash
 input="$(cat)"
+[ -n "${TMUX_RADAR_TEST_FZF_MARKER:-}" ] && : > "$TMUX_RADAR_TEST_FZF_MARKER"
+if [ -n "${TMUX_RADAR_TEST_FZF_EXIT:-}" ]; then
+  printf 'INJECTED_RAW_FZF_ERROR\033[31m\n' >&2
+  exit "$TMUX_RADAR_TEST_FZF_EXIT"
+fi
 row="$(printf '%s\n' "$input" | awk -F '\t' -v t="$TMUX_RADAR_TEST_SELECT" '$1 == t { print; exit }')"
 if [ "${TMUX_RADAR_TEST_CLOSE_BEFORE_SELECT:-0}" = 1 ]; then
+  old_coord="$("$REAL_TMUX" display-message -p -t "$TMUX_RADAR_TEST_SELECT" '#{session_name}:#{window_index}.#{pane_index}')"
   "$REAL_TMUX" kill-pane -t "$TMUX_RADAR_TEST_SELECT"
+  replacement="$("$REAL_TMUX" display-message -p -t "$old_coord" '#{pane_id}' 2>/dev/null || true)"
+  if [ -z "$replacement" ]; then
+    replacement="$("$REAL_TMUX" split-window -d -P -F '#{pane_id}' -t "${old_coord%.*}")"
+  fi
+  printf '%s\t%s\n' "$old_coord" "$replacement" > "$TMUX_RADAR_TEST_REUSE_PROOF"
 fi
 printf '%s\n' "$row"
 SH
 chmod +x "$FAKE_BIN/fzf"
 
-export TMUX_RADAR_TEST_SELECT='alpha:0.1'
+# List generation is distinct from fzf. Producer failures are nonzero and
+# sanitized, and fzf is never invoked on a failed initial list.
+export TMUX_RADAR_TEST_FZF_MARKER="$TMP/fzf-invoked"
+export TMUX_RADAR_TEST_FAIL_LIST=1
+for view in all recent attention; do
+  set +e
+  PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list "$view" >"$TMP/list-$view.out" 2>"$TMP/list-$view.err"
+  list_rc=$?
+  set -e
+  [ "$list_rc" -ne 0 ] || fail "list $view failure incorrectly returned success"
+  grep -q 'unable to list panes' "$TMP/list-$view.err" || fail "list $view failure omitted concise diagnostic"
+  ! grep -q 'INJECTED_RAW_LIST_ERROR' "$TMP/list-$view.err" || fail "list $view leaked raw tmux stderr"
+done
+rm -f "$TMUX_RADAR_TEST_FZF_MARKER"
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu all >"$TMP/menu-list-fail.out" 2>"$TMP/menu-list-fail.err"
+menu_list_rc=$?
+set -e
+[ "$menu_list_rc" -ne 0 ] || fail 'menu list failure incorrectly returned success'
+[ ! -e "$TMUX_RADAR_TEST_FZF_MARKER" ] || fail 'menu invoked fzf after list generation failed'
+grep -q 'unable to list panes' "$TMP/menu-list-fail.err" || fail 'menu list failure omitted concise diagnostic'
+! grep -q 'INJECTED_RAW_LIST_ERROR' "$TMP/menu-list-fail.err" || fail 'menu list failure leaked raw tmux stderr'
+unset TMUX_RADAR_TEST_FAIL_LIST
+printf 'PASS: list failures are explicit and stop before fzf\n'
+
+# fzf exit 1 (no match) and 130 (cancel) are clean success; internal failures
+# are nonzero, sanitized, and do not mutate switch or MRU state.
+cp "$TMP/state/pane-mru" "$TMP/fzf.mru.before"
+for fzf_exit in 1 130; do
+  export TMUX_RADAR_TEST_FZF_EXIT="$fzf_exit"
+  : > "$TMUX_RADAR_TEST_TMUX_LOG"
+  PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu all >"$TMP/fzf-$fzf_exit.out" 2>"$TMP/fzf-$fzf_exit.err" ||
+    fail "fzf exit $fzf_exit should be a clean cancellation"
+  ! [ -s "$TMUX_RADAR_TEST_TMUX_LOG" ] || fail "fzf exit $fzf_exit attempted a switch"
+  cmp -s "$TMP/fzf.mru.before" "$TMP/state/pane-mru" || fail "fzf exit $fzf_exit mutated MRU"
+done
+export TMUX_RADAR_TEST_FZF_EXIT=2
+: > "$TMUX_RADAR_TEST_TMUX_LOG"
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu all >"$TMP/fzf-2.out" 2>"$TMP/fzf-2.err"
+fzf_rc=$?
+set -e
+[ "$fzf_rc" -ne 0 ] || fail 'fzf exit 2 incorrectly returned success'
+grep -q 'picker failed' "$TMP/fzf-2.err" || fail 'fzf exit 2 omitted concise diagnostic'
+! grep -q 'INJECTED_RAW_FZF_ERROR' "$TMP/fzf-2.err" || fail 'fzf exit 2 leaked raw stderr'
+! [ -s "$TMUX_RADAR_TEST_TMUX_LOG" ] || fail 'fzf exit 2 attempted a switch'
+cmp -s "$TMP/fzf.mru.before" "$TMP/state/pane-mru" || fail 'fzf exit 2 mutated MRU'
+unset TMUX_RADAR_TEST_FZF_EXIT
+printf 'PASS: only fzf cancel/no-match exits are successful\n'
+
+export TMUX_RADAR_TEST_SELECT="$P_ALPHA_1"
 unset TMUX_RADAR_TEST_CLOSE_BEFORE_SELECT TMUX_RADAR_TEST_FAIL_SWITCH
+: > "$TMUX_RADAR_TEST_TMUX_LOG"
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu all >"$TMP/exact.out" 2>"$TMP/exact.err" ||
   fail 'selecting an exact All pane returned failure'
 active_pane="$(tmux -L "$SOCKET" display-message -p -t alpha:0 '#{pane_index}')"
 [ "$active_pane" = 1 ] || fail "selection did not switch to the exact pane (active index $active_pane)"
+switch_log="$(cat "$TMUX_RADAR_TEST_TMUX_LOG")"
+[ "$switch_log" = "switch-client -t $P_ALPHA_1" ] || fail "exact selection was not one stable-id switch: $switch_log"
+[ "$(tail -1 "$TMP/state/pane-mru" | cut -f1)" = "$P_ALPHA_1" ] || fail 'successful switch did not record MRU after switching'
 printf 'PASS: selection switches to the exact pane target\n'
 
-tmux -L "$SOCKET" split-window -d -t alpha:1
-export TMUX_RADAR_TEST_SELECT='alpha:1.1'
+tmux -L "$SOCKET" split-window -d -t alpha:0
+TMUX_RADAR_TEST_SELECT="$(tmux -L "$SOCKET" list-panes -t alpha:0 -F '#{pane_index} #{pane_id}' | sort -n | sed -n '2s/^[^ ]* //p')"
+export TMUX_RADAR_TEST_SELECT
+export TMUX_RADAR_TEST_REUSE_PROOF="$TMP/reuse.proof"
 export TMUX_RADAR_TEST_CLOSE_BEFORE_SELECT=1
+cp "$TMP/state/pane-mru" "$TMP/race.mru.before"
+: > "$TMUX_RADAR_TEST_TMUX_LOG"
 set +e
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu all >"$TMP/race.out" 2>"$TMP/race.err"
 race_rc=$?
 set -e
 [ "$race_rc" -ne 0 ] || fail 'disappearing selected pane incorrectly returned success'
+IFS=$'\t' read -r reused_coord replacement_id < "$TMUX_RADAR_TEST_REUSE_PROOF"
+[ -n "$replacement_id" ] && [ "$replacement_id" != "$TMUX_RADAR_TEST_SELECT" ] || fail 'race fixture did not reuse the killed pane coordinate'
+[ "$(tmux -L "$SOCKET" display-message -p -t "$reused_coord" '#{pane_id}')" = "$replacement_id" ] || fail 'race fixture lost its coordinate replacement proof'
 grep -q 'pane closed; reopen the switcher' "$TMP/race.err" "$TMP/race.out" 2>/dev/null ||
   { printf '%s\n' '--- disappearing selection stderr ---' >&2; cat "$TMP/race.err" >&2; fail 'disappearing selected pane omitted the concise closed-pane explanation'; }
 if grep -qiE 'can.t find pane|no such pane|unknown target' "$TMP/race.err"; then
   fail 'disappearing selected pane leaked a raw tmux error'
 fi
+! [ -s "$TMUX_RADAR_TEST_TMUX_LOG" ] || fail 'dead stable pane ID attempted a switch'
+cmp -s "$TMP/race.mru.before" "$TMP/state/pane-mru" || fail 'dead stable pane ID mutated MRU'
 printf 'PASS: disappearing selection fails explicitly without partial switching\n'
 
 unset TMUX_RADAR_TEST_CLOSE_BEFORE_SELECT
-export TMUX_RADAR_TEST_SELECT='beta:0.0'
+export TMUX_RADAR_TEST_SELECT="$P_BETA_0"
 export TMUX_RADAR_TEST_FAIL_SWITCH=1
+cp "$TMP/state/pane-mru" "$TMP/switch-fail.mru.before"
+: > "$TMUX_RADAR_TEST_TMUX_LOG"
 before_target="$(tmux -L "$SOCKET" display-message -p -t alpha '#{session_name}:#{window_index}.#{pane_index}')"
 set +e
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu all >"$TMP/switch-fail.out" 2>"$TMP/switch-fail.err"
@@ -294,6 +423,9 @@ set -e
 ! grep -q 'INJECTED_RAW_TMUX_ERROR' "$TMP/switch-fail.err" || fail 'switch-command failure leaked raw tmux stderr'
 after_target="$(tmux -L "$SOCKET" display-message -p -t alpha '#{session_name}:#{window_index}.#{pane_index}')"
 [ "$after_target" = "$before_target" ] || fail 'switch-command failure partially changed the selected pane'
+switch_log="$(cat "$TMUX_RADAR_TEST_TMUX_LOG")"
+[ "$switch_log" = "switch-client -t $P_BETA_0" ] || fail "failure path was not one stable-id switch attempt: $switch_log"
+cmp -s "$TMP/switch-fail.mru.before" "$TMP/state/pane-mru" || fail 'failed switch mutated pane MRU'
 printf 'PASS: injected switch failure is explicit, nonzero, and non-partial\n'
 
 # --- larger fixture: stable complete pane scan ------------------------------
@@ -308,9 +440,9 @@ done
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list all > "$TMP/large.rows"
 strip_ansi < "$TMP/large.rows" > "$TMP/large.plain"
 assert_pane_rows 'large All fixture' "$TMP/large.plain"
-scale_count="$(awk -F '\t' '$1 ~ /^scale:/ { n++ } END { print n+0 }' "$TMP/large.plain")"
+scale_count="$(awk -F '\t' '$2 ~ /^scale:/ { n++ } END { print n+0 }' "$TMP/large.plain")"
 [ "$scale_count" -eq 30 ] || fail "large All scan lost or duplicated panes (got $scale_count, want 30)"
-scale_targets="$(awk -F '\t' '$1 ~ /^scale:/ { print $1 }' "$TMP/large.plain")"
+scale_targets="$(awk -F '\t' '$2 ~ /^scale:/ { split($2, a, " · "); print a[1] }' "$TMP/large.plain")"
 expected_targets="$(for win in 0 1 2; do for pane in $(seq 0 9); do printf 'scale:%s.%s\n' "$win" "$pane"; done; done)"
 [ "$scale_targets" = "$expected_targets" ] || fail 'large All fixture ordering is not canonical session/window/pane order'
 printf 'PASS: 30-pane fixture scans completely in stable canonical order\n'

@@ -111,7 +111,8 @@ windows and sessions (pane-level MRU is recorded by tmux hooks; see
 `@radar-last-key`).
 
 `prefix + C-w` opens the picker. Every view contains only exact live-pane
-destinations:
+destinations. The hidden target is the stable tmux pane ID (`%N`); the visible
+row keeps the current `session:window.pane` location searchable:
 
 | Key | Action |
 |-----|--------|
@@ -123,7 +124,7 @@ destinations:
 | `shift-↑` / `shift-↓` | scroll preview by line |
 | `PgUp` / `PgDn` | scroll preview by page |
 | `ctrl-n` / `ctrl-p` | move selection (fzf default) |
-| `Enter` | revalidate and switch to the selected exact pane |
+| `Enter` | revalidate the stable pane ID and switch with one tmux client operation |
 | `Esc` | cancel without switching |
 
 All three scopes share the same pane-first row model; there is no window-row
@@ -553,8 +554,9 @@ when the bar renders (≤30s), and whenever Attention opens.
 
 ## How it works
 
-- Rows are `target ⇥ search-display ⇥ meta-display`; fzf hides the target,
-  displays the other fields, and searches both visible fields.
+- Rows are `%pane-id ⇥ search-display ⇥ meta-display`; fzf hides the stable
+  pane ID, displays the other fields (including `session:window.pane`), and
+  searches both visible fields.
 - Preview uses `--preview-window '<pos>,nowrap,follow'`; `follow` tails to the
   bottom so the current state is visible.
 - Colors are applied **shell/awk-side after** every tmux round-trip, never

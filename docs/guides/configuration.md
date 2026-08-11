@@ -33,7 +33,9 @@ set -g @radar-preview-follow 'on'
 The picker keys are intentionally fixed around its three scopes: `Ctrl-r`
 opens Recent, `Ctrl-i` opens Attention, and `Ctrl-t` opens All. `Alt-p` toggles
 preview, the usual fzf navigation keys move selection, and `Enter` switches to
-the exact revalidated pane. See the interaction contract in
+the exact revalidated stable pane ID (`%N`) with one tmux client operation.
+The mutable `session:window.pane` coordinate remains visible and searchable but
+is never the selection identity. See the interaction contract in
 [`DESIGN.md`](../../DESIGN.md).
 
 ## Optional AI supervisor

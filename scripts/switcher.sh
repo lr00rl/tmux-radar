@@ -4,7 +4,7 @@
 #
 # Subcommands (the script calls itself for fzf reload/preview/binds):
 #   menu (default)                  launch the fzf popup
-#   list [view]                     print TAB rows "<target>\t<name>\t<meta>"
+#   list [view]                     print TAB rows "%pane-id\t<name>\t<meta>"
 #   preview <target>                render the right-hand preview for one row
 #   set-view <view>                 (fzf transform) switch view, emit actions
 #
@@ -84,8 +84,10 @@ write_state() { [ -n "${SW_STATE:-}" ] && printf '%s\n' "$VIEW" > "$SW_STATE"; }
 # live_pane_records prepends pane_id for internal MRU joining; every display
 # field is flattened before tabs are introduced.
 live_pane_records() {
-  tmux list-panes -a -F \
-    "#{pane_id}${SEP}#{session_name}:#{window_index}.#{pane_index}${SEP}#{window_name}${SEP}#{pane_title}${SEP}#{pane_current_command}${SEP}#{pane_current_path}" 2>/dev/null |
+  local raw
+  raw="$(tmux list-panes -a -F \
+    "#{pane_id}${SEP}#{session_name}:#{window_index}.#{pane_index}${SEP}#{window_name}${SEP}#{pane_title}${SEP}#{pane_current_command}${SEP}#{pane_current_path}" 2>/dev/null)" || return 1
+  printf '%s\n' "$raw" |
     LC_ALL=C awk -v FS="$SEP" -v OFS='\t' -v home="$HOME" '
       function clean(s) {
         gsub(/[[:cntrl:]]/, " ", s)
@@ -108,27 +110,28 @@ live_pane_records() {
 }
 
 list_all() {
-  live_pane_records | cut -f2-
+  live_pane_records | cut -f1,3-
 }
 
 list_recent() {
-  local mfile="$PANE_MRU_FILE"
+  local mfile="$PANE_MRU_FILE" live
   [ -r "$mfile" ] || mfile=/dev/null
+  live="$(live_pane_records)" || return 1
   awk -F '\t' '
-    NR==FNR { row[$1]=$2 FS $3 FS $4; order[++m]=$1; next }
+    NR==FNR { row[$1]=$1 FS $3 FS $4; order[++m]=$1; next }
     { recent[++n]=$1 }
     END {
       for (i=n; i>=1; i--) { id=recent[i]; if ((id in row) && !seen[id]++) print row[id] }
       for (i=1; i<=m; i++) { id=order[i]; if (!seen[id]++) print row[id] }
     }
-  ' <(live_pane_records) "$mfile"
+  ' <(printf '%s\n' "$live") "$mfile"
 }
 
 list_attention() {  # pane-level AI-status process view; hook-marked panes float first
-  local live flags ps_rows commands reg now
-  live="$(tmux list-panes -a -F \
-    "#{pane_id}${SEP}#{session_name}:#{window_index}${SEP}#{pane_index}${SEP}#{window_name}${SEP}#{pane_title}${SEP}#{pane_current_command}${SEP}#{pane_current_path}${SEP}#{pane_pid}${SEP}#{pane_tty}" 2>/dev/null |
-    LC_ALL=C awk -v FS="$SEP" -v OFS='\t' '
+  local live live_raw flags ps_rows commands reg now
+  live_raw="$(tmux list-panes -a -F \
+    "#{pane_id}${SEP}#{session_name}:#{window_index}${SEP}#{pane_index}${SEP}#{window_name}${SEP}#{pane_title}${SEP}#{pane_current_command}${SEP}#{pane_current_path}${SEP}#{pane_pid}${SEP}#{pane_tty}" 2>/dev/null)" || return 1
+  live="$(printf '%s\n' "$live_raw" | LC_ALL=C awk -v FS="$SEP" -v OFS='\t' '
       function clean(s) { gsub(/[[:cntrl:]]/, " ", s); gsub(/[[:space:]][[:space:]]+/, " ", s); return s }
       { for (i=1; i<=NF; i++) $i=clean($i); print }
     ')"
@@ -143,6 +146,7 @@ list_attention() {  # pane-level AI-status process view; hook-marked panes float
   { printf '__PANES__\n%s\n__FLAGS__\n%s\n__PS__\n%s\n__REG__\n%s\n' "$live" "$flags" "$ps_rows" "$reg"; } |
     LC_ALL=C awk -F '\t' -v cmds="$commands" -v now="$now" -v C="$C" -v Y="$Y" -v G="$G" -v M="$M" -v D="$D" -v R="$R" '
       function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+      function clean_user(s) { gsub(/[[:cntrl:]]/, " ", s); gsub(/[[:space:]][[:space:]]+/, " ", s); return trim(s) }
       function clean_tty(t) { sub(/^\/dev\//, "", t); return t }
       function first_word(s, x) { x=trim(s); sub(/[[:space:]].*/, "", x); return x }
       function level_for(src, label,    l) {
@@ -255,7 +259,7 @@ list_attention() {  # pane-level AI-status process view; hook-marked panes float
         pane=$1
         wt[pane]=$2; pidx[pane]=$3; wn[pane]=$4; ti[pane]=$5; cm[pane]=$6; pa[pane]=$7
         pane_shell=$8; pane_tty[pane]=clean_tty($9)
-        pane_target[pane]=wt[pane] "." pidx[pane]
+        pane_target[pane]=pane
         pane_by_pid[pane_shell]=pane
         panes_on_tty[pane_tty[pane]]=panes_on_tty[pane_tty[pane]] pane "\034"
         order[++n]=pane
@@ -265,9 +269,9 @@ list_attention() {  # pane-level AI-status process view; hook-marked panes float
         if ($1 == "-") next                   # paneless marks are not pane targets
         flagged[$1]=1
         flag_epoch[$1]=$2 + 0
-        flag_source[$1]=$3
-        flag_label[$1]=(NF >= 5 ? $5 : $4)
-        flag_saved[$1]=(NF >= 6 ? $6 : "")
+        flag_source[$1]=clean_user($3)
+        flag_label[$1]=clean_user(NF >= 5 ? $5 : $4)
+        flag_saved[$1]=clean_user(NF >= 6 ? $6 : "")
         flag_level[$1]=level_for(flag_source[$1], flag_label[$1])
         next
       }
@@ -280,8 +284,9 @@ list_attention() {  # pane-level AI-status process view; hook-marked panes float
         if ($3 + 0 > 0 && !($3 in proc_parent)) next
         if (($4 in reg_last) && reg_last[$4] > $6 + 0) next
         reg_last[$4]=$6 + 0
-        reg_kind[$4]=$1; reg_started[$4]=$5 + 0; reg_state[$4]=$7
-        add_match($4, $1)
+        kind=clean_user($1); state=clean_user($7)
+        reg_kind[$4]=kind; reg_started[$4]=$5 + 0; reg_state[$4]=state
+        add_match($4, kind)
         next
       }
       END {
@@ -335,13 +340,22 @@ list_attention() {  # pane-level AI-status process view; hook-marked panes float
 }
 
 do_list() {  # do_list [view]
+  local rows list_fn
   read_state "${1:-}"
   case "$VIEW" in
-    recent)    list_recent ;;
-    attention) list_attention ;;
-    all)       list_all ;;
+    recent) list_fn=list_recent ;;
+    attention) list_fn=list_attention ;;
+    all) list_fn=list_all ;;
   esac
+  if ! rows="$("$list_fn")"; then
+    printf '%s\n' 'unable to list panes; reopen the switcher' >&2
+    return 1
+  fi
+  [ -n "$rows" ] && printf '%s\n' "$rows"
+  return 0
 }
+
+sanitize_text() { LC_ALL=C tr '\000-\037\177' ' ' | sed 's/  */ /g; s/^ //; s/ $//'; }
 
 _age_since() {  # _age_since <epoch> -> 45s / 3m / 2h / 1d
   local s
@@ -379,6 +393,8 @@ _pane_status_header() {  # $1 = pane %id; tech header + separator when the pane 
   if [ -n "$mark" ]; then
     IFS=$'\037' read -r m_epoch m_src m_key m_label <<< "$(printf '%s' "$mark" |
       awk -F '\t' '{ printf "%s\037%s\037%s\037%s", $2, $3, $4, (NF >= 5 ? $5 : $4) }')"
+    m_src="$(printf '%s' "$m_src" | sanitize_text)"
+    m_label="$(printf '%s' "$m_label" | sanitize_text)"
     level="$(_level_for "$m_src" "$m_label")"
     case "$level" in
       action) icon='⚠'; color="$M" ;;
@@ -390,6 +406,9 @@ _pane_status_header() {  # $1 = pane %id; tech header + separator when the pane 
     IFS=$'\037' read -r r_kind r_key r_pid r_started r_state r_cwd <<< "$(printf '%s' "$reg" |
       awk -F '\t' '{ printf "%s\037%s\037%s\037%s\037%s\037%s", $1, $2, $3, $5, $7, $8 }')"
   fi
+  r_kind="$(printf '%s' "$r_kind" | sanitize_text)"
+  r_state="$(printf '%s' "$r_state" | sanitize_text)"
+  r_cwd="$(printf '%s' "$r_cwd" | sanitize_text)"
   kind="${r_kind:-$m_src}"
   parts="$icon ${kind:-?}"
   [ -n "$r_state" ] && parts="$parts · $r_state"
@@ -450,7 +469,7 @@ cmd_set_view() {  # fzf transform: switch view, reload, repoint prompt
 
 do_menu() {
   local initial_view="${1:-}"
-  local fzf preview_pos follow preview_win selected target session win
+  local fzf preview_pos follow preview_win selected target list_file fzf_rc
   local -a fzf_args
   fzf="$(command -v fzf || true)"
   [ -n "$fzf" ] || { tmux display-message "tmux-radar: fzf not found"; exit 1; }
@@ -480,8 +499,16 @@ do_menu() {
   # the query is nonempty while preserving the server order at rest.
   [ "$VIEW" != all ] && fzf_args+=(--no-sort)
 
-  selected="$(
-    "$SELF" list | "$fzf" \
+  list_file="$(mktemp "${STATE_DIR}/.rows.XXXXXX")"
+  if ! "$SELF" list > "$list_file" 2>/dev/null; then
+    rm -f "$SW_STATE" "$list_file" 2>/dev/null || true
+    printf '%s\n' 'unable to list panes; reopen the switcher' >&2
+    tmux display-message 'tmux-radar: unable to list panes; reopen the switcher' >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  if selected="$(
+    "$fzf" \
       "${fzf_args[@]}" \
       --layout=reverse --prompt="$(_prompt)" \
       --header='C-r Recent · C-i Attention (0/0 = no detected AI pane) · C-t All · A-p preview · Enter switch' \
@@ -493,37 +520,47 @@ do_menu() {
       --bind='alt-p:toggle-preview' \
       --bind='shift-up:preview-up,shift-down:preview-down' \
       --bind='pgup:preview-page-up,pgdn:preview-page-down' \
-      || true
-  )"
-  rm -f "$SW_STATE" 2>/dev/null || true
+      < "$list_file" 2>/dev/null
+  )"; then
+    fzf_rc=0
+  else
+    fzf_rc=$?
+  fi
+  rm -f "$SW_STATE" "$list_file" 2>/dev/null || true
+
+  case "$fzf_rc" in
+    0) ;;
+    1|130) return 0 ;;
+    *)
+      printf '%s\n' 'picker failed; reopen the switcher' >&2
+      tmux display-message 'tmux-radar: picker failed; reopen the switcher' >/dev/null 2>&1 || true
+      return 1
+      ;;
+  esac
 
   [ -n "$selected" ] || exit 0
   target="${selected%%$'\t'*}"
-  if [[ ! "$target" =~ ^[^:[:cntrl:]]+:[0-9]+\.[0-9]+$ ]]; then
+  if [[ ! "$target" =~ ^%[0-9]+$ ]]; then
       tmux display-message "tmux-radar: invalid target '$target'; no switch performed" 2>/dev/null || true
       return 1
   fi
 
-  if [ "$(tmux display-message -p -t "$target" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || true)" != "$target" ]; then
+  if [ "$(tmux display-message -p -t "$target" '#{pane_id}' 2>/dev/null || true)" != "$target" ]; then
     printf '%s\n' 'pane closed; reopen the switcher' >&2
     tmux display-message 'tmux-radar: pane closed; reopen the switcher' >/dev/null 2>&1 || true
     return 1
   fi
 
-  session="${target%%:*}"
-  win="${target%.*}"            # sess:win (drops ".pane" if present)
-  [ -x "$MRU_RECORD" ] && "$MRU_RECORD" "$target" >/dev/null 2>&1 || true
-  if ! tmux switch-client -t "$session" 2>/dev/null ||
-     ! tmux select-window -t "$win" 2>/dev/null ||
-     ! tmux select-pane -t "$target" 2>/dev/null; then
+  if ! tmux switch-client -t "$target" 2>/dev/null; then
     printf '%s\n' 'unable to switch pane; reopen the switcher' >&2
     tmux display-message 'tmux-radar: unable to switch pane; reopen the switcher' >/dev/null 2>&1 || true
     return 1
   fi
+  [ -x "$MRU_RECORD" ] && "$MRU_RECORD" "$target" >/dev/null 2>&1 || true
 }
 
 cmd_last_pane() {  # jump to the most recently used *other* pane, cross-session
-  local cur pane loc sess winid
+  local cur pane
   cur="$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)"
   if [ ! -r "$PANE_MRU_FILE" ]; then
     tmux display-message "tmux-radar: no pane history yet" 2>/dev/null || true
@@ -533,13 +570,10 @@ cmd_last_pane() {  # jump to the most recently used *other* pane, cross-session
   while IFS= read -r pane; do
     [ -n "$pane" ] || continue
     [ "$pane" != "$cur" ] || continue
-    loc="$(tmux display-message -p -t "$pane" '#{session_id} #{window_id}' 2>/dev/null || true)"
-    [ -n "$loc" ] || continue
-    sess="${loc%% *}"; winid="${loc##* }"
-    tmux switch-client -t "$sess" 2>/dev/null || true
-    tmux select-window -t "$winid" 2>/dev/null || true
-    tmux select-pane -t "$pane" 2>/dev/null || true
-    exit 0
+    [ "$(tmux display-message -p -t "$pane" '#{pane_id}' 2>/dev/null || true)" = "$pane" ] || continue
+    if tmux switch-client -t "$pane" 2>/dev/null; then exit 0; fi
+    printf '%s\n' 'unable to switch pane; reopen the switcher' >&2
+    exit 1
   done < <(awk -F '\t' '{ ids[NR] = $1 } END { for (i = NR; i >= 1; i--) print ids[i] }' \
     "$PANE_MRU_FILE" 2>/dev/null)
   tmux display-message "tmux-radar: no other live pane in history" 2>/dev/null || true

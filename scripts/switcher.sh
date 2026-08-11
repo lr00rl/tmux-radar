@@ -453,22 +453,39 @@ _prompt() {
 }
 
 cmd_set_view() {  # fzf transform: switch view, reload, repoint prompt
-  local pos sort_action
+  local next_view pos sort_action rows_tmp reload_cmd
   read_state
-  VIEW="$(normalize_view "${1:-recent}")"
+  next_view="$(normalize_view "${1:-recent}")"
   # GC stale marks before the AI status list renders (~50ms, one keystroke)
-  [ "$VIEW" = attention ] && "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 || true
+  [ "$next_view" = attention ] && "$SCRIPT_DIR/needinput-notify.sh" tick >/dev/null 2>&1 || true
+  if [ -z "${SW_ROWS:-}" ] || [ -z "${SW_ERROR:-}" ]; then
+    printf abort
+    return 0
+  fi
+  rows_tmp="$(mktemp "${SW_ROWS}.XXXXXX")" || {
+    : > "$SW_ERROR"
+    printf abort
+    return 0
+  }
+  if ! "$SELF" list "$next_view" > "$rows_tmp" 2>/dev/null || ! mv "$rows_tmp" "$SW_ROWS"; then
+    rm -f "$rows_tmp" 2>/dev/null || true
+    : > "$SW_ERROR"
+    printf abort
+    return 0
+  fi
+  VIEW="$next_view"
   write_state
   pos=1
   [ "$VIEW" = recent ] && pos=2
   sort_action=disable-sort
   [ "$VIEW" = all ] && sort_action=enable-sort
-  printf '%s+reload-sync(%s list)+change-prompt(%s)+pos(%s)' "$sort_action" "$SELF" "$(_prompt)" "$pos"
+  printf -v reload_cmd 'cat %q' "$SW_ROWS"
+  printf '%s+reload-sync(%s)+change-prompt(%s)+pos(%s)' "$sort_action" "$reload_cmd" "$(_prompt)" "$pos"
 }
 
 do_menu() {
   local initial_view="${1:-}"
-  local fzf preview_pos follow preview_win selected target list_file fzf_rc
+  local fzf preview_pos follow preview_win selected target list_file fzf_rc reload_failed
   local -a fzf_args
   fzf="$(command -v fzf || true)"
   [ -n "$fzf" ] || { tmux display-message "tmux-radar: fzf not found"; exit 1; }
@@ -499,8 +516,10 @@ do_menu() {
   [ "$VIEW" != all ] && fzf_args+=(--no-sort)
 
   list_file="$(mktemp "${STATE_DIR}/.rows.XXXXXX")"
+  SW_ROWS="$list_file"; export SW_ROWS
+  SW_ERROR="${SW_STATE}.error"; export SW_ERROR
   if ! "$SELF" list > "$list_file" 2>/dev/null; then
-    rm -f "$SW_STATE" "$list_file" 2>/dev/null || true
+    rm -f "$SW_STATE" "$SW_ERROR" "$list_file" 2>/dev/null || true
     printf '%s\n' 'unable to list panes; reopen the switcher' >&2
     tmux display-message 'tmux-radar: unable to list panes; reopen the switcher' >/dev/null 2>&1 || true
     return 1
@@ -525,7 +544,15 @@ do_menu() {
   else
     fzf_rc=$?
   fi
-  rm -f "$SW_STATE" "$list_file" 2>/dev/null || true
+  reload_failed=0
+  [ -e "$SW_ERROR" ] && reload_failed=1
+  rm -f "$SW_STATE" "$SW_ERROR" "$list_file" 2>/dev/null || true
+
+  if [ "$reload_failed" = 1 ]; then
+    printf '%s\n' 'unable to list panes; reopen the switcher' >&2
+    tmux display-message 'tmux-radar: unable to list panes; reopen the switcher' >/dev/null 2>&1 || true
+    return 1
+  fi
 
   case "$fzf_rc" in
     0) ;;

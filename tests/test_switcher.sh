@@ -3,6 +3,7 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SWITCHER="$ROOT/scripts/switcher.sh"
+NOTIFY="$ROOT/scripts/needinput-notify.sh"
 TMP="$(mktemp -d /tmp/radar-sw.XXXXXX)"
 SOCKET="rs$$"
 FAKE_BIN="$TMP/bin"
@@ -246,6 +247,45 @@ fi
 grep -q 'sid reg key ' "$TMP/preview-registry-controls.plain" || fail 'preview lost the sanitized registry session key'
 printf 'PASS: Attention and preview sanitize user control bytes while retaining renderer ANSI\n'
 
+# The public notifier API must keep its persisted TSV safe, not merely rely on
+# the switcher renderer to repair unsafe hook data on read.
+: > "$TMP/state/need-input"
+: > "$TMP/state/agent-registry"
+# shellcheck disable=SC2329 # exported below; invoked inside the notifier child
+tmux() {
+  case " $* " in
+    *' #{pane_title} '*) printf '%s' $'saved\ttitle\rcontrol\033X'; return 0 ;;
+  esac
+  "$REAL_TMUX" "$@"
+}
+export -f tmux
+env -u CLAUDE_JOB_DIR "$NOTIFY" mark "$P_ALPHA_1" \
+  $'hook\tsource\rcontrol\033X' $'your\t\rturn\033Y' $'s:mark\t\rkey\033Z'
+unset -f tmux
+[ "$(wc -l < "$TMP/state/need-input" | tr -d ' ')" -eq 1 ] ||
+  fail 'public mark API wrote more than one physical state row'
+awk -F '\t' 'NF == 6 { ok=1 } END { exit !ok }' "$TMP/state/need-input" ||
+  fail 'public mark API did not preserve the exact six-field TSV contract'
+if LC_ALL=C tr -d '\t\n' < "$TMP/state/need-input" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+  fail 'public mark API persisted an unsafe control byte'
+fi
+IFS=$'\t' read -r _mark_pane _mark_epoch mark_source mark_key mark_label mark_title < "$TMP/state/need-input"
+[ "$mark_source" = 'hook source control X' ] || fail "public mark API normalized source incorrectly: $mark_source"
+[ "$mark_key" = 's:mark key Z' ] || fail "public mark API normalized key incorrectly: $mark_key"
+[ "$mark_label" = 'your turn Y' ] || fail "public mark API normalized label incorrectly: $mark_label"
+[ "$mark_title" = 'saved title control X' ] || fail "public mark API normalized saved title incorrectly: $mark_title"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list attention > "$TMP/public-mark.rows"
+strip_ansi < "$TMP/public-mark.rows" > "$TMP/public-mark.plain"
+assert_pane_rows 'public mark Attention fixture' "$TMP/public-mark.plain"
+grep -q 'DONE' "$TMP/public-mark.plain" || fail 'public mark API normalization changed Attention semantics'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" preview "$P_ALPHA_1" > "$TMP/public-mark-preview.out"
+strip_ansi < "$TMP/public-mark-preview.out" > "$TMP/public-mark-preview.plain"
+if { cat "$TMP/public-mark.plain" "$TMP/public-mark-preview.plain" | LC_ALL=C tr -d '\t\n' | LC_ALL=C grep -q '[[:cntrl:]]'; }; then
+  fail 'public mark API leaked unsafe controls into Attention or preview'
+fi
+grep -q 'sid mark key' "$TMP/public-mark-preview.plain" || fail 'preview lost the normalized public mark session key'
+printf 'PASS: public mark API persists normalized six-field Attention metadata\n'
+
 # Equal-severity/equal-epoch marks retain canonical tmux server order. Create a
 # lexically earlier session after the existing panes so pane-id creation order
 # is deliberately the opposite of server order.
@@ -302,6 +342,15 @@ printf 'PASS: menu attention opens directly with a nonselectable empty explanati
 export TMUX_RADAR_TEST_TMUX_LOG="$TMP/tmux.log"
 cat > "$FAKE_BIN/tmux" <<'SH'
 #!/usr/bin/env bash
+if [ "${1:-}" = list-panes ] && [ "${TMUX_RADAR_TEST_FAIL_RELOAD:-0}" = 1 ]; then
+  count="$(cat "$TMUX_RADAR_TEST_LIST_COUNT" 2>/dev/null || printf 0)"
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$TMUX_RADAR_TEST_LIST_COUNT"
+  if [ "$count" -gt 1 ]; then
+    printf 'INJECTED_RAW_LIST_ERROR\033[31m\n' >&2
+    exit 41
+  fi
+fi
 if [ "${1:-}" = list-panes ] && [ "${TMUX_RADAR_TEST_FAIL_LIST:-0}" = 1 ]; then
   printf 'INJECTED_RAW_LIST_ERROR\n' >&2
   exit 41
@@ -372,6 +421,57 @@ grep -q 'unable to list panes' "$TMP/menu-list-fail.err" || fail 'menu list fail
 ! grep -q 'INJECTED_RAW_LIST_ERROR' "$TMP/menu-list-fail.err" || fail 'menu list failure leaked raw tmux stderr'
 unset TMUX_RADAR_TEST_FAIL_LIST
 printf 'PASS: list failures are explicit and stop before fzf\n'
+
+# A scope reload is a second producer transaction. If it fails after the
+# initial list succeeds, fzf must abort and the menu must report producer
+# failure rather than treating abort/no-match as a clean empty result.
+export TMUX_RADAR_TEST_FAIL_RELOAD=1
+export TMUX_RADAR_TEST_LIST_COUNT="$TMP/reload-list-count"
+export TMUX_RADAR_TEST_SWITCHER="$SWITCHER"
+rm -f "$TMUX_RADAR_TEST_LIST_COUNT"
+cat > "$FAKE_BIN/fzf" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+action="$(bash "$TMUX_RADAR_TEST_SWITCHER" set-view attention)"
+[ "$action" = abort ] && exit 130
+printf 'unexpected transform action: %s\n' "$action" >&2
+exit 2
+SH
+chmod +x "$FAKE_BIN/fzf"
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu all >"$TMP/reload-fail.out" 2>"$TMP/reload-fail.err"
+reload_rc=$?
+set -e
+[ "$reload_rc" -ne 0 ] || fail 'scope reload list failure incorrectly returned success'
+grep -q 'unable to list panes' "$TMP/reload-fail.err" || fail 'scope reload failure omitted concise producer diagnostic'
+! grep -q 'INJECTED_RAW_LIST_ERROR' "$TMP/reload-fail.err" || fail 'scope reload failure leaked raw tmux stderr'
+! grep -q 'picker failed' "$TMP/reload-fail.err" || fail 'scope reload producer failure was misreported as picker failure'
+[ "$(cat "$TMUX_RADAR_TEST_LIST_COUNT")" -ge 2 ] || fail 'scope reload regression did not exercise a successful initial list followed by reload'
+unset TMUX_RADAR_TEST_FAIL_RELOAD TMUX_RADAR_TEST_LIST_COUNT TMUX_RADAR_TEST_SWITCHER
+printf 'PASS: scope reload producer failures abort the menu explicitly\n'
+
+# Restore the selection-capable fake picker for the remaining menu scenarios.
+cat > "$FAKE_BIN/fzf" <<'SH'
+#!/usr/bin/env bash
+input="$(cat)"
+[ -n "${TMUX_RADAR_TEST_FZF_MARKER:-}" ] && : > "$TMUX_RADAR_TEST_FZF_MARKER"
+if [ -n "${TMUX_RADAR_TEST_FZF_EXIT:-}" ]; then
+  printf 'INJECTED_RAW_FZF_ERROR\033[31m\n' >&2
+  exit "$TMUX_RADAR_TEST_FZF_EXIT"
+fi
+row="$(printf '%s\n' "$input" | awk -F '\t' -v t="$TMUX_RADAR_TEST_SELECT" '$1 == t { print; exit }')"
+if [ "${TMUX_RADAR_TEST_CLOSE_BEFORE_SELECT:-0}" = 1 ]; then
+  old_coord="$("$REAL_TMUX" display-message -p -t "$TMUX_RADAR_TEST_SELECT" '#{session_name}:#{window_index}.#{pane_index}')"
+  "$REAL_TMUX" kill-pane -t "$TMUX_RADAR_TEST_SELECT"
+  replacement="$("$REAL_TMUX" display-message -p -t "$old_coord" '#{pane_id}' 2>/dev/null || true)"
+  if [ -z "$replacement" ]; then
+    replacement="$("$REAL_TMUX" split-window -d -P -F '#{pane_id}' -t "${old_coord%.*}")"
+  fi
+  printf '%s\t%s\n' "$old_coord" "$replacement" > "$TMUX_RADAR_TEST_REUSE_PROOF"
+fi
+printf '%s\n' "$row"
+SH
+chmod +x "$FAKE_BIN/fzf"
 
 # fzf exit 1 (no match) and 130 (cancel) are clean success; internal failures
 # are nonzero, sanitized, and do not mutate switch or MRU state.

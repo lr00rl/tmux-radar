@@ -162,7 +162,11 @@ opt() {  # opt <option> <default> (empty/no server -> default)
   if [ -n "${v:-}" ]; then printf '%s' "$v"; else printf '%s' "$def"; fi
 }
 
-_san() { printf '%s' "${1:-}" | tr '\t\n' '  '; }
+_san() {
+  printf '%s' "${1:-}" |
+    LC_ALL=C tr '\000-\037\177' ' ' |
+    sed 's/  */ /g; s/^ //; s/ $//'
+}
 
 _b64d() { printf '%s' "$1" | base64 -d 2>/dev/null || printf '%s' "$1" | base64 -D 2>/dev/null || true; }
 
@@ -589,6 +593,8 @@ _sync_bar() {
 cmd_mark() {  # cmd_mark <pane|-> <source> <label> [key]
   local pane="${1:-${TMUX_PANE:-}}" source="${2:-tool}" label="${3:-needs input}" key="${4:-}"
   have_tmux || exit 0
+  source="$(_san "$source")"
+  key="$(_san "$key")"
   label="$(_san "$label")"
   local now saved_title=""
   now="$(date +%s)"
@@ -665,8 +671,11 @@ cmd_tick() {
     \( -name "$(basename "$STATE_FILE").??????" -o -name "$(basename "$REG_FILE").??????" \) \
     -mmin +10 -delete 2>/dev/null || true
   if [ -r "$ERR_LOG" ] && [ "$(wc -l < "$ERR_LOG" 2>/dev/null || echo 0)" -gt 1000 ]; then
-    tmp="$(mktemp "$ERR_LOG.XXXXXX")" 2>/dev/null &&
-      { tail -n 500 "$ERR_LOG" > "$tmp" && mv "$tmp" "$ERR_LOG" || rm -f "$tmp"; }
+    if tmp="$(mktemp "$ERR_LOG.XXXXXX")" 2>/dev/null; then
+      if ! tail -n 500 "$ERR_LOG" > "$tmp" || ! mv "$tmp" "$ERR_LOG"; then
+        rm -f "$tmp"
+      fi
+    fi
   fi
   snapshot="$("$PS_BIN" -axo pid=,ppid=,tty=,command= 2>/dev/null || true)"
   # reg_ok = "the registry answered". Without it (ps failed, or the registry

@@ -394,7 +394,7 @@ _fzf_version_supported() {
 }
 
 _reload_picker() {  # publish VIEW/EXPANDED as one coherent fzf transaction
-  local rows_tmp reload_cmd header
+  local focus_pos="${1:-1}" rows_tmp reload_cmd header
   if [ -z "${SW_ROWS:-}" ] || [ -z "${SW_ERROR:-}" ]; then
     printf 'abort\n'
     return 0
@@ -421,14 +421,16 @@ _reload_picker() {  # publish VIEW/EXPANDED as one coherent fzf transaction
   header="$(_header)"
   # fzf reads transform actions line-by-line and ignores a final unterminated
   # record even when the producer command itself succeeded.
-  printf 'reload-sync(%s)+change-prompt(%s)+change-header(%s)+pos(1)\n' \
-    "$reload_cmd" "$(_prompt)" "$header"
+  printf 'reload-sync(%s)+change-prompt(%s)+change-header(%s)+pos(%s)\n' \
+    "$reload_cmd" "$(_prompt)" "$header" "$focus_pos"
 }
 
 cmd_set_view() {  # fzf transform: switch view, reload, repoint prompt
+  local focus_pos=1
   read_state
   VIEW="$(normalize_view "${1:-recent}")"
-  _reload_picker
+  [ "$VIEW" = recent ] && focus_pos=2
+  _reload_picker "$focus_pos"
 }
 
 cmd_toggle_expand() {  # fzf transform: toggle pane leaves in Recent/Tree
@@ -489,6 +491,9 @@ do_menu() {
   # Relevance applies consistently; input order is the final tie break, which
   # preserves each view's canonical order for an empty query.
   fzf_args=(--ansi --delimiter=$'\t' --with-nth=2.. --cycle '--tiebreak=begin,index')
+  # Recent is a switch-back surface: row 1 is the current MRU window and row 2
+  # is the previous window. Wait for the list before placing the initial cursor.
+  [ "$VIEW" = recent ] && fzf_args+=(--sync '--bind=start:pos(2)')
 
   list_file="$(mktemp "${STATE_DIR}/.rows.XXXXXX")"
   SW_ROWS="$list_file"; export SW_ROWS

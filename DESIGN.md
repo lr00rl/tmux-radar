@@ -157,6 +157,9 @@ name remains the first searchable/displayed term on window and pane rows.
 ## Components
 
 - View switcher: `Ctrl-r` Recent, `Ctrl-i` Inbox, `Ctrl-t` Tree.
+- Recent fast-switch focus: the current MRU window stays on row 1, while the
+  initial cursor and every `Ctrl-r` view switch land on row 2—the previous
+  window—so opening the picker and pressing `Enter` switches back immediately.
 - Hierarchy drill-down: `Ctrl-e` toggles pane rows in Recent and Tree; Inbox is
   already pane-level and leaves the toggle unavailable.
 - Result list: one hidden stable pane target plus two visible fields.
@@ -174,8 +177,9 @@ No new component framework or dependency is introduced.
 
 - Target standard: complete keyboard operation and truthful text state in the
   terminal medium; color is never the sole state channel.
-- Focus/selection: fzf's pointer and highlight remain visible; view reloads put
-  the cursor on a valid first choice and never accept implicitly.
+- Focus/selection: fzf's pointer and highlight remain visible. Recent starts on
+  the previous window at row 2; Tree and Inbox start on row 1. Query changes
+  return to the first match, and no view accepts implicitly.
 - Keyboard behavior: shortcuts are shown in the popup; `Esc` always cancels;
   preview scrolling retains standard documented keys.
 - Readability: sanitize C0/DEL controls, preserve Chinese text, keep the window

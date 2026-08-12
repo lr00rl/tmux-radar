@@ -498,6 +498,10 @@ PATH="$TMP/min-fzf-bin:$PATH" bash "$SWITCHER" menu recent >/dev/null 2>"$TMP/mi
 [ -e "$TMUX_RADAR_MIN_FZF_OPENED" ] || fail 'fzf 0.59 did not reach interactive mode'
 printf 'PASS: unsupported fzf versions fail before interactive mode\n'
 
+# Capture the actual initial Recent invocation separately from the empty Inbox
+# invocation above: the fast-switch view has a deliberate row-2 focus policy.
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu recent >/dev/null 2>"$TMP/menu-recent.err" ||
+  fail 'menu recent failed while capturing its initial selection policy'
 grep -Eq -- '--tiebreak(=|$).*begin,index|--tiebreak=begin,index' "$TMP/fzf.args" ||
   fail 'fzf does not tie-break relevance by beginning position then input order'
 ! grep -qx -- '--nth=2..' "$TMP/fzf.args" ||
@@ -508,6 +512,10 @@ grep -q 'C-e panes' "$TMP/fzf.args" || fail 'picker header does not advertise C-
 grep -q 'A-1..9' "$TMP/fzf.args" || fail 'picker header does not advertise direct row jumps'
 grep -Eq 'ctrl-t:transform\([^)]*set-view tree\)' "$TMP/fzf.args" ||
   fail 'C-t does not switch to the Tree view'
+grep -qx -- '--sync' "$TMP/fzf.args" ||
+  fail 'initial Recent selection can race before fzf has loaded row 2'
+grep -Eq 'start:pos\(2\)' "$TMP/fzf.args" ||
+  fail 'initial Recent view does not select the previous window on row 2'
 grep -Eq 'ctrl-e:transform\([^)]*toggle-expand' "$TMP/fzf.args" ||
   fail 'C-e does not toggle pane drill-down'
 grep -Eq 'alt-1:transform\([^)]*jump 1\)' "$TMP/fzf.args" || fail 'Alt-1 safe row jump is not bound'
@@ -516,6 +524,16 @@ in_range_jump="$(FZF_MATCH_COUNT=2 bash "$SWITCHER" jump 2)"
 [ "$in_range_jump" = 'pos(2)+accept' ] || fail "in-range Alt-N action is unsafe: $in_range_jump"
 out_of_range_jump="$(FZF_MATCH_COUNT=2 bash "$SWITCHER" jump 9)"
 [ "$out_of_range_jump" = 'bell' ] || fail "out-of-range Alt-N action accepted or moved: $out_of_range_jump"
+printf 'tree\t0\n' > "$TMP/recent-focus.state"
+: > "$TMP/recent-focus.rows"
+rm -f "$TMP/recent-focus.error"
+recent_focus_action="$(
+  SW_STATE="$TMP/recent-focus.state" SW_ROWS="$TMP/recent-focus.rows" SW_ERROR="$TMP/recent-focus.error" \
+    PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" set-view recent
+)"
+case "$recent_focus_action" in *'+pos(2)') ;; *)
+  fail "C-r reload does not select the previous window on row 2: $recent_focus_action" ;;
+esac
 search_order="$(
   printf '%%1\tpriority-window alpha:0.0/title\t/tmp · zsh\n%%2\tother-window alpha:0.1/title\t/tmp/priority-window · zsh\n' |
     "$REAL_FZF" --filter='priority-window' --delimiter=$'\t' --with-nth=2.. --tiebreak=begin,index |
@@ -530,12 +548,33 @@ printf 'PASS: picker exposes the restored controls and ranks window names first\
 REAL_FZF_BIN="$TMP/real-fzf-bin"
 mkdir -p "$REAL_FZF_BIN" "$TMP/keyboard-state"
 ln -sf "$REAL_FZF" "$REAL_FZF_BIN/fzf"
+cat > "$REAL_FZF_BIN/tmux" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = switch-client ] && [ -n "${TMUX_RADAR_TEST_SWITCH_TARGET:-}" ]; then
+  printf '%s\n' "${3:-}" > "$TMUX_RADAR_TEST_SWITCH_TARGET"
+  exit 0
+fi
+exec "$REAL_TMUX" "$@"
+SH
+chmod +x "$REAL_FZF_BIN/tmux"
 tmux -L "$SOCKET" select-pane -t "$P_ALPHA_1" -T 'keyboard-pane-leaf'
 tmux -L "$SOCKET" new-window -d -t alpha: -n ct-keyboard
 KEYBOARD_TARGET='alpha:ct-keyboard.0'
 KEYBOARD_PATH="$REAL_FZF_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+KEYBOARD_WINDOW_ID="$(tmux -L "$SOCKET" display-message -p -t "$KEYBOARD_TARGET" '#{window_id}')"
+tmux -L "$SOCKET" list-windows -a -F '#{window_id}' |
+  awk -v previous="$W_ALPHA_1" -v current="$KEYBOARD_WINDOW_ID" '
+    $0 != previous && $0 != current && !seen[$0]++ { print }
+    END { print previous; print current }
+  ' > "$TMP/keyboard-state/window-mru"
+keyboard_expected_second="$(
+  PATH="$KEYBOARD_PATH" TMUX_RADAR_STATE_DIR="$TMP/keyboard-state" bash "$SWITCHER" list recent 0 |
+    awk -F '\t' 'NR == 2 { print $1 }'
+)"
+[ "$keyboard_expected_second" = "$P_ALPHA_W1" ] ||
+  fail "Recent fixture did not place the previous window on row 2: $keyboard_expected_second"
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" -l -- \
-  "PATH='$KEYBOARD_PATH' TMUX_RADAR_STATE_DIR='$TMP/keyboard-state' bash '$SWITCHER' menu"
+  "PATH='$KEYBOARD_PATH' TMUX_RADAR_STATE_DIR='$TMP/keyboard-state' TMUX_RADAR_TEST_SWITCH_TARGET='$TMP/keyboard-switch-target' bash '$SWITCHER' menu"
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" Enter
 for _ in $(seq 1 50); do
   tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-before"
@@ -543,6 +582,24 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 grep -q '^Recent>' "$TMP/keyboard-before" || fail 'real picker did not reach its initial Recent prompt'
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" Enter
+for _ in $(seq 1 50); do
+  [ -s "$TMP/keyboard-switch-target" ] && break
+  sleep 0.1
+done
+[ "$(cat "$TMP/keyboard-switch-target" 2>/dev/null || true)" = "$P_ALPHA_W1" ] ||
+  fail 'opening Recent and pressing Enter did not switch to the previous window on row 2'
+
+# Open a second real picker to exercise the remaining view transforms.
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" -l -- \
+  "PATH='$KEYBOARD_PATH' TMUX_RADAR_STATE_DIR='$TMP/keyboard-state' bash '$SWITCHER' menu"
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" Enter
+for _ in $(seq 1 50); do
+  tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-before-views"
+  grep -q '^Recent>' "$TMP/keyboard-before-views" && break
+  sleep 0.1
+done
+grep -q '^Recent>' "$TMP/keyboard-before-views" || fail 'real picker did not reopen after Recent quick-switch proof'
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-t
 for _ in $(seq 1 50); do
   tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-after"
@@ -606,7 +663,7 @@ grep -q '^Tree>' "$TMP/keyboard-alt9-filtered" || fail 'filtered out-of-range Al
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-u
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" Escape
 tmux -L "$SOCKET" kill-window -t alpha:ct-keyboard
-printf 'PASS: real view keys, Inbox no-op expansion, and safe Alt-N transforms work\n'
+printf 'PASS: Recent opens on row 2; real view keys, Inbox no-op, and safe Alt-N work\n'
 
 # Cleanup must complete before fzf sees its first row, even when Recent/Tree is
 # the initial view. A deliberately slow ps snapshot makes the old background

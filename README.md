@@ -118,7 +118,7 @@ row keeps the current `session:window.pane` location searchable:
 | Key | Action |
 |-----|--------|
 | type | search visible identity and metadata |
-| `ctrl-r` | **Recent**: all live windows, window MRU first |
+| `ctrl-r` | **Recent**: all live windows, window MRU first; starts on row 2 so `Enter` switches back immediately |
 | `ctrl-i` | **Inbox**: unread pane-backed ACTION, DONE, and NOTICE events only |
 | `ctrl-t` | **Tree**: session → window hierarchy |
 | `ctrl-e` | show/hide exact pane leaves in Recent or Tree; no-op in Inbox |

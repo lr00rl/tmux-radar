@@ -42,7 +42,7 @@ opt() {  # opt <option> <default>
 }
 
 # ANSI (tmux -F / printf emit literally; fzf --ansi renders)
-C=$'\033[1;36m'; Y=$'\033[33m'; G=$'\033[1;32m'; M=$'\033[1;35m'; D=$'\033[2m'; R=$'\033[0m'
+C=$'\033[1;36m'; Y=$'\033[33m'; G=$'\033[1;32m'; M=$'\033[1;35m'; B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
 SEP=$'\037'
 
 short_path() {  # short_path <path> -> compact display path
@@ -118,13 +118,22 @@ live_pane_snapshot() {
 list_tree() {
   local live
   live="$(live_pane_snapshot)" || return 1
-  printf '%s\n' "$live" | LC_ALL=C awk -F '\t' -v OFS='\t' -v expanded="$EXPANDED" -v C="$C" -v D="$D" -v R="$R" '
-    function window_row(link, branch) {
-      return wname[link] "  " branch " " C session[link] ":" widx[link] R
+  printf '%s\n' "$live" | LC_ALL=C awk -F '\t' -v OFS='\t' -v expanded="$EXPANDED" -v C="$C" -v Y="$Y" -v B="$B" -v D="$D" -v R="$R" '
+    function runtime_meta(count, cmd, path, show_count,    text) {
+      text=""
+      if (show_count && count > 1) text=count "p"
+      if (cmd != "") text=text (text != "" ? " · " : "") cmd
+      if (path != "") text=text (text != "" ? " · " : "") path
+      return D text R
     }
-    function pane_row(pk, branch,    title) {
-      title=(ptitle[pk] != "" ? "/" ptitle[pk] : "")
-      return pname[pk] "     " branch " " C psession[pk] ":" pwidx[pk] "." pidx[pk] title R
+    function session_row(sk) {
+      return C "▾" R " " D sprintf("%2d", wn[sk]) "w ──" R " " B sname[sk] R
+    }
+    function window_row(link, branch) {
+      return D "  " branch R " " Y sprintf("%2s", widx[link]) R " " wname[link]
+    }
+    function pane_row(pk, stem, branch) {
+      return D stem branch R " " Y pidx[pk] R " " ptitle[pk]
     }
     {
       p=$1; s=$2; sk=$3; w=$4; link=sk SUBSEP w; pk=link SUBSEP p
@@ -134,25 +143,29 @@ list_tree() {
       if ($7 == 1 && $9 == 1) starget[sk]=p
       if (!(link in seen_link)) {
         seen_link[link]=1; worder[sk, ++wn[sk]]=link
-        session[link]=s; widx[link]=$5; wname[link]=$6; wtarget[link]=p
+        widx[link]=$5; wname[link]=$6; wtarget[link]=p
+        wcmd[link]=$11; wpath[link]=$12
       }
-      if ($9 == 1) wtarget[link]=p
+      if ($9 == 1) {
+        wtarget[link]=p; wcmd[link]=$11; wpath[link]=$12
+      }
       if (pk in seen_pane_link) next
       seen_pane_link[pk]=1; porder[link, ++pn[link]]=pk; ptarget[pk]=p
-      pname[pk]=$6; psession[pk]=s; pwidx[pk]=$5; pidx[pk]=$8
+      pidx[pk]=$8
       ptitle[pk]=$10; pcmd[pk]=$11; ppath[pk]=$12
     }
     END {
       for (si=1; si<=sn; si++) {
         sk=sorder[si]
-        print starget[sk], "▾ " sname[sk], D wn[sk] " window" (wn[sk] == 1 ? "" : "s") R
+        print starget[sk], session_row(sk), D R
         for (wi=1; wi<=wn[sk]; wi++) {
           link=worder[sk, wi]; wb=(wi == wn[sk] ? "└─" : "├─")
-          print wtarget[link], window_row(link, wb), D "window · " pn[link] " pane" (pn[link] == 1 ? "" : "s") R
+          print wtarget[link], window_row(link, wb), runtime_meta(pn[link], wcmd[link], wpath[link], 1)
           if (expanded != 1) continue
+          stem=(wi == wn[sk] ? "      " : "  │   ")
           for (pi=1; pi<=pn[link]; pi++) {
             pk=porder[link, pi]; pb=(pi == pn[link] ? "└─" : "├─")
-            print ptarget[pk], pane_row(pk, pb), D pcmd[pk] " · " ppath[pk] R
+            print ptarget[pk], pane_row(pk, stem, pb), runtime_meta(0, pcmd[pk], ppath[pk], 0)
           }
         }
       }

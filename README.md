@@ -112,8 +112,10 @@ windows and sessions (pane-level MRU is recorded by tmux hooks; see
 `@radar-last-key`).
 
 `prefix + C-w` opens the picker. Every view contains only exact live-pane
-destinations. The hidden target is the stable tmux pane ID (`%N`); the visible
-row keeps the current `session:window.pane` location searchable:
+destinations. The hidden target is the stable tmux pane ID (`%N`). Recent and
+Inbox keep the current `session:window.pane` location searchable; Tree uses the
+visible session group plus aligned window/pane indexes instead of repeating the
+full coordinate on every row:
 
 | Key | Action |
 |-----|--------|
@@ -138,6 +140,18 @@ sessions remain available in notification/supervisor surfaces instead of
 becoming nonfunctional picker rows. `all` aliases Tree and `needinput` aliases
 Inbox for compatibility. The older `attention` token is accepted silently for
 existing scripts but is no longer a documented product view.
+
+Tree deliberately scans as a compact hierarchy rather than a prose report:
+
+```text
+▾  8w ── Openjobs-data
+  ├─  0 openjobs-data-spark          zsh · ~/project
+  ├─  7 tidb_123                  3p · ssh · ~
+  └─  8 scripts                      ssh · ~/Falcon
+```
+
+Single-pane windows omit the meaningless `1p`; only multi-pane windows show a
+compact count. `Ctrl-e` continues the same branch rail into exact pane leaves.
 
 ## Configuration
 

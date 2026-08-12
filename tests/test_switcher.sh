@@ -148,13 +148,19 @@ PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 0 > "$TMP/tree.rows"
 strip_ansi < "$TMP/tree.rows" > "$TMP/tree.plain"
 assert_live_rows 'collapsed Tree' "$TMP/tree.plain"
 awk -F '\t' '
-  $2 ~ /^▾ (alpha|beta)([[:space:]]|$)/ { sessions++ }
-  $2 ~ /^[^[:space:]].*[[:space:]][├└]─ (alpha|beta):[0-9]+/ { windows++ }
+  $2 ~ /^▾ [[:space:]][0-9]+w ── (alpha|beta)$/ { sessions++ }
+  $2 ~ /^  [├└]─ [[:space:]][0-9]+ (zero|one)$/ { windows++ }
   $2 ~ /:[0-9]+\.[0-9]+/ { panes++ }
   END { exit !(NR == 5 && sessions == 2 && windows == 3 && panes == 0) }
 ' "$TMP/tree.plain" || fail 'Tree does not rest as a canonical 2-session/3-window hierarchy'
-TREE_SESSION_TARGET="$(awk -F '\t' '$2 ~ /^▾ beta([[:space:]]|$)/ { print $1; exit }' "$TMP/tree.plain")"
+TREE_SESSION_TARGET="$(awk -F '\t' '$2 ~ /── beta$/ { print $1; exit }' "$TMP/tree.plain")"
 [ -n "$TREE_SESSION_TARGET" ] || fail 'Tree omitted the switchable beta session row'
+awk -F '\t' '
+  $2 ~ /^  [├└]─ [[:space:]]0 zero$/ && $3 !~ /^2p · / { bad=1 }
+  $2 ~ /^  [├└]─ [[:space:]]1 one$/ && $3 ~ /^1p · / { bad=1 }
+  $3 ~ /window ·| pane(s)?([[:space:]]|$)/ { bad=1 }
+  END { exit bad }
+' "$TMP/tree.plain" || fail 'Tree kept redundant prose instead of compact runtime evidence'
 if LC_ALL=C grep -q $'\r' "$TMP/tree.plain"; then
   fail 'Tree left a carriage return in user-derived display content'
 fi
@@ -163,9 +169,9 @@ PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 1 > "$TMP/tree-expanded.rows"
 strip_ansi < "$TMP/tree-expanded.rows" > "$TMP/tree-expanded.plain"
 assert_live_rows 'expanded Tree' "$TMP/tree-expanded.plain"
 awk -F '\t' '
-  $2 ~ /^▾ (alpha|beta)([[:space:]]|$)/ { sessions++ }
-  $2 ~ /^[^[:space:]].*[[:space:]][├└]─ (alpha|beta):[0-9]+/ && $2 !~ /:[0-9]+\.[0-9]+/ { windows++ }
-  $2 ~ /:[0-9]+\.[0-9]+/ { panes++ }
+  $2 ~ /^▾ [[:space:]][0-9]+w ── (alpha|beta)$/ { sessions++ }
+  $2 ~ /^  [├└]─ [[:space:]][0-9]+ (zero|one)$/ { windows++ }
+  $2 ~ /^  ([│]   |    )[├└]─ [0-9]+ / { panes++ }
   END { exit !(NR == 10 && sessions == 2 && windows == 3 && panes == 5) }
 ' "$TMP/tree-expanded.plain" || fail 'Ctrl-e expansion model is not a canonical 2-session/3-window/5-pane hierarchy'
 
@@ -183,16 +189,14 @@ LINKED_PANE="$(tmux -L "$SOCKET" display-message -p -t alpha:1.0 '#{pane_id}')"
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 0 > "$TMP/tree-linked.rows"
 strip_ansi < "$TMP/tree-linked.rows" > "$TMP/tree-linked.plain"
 assert_live_rows 'linked-window collapsed Tree' "$TMP/tree-linked.plain"
-[ "$(awk -F '\t' '$2 ~ /^one / { n++ } END { print n+0 }' "$TMP/tree-linked.plain")" -eq 2 ] ||
+[ "$(awk -F '\t' '$2 ~ /^  [├└]─ [[:space:]]1 one$/ { n++ } END { print n+0 }' "$TMP/tree-linked.plain")" -eq 2 ] ||
   fail 'linked window was not represented once under each session in Tree'
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 1 > "$TMP/tree-linked-expanded.rows"
 strip_ansi < "$TMP/tree-linked-expanded.rows" > "$TMP/tree-linked-expanded.plain"
-[ "$(grep -c 'alpha:1\.0' "$TMP/tree-linked-expanded.plain")" -eq 1 ] ||
-  fail 'linked Tree duplicated or lost the alpha link pane coordinate'
-[ "$(grep -c 'beta:1\.0' "$TMP/tree-linked-expanded.plain")" -eq 1 ] ||
-  fail 'linked Tree duplicated or lost the beta link pane coordinate'
-[ "$(awk -F '\t' -v p="$LINKED_PANE" '$1 == p && $2 ~ /^one / { n++ } END { print n+0 }' "$TMP/tree-linked-expanded.plain")" -eq 4 ] ||
-  fail 'linked Tree did not emit two window rows plus two pane leaves for the shared pane'
+[ "$(awk -F '\t' '$2 ~ /^  [├└]─ [[:space:]]1 one$/ { n++ } END { print n+0 }' "$TMP/tree-linked-expanded.plain")" -eq 2 ] ||
+  fail 'linked Tree did not emit one window row under each session'
+[ "$(awk -F '\t' -v p="$LINKED_PANE" '$1 == p && $2 ~ /^  ([│]   |    )[├└]─ 0 / { n++ } END { print n+0 }' "$TMP/tree-linked-expanded.plain")" -eq 2 ] ||
+  fail 'linked Tree did not emit one pane leaf under each session link'
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list recent 1 > "$TMP/recent-linked.rows"
 strip_ansi < "$TMP/recent-linked.rows" > "$TMP/recent-linked.plain"
 [ "$(wc -l < "$TMP/recent-linked.plain" | tr -d ' ')" -eq 8 ] ||
@@ -607,15 +611,15 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 grep -q '^Tree>' "$TMP/keyboard-after" || fail 'real Ctrl-t key event did not change the picker to Tree'
-grep -q 'alpha:0\.1' "$TMP/keyboard-after" && fail 'collapsed Tree exposed pane rows before Ctrl-e'
+grep -q 'keyboard-pane-leaf' "$TMP/keyboard-after" && fail 'collapsed Tree exposed pane rows before Ctrl-e'
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-e
 for _ in $(seq 1 50); do
   tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-expanded"
-  grep -q '^Tree+>' "$TMP/keyboard-expanded" && grep -q 'alpha:0\.1' "$TMP/keyboard-expanded" && break
+  grep -q '^Tree+>' "$TMP/keyboard-expanded" && grep -q 'keyboard-pane-leaf' "$TMP/keyboard-expanded" && break
   sleep 0.1
 done
 grep -q '^Tree+>' "$TMP/keyboard-expanded" || fail 'real Ctrl-e key event did not enter expanded Tree state'
-grep -q 'alpha:0\.1' "$TMP/keyboard-expanded" || fail 'real Ctrl-e key event did not reveal pane rows'
+grep -q 'keyboard-pane-leaf' "$TMP/keyboard-expanded" || fail 'real Ctrl-e key event did not reveal pane rows'
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-i
 for _ in $(seq 1 50); do
   tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-inbox"
@@ -1000,11 +1004,22 @@ PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list all 1 > "$TMP/large.rows"
 unset TMUX_RADAR_TEST_COUNT_LIST_CALLS
 strip_ansi < "$TMP/large.rows" > "$TMP/large.plain"
 assert_live_rows 'large expanded Tree' "$TMP/large.plain"
-scale_count="$(awk -F '\t' '$1 ~ /^%[0-9]+$/ && $2 ~ /scale:[0-9]+\.[0-9]+/ { n++ } END { print n+0 }' "$TMP/large.plain")"
+scale_count="$(awk -F '\t' '
+  $2 ~ /── scale$/ { in_scale=1; next }
+  in_scale && $2 ~ /^▾ / { in_scale=0 }
+  in_scale && $2 ~ /^  ([│]   |    )[├└]─ [0-9]+ / { n++ }
+  END { print n+0 }
+' "$TMP/large.plain")"
 [ "$scale_count" -eq 100 ] || fail "large Tree scan lost or duplicated panes (got $scale_count, want 100)"
 scale_targets="$(awk -F '\t' '
-  $1 ~ /^%[0-9]+$/ && match($2, /scale:[0-9]+\.[0-9]+/) {
-    print substr($2, RSTART, RLENGTH)
+  $2 ~ /── scale$/ { in_scale=1; next }
+  in_scale && $2 ~ /^▾ / { in_scale=0 }
+  in_scale && $2 ~ /^  [├└]─ / {
+    line=$2; sub(/^.*[├└]─ /, "", line); split(line, part, " "); win=part[1]; next
+  }
+  in_scale && $2 ~ /^  ([│]   |    )[├└]─ [0-9]+ / {
+    line=$2; sub(/^.*[├└]─ /, "", line); split(line, part, " ")
+    print "scale:" win "." part[1]
   }
 ' "$TMP/large.plain")"
 expected_targets="$(for win in $(seq 0 9); do for pane in $(seq 0 9); do printf 'scale:%s.%s\n' "$win" "$pane"; done; done)"

@@ -140,7 +140,7 @@ still preserve destination correctness underneath.
 - Geometry: flat terminal surface, hairline popup/preview separators, no cards,
   shadows, gradients, blur, or decorative motion.
 - Signature details:
-  - precise tree branches and aligned locations;
+  - a continuous Tree rail with aligned two-column window indexes;
   - one compact keyboard legend that changes with the active view;
   - state words plus restrained icons in Inbox;
   - direct row jumps (`Alt-1`…`Alt-9`) as visible expert affordances.
@@ -148,11 +148,19 @@ still preserve destination correctness underneath.
 Recommended row hierarchy:
 
 ```text
-window-name    session:window[.pane]    title/state    · command · ~/cwd
+Recent: window-name    session:window[.pane]    title/state · command · ~/cwd
+Tree:   ▾  8w ── session-name
+          ├─  0 window-name             command · ~/cwd
+          └─  7 multi-pane-window    3p · command · ~/cwd
 ```
 
-Tree prefixes indent this same identity rather than replacing it. The window
-name remains the first searchable/displayed term on window and pane rows.
+Recent and Inbox keep the window name as the first displayed term. Tree uses a
+structural prefix before the same primary identity: session count, branch rail,
+and a two-column window index. The window name remains the first semantic search
+term and begins before an equivalent session-name match. Tree does not repeat
+`session:window`, `window · 1 pane`, or the parent window name on every child;
+its hierarchy already communicates those relationships. Multi-pane counts use
+compact `Np` metadata, while command and compact cwd provide recognition value.
 
 ## Components
 

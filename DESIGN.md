@@ -149,15 +149,16 @@ Recommended row hierarchy:
 
 ```text
 Recent: window-name    session:window[.pane]    title/state · command · ~/cwd
-Tree:   ▾  8w ── session-name
+Tree:   ▾ session-name                         8w
           ├─  0 window-name             command · ~/cwd
           └─  7 multi-pane-window    3p · command · ~/cwd
 ```
 
 Recent and Inbox keep the window name as the first displayed term. Tree uses a
-structural prefix before the same primary identity: session count, branch rail,
-and a two-column window index. The window name remains the first semantic search
-term and begins before an equivalent session-name match. Tree does not repeat
+structural prefix before the same primary identity: disclosure/branch glyphs
+and a two-column window index. Session names are primary; their compact window
+count moves to the dim metadata column. Picker-only search weighting keeps an
+exact window-name match ahead of an identical session label. Tree does not repeat
 `session:window`, `window · 1 pane`, or the parent window name on every child;
 its hierarchy already communicates those relationships. Multi-pane counts use
 compact `Np` metadata, while command and compact cwd provide recognition value.

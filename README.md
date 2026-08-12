@@ -144,7 +144,7 @@ existing scripts but is no longer a documented product view.
 Tree deliberately scans as a compact hierarchy rather than a prose report:
 
 ```text
-▾  8w ── Openjobs-data
+▾ Openjobs-data                         8w
   ├─  0 openjobs-data-spark          zsh · ~/project
   ├─  7 tidb_123                  3p · ssh · ~
   └─  8 scripts                      ssh · ~/Falcon

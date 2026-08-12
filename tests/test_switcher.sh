@@ -148,12 +148,12 @@ PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 0 > "$TMP/tree.rows"
 strip_ansi < "$TMP/tree.rows" > "$TMP/tree.plain"
 assert_live_rows 'collapsed Tree' "$TMP/tree.plain"
 awk -F '\t' '
-  $2 ~ /^▾ [[:space:]][0-9]+w ── (alpha|beta)$/ { sessions++ }
+  $2 ~ /^▾ (alpha|beta)$/ && $3 ~ /^[[:space:]]*[0-9]+w$/ { sessions++ }
   $2 ~ /^  [├└]─ [[:space:]][0-9]+ (zero|one)$/ { windows++ }
   $2 ~ /:[0-9]+\.[0-9]+/ { panes++ }
   END { exit !(NR == 5 && sessions == 2 && windows == 3 && panes == 0) }
 ' "$TMP/tree.plain" || fail 'Tree does not rest as a canonical 2-session/3-window hierarchy'
-TREE_SESSION_TARGET="$(awk -F '\t' '$2 ~ /── beta$/ { print $1; exit }' "$TMP/tree.plain")"
+TREE_SESSION_TARGET="$(awk -F '\t' '$2 == "▾ beta" && $3 ~ /^[[:space:]]*1w$/ { print $1; exit }' "$TMP/tree.plain")"
 [ -n "$TREE_SESSION_TARGET" ] || fail 'Tree omitted the switchable beta session row'
 awk -F '\t' '
   $2 ~ /^  [├└]─ [[:space:]]0 zero$/ && $3 !~ /^2p · / { bad=1 }
@@ -169,7 +169,7 @@ PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 1 > "$TMP/tree-expanded.rows"
 strip_ansi < "$TMP/tree-expanded.rows" > "$TMP/tree-expanded.plain"
 assert_live_rows 'expanded Tree' "$TMP/tree-expanded.plain"
 awk -F '\t' '
-  $2 ~ /^▾ [[:space:]][0-9]+w ── (alpha|beta)$/ { sessions++ }
+  $2 ~ /^▾ (alpha|beta)$/ && $3 ~ /^[[:space:]]*[0-9]+w$/ { sessions++ }
   $2 ~ /^  [├└]─ [[:space:]][0-9]+ (zero|one)$/ { windows++ }
   $2 ~ /^  ([│]   |    )[├└]─ [0-9]+ / { panes++ }
   END { exit !(NR == 10 && sessions == 2 && windows == 3 && panes == 5) }
@@ -219,7 +219,7 @@ printf 'PASS: linked windows preserve Tree links and stay deduplicated in Recent
 # as Recent/Inbox, even when a session has the identical name.
 tmux -L "$SOCKET" new-session -d -s priority-window -n neutral -x 120 -y 40
 tmux -L "$SOCKET" rename-window -t alpha:1 priority-window
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 0 > "$TMP/tree-search-priority.rows"
+TMUX_RADAR_PICKER_ROWS=1 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 0 > "$TMP/tree-search-priority.rows"
 tree_search_first="$(
   "$REAL_FZF" --ansi --filter='priority-window' --delimiter=$'\t' --with-nth=2.. --tiebreak=begin,index \
     < "$TMP/tree-search-priority.rows" | cut -f1 | head -1
@@ -1005,14 +1005,14 @@ unset TMUX_RADAR_TEST_COUNT_LIST_CALLS
 strip_ansi < "$TMP/large.rows" > "$TMP/large.plain"
 assert_live_rows 'large expanded Tree' "$TMP/large.plain"
 scale_count="$(awk -F '\t' '
-  $2 ~ /── scale$/ { in_scale=1; next }
+  $2 == "▾ scale" { in_scale=1; next }
   in_scale && $2 ~ /^▾ / { in_scale=0 }
   in_scale && $2 ~ /^  ([│]   |    )[├└]─ [0-9]+ / { n++ }
   END { print n+0 }
 ' "$TMP/large.plain")"
 [ "$scale_count" -eq 100 ] || fail "large Tree scan lost or duplicated panes (got $scale_count, want 100)"
 scale_targets="$(awk -F '\t' '
-  $2 ~ /── scale$/ { in_scale=1; next }
+  $2 == "▾ scale" { in_scale=1; next }
   in_scale && $2 ~ /^▾ / { in_scale=0 }
   in_scale && $2 ~ /^  [├└]─ / {
     line=$2; sub(/^.*[├└]─ /, "", line); split(line, part, " "); win=part[1]; next

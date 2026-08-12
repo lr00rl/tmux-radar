@@ -44,6 +44,7 @@ opt() {  # opt <option> <default>
 # ANSI (tmux -F / printf emit literally; fzf --ansi renders)
 C=$'\033[1;36m'; Y=$'\033[33m'; G=$'\033[1;32m'; M=$'\033[1;35m'; B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
 SEP=$'\037'
+ZWSP=$'\342\200\213'
 
 short_path() {  # short_path <path> -> compact display path
   local p="${1:-}" home_prefix
@@ -118,7 +119,9 @@ live_pane_snapshot() {
 list_tree() {
   local live
   live="$(live_pane_snapshot)" || return 1
-  printf '%s\n' "$live" | LC_ALL=C awk -F '\t' -v OFS='\t' -v expanded="$EXPANDED" -v C="$C" -v Y="$Y" -v B="$B" -v D="$D" -v R="$R" '
+  printf '%s\n' "$live" | LC_ALL=C awk -F '\t' -v OFS='\t' -v expanded="$EXPANDED" \
+    -v picker="${TMUX_RADAR_PICKER_ROWS:-0}" -v ZWSP="$ZWSP" \
+    -v C="$C" -v Y="$Y" -v B="$B" -v D="$D" -v R="$R" '
     function runtime_meta(count, cmd, path, show_count,    text) {
       text=""
       if (show_count && count > 1) text=count "p"
@@ -126,8 +129,20 @@ list_tree() {
       if (path != "") text=text (text != "" ? " · " : "") path
       return D text R
     }
+    function picker_session_name(name,    weighted) {
+      if (picker != 1) return name
+      # fzf cannot weight a hidden field separately from the displayed fields.
+      # Zero-width separators preserve the rendered label while making an exact
+      # window-name match outrank an identical structural session label.
+      weighted=name
+      gsub(/[A-Za-z0-9]/, "&" ZWSP, weighted)
+      return weighted
+    }
     function session_row(sk) {
-      return C "▾" R " " D sprintf("%2d", wn[sk]) "w ──" R " " B sname[sk] R
+      return C "▾" R " " B picker_session_name(sname[sk]) R
+    }
+    function session_meta(sk) {
+      return D wn[sk] "w" R
     }
     function window_row(link, branch) {
       return D "  " branch R " " Y sprintf("%2s", widx[link]) R " " wname[link]
@@ -157,7 +172,7 @@ list_tree() {
     END {
       for (si=1; si<=sn; si++) {
         sk=sorder[si]
-        print starget[sk], session_row(sk), D R
+        print starget[sk], session_row(sk), session_meta(sk)
         for (wi=1; wi<=wn[sk]; wi++) {
           link=worder[sk, wi]; wb=(wi == wn[sk] ? "└─" : "├─")
           print wtarget[link], window_row(link, wb), runtime_meta(pn[link], wcmd[link], wpath[link], 1)
@@ -423,7 +438,7 @@ _reload_picker() {  # publish VIEW/EXPANDED as one coherent fzf transaction
     printf 'abort\n'
     return 0
   }
-  if ! "$SELF" list "$VIEW" "$EXPANDED" > "$rows_tmp" 2>/dev/null || ! mv "$rows_tmp" "$SW_ROWS"; then
+  if ! TMUX_RADAR_PICKER_ROWS=1 "$SELF" list "$VIEW" "$EXPANDED" > "$rows_tmp" 2>/dev/null || ! mv "$rows_tmp" "$SW_ROWS"; then
     rm -f "$rows_tmp" 2>/dev/null || true
     : > "$SW_ERROR"
     printf 'abort\n'
@@ -511,7 +526,7 @@ do_menu() {
   list_file="$(mktemp "${STATE_DIR}/.rows.XXXXXX")"
   SW_ROWS="$list_file"; export SW_ROWS
   SW_ERROR="${SW_STATE}.error"; export SW_ERROR
-  if ! "$SELF" list > "$list_file" 2>/dev/null; then
+  if ! TMUX_RADAR_PICKER_ROWS=1 "$SELF" list > "$list_file" 2>/dev/null; then
     rm -f "$SW_STATE" "$SW_ERROR" "$list_file" 2>/dev/null || true
     printf '%s\n' 'unable to list panes; reopen the switcher' >&2
     tmux display-message 'tmux-radar: unable to list panes; reopen the switcher' >/dev/null 2>&1 || true

@@ -687,6 +687,7 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 grep -q '^Tree>' "$TMP/keyboard-tree-collapsed" || fail 'real Ctrl-e did not collapse Tree before numeric jump'
+sleep 0.3   # let fzf finish applying the reload before the jump key lands
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" M-9
 sleep 0.2
 tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-alt9"

@@ -398,8 +398,11 @@ Required end-to-end checks:
     freshly rendered permission prompt (one screen change) never heals, and a
     contradicted waiting row downgrades to working.
 15. A registry row whose pane is absent from this server keeps liveness but is
-    re-homed to paneless; `$TMUX_PANE` values that do not resolve locally are
-    re-resolved before use.
+    re-homed to paneless; a row whose pid provably lives on another tty (a
+    foreign server, a daemon pty) while its claimed pane hosts no agent is
+    re-homed the same way, and its wrong-pane marks are dropped; `$TMUX_PANE`
+    values that do not resolve locally are re-resolved before use, and the
+    cwd fallback only applies to hooks with no controlling terminal.
 16. Agents lists marked, registered, and scanner-found panes ordered by
     severity, and Recent/Tree window rows carry the aggregated badges without
     changing row targets or the three-field contract.

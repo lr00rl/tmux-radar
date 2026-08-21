@@ -199,6 +199,27 @@ chk "dead-pane row with a live pid is re-homed to paneless, not dropped" \
   "awk -F'\t' '\$2==\"s:swarm1\" && \$4==\"-\"' '$REG' | grep -q ."
 kill "$BG_PID" 2>/dev/null
 
+# --- 6.5 mis-homed rows: pid coherent with a foreign tty, not the named pane ---
+FSOCK="radarforeign$$"
+tmux -L "$FSOCK" -f /dev/null kill-server 2>/dev/null || true
+tmux -L "$FSOCK" -f /dev/null new-session -d -s elsewhere 'sleep 601'
+# the pane_pid is the sleep itself (sh -c execs it); pgrep -f would match the
+# harness's own command line, which merely mentions the pattern
+FPID="$(tmux -L "$FSOCK" display-message -p -t elsewhere:0.0 '#{pane_pid}')"
+tmux new-window -n plain                       # a pane with no agent at all
+PLAIN_PANE="$(tmux display-message -p '#{pane_id}')"
+tmux select-window -t 0
+"$N" agent-register claude s:misplaced "$FPID" "$PLAIN_PANE" /tmp/proj 2>/dev/null || true
+awk -F'\t' -v OFS='\t' '$2=="s:misplaced"{$9="sleep"}1' "$REG" > "$REG.t" && mv "$REG.t" "$REG"
+env -u CLAUDE_JOB_DIR "$N" mark "$PLAIN_PANE" claude "Claude finished — your turn" s:misplaced
+force_scan
+chk "row whose pid lives on a foreign tmux server is re-homed to paneless" \
+  "awk -F'\t' '\$2==\"s:misplaced\" && \$4==\"-\"' '$REG' | grep -q ."
+chk "its wrong-pane mark is dropped in the same scan" \
+  "! grep -q 's:misplaced' '$MARKS'"
+tmux kill-window -t "$PLAIN_PANE" 2>/dev/null || true
+tmux -L "$FSOCK" kill-server 2>/dev/null || true
+
 # --- 7. picker surfaces ---------------------------------------------------------
 AGENTS="$("$SW" list agents)"
 chk "Agents view lists the scanner-adopted working pane" \

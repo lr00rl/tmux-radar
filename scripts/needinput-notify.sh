@@ -911,6 +911,15 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       return ""
     }
     function basename(a0,    n, parts) { n = split(a0, parts, "/"); return parts[n] }
+    function pane_of(pid,    cur, hops) {
+      if (ptty[pid] != "" && ptty[pid] != "??" && (ptty[pid] in bytty)) return bytty[ptty[pid]]
+      cur = pid
+      for (hops = 0; hops < 80 && cur != "" && cur != "0"; hops++) {
+        if (cur in bypid) return bypid[cur]
+        cur = par[cur]
+      }
+      return ""
+    }
     BEGIN { m = split(tolower(cmds), raw, /[[:space:],:]+/); for (i = 1; i <= m; i++) if (raw[i] != "") want[raw[i]] = 1 }
     $0 == "__PANES__"   { mode = 1; next }
     $0 == "__PS__"      { mode = 2; next }
@@ -937,7 +946,7 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       a0 = rest; sub(/[[:space:]].*/, "", a0)
       a1 = ""
       if (rest ~ /[[:space:]]/) { a1 = rest; sub(/^[^[:space:]]+[[:space:]]+/, "", a1); sub(/[[:space:]].*/, "", a1) }
-      par[pid] = ppid
+      par[pid] = ppid; ptty[pid] = cleantty(tty)
       k = agent_kind(a0, a1)
       if (k != "") {
         akind[pid] = k; atty[pid] = cleantty(tty)
@@ -965,37 +974,49 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       if ($4 != "-") {
         anyclaim[$4] = 1
         if ($2 !~ /^p:/) hookown[$4] = 1
+        if (!($4 in livepane)) print "REHOME\t" $2 "\t-"
+        else if (($3 + 0) > 0) { nr++; regkey[nr] = $2; regpane[nr] = $4; regpid[nr] = $3 + 0 }
       }
-      if (($3 + 0) > 0) regpid[$3] = 1
-      if ($4 != "-" && !($4 in livepane)) print "REHOME\t" $2
+      if (($3 + 0) > 0) regpid_seen[$3] = 1
       if ($7 == "waiting" && $4 != "-") waitkey[$4] = $2
       next
     }
     END {
       for (pid in akind) {
-        pane = ""; how = ""
-        if (atty[pid] != "" && atty[pid] != "??" && (atty[pid] in bytty)) { pane = bytty[atty[pid]]; how = "tty" }
-        else {
-          cur = pid
-          for (hops = 0; hops < 80 && cur != "" && cur != "0"; hops++) {
-            if (cur in bypid) { pane = bypid[cur]; how = "walk"; break }
-            cur = par[cur]
-          }
-        }
+        pane = pane_of(pid)
         if (pane == "") continue
         # One pane gets one row: a process sitting on the pane tty beats a
         # parent-chain match, and the binary whose basename IS the kind beats
         # a launcher/helper that merely carries it as a path component.
-        score = (how == "tty" ? 2 : 0) + (tolower(aproc[pid]) == akind[pid] ? 1 : 0)
+        score = (atty[pid] != "" && (atty[pid] in bytty) && bytty[atty[pid]] == pane ? 2 : 0) + (tolower(aproc[pid]) == akind[pid] ? 1 : 0)
         if (!(pane in bestscore) || score > bestscore[pane]) {
           bestscore[pane] = score; bestpid[pane] = pid
+        }
+      }
+      # tty/ancestry coherence, two tiers:
+      # - the recorded pane hosts no live agent process, and the pid provably
+      #   lives on a real tty elsewhere (foreign server, daemon pty): the pane
+      #   claim is dead; re-home to the pane of that pid here, or paneless.
+      # - the pid provably sits on a DIFFERENT live pane: always correct it.
+      # A pid without a tty ("??") proves nothing either way; trust the hook.
+      for (i = 1; i <= nr; i++) {
+        rp = regpid[i]; po = ""
+        if ((rp in ptty) && ptty[rp] != "" && ptty[rp] != "??") {
+          po = (ptty[rp] in bytty) ? bytty[ptty[rp]] : "-"
+          if ((regpane[i] in bestpid) && po == "-") po = ""   # pane is agent-live; an off-server tty alone does not disprove it
+        } else if (rp in par) {
+          po = pane_of(rp)                                    # ancestry-only, and only a different live pane corrects
+        }
+        if (po != "" && po != regpane[i]) {
+          print "REHOME\t" regkey[i] "\t" po
+          print "DROPKEY\t" regkey[i]        # marks targeted the wrong pane
         }
       }
       for (pane in bestpid) {
         pid = bestpid[pane]
         # claimed: 2 = a hook-owned (s:) session row holds this pane, 1 = only
         # scanner-adopted (p:) rows or a pid match, 0 = untracked
-        claimed = (pane in hookown) ? 2 : (((pane in anyclaim) || (pid in regpid)) ? 1 : 0)
+        claimed = (pane in hookown) ? 2 : (((pane in anyclaim) || (pid in regpid_seen)) ? 1 : 0)
         # empty fields collapse under IFS=tab reads; "-" marks "no value"
         t = ptitle[pane]; if (t == "") t = "-"
         prev = (pane in oldstate ? oldstate[pane] : "-")
@@ -1009,68 +1030,13 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       for (p in waitkey)   print "DOWN\t" p "\t" waitkey[p]
     }')"
 
-  local pane kind apid aproc path title pth psh pstreak claimed prev onscreen hasmark
-  local live_rows="" sample_rows="" adopt_rows="" heal_keys="" down_keys="" rehome_keys="" working2="" synth_rows=""
-  local th sh state streak tag key kn s_pane s_kind s_label s_key
-  while IFS=$'\t' read -r tag pane rest; do
-    case "$tag" in
-      REHOME) rehome_keys="${rehome_keys}${pane}"$'\001'; continue ;;   # pane field holds the key
-      A) ;;
-      *) continue ;;                                                    # HEAL/DOWN resolved below
-    esac
-    IFS=$'\t' read -r kind apid aproc path title pth psh pstreak claimed prev onscreen hasmark <<< "$rest"
-    [ "$title" = "-" ] && title=""
-    [ "$pth" = "-" ] && pth=""
-    [ "$psh" = "-" ] && psh=""
-    th="$(printf '%s' "$title" | cksum)"; th="${th%% *}"
-    # One capture per agent pane per scan: cheap at scan cadence, and the
-    # working/stalled verdict stays exact even across title-only changes.
-    sh="$(tmux capture-pane -p -t "$pane" 2>/dev/null | cksum)"; sh="${sh%% *}"
-    case "$title" in
-      # Codex animates an attention marker into its native title while blocked
-      # on approval; change detection alone would read it as working.
-      *"Action Required"*|*"action required"*|*"Needs Approval"*|*"needs approval"*)
-        state=blocked ;;
-      *)
-        if { [ -n "$pth" ] && [ "$th" != "$pth" ]; } || { [ -n "$psh" ] && [ "$sh" != "$psh" ]; } || [ -z "$psh" ]; then
-          state=working
-        else
-          state=stalled
-        fi
-        ;;
-    esac
-    streak=0
-    [ "$state" = working ] && streak=$((pstreak + 1))
-    [ "$streak" -ge 2 ] && working2="${working2}${pane} "
-    live_rows="${live_rows}${pane}"$'\t'"${kind}"$'\t'"${state}"$'\t'"$(_san "$title")"$'\t'"${now}"$'\n'
-    sample_rows="${sample_rows}${pane}"$'\t'"${th}"$'\t'"${sh}"$'\t'"${streak}"$'\n'
-    if [ "$claimed" = 0 ]; then
-      adopt_rows="${adopt_rows}${kind}"$'\t'"p:${apid}"$'\t'"${apid}"$'\t'"${pane}"$'\t'"${now}"$'\t'"${now}"$'\t'"${state}"$'\t'"$(_san "$path")"$'\t'"$(_san "$aproc")"$'\n'
-      claimed=1   # adopted now: event synthesis below applies from this scan on
-    fi
-    # Hookless (or hook-gapped) panes still produce no events of their own.
-    # An observed transition into blocked, or from working into stalled, IS
-    # the event — synthesize it once, off-screen only, never over an
-    # existing unread mark.
-    if [ "$claimed" -ge 1 ] && [ "$onscreen" = 0 ] && [ "$hasmark" = 0 ]; then
-      case "$kind" in
-        claude) kn=Claude ;; codex) kn=Codex ;; kimi) kn=Kimi ;; pi) kn=Pi ;; *) kn=Agent ;;
-      esac
-      if [ "$state" = blocked ] && [ "$prev" != blocked ]; then
-        synth_rows="${synth_rows}${pane}"$'\t'"${kind}"$'\t'"${kn} needs approval (scan)"$'\t'"p:${apid}"$'\n'
-      elif [ "$state" = stalled ] && [ "$prev" = working ]; then
-        synth_rows="${synth_rows}${pane}"$'\t'"${kind}"$'\t'"${kn} finished — your turn (scan)"$'\t'"p:${apid}"$'\n'
-      fi
-    fi
-    [ -n "${TMUX_RADAR_SCAN_DEBUG:-}" ] && printf 'SCANDBG %s claimed=%s onscreen=%s hasmark=%s prev=%s state=%s synth=%s\n' "$pane" "$claimed" "$onscreen" "$hasmark" "$prev" "$state" "${#synth_rows}" >&2
-  done <<< "$rows"
-
   local pane kind apid aproc path title pth psh pstreak phstreak phepoch claimed prev onscreen hasmark mkey mepoch
-  local live_rows="" sample_rows="" adopt_rows="" heal_keys="" down_keys="" rehome_keys="" working2="" synth_rows=""
+  local live_rows="" sample_rows="" adopt_rows="" heal_keys="" down_keys="" rehome_spec="" rehome_drop="" working2="" synth_rows=""
   local th sh state streak hstreak tag key kn s_pane s_kind s_label s_key
   while IFS=$'\t' read -r tag pane rest; do
     case "$tag" in
-      REHOME) rehome_keys="${rehome_keys}${pane}"$'\001'; continue ;;   # pane field holds the key
+      REHOME) rehome_spec="${rehome_spec}${pane}=${rest:-}"$'\001'; continue ;;  # pane=key, rest=new pane
+      DROPKEY) rehome_drop="${rehome_drop}${pane}"$'\001'; continue ;;           # pane holds the mark key
       A) ;;
       *) continue ;;                                                    # DOWN resolved below
     esac
@@ -1159,18 +1125,23 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
     done
   fi
 
-  [ -n "$heal_keys" ] || [ -n "$down_keys" ] || [ -n "$adopt_rows" ] || [ -n "$rehome_keys" ] || return 0
+  [ -n "$heal_keys" ] || [ -n "$down_keys" ] || [ -n "$adopt_rows" ] || [ -n "$rehome_spec" ] || return 0
   lock_or_error || return 0
-  if [ -n "$heal_keys" ]; then
-    # approved in place / resumed without a prompt: the wait is observably over
-    _drop_rows 'index(hk, "\001" $4 "\001") > 0' -v hk=$'\001'"$heal_keys"
+  # heal_keys: marks the screen outlived; rehome_drop: marks that pointed at a
+  # pane their session never lived in
+  if [ -n "$heal_keys" ] || [ -n "$rehome_drop" ]; then
+    _drop_rows 'index(hk, "\001" $4 "\001") > 0' -v hk=$'\001'"$heal_keys$rehome_drop"
   fi
-  if [ -n "$down_keys" ] || [ -n "$rehome_keys" ] || [ -n "$adopt_rows" ]; then
+  if [ -n "$down_keys" ] || [ -n "$rehome_spec" ] || [ -n "$adopt_rows" ]; then
     tmp="$(mktemp "${REG_FILE}.XXXXXX")" || { unlock; return 0; }
     { if [ -r "$REG_FILE" ]; then
-        awk -F '\t' -v OFS='\t' -v down=$'\001'"$down_keys" -v rehome=$'\001'"$rehome_keys" 'NF >= 9 {
+        awk -F '\t' -v OFS='\t' -v down=$'\001'"$down_keys" -v spec=$'\001'"$rehome_spec" 'NF >= 9 {
           if (down != "\001" && $7 == "waiting" && index(down, "\001" $2 "\001") > 0) $7 = "working"
-          if (rehome != "\001" && index(rehome, "\001" $2 "\001") > 0) $4 = "-"
+          if (spec != "\001" && index(spec, "\001" $2 "=") > 0) {
+            tail = substr(spec, index(spec, "\001" $2 "=") + length($2) + 2)
+            sub(/\001.*/, "", tail)
+            $4 = tail
+          }
           print
         }' "$REG_FILE"
       fi
@@ -1216,7 +1187,18 @@ _claude_target() {  # sets PANE / KEY / WHERE from hook json in $1
     # own tty / process ancestry before falling back to a paneless mark, so the
     # mark is jumpable instead of a bare "session id + name" row.
     p="$(_resolve_pane_by_proc || true)"
-    if [ -z "$p" ] && [ -n "$cwd" ]; then p="$(_resolve_pane_by_cwd "$cwd" || true)"; fi
+    # The cwd guess is only for hooks with NO controlling terminal (daemons,
+    # job runners). A hook that owns a tty we cannot place runs on a foreign
+    # tmux server (teammate swarms): guessing by cwd would pin the event on an
+    # unrelated pane that merely shares the directory.
+    if [ -z "$p" ] && [ -n "$cwd" ]; then
+      local mytty
+      mytty="$("$PS_BIN" -o tty= -p $$ 2>/dev/null || true)"
+      mytty="$(printf '%s' "$mytty" | tr -d '[:space:]')"
+      if [ "$mytty" = "??" ] || [ -z "$mytty" ]; then
+        p="$(_resolve_pane_by_cwd "$cwd" || true)"
+      fi
+    fi
     if [ -n "$p" ]; then PANE="$p"; return 0; fi
     PANE="-"
     [ -n "$KEY" ] || KEY="bg:${WHERE:-unknown}"

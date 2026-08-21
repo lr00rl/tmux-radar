@@ -439,21 +439,26 @@ claude_install() {
   backup_file "$CLAUDE_SETTINGS"
   # Migration: remove only the legacy SessionEnd -> claude-clear wiring. The
   # current claude-end hook has selective cleanup semantics and must survive
-  # idempotent reinstalls.
+  # idempotent reinstalls. Both the absolute and the $HOME-prefixed spellings
+  # count as ours.
+  local alt_notify=""
+  case "$NOTIFY" in "$HOME"/*) alt_notify='$HOME/'"${NOTIFY#"$HOME"/}" ;; esac
+  local legacy_alt=""; [ -n "$alt_notify" ] && legacy_alt="$alt_notify claude-clear"
   local mtmp; mtmp="$(mktemp)"
-  jq --arg legacy "$NOTIFY claude-clear" '
+  jq --arg legacy "$NOTIFY claude-clear" --arg legacy_alt "$legacy_alt" '
     if (.hooks // {}).SessionEnd then
-      .hooks.SessionEnd |= ( map(.hooks |= map(select((.command // "") != $legacy)))
+      .hooks.SessionEnd |= ( map(.hooks |= map(select((.command // "") as $c | ($c != $legacy) and (($legacy_alt == "") or ($c != $legacy_alt)))))
                              | map(select((.hooks // []) | length > 0)) )
       | if (.hooks.SessionEnd | length) == 0 then del(.hooks.SessionEnd) else . end
     else . end
   ' "$CLAUDE_SETTINGS" > "$mtmp" && _replace_file "$mtmp" "$CLAUDE_SETTINGS"
-  local i ev cmd tmp
+  local i ev cmd alt_cmd tmp
   for i in "${!CLAUDE_EVENTS[@]}"; do
     ev="${CLAUDE_EVENTS[$i]}"; cmd="$NOTIFY ${CLAUDE_SUBCMDS[$i]}"; tmp="$(mktemp)"
-    jq --arg ev "$ev" --arg cmd "$cmd" '
+    alt_cmd=""; [ -n "$alt_notify" ] && alt_cmd="$alt_notify ${CLAUDE_SUBCMDS[$i]}"
+    jq --arg ev "$ev" --arg cmd "$cmd" --arg alt "$alt_cmd" '
       .hooks //= {} | .hooks[$ev] //= []
-      | if any(.hooks[$ev][]?; ((.hooks // [])[]?.command) == $cmd) then .
+      | if any(.hooks[$ev][]?; ((.hooks // [])[]?.command) as $c | ($c == $cmd) or (($alt != "") and ($c == $alt))) then .
         else .hooks[$ev] += [ { "hooks": [ { "type": "command", "command": $cmd } ] } ] end
     ' "$CLAUDE_SETTINGS" > "$tmp" && _replace_file "$tmp" "$CLAUDE_SETTINGS"
     info "Claude $ev -> $cmd"
@@ -479,7 +484,9 @@ claude_uninstall() {
 
 claude_status() {
   if command -v jq >/dev/null 2>&1 && [ -f "$CLAUDE_SETTINGS" ]; then
-    local c; c="$(jq --arg p "$NOTIFY " '[.hooks // {} | .. | .command? // empty | select(startswith($p))] | length' "$CLAUDE_SETTINGS" 2>/dev/null || echo 0)"
+    # both the absolute path and the $HOME-prefixed spelling are valid wiring
+    local alt=""; case "$NOTIFY" in "$HOME"/*) alt='$HOME/'"${NOTIFY#"$HOME"/} " ;; esac
+    local c; c="$(jq --arg p "$NOTIFY " --arg alt "$alt" '[.hooks // {} | .. | .command? // empty | select((startswith($p)) or (($alt != "") and startswith($alt)))] | length' "$CLAUDE_SETTINGS" 2>/dev/null || echo 0)"
     echo "Claude hooks installed: ${c:-0}/5"
   else echo "Claude settings: (none / jq missing)"; fi
 }
@@ -568,6 +575,27 @@ kimi_install() {
   tmp="$(mktemp "$(dirname "$KIMI_CONFIG")/.config-final.XXXXXX")" ||
     die "mktemp failed for $KIMI_CONFIG"
   kimi_strip_block "$KIMI_CONFIG" > "$base"
+  # Adopt pre-marker wiring: bare [[hooks]] stanzas pointing at our kimi-hook
+  # (a kimi config rewrite drops comments, markers included) are removed here
+  # and replaced by the canonical managed block below, never duplicated. The
+  # rewrite only runs when such stanzas exist, so untouched configs stay
+  # byte-exact (no-final-newline files included).
+  if grep -qF "needinput-notify.sh' kimi-hook" "$base"; then
+    local base2
+    base2="$(mktemp "$(dirname "$KIMI_CONFIG")/.config-bare.XXXXXX")" ||
+      die "mktemp failed for $KIMI_CONFIG"
+    awk '
+      function flush() {
+        if (buf ~ /needinput-notify\.sh/ && buf ~ /kimi-hook/) { buf=""; return }
+        printf "%s", buf; buf=""
+      }
+      /^\[\[hooks\]\]/ { flush(); buf=$0 "\n"; collecting=1; next }
+      collecting && /^\[/ { flush(); collecting=0; print; next }
+      collecting { buf = buf $0 "\n"; if ($0 == "") { flush(); collecting=0 } next }
+      { print }
+      END { flush() }
+    ' "$base" > "$base2" && mv "$base2" "$base"
+  fi
   kimi_build_block > "$block"
   cat "$base" > "$tmp"
   [ ! -s "$tmp" ] || printf '\n' >> "$tmp"
@@ -628,6 +656,19 @@ kimi_status() {
     $0 == end { inside=0 }
   ' "$KIMI_CONFIG")"
   if [ "$actual" != "$expected" ]; then
+    # No markers at all means either nothing installed or pre-marker wiring
+    # (comments stripped by a kimi config rewrite). Bare stanzas that cover
+    # every event work fine; they just are not managed.
+    if ! grep -qF "$KIMI_HOOK_BEGIN" "$KIMI_CONFIG"; then
+      local bare
+      bare="$(awk 'BEGIN { RS=""; FS="\n" }
+        /needinput-notify\.sh/ && /kimi-hook/ { n++ } END { print n+0 }' "$KIMI_CONFIG")"
+      if [ "$bare" -eq "${#KIMI_EVENTS[@]}" ]; then
+        echo "Kimi hooks installed: 7/7 (unmanaged; run install to adopt the managed block)"
+        return 0
+      fi
+      [ "$bare" -eq 0 ] && { echo "Kimi hooks installed: 0/7"; return 0; }
+    fi
     echo "Kimi hooks: managed block drifted ($KIMI_CONFIG)"
     return 1
   fi

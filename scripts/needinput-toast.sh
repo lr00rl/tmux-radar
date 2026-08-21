@@ -7,7 +7,9 @@
 # Reads the need-input state file (see needinput-notify.sh for the format) and
 # prints one styled chip per live mark whose pane is NOT currently on screen
 # (paneless background marks always show), newest first, capped at $MAX with a
-# "+N" overflow counter.
+# "+N" overflow counter. Chips are deliberately terse — `⚠ mira-api`, never
+# the full sentence — because they share one line with the window list; the
+# picker (Inbox/Agents) carries the long form.
 set -euo pipefail
 
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
@@ -53,6 +55,20 @@ case "${1:-render}" in
       function style_for(level) {
         return (level == "action" ? "#[fg=colour234,bg=colour208,bold]" : (level == "done" ? "#[fg=colour234,bg=colour35,bold]" : "#[fg=colour234,bg=colour220,bold]"))
       }
+      # Terse chip identity. Pane marks: the user-named window (fallback
+      # session:window). Paneless bg marks ("Claude·proj: text"): the project.
+      function chip_text(label, pane,    s) {
+        if (pane != "-") {
+          s = wname[pane]
+          if (s == "") s = where[pane]
+          return s
+        }
+        s = label
+        sub(/^[A-Za-z]+·/, "", s)      # strip "Claude·" / "Codex·" source prefix
+        sub(/:.*/, "", s)              # drop the ": detail" tail
+        if (s == "" || s == label) s = label
+        return s
+      }
       BEGIN {
         n = split(panes, pl, "\001")
         for (i = 1; i <= n; i++) {
@@ -60,7 +76,8 @@ case "${1:-render}" in
           if (f[1] == "") continue
           alive[f[1]] = 1
           if (f[2] == 1) viewed[f[1]] = 1
-          where[f[1]] = f[3] " " f[4]
+          where[f[1]] = f[3]
+          wname[f[1]] = f[4]
         }
       }
       NF >= 4 {
@@ -68,9 +85,9 @@ case "${1:-render}" in
         label = (NF >= 5 ? $5 : $4)
         level = level_for($3, label)
         if (barttl + 0 > 0 && now - $2 > barttl + 0) next
-        if (pane == "-") { txt[++c] = label; lv[c] = level; next }
+        if (pane == "-") { txt[++c] = chip_text(label, pane); lv[c] = level; next }
         if (!(pane in alive) || (pane in viewed)) next
-        txt[++c] = label " · " where[pane]
+        txt[++c] = chip_text(label, pane)
         lv[c] = level
       }
       END {

@@ -283,16 +283,24 @@ aimed at a foreign tmux server (Claude teammate swarms run under
    (pid + argv identity) but is re-homed to paneless `-`, so no surface ever
    targets a pane this server cannot switch to. The same validation applies
    to `$TMUX_PANE` arriving from a foreign server at hook time.
-5. The scanner never creates Inbox marks. Unread semantics stay hook truth;
-   detection is the floor, not a replacement.
+5. The scanner does not fabricate events, but an observed transition is one:
+   an off-screen pane with no unread mark that flips into `blocked`, or from
+   `working` into `stalled`, gets exactly one synthesized mark keyed by its
+   adopted `p:<pid>` row. That is how sessions started before hook install —
+   or agents without an adapter — still reach the Inbox. Hook-owned panes
+   keep their native, richer events; a synthesized mark never replaces an
+   existing unread one.
+6. Recent and Tree rows aggregate per-pane states into window badges, and
+   `Ctrl-a` shows the live fleet. Both surfaces are deliberately lossy in the
+   same direction: a finished turn stays in the Inbox review queue, and an
+   idle agent pane is a free shell — neither earns a badge or a board row.
+   The board shows unread ACTION, blocked/waiting, and working panes only.
 
-Recent and Tree rows aggregate these per-pane states into window badges
-(`⚠` needs you, `✓` done unread, `◐` working, `·` idle; at most the two most
-severe groups, with counts). Agents (`Ctrl-a`) lists the merged per-pane rows
-sorted by severity: unread ACTION, blocked/waiting, unread DONE, working,
-idle. Merge precedence per pane: an unread mark outranks live state; a live
+Merge precedence per pane: an unread mark outranks live state; a live
 `blocked`/`waiting` outranks a stale registry `working`; a live `working`
-contradicts and hides a registry `waiting`.
+contradicts and hides a registry `waiting`. Badges aggregate per window, most
+severe first, at most two groups with counts: `⚠` needs you, `✓` done unread,
+`◐` working.
 
 ## Content voice
 

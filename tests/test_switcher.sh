@@ -653,7 +653,7 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 grep -q '^Agents>' "$TMP/keyboard-agents" || fail 'real Ctrl-a key event did not change the picker to Agents'
-grep -q 'No live agents' "$TMP/keyboard-agents" || fail 'empty Agents view did not publish its truthful empty state'
+grep -q 'Agents clear' "$TMP/keyboard-agents" || fail 'empty Agents view did not publish its truthful empty state'
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-e
 sleep 0.2
 tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-agents-expand"

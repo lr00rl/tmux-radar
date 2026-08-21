@@ -25,24 +25,28 @@ long-running agents.
 ## Features
 
 - **Four focused views** — Recent contains every live window in window-MRU
-  order, Inbox contains only unread ACTION/DONE/NOTICE events, Agents is a
-  live board of every pane hosting an AI agent (working / blocked / idle),
-  and Tree browses the session/window hierarchy. `Ctrl-e` reveals pane leaves
-  in Recent/Tree.
+  order, Inbox contains only unread ACTION/DONE/NOTICE events, Agents is the
+  live fleet board (everything blocked, waiting, or working right now), and
+  Tree browses the session/window hierarchy. `Ctrl-e` reveals pane leaves in
+  Recent/Tree. Finished turns stay in the Inbox review queue and idle agent
+  panes read as free shells — neither earns a board row or a badge.
 - **AI state badges everywhere** — Recent and Tree rows carry per-window agent
-  badges (`⚠` needs you, `✓` finished unread, `◐` working, `·` idle), so the
-  state of your whole fleet is visible in the default view without opening a
-  dedicated surface.
+  badges (`⚠` needs you, `✓` finished unread, `◐` working), so the state of
+  your whole fleet is visible in the default view without opening a dedicated
+  surface.
 - **A live scanner behind the hooks** — hooks are push and miss what they
   never saw: sessions started before hook installation, agents without an
   adapter, and permission prompts approved in place. Every
   `@radar-scan-interval` seconds the scanner classifies each pane hosting a
-  watched agent process (ps argv0 match) as `working`, `stalled`, or
-  `blocked` (Codex's own `Action Required` title is honored) from visible
-  title/screen change. Untracked agent panes are adopted into the registry,
-  stale ACTION marks heal after two consecutive working scans, and registry
-  rows whose pane lives on a foreign tmux server (Claude teammate swarms) are
-  re-homed to paneless instead of pointing at a pane that does not exist here.
+  watched agent process (ps argv0/argv1 match — node/bun-wrapped CLIs like pi
+  included) as `working`, `stalled`, or `blocked` (Codex's own
+  `Action Required` title is honored) from visible title/screen change.
+  Untracked agent panes are adopted into the registry, stale ACTION marks
+  heal after two consecutive working scans, registry rows whose pane lives on
+  a foreign tmux server (Claude teammate swarms) are re-homed to paneless,
+  and an observed transition into `blocked` or out of `working` synthesizes
+  exactly one Inbox event for off-screen panes — hookless sessions still
+  reach you.
 - **Window-name-first search** — the user-assigned window name is the first
   searchable identity; location, title, command, path, and event state follow.
 - **Exact-pane switching** — every selectable row targets one pane. Selection
@@ -52,8 +56,9 @@ long-running agents.
   hide work.
 - **Live preview** — the selected pane's content, no wrap, anchored to the
   bottom (current prompt/state visible), with line/page scroll.
-- **AI status alerts** — Claude/Codex/Kimi/OpenCode flag their pane for action-required
-  prompts and finished-turn notices; a compact chip appears in the existing
+- **AI status alerts** — Claude/Codex/Kimi/OpenCode/pi flag their pane for action-required
+  prompts and finished-turn notices; a compact chip (`⚠ mira-api`, never a
+  full sentence) appears in the existing
   status area while an off-screen mark is fresh,
   the pane's **title flips to a status label** (`⚠` action required, `✓`
   finished, `!` notice), and the pane shows up in Inbox.
@@ -258,7 +263,7 @@ For focused walkthroughs, see [configuration](docs/guides/configuration.md),
 [agent hooks](docs/guides/agent-hooks.md), and
 [development](docs/guides/development.md).
 
-## Inbox + alerts (Claude Code / Codex / Kimi / OpenCode)
+## Inbox + alerts (Claude Code / Codex / Kimi / OpenCode / pi)
 
 Inbox (`ctrl-i`) is an unread lifecycle queue, not a process monitor. It lists a
 live pane only when a hook or the public mark API recorded an unread event:
@@ -298,7 +303,12 @@ dependency-free lifecycle bridge to
 `~/.config/opencode/plugins/tmux-radar.js`. One bridge process blocks on a pipe
 for the lifetime of each OpenCode TUI; it does not spawn or poll per event.
 Permission requests, structured questions, replies, idle completion, errors,
-and deletion are ordered by session/generation before changing marks. Existing
+and deletion are ordered by session/generation before changing marks. When pi
+is installed, the installer drops a small in-process extension at
+`~/.pi/agent/extensions/tmux-radar.ts` (auto-discovered; `/reload` picks it up
+in live sessions) bridging `session_start` / interactive `input` / `agent_end`
+/ `session_shutdown`. pi exposes no approval-request event, so its permission
+waits are covered by the live scanner instead. Existing
 user hooks, trust entries, notify chains, and symlinked config paths are
 preserved. Restart the affected Claude/Codex/OpenCode sessions after
 installation, then review `/hooks` if Codex asks you to trust the handlers.

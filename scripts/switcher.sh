@@ -197,18 +197,19 @@ list_tree() {
       if (path != "") text=text (text != "" ? " · " : "") path
       return D text R
     }
-    function badge_for(link,    i, raw, s, c1, c2, c3, c4, c5, out, e) {
-      c1=c2=c3=c4=c5=0
+    function badge_for(link,    i, raw, s, c1, c2, c3, c4, out, e) {
+      c1=c2=c3=c4=0
       for (i=1; i<=pn[link]; i++) {
         raw=ptarget[porder[link,i]]
-        if (raw in aisev) { s=aisev[raw]; if (s==1) c1++; else if (s==2) c2++; else if (s==3) c3++; else if (s==4) c4++; else c5++ }
+        # sev 5 (idle) is deliberately not badged: an idle agent pane reads as
+        # a free shell, not as work that needs you
+        if (raw in aisev) { s=aisev[raw]; if (s==1) c1++; else if (s==2) c2++; else if (s==3) c3++; else if (s==4) c4++ }
       }
       out=""; e=0
       if (c1 && e<2) { out=out " " cg(1,"⚠") (c1>1?c1:""); e++ }
       if (c2 && e<2) { out=out " " cg(2,"⚠") (c2>1?c2:""); e++ }
       if (c3 && e<2) { out=out " " cg(3,"✓") (c3>1?c3:""); e++ }
       if (c4 && e<2) { out=out " " cg(4,"◐") (c4>1?c4:""); e++ }
-      if (c5 && e<2) { out=out " " cg(5,"·") (c5>1?c5:""); e++ }
       sub(/^ /, "", out)
       return out
     }
@@ -235,7 +236,7 @@ list_tree() {
       return (b != "" ? b " " : "") runtime_meta(pn[link], wcmd[link], wpath[link], 1)
     }
     function pane_row(pk, stem, branch,    raw, g) {
-      raw=ptarget[pk]; g=(raw in aisev ? cg(aisev[raw], aiglyph[raw]) " " : "")
+      raw=ptarget[pk]; g=((raw in aisev) && aisev[raw] != 5 ? cg(aisev[raw], aiglyph[raw]) " " : "")
       return D stem branch R " " Y pidx[pk] R " " g ptitle[pk]
     }
     NF >= 10 {
@@ -286,18 +287,19 @@ list_recent() {
   { printf '%s\n' "$live"; printf '%s\n' "$merged"; cat "$mfile"; } |
   LC_ALL=C awk -F '\t' -v OFS='\t' -v expanded="$EXPANDED" -v C="$C" -v Y="$Y" -v G="$G" -v M="$M" -v D="$D" -v R="$R" '
     function cg(sev, glyph) { return (sev==1 ? M glyph R : sev==2 ? Y glyph R : sev==3 ? G glyph R : sev==4 ? C glyph R : D glyph R) }
-    function badge_for(w,    i, pk, s, c1, c2, c3, c4, c5, out, e) {
-      c1=c2=c3=c4=c5=0
+    function badge_for(w,    i, pk, s, c1, c2, c3, c4, out, e) {
+      c1=c2=c3=c4=0
       for (i=1; i<=pn[w]; i++) {
         pk=porder[w, i]
-        if (pk in aisev) { s=aisev[pk]; if (s==1) c1++; else if (s==2) c2++; else if (s==3) c3++; else if (s==4) c4++; else c5++ }
+        # sev 5 (idle) is deliberately not badged: an idle agent pane reads as
+        # a free shell, not as work that needs you
+        if (pk in aisev) { s=aisev[pk]; if (s==1) c1++; else if (s==2) c2++; else if (s==3) c3++; else if (s==4) c4++ }
       }
       out=""; e=0
       if (c1 && e<2) { out=out " " cg(1,"⚠") (c1>1?c1:""); e++ }
       if (c2 && e<2) { out=out " " cg(2,"⚠") (c2>1?c2:""); e++ }
       if (c3 && e<2) { out=out " " cg(3,"✓") (c3>1?c3:""); e++ }
       if (c4 && e<2) { out=out " " cg(4,"◐") (c4>1?c4:""); e++ }
-      if (c5 && e<2) { out=out " " cg(5,"·") (c5>1?c5:""); e++ }
       sub(/^ /, "", out)
       return out
     }
@@ -309,7 +311,7 @@ list_recent() {
       if (expanded != 1) return
       for (i=1; i<=pn[w]; i++) {
         p=porder[w, i]; title=(ptitle[p] != "" ? "/" ptitle[p] : "")
-        g=(p in aisev ? cg(aisev[p], aiglyph[p]) " " : "")
+        g=((p in aisev) && aisev[p] != 5 ? cg(aisev[p], aiglyph[p]) " " : "")
         print p, "   " wname[w] " " C session[w] ":" widx[w] "." pidx[p] g title R, D pcmd[p] " · " ppath[p] R
       }
     }
@@ -431,6 +433,10 @@ list_agents() {
       cn=0
       for (i=1; i<=n; i++) {
         p=order[i]; if (!(p in asev)) continue
+        # the board is for the live fleet: blocked/waiting and working panes,
+        # plus unread ACTION events. DONE/NOTICE belong to the Inbox review
+        # queue and IDLE panes are just free shells — both stay out.
+        if (asev[p] != 1 && asev[p] != 2 && asev[p] != 4) continue
         cn++; cr[cn]=asev[p]; ce[cn]=aepoch[p]; cp[cn]=p
       }
       # severity asc, then newest first (insertion sort over a tiny set)
@@ -592,7 +598,7 @@ _header() {
     printf '%s · ' 'Inbox clear — no unread AI event needs you.'
   fi
   if [ "$VIEW" = agents ] && [ -n "${SW_ROWS:-}" ] && [ ! -s "$SW_ROWS" ]; then
-    printf '%s · ' 'No live agents — no hook event and no agent process on this tmux server.'
+    printf '%s · ' 'Agents clear — nothing blocked, waiting, or working.'
   fi
   printf '%s' 'C-r Recent · C-i Inbox · C-a Agents · C-t Tree'
   printf '%s' ' · C-e panes · A-1..9 jump · A-p preview · Enter switch'

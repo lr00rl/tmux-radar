@@ -47,7 +47,7 @@ echo
 echo "### install/uninstall round-trip under the shim, from a path with & and #"
 # a scripts dir whose path contains sed-hostile characters
 SRC="$T/pa#th & dir/scripts"
-mkdir -p "$SRC"; cp "$WT/scripts/"*.sh "$SRC/"; cp "$WT/scripts/opencode-tmux-notify.js" "$SRC/"
+mkdir -p "$SRC"; cp "$WT/scripts/"*.sh "$SRC/"; cp "$WT/scripts/opencode-tmux-notify.js" "$SRC/"; cp "$WT/scripts/pi-tmux-notify.ts" "$SRC/"
 chmod +x "$SRC/"*.sh
 IH="$SRC/install-hooks.sh"
 NOTIFY_PATH="$SRC/needinput-notify.sh"
@@ -58,7 +58,8 @@ export CODEX_HOOKS_JSON="$T/home/.codex/hooks.json"
 export KIMI_CONFIG="$T/home/.kimi-code/config.toml"
 export TMUX_RADAR_TEST_KIMI_PRESENT=on
 export OPENCODE_CONFIG_DIR="$T/home/.config/opencode"
-mkdir -p "$T/home/.claude" "$T/home/.codex" "$T/home/.kimi-code" "$OPENCODE_CONFIG_DIR"
+export PI_AGENT_DIR="$T/home/.pi/agent"
+mkdir -p "$T/home/.claude" "$T/home/.codex" "$T/home/.kimi-code" "$OPENCODE_CONFIG_DIR" "$PI_AGENT_DIR"
 
 # pre-existing user content that must be preserved
 cat > "$CLAUDE_SETTINGS" <<'JSON'
@@ -111,6 +112,11 @@ chk "opencode: placeholder substituted with the real (&/# laden) path" \
   "grep -qF 'const NOTIFY = \"$NOTIFY_PATH\"' '$OPENCODE_CONFIG_DIR/plugins/tmux-radar.js'"
 chk "opencode: plugin is valid JS after substitution" \
   "! command -v node >/dev/null || node --check '$OPENCODE_CONFIG_DIR/plugins/tmux-radar.js' 2>/dev/null"
+chk "pi: extension installed" "[ -f '$PI_AGENT_DIR/extensions/tmux-radar.ts' ]"
+chk "pi: placeholder substituted with the real (&/# laden) path" \
+  "grep -qF 'const NOTIFY = \"$NOTIFY_PATH\"' '$PI_AGENT_DIR/extensions/tmux-radar.ts'"
+chk "pi: extension parses after substitution" \
+  "! command -v node >/dev/null || node --check '$PI_AGENT_DIR/extensions/tmux-radar.ts' 2>/dev/null"
 
 echo
 echo "### idempotency: a second install must not duplicate anything"
@@ -129,6 +135,7 @@ chk "status reports all 3 Codex hooks" \
   "[ \$(printf '%s' \"\$STATUS\" | grep -Ec '^Codex native (PermissionRequest|Stop|UserPromptSubmit): installed') -eq 3 ]"
 chk "status reports all 7 Kimi hooks" "printf '%s' \"\$STATUS\" | grep -q 'Kimi hooks installed: 7/7'"
 chk "status reports the opencode plugin" "printf '%s' \"\$STATUS\" | grep -qi 'opencode plugin: installed'"
+chk "status reports the pi extension" "printf '%s' \"\$STATUS\" | grep -qi 'pi extension: installed'"
 
 awk '
   /^# >>> tmux-radar kimi hooks >>>$/ { inside=1 }
@@ -175,6 +182,7 @@ chk "kimi: managed block removed" "! grep -qF '# >>> tmux-radar kimi hooks >>>' 
 chk "kimi: user hook and config survive uninstall" \
   "grep -qF 'echo user-kimi-hook' '$KIMI_CONFIG' && grep -qF 'model = \"kimi-k2\"' '$KIMI_CONFIG' && grep -qF 'max_context = 1000000' '$KIMI_CONFIG'"
 chk "opencode: plugin removed" "[ ! -f '$OPENCODE_CONFIG_DIR/plugins/tmux-radar.js' ]"
+chk "pi: extension removed" "[ ! -f '$PI_AGENT_DIR/extensions/tmux-radar.ts' ]"
 
 echo
 echo "### symlinked configs (dotfile repos) must stay symlinks"

@@ -9,6 +9,7 @@
 #   $KIMI_CODE_HOME/config.toml, or ~/.kimi-code/config.toml
 #                              (Kimi native lifecycle hooks)
 #   ~/.config/opencode/plugins/tmux-radar.js (OpenCode lifecycle plugin)
+#   ~/.pi/agent/extensions/tmux-radar.ts (pi lifecycle extension)
 #
 # Usage: install-hooks.sh [install|uninstall|status]
 set -euo pipefail
@@ -676,26 +677,73 @@ opencode_status() {
   else echo "OpenCode plugin: absent"; fi
 }
 
+# pi (pi-mono coding agent): a TypeScript extension under
+# ~/.pi/agent/extensions, auto-discovered and hot-reloaded by `/reload`.
+PI_EXT_DIR="${PI_AGENT_DIR:-$HOME/.pi/agent}/extensions"
+PI_EXTENSION="$PI_EXT_DIR/tmux-radar.ts"
+
+pi_present() {
+  [ -d "$(dirname "$PI_EXT_DIR")" ] || command -v pi >/dev/null 2>&1
+}
+
+pi_install() {
+  if ! pi_present; then
+    info "pi not found (no ~/.pi/agent, no 'pi' on PATH) - skipped"
+    return 0
+  fi
+  local src="$SCRIPT_DIR/pi-tmux-notify.ts" tmp esc
+  [ -f "$src" ] || die "$src not found"
+  mkdir -p "$PI_EXT_DIR"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/radar-pi.XXXXXX")"
+  case "$NOTIFY" in
+    *'"'*|*\\*|*$'\n'*) die "notify path cannot be represented safely in TypeScript: $NOTIFY" ;;
+  esac
+  esc="$(_esc_rhs "$NOTIFY")"
+  sed "s#__TMUX_RADAR_NOTIFY__#$esc#g" "$src" > "$tmp"
+  if [ -f "$PI_EXTENSION" ] && ! cmp -s "$tmp" "$PI_EXTENSION"; then
+    backup_file "$PI_EXTENSION"
+  fi
+  _replace_file "$tmp" "$PI_EXTENSION"
+  info "pi extension -> $PI_EXTENSION (run /reload inside live pi sessions)"
+}
+
+pi_uninstall() {
+  if [ -f "$PI_EXTENSION" ]; then
+    rm -f "$PI_EXTENSION"
+    info "removed pi extension"
+  else
+    info "no pi extension installed"
+  fi
+}
+
+pi_status() {
+  if ! pi_present; then echo "pi: not installed (skipped)"
+  elif [ -f "$PI_EXTENSION" ]; then echo "pi extension: installed"
+  else echo "pi extension: absent"; fi
+}
+
 [ -x "$NOTIFY" ] || die "$NOTIFY not found/executable"
 
 case "${1:-install}" in
   install)
     echo "Installing tmux-radar AI-status hooks:"
-    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$KIMI_CONFIG" "$OPENCODE_PLUGIN"
+    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$KIMI_CONFIG" "$OPENCODE_PLUGIN" "$PI_EXTENSION"
     codex_install
     kimi_install
     claude_install
     opencode_install
+    pi_install
     transaction_commit
     echo "Done. Restart Claude/Codex/Kimi/OpenCode sessions (or reload their config) to pick up the hooks."
     ;;
   uninstall)
     echo "Uninstalling tmux-radar AI-status hooks:"
-    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$KIMI_CONFIG" "$OPENCODE_PLUGIN"
+    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$KIMI_CONFIG" "$OPENCODE_PLUGIN" "$PI_EXTENSION"
     codex_uninstall
     kimi_uninstall
     claude_uninstall
     opencode_uninstall
+    pi_uninstall
     transaction_commit
     ;;
   status)
@@ -704,6 +752,7 @@ case "${1:-install}" in
     codex_status || status_rc=1
     kimi_status || status_rc=1
     opencode_status || status_rc=1
+    pi_status || status_rc=1
     exit "$status_rc"
     ;;
   *) die "usage: install-hooks.sh [install|uninstall|status]" ;;

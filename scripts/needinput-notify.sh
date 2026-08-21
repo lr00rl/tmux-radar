@@ -44,11 +44,17 @@
 # process stays alive), or `blocked` (the agent's own title says action is
 # required, e.g. Codex's animated "Action Required" marker). Output:
 #   "<pane>\t<kind>\t<state>\t<title>\t<epoch>"
-# The scanner never creates Inbox marks (events stay hook truth); it heals
-# stale ACTION marks after two consecutive working verdicts, downgrades
-# registry rows whose `waiting` the screen contradicts, and adopts untracked
-# agent panes into the registry as "p:<pid>" rows so every surface reads one
-# model. Disable with `set -g @radar-scan off`.
+# Untracked agent panes are adopted into the registry as "p:<pid>" rows so
+# every surface reads one model; two consecutive working verdicts heal a
+# stale ACTION mark and downgrade a registry `waiting` the screen
+# contradicts; rows whose pane lives on a foreign tmux server keep liveness
+# but are re-homed to paneless.
+# The scanner never invents events, but an OBSERVED transition is one: for a
+# pane with no unread mark whose window is off-screen, a flip into `blocked`,
+# or from `working` into `stalled`, synthesizes exactly one mark (keyed by the
+# adopted p:<pid> row) — that is how hookless sessions (started before hook
+# install, or without an adapter) still reach the Inbox. Disable with
+# `set -g @radar-scan off`.
 #
 # Safe to call outside tmux (no-op unless a server is reachable).
 set -euo pipefail
@@ -281,6 +287,14 @@ _watched_commands() {
   printf '%s' "${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude opencode kimi pi')}}"
 }
 
+# Component normalization shared by every awk matcher below: strip a trailing
+# ".app", and map known package-directory names to their watched command
+# (pi's cli.js lives under .../pi-coding-agent/... while the watched name is
+# "pi"). Keep the awk copies in sync.
+#   normc(c) { sub(/\.app$/, "", c); if (c == "pi-coding-agent") c = "pi"; return c }
+# Script-runtime wrappers (node/bun/deno) hide the real program in argv[1]:
+# matchers receive argv0 plus the next token and check both.
+
 # Panes currently hosting a watched AI agent (claude/codex/…). Prints
 # "OK\001%id\001%id\001…" — "OK\001" alone means the scan RAN and found none;
 # EMPTY output means the scan failed and the caller must not GC on it.
@@ -302,11 +316,16 @@ _agent_panes() {
   [ -n "$ps_rows" ] || return 0
   { printf '__PANES__\n%s\n__PS__\n%s\n' "$panes" "$ps_rows"; } | LC_ALL=C awk -v cmds="$cmds" '
     function cleantty(t) { sub(/^\/dev\//, "", t); return t }
-    function is_agent(a0,    n, parts, i, c, w) {
-      a0 = tolower(a0); gsub(/\\/, "/", a0)
-      n = split(a0, parts, "/")
-      for (w in want)
-        for (i = 1; i <= n; i++) { c = parts[i]; sub(/\.app$/, "", c); if (c == w) return 1 }
+    function normc(c) { sub(/\.app$/, "", c); if (c == "pi-coding-agent") c = "pi"; return c }
+    function is_agent(a0, a1,    low, n, parts, i, c, w, b, m, p2) {
+      low = tolower(a0); gsub(/\\/, "/", low)
+      n = split(low, parts, "/")
+      for (i = 1; i <= n; i++) { c = normc(parts[i]); if (c in want) return 1 }
+      b = normc(parts[n])
+      if (b == "node" || b == "nodejs" || b == "bun" || b == "deno") {
+        m = split(tolower(a1), p2, "/")
+        for (i = 1; i <= m; i++) { c = normc(p2[i]); if (c in want) return 1 }
+      }
       return 0
     }
     BEGIN {
@@ -318,7 +337,7 @@ _agent_panes() {
     mode == 1 && $1 != "" { bypid[$2] = $1; bytty[cleantty($3)] = $1; next }
     mode == 2 && $1 != "" {
       par[$1] = $2
-      if (is_agent($4)) { agent[$1] = 1; atty[$1] = cleantty($3) }
+      if (is_agent($4, $5)) { agent[$1] = 1; atty[$1] = cleantty($3) }
       next
     }
     END {
@@ -347,10 +366,16 @@ _resolve_agent_pid() {  # _resolve_agent_pid <kind>
   [ -n "$rel" ] || return 0
   printf '%s\n' "$rel" | LC_ALL=C awk -v me="$$" -v kind="$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')" '
     function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-    function kindmatch(argv0,    low, n, parts, i, c) {
-      low = tolower(argv0); gsub(/\\/, "/", low)
+    function normc(c) { sub(/\.app$/, "", c); if (c == "pi-coding-agent") c = "pi"; return c }
+    function kindmatch(a0, a1,    low, n, parts, i, c, b, m, p2) {
+      low = tolower(a0); gsub(/\\/, "/", low)
       n = split(low, parts, "/")
-      for (i = 1; i <= n; i++) { c = parts[i]; sub(/\.app$/, "", c); if (c == kind) return 1 }
+      for (i = 1; i <= n; i++) { c = normc(parts[i]); if (c == kind) return 1 }
+      b = normc(parts[n])
+      if (b == "node" || b == "nodejs" || b == "bun" || b == "deno") {
+        m = split(tolower(a1), p2, "/")
+        for (i = 1; i <= m; i++) { c = normc(p2[i]); if (c == kind) return 1 }
+      }
       return 0
     }
     {
@@ -358,13 +383,16 @@ _resolve_agent_pid() {  # _resolve_agent_pid <kind>
       pid = rest; sub(/[[:space:]].*/, "", pid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
       ppid = rest; sub(/[[:space:]].*/, "", ppid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
       a0 = rest; sub(/[[:space:]].*/, "", a0)
-      par[pid] = ppid; argv[pid] = a0
+      a1 = ""
+      if (rest ~ /[[:space:]]/) { a1 = rest; sub(/^[^[:space:]]+[[:space:]]+/, "", a1); sub(/[[:space:]].*/, "", a1) }
+      par[pid] = ppid; argv[pid] = a0; argv1[pid] = a1
     }
     END {
       cur = me
       for (hops = 0; hops < 40 && cur != "" && cur != "0" && cur != "1"; hops++) {
-        if (kindmatch(argv[cur])) {
-          n = split(argv[cur], parts, "/"); b = parts[n]; sub(/\.app$/, "", b)
+        if (kindmatch(argv[cur], argv1[cur])) {
+          b = normc(argv[cur]); n = split(argv[cur], parts, "/"); b = normc(parts[n])
+          if (b == "node" || b == "nodejs" || b == "bun" || b == "deno") b = kind
           print cur "\t" b
           exit
         }
@@ -721,10 +749,16 @@ cmd_tick() {
     verdicts="$({ printf '__PS__\n%s\n__REG__\n' "$snapshot"; cat "$REG_FILE"; } |
       LC_ALL=C awk -F '\t' -v agent_panes="${agents#OK}" -v scan_ok="$agent_scan" '
       function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-      function argmatch(argv0, name,    low, n, parts, i, c) {
-        low = tolower(argv0); gsub(/\\/, "/", low)
+      function normc(c) { sub(/\.app$/, "", c); if (c == "pi-coding-agent") c = "pi"; return c }
+      function argmatch(a0, a1, name,    low, n, parts, i, c, b, m, p2) {
+        low = tolower(a0); gsub(/\\/, "/", low)
         n = split(low, parts, "/")
-        for (i = 1; i <= n; i++) { c = parts[i]; sub(/\.app$/, "", c); if (c == name) return 1 }
+        for (i = 1; i <= n; i++) { c = normc(parts[i]); if (c == name) return 1 }
+        b = normc(parts[n])
+        if (b == "node" || b == "nodejs" || b == "bun" || b == "deno") {
+          m = split(tolower(a1), p2, "/")
+          for (i = 1; i <= m; i++) { c = normc(p2[i]); if (c == name) return 1 }
+        }
         return 0
       }
       $0 == "__PS__"  { mode = 1; next }
@@ -735,7 +769,9 @@ cmd_tick() {
         ppid = rest; sub(/[[:space:]].*/, "", ppid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
         tty = rest; sub(/[[:space:]].*/, "", tty); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
         a0 = rest; sub(/[[:space:]].*/, "", a0)
-        argv[pid] = a0; next
+        a1 = ""
+        if (rest ~ /[[:space:]]/) { a1 = rest; sub(/^[^[:space:]]+[[:space:]]+/, "", a1); sub(/[[:space:]].*/, "", a1) }
+        argv[pid] = a0; argv1[pid] = a1; next
       }
       mode == 2 && NF >= 9 {
         pid = $3 + 0
@@ -744,7 +780,7 @@ cmd_tick() {
           if (scan_ok == "") { print "U\t" $0; next }
           if (index(agent_panes, "\001" $4 "\001") > 0) alive = 1
         }
-        else if ((pid in argv) && argmatch(argv[pid], tolower($9))) alive = 1
+        else if ((pid in argv) && argmatch(argv[pid], argv1[pid], tolower($9))) alive = 1
         print (alive ? "L" : "D") "\t" $0
       }')"
     dead_specs="$(printf '%s\n' "$verdicts" | awk -F '\t' '$1 == "D" { print }')"
@@ -830,15 +866,18 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
   fi
   [ -n "$snapshot" ] || return 0
   sep=$'\037'
-  panes="$(tmux list-panes -a -F "#{pane_id}${sep}#{pane_pid}${sep}#{pane_tty}${sep}#{pane_current_path}${sep}#{pane_title}" 2>/dev/null)"
+  panes="$(tmux list-panes -a -F "#{pane_id}${sep}#{pane_pid}${sep}#{pane_tty}${sep}#{pane_current_path}${sep}#{pane_title}${sep}#{&&:#{pane_active},#{&&:#{window_active},#{!=:#{session_attached},0}}}" 2>/dev/null)"
   [ -n "$panes" ] || return 0
 
-  # One awk joins panes, ps, previous samples, marks and registry; emits
-  # tagged rows:  A = agent-hosting pane to classify, HEAL = ACTION mark whose
-  # pane is already working (candidate, streak checked in the shell loop),
-  # REHOME = registry row on a pane this server does not have.
+  # One awk joins panes, ps, previous samples, the last ai-live, marks and
+  # registry; emits tagged rows:  A = agent-hosting pane to classify,
+  # HEAL = ACTION mark whose pane is already working (candidate, streak
+  # checked in the shell loop), REHOME = registry row on a pane this server
+  # does not have.
   rows="$({ printf '__PANES__\n%s\n__PS__\n%s\n__SAMPLES__\n' "$panes" "$snapshot"
             [ -r "$LIVE_SAMPLES" ] && cat "$LIVE_SAMPLES"
+            printf '__OLDLIVE__\n'
+            [ -r "$LIVE_FILE" ] && cat "$LIVE_FILE"
             printf '__MARKS__\n'
             [ -r "$STATE_FILE" ] && cat "$STATE_FILE"
             printf '__REG__\n'
@@ -848,10 +887,16 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
     function cleantty(t) { sub(/^\/dev\//, "", t); return t }
     function clean(s) { gsub(/[[:cntrl:]]/, " ", s); gsub(/[[:space:]][[:space:]]+/, " ", s)
                         sub(/^ /, "", s); sub(/ $/, "", s); return s }
-    function agent_kind(a0,    low, n, parts, i, c, w) {
+    function normc(c) { sub(/\.app$/, "", c); if (c == "pi-coding-agent") c = "pi"; return c }
+    function agent_kind(a0, a1,    low, n, parts, i, c, w, b, m, p2) {
       low = tolower(a0); gsub(/\\/, "/", low)
       n = split(low, parts, "/")
-      for (w in want) for (i = 1; i <= n; i++) { c = parts[i]; sub(/\.app$/, "", c); if (c == w) return w }
+      for (i = 1; i <= n; i++) { c = normc(parts[i]); if (c in want) return c }
+      b = normc(parts[n])
+      if (b == "node" || b == "nodejs" || b == "bun" || b == "deno") {
+        m = split(tolower(a1), p2, "/")
+        for (i = 1; i <= m; i++) { c = normc(p2[i]); if (c in want) return c }
+      }
       return ""
     }
     function basename(a0,    n, parts) { n = split(a0, parts, "/"); return parts[n] }
@@ -859,6 +904,7 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
     $0 == "__PANES__"   { mode = 1; next }
     $0 == "__PS__"      { mode = 2; next }
     $0 == "__SAMPLES__" { mode = 3; next }
+    $0 == "__OLDLIVE__" { mode = 6; next }
     $0 == "__MARKS__"   { mode = 4; next }
     $0 == "__REG__"     { mode = 5; next }
     $0 == "__END__"     { mode = 0; next }
@@ -866,7 +912,7 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       split($0, f, sep)
       if (f[1] == "") next
       bypid[f[2]] = f[1]; bytty[cleantty(f[3])] = f[1]; livepane[f[1]] = 1
-      ppath[f[1]] = f[4]; ptitle[f[1]] = clean(f[5])
+      ppath[f[1]] = f[4]; ptitle[f[1]] = clean(f[5]); ponscreen[f[1]] = f[6]
       # our own retitle (or one from the user) carries no state signal; strip
       # the status prefix so marks being set/cleared never flip the activity hash
       sub(/^(⚠|✓|!|·) /, "", ptitle[f[1]])
@@ -878,20 +924,31 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       ppid = rest; sub(/[[:space:]].*/, "", ppid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
       tty = rest; sub(/[[:space:]].*/, "", tty); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
       a0 = rest; sub(/[[:space:]].*/, "", a0)
+      a1 = ""
+      if (rest ~ /[[:space:]]/) { a1 = rest; sub(/^[^[:space:]]+[[:space:]]+/, "", a1); sub(/[[:space:]].*/, "", a1) }
       par[pid] = ppid
-      k = agent_kind(a0)
-      if (k != "") { akind[pid] = k; atty[pid] = cleantty(tty); aproc[pid] = basename(a0) }
+      k = agent_kind(a0, a1)
+      if (k != "") {
+        akind[pid] = k; atty[pid] = cleantty(tty)
+        aproc[pid] = normc(basename(a0))
+        if (aproc[pid] == "node" || aproc[pid] == "nodejs" || aproc[pid] == "bun" || aproc[pid] == "deno") aproc[pid] = k
+      }
       next
     }
     mode == 3 && NF >= 4 { pth[$1] = $2; psh[$1] = $3; pstreak[$1] = $4 + 0; next }
+    mode == 6 && NF >= 3 { oldstate[$1] = $3; next }
     mode == 4 && NF >= 5 {
+      markseen[$1] = 1
       l = tolower($3 " " $5)
       if (l ~ /(needs approval|needs your permission|needs input|waiting.*input|waiting on you|wait.*input|permission|approval|action required|approve|拿不准|需要你|需要.*许可|需要.*批准|等待.*输入)/)
         actionkey[$1] = $4                       # latest ACTION mark key per pane
       next
     }
     mode == 5 && NF >= 9 {
-      if ($4 != "-") regclaim[$4] = 1
+      if ($4 != "-") {
+        anyclaim[$4] = 1
+        if ($2 !~ /^p:/) hookown[$4] = 1
+      }
       if (($3 + 0) > 0) regpid[$3] = 1
       if ($4 != "-" && !($4 in livepane)) print "REHOME\t" $2
       if ($7 == "waiting" && $4 != "-") waitkey[$4] = $2
@@ -919,26 +976,30 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       }
       for (pane in bestpid) {
         pid = bestpid[pane]
-        claimed = ((pane in regclaim) || (pid in regpid)) ? 1 : 0
+        # claimed: 2 = a hook-owned (s:) session row holds this pane, 1 = only
+        # scanner-adopted (p:) rows or a pid match, 0 = untracked
+        claimed = (pane in hookown) ? 2 : (((pane in anyclaim) || (pid in regpid)) ? 1 : 0)
         # empty fields collapse under IFS=tab reads; "-" marks "no value"
         t = ptitle[pane]; if (t == "") t = "-"
+        prev = (pane in oldstate ? oldstate[pane] : "-")
         print "A\t" pane "\t" akind[pid] "\t" pid "\t" aproc[pid] "\t" clean(ppath[pane]) "\t" t "\t" \
-              (pane in pth ? pth[pane] : "-") "\t" (pane in psh ? psh[pane] : "-") "\t" (pane in pstreak ? pstreak[pane] : 0) "\t" claimed
+              (pane in pth ? pth[pane] : "-") "\t" (pane in psh ? psh[pane] : "-") "\t" (pane in pstreak ? pstreak[pane] : 0) "\t" \
+              claimed "\t" prev "\t" ponscreen[pane] "\t" ((pane in markseen) ? 1 : 0)
       }
       for (p in actionkey) print "HEAL\t" p "\t" actionkey[p]
       for (p in waitkey)   print "DOWN\t" p "\t" waitkey[p]
     }')"
 
-  local pane kind apid aproc path title pth psh pstreak claimed
-  local live_rows="" sample_rows="" adopt_rows="" heal_keys="" down_keys="" rehome_keys="" working2=""
-  local th sh state streak tag key
+  local pane kind apid aproc path title pth psh pstreak claimed prev onscreen hasmark
+  local live_rows="" sample_rows="" adopt_rows="" heal_keys="" down_keys="" rehome_keys="" working2="" synth_rows=""
+  local th sh state streak tag key kn s_pane s_kind s_label s_key
   while IFS=$'\t' read -r tag pane rest; do
     case "$tag" in
       REHOME) rehome_keys="${rehome_keys}${pane}"$'\001'; continue ;;   # pane field holds the key
       A) ;;
       *) continue ;;                                                    # HEAL/DOWN resolved below
     esac
-    IFS=$'\t' read -r kind apid aproc path title pth psh pstreak claimed <<< "$rest"
+    IFS=$'\t' read -r kind apid aproc path title pth psh pstreak claimed prev onscreen hasmark <<< "$rest"
     [ "$title" = "-" ] && title=""
     [ "$pth" = "-" ] && pth=""
     [ "$psh" = "-" ] && psh=""
@@ -966,7 +1027,23 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
     sample_rows="${sample_rows}${pane}"$'\t'"${th}"$'\t'"${sh}"$'\t'"${streak}"$'\n'
     if [ "$claimed" = 0 ]; then
       adopt_rows="${adopt_rows}${kind}"$'\t'"p:${apid}"$'\t'"${apid}"$'\t'"${pane}"$'\t'"${now}"$'\t'"${now}"$'\t'"${state}"$'\t'"$(_san "$path")"$'\t'"$(_san "$aproc")"$'\n'
+      claimed=1   # adopted now: event synthesis below applies from this scan on
     fi
+    # Hookless (or hook-gapped) panes still produce no events of their own.
+    # An observed transition into blocked, or from working into stalled, IS
+    # the event — synthesize it once, off-screen only, never over an
+    # existing unread mark.
+    if [ "$claimed" -ge 1 ] && [ "$onscreen" = 0 ] && [ "$hasmark" = 0 ]; then
+      case "$kind" in
+        claude) kn=Claude ;; codex) kn=Codex ;; kimi) kn=Kimi ;; pi) kn=Pi ;; *) kn=Agent ;;
+      esac
+      if [ "$state" = blocked ] && [ "$prev" != blocked ]; then
+        synth_rows="${synth_rows}${pane}"$'\t'"${kind}"$'\t'"${kn} needs approval (scan)"$'\t'"p:${apid}"$'\n'
+      elif [ "$state" = stalled ] && [ "$prev" = working ]; then
+        synth_rows="${synth_rows}${pane}"$'\t'"${kind}"$'\t'"${kn} finished — your turn (scan)"$'\t'"p:${apid}"$'\n'
+      fi
+    fi
+    [ -n "${TMUX_RADAR_SCAN_DEBUG:-}" ] && printf 'SCANDBG %s claimed=%s onscreen=%s hasmark=%s prev=%s state=%s synth=%s\n' "$pane" "$claimed" "$onscreen" "$hasmark" "$prev" "$state" "${#synth_rows}" >&2
   done <<< "$rows"
 
   # Healing needs the per-pane verdicts: keep only HEAL/DOWN candidates whose
@@ -989,6 +1066,14 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
   local tmp
   tmp="$(mktemp "${LIVE_FILE}.XXXXXX")" && printf '%s' "$live_rows" > "$tmp" && mv "$tmp" "$LIVE_FILE"
   tmp="$(mktemp "${LIVE_SAMPLES}.XXXXXX")" && printf '%s' "$sample_rows" > "$tmp" && mv "$tmp" "$LIVE_SAMPLES"
+
+  # Synthesized transition events are independent of registry/mark commits:
+  # cmd_mark re-locks, validates the pane, retitles, and republishes per event.
+  if [ -n "$synth_rows" ] && [ "$(opt @radar-needinput on)" = "on" ]; then
+    printf '%s' "$synth_rows" | while IFS=$'\t' read -r s_pane s_kind s_label s_key; do
+      [ -n "$s_pane" ] && cmd_mark "$s_pane" "$s_kind" "$s_label" "$s_key"
+    done
+  fi
 
   [ -n "$heal_keys" ] || [ -n "$down_keys" ] || [ -n "$adopt_rows" ] || [ -n "$rehome_keys" ] || return 0
   lock_or_error || return 0

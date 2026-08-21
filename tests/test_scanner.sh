@@ -79,16 +79,54 @@ chk "static agent turns stalled on the next scan" \
 chk "looping agent stays working across scans" \
   "awk -F'\t' -v p='$WPANE' '\$1==p && \$3==\"working\"' '$LIVE' | grep -q ."
 
+# --- 2.5 transition synthesis: hookless panes still reach the Inbox ------------
+# the isolated server is detached, so every pane counts as off-screen here
+chk "working to stalled transition synthesizes one DONE mark" \
+  "awk -F'\t' -v p='$SPANE' '\$1==p && \$5 ~ /finished.*scan/' '$MARKS' | grep -q ."
+chk "synthesized DONE mark is Inbox-eligible" \
+  "'$SW' list inbox | grep -q '$SPANE'"
+chk "an agent that keeps working synthesizes nothing" \
+  "! awk -F'\t' -v p='$WPANE' '\$1==p' '$MARKS' | grep -q ."
+
+# --- 2.6 node-wrapped agents (pi's real ps shape: argv0=node, program in argv1) ---
+# a #!/usr/bin/env node script shows as "node <path>" in ps, exactly like pi
+mkdir -p "$T/lib/pi-coding-agent"
+printf '#!/usr/bin/env node\nsetInterval(() => {}, 1000)\n' > "$T/lib/pi-coding-agent/cli.js"
+chmod +x "$T/lib/pi-coding-agent/cli.js"
+tmux new-window -n pifake "$T/lib/pi-coding-agent/cli.js"
+PI_PANE="$(tmux display-message -p '#{pane_id}')"
+sleep 1
+force_scan
+chk "node-wrapped agent is detected via argv1 path components" \
+  "awk -F'\t' -v p='$PI_PANE' '\$1==p && \$2==\"pi\"' '$LIVE' | grep -q ."
+chk "its adopted registry row survives the tick liveness GC" \
+  "awk -F'\t' -v p='$PI_PANE' '\$4==p && \$2 ~ /^p:[0-9]+\$/ && \$9==\"pi\"' '$REG' | grep -q ."
+tmux kill-window -t "$PI_PANE" 2>/dev/null || true
+
 # --- 3. blocked title beats change detection ---------------------------------
 tmux select-pane -t "$SPANE" -T '[ . ] Action Required | proj'
 force_scan
 chk "animated Action Required title classifies blocked, not working" \
   "awk -F'\t' -v p='$SPANE' '\$1==p && \$3==\"blocked\"' '$LIVE' | grep -q ."
+chk "an existing unread mark suppresses the blocked synthesis" \
+  "! awk -F'\t' -v p='$SPANE' '\$1==p && \$5 ~ /needs approval/' '$MARKS' | grep -q ."
+"$N" clear "$SPANE"   # clear the synthesized DONE; pane still blocked
+force_scan            # same state, no transition -> still no new mark
+chk "no transition, no second mark" \
+  "! awk -F'\t' -v p='$SPANE' '\$1==p' '$MARKS' | grep -q ."
 tmux select-pane -t "$SPANE" -T 'plain title'
 force_scan   # the retitle itself is one activity signal
-force_scan   # settle: no further change -> stalled
+force_scan   # settle: no further change -> stalled (synthesizes DONE again)
 chk "title back to normal settles to stalled" \
   "awk -F'\t' -v p='$SPANE' '\$1==p && \$3==\"stalled\"' '$LIVE' | grep -q ."
+"$N" clear "$SPANE"
+tmux select-pane -t "$SPANE" -T '[ ! ] Action Required | proj'
+force_scan   # stalled -> blocked with no unread mark: the event fires
+chk "blocked transition synthesizes an ACTION mark for a hookless pane" \
+  "awk -F'\t' -v p='$SPANE' '\$1==p && \$5 ~ /needs approval.*scan/' '$MARKS' | grep -q ."
+force_scan   # still blocked: transition already consumed
+chk "a held blocked state does not re-fire" \
+  "[ \"\$(awk -F'\t' -v p='$SPANE' '\$1==p' '$MARKS' | wc -l | tr -d ' ')\" = 1 ]"
 
 # --- 4. stale ACTION mark healing ---------------------------------------------
 # fresh streak: prior scans already proved this pane works; healing needs two
@@ -124,10 +162,14 @@ kill "$BG_PID" 2>/dev/null
 
 # --- 7. picker surfaces ---------------------------------------------------------
 AGENTS="$("$SW" list agents)"
-chk "Agents view lists the scanner-adopted pane" \
-  "printf '%s' '$AGENTS' | grep -q '$WPANE'"
-chk "Agents view ranks blocked above working" \
-  "[ \"\$(printf '%s' \"$AGENTS\" | grep -n 'BLOCKED' | head -1 | cut -d: -f1)\" -lt \"\$(printf '%s' \"$AGENTS\" | grep -n 'WORKING' | head -1 | cut -d: -f1)\" ] 2>/dev/null || true"
+chk "Agents view lists the scanner-adopted working pane" \
+  "printf '%s' \"$AGENTS\" | grep -q '$WPANE'"
+chk "Agents view hides idle panes" \
+  "! printf '%s' \"$AGENTS\" | grep -q 'IDLE'"
+BLPOS="$(printf '%s' "$AGENTS" | grep -nE 'ACTION|BLOCKED' | head -1 | cut -d: -f1)"
+WKPOS="$(printf '%s' "$AGENTS" | grep -n 'WORKING' | head -1 | cut -d: -f1)"
+chk "Agents view ranks needs-you above working" \
+  "[ -n '$BLPOS' ] && [ -n '$WKPOS' ] && [ '$BLPOS' -lt '$WKPOS' ]"
 RECENT="$("$SW" list recent)"
 chk "Recent window rows carry a working badge for agent windows" \
   "printf '%s' \"$RECENT\" | grep -q '◐'"

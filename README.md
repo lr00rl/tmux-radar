@@ -24,9 +24,25 @@ long-running agents.
 
 ## Features
 
-- **Three focused views** — Recent contains every live window in window-MRU
-  order, Inbox contains only unread ACTION/DONE/NOTICE events, and Tree browses
-  the session/window hierarchy. `Ctrl-e` reveals pane leaves in Recent/Tree.
+- **Four focused views** — Recent contains every live window in window-MRU
+  order, Inbox contains only unread ACTION/DONE/NOTICE events, Agents is a
+  live board of every pane hosting an AI agent (working / blocked / idle),
+  and Tree browses the session/window hierarchy. `Ctrl-e` reveals pane leaves
+  in Recent/Tree.
+- **AI state badges everywhere** — Recent and Tree rows carry per-window agent
+  badges (`⚠` needs you, `✓` finished unread, `◐` working, `·` idle), so the
+  state of your whole fleet is visible in the default view without opening a
+  dedicated surface.
+- **A live scanner behind the hooks** — hooks are push and miss what they
+  never saw: sessions started before hook installation, agents without an
+  adapter, and permission prompts approved in place. Every
+  `@radar-scan-interval` seconds the scanner classifies each pane hosting a
+  watched agent process (ps argv0 match) as `working`, `stalled`, or
+  `blocked` (Codex's own `Action Required` title is honored) from visible
+  title/screen change. Untracked agent panes are adopted into the registry,
+  stale ACTION marks heal after two consecutive working scans, and registry
+  rows whose pane lives on a foreign tmux server (Claude teammate swarms) are
+  re-homed to paneless instead of pointing at a pane that does not exist here.
 - **Window-name-first search** — the user-assigned window name is the first
   searchable identity; location, title, command, path, and event state follow.
 - **Exact-pane switching** — every selectable row targets one pane. Selection
@@ -44,7 +60,8 @@ long-running agents.
   Only the pane you focus is marked read; sibling agent panes remain unread.
   Marks also clear when you reply — and
   **stale marks self-heal**: a mark whose agent TUI has exited is dropped
-  automatically.
+  automatically, and an ACTION mark whose pane is observably working again
+  (you approved the prompt in place) heals within two scans.
 - **Background Claude sessions covered** — Claude Code sessions that run outside
   any tmux pane (dashboard / background jobs / cloud) are tracked per
   `session_id` and surface on notification/supervisor surfaces. They are not
@@ -122,8 +139,9 @@ full coordinate on every row:
 | type | search visible identity and metadata |
 | `ctrl-r` | **Recent**: all live windows, window MRU first; starts on row 2 so `Enter` switches back immediately |
 | `ctrl-i` | **Inbox**: unread pane-backed ACTION, DONE, and NOTICE events only |
+| `ctrl-a` | **Agents**: every pane with a live agent — BLOCKED/WAITING first, then WORKING, DONE, IDLE |
 | `ctrl-t` | **Tree**: session → window hierarchy |
-| `ctrl-e` | show/hide exact pane leaves in Recent or Tree; no-op in Inbox |
+| `ctrl-e` | show/hide exact pane leaves in Recent or Tree; no-op in Inbox/Agents |
 | `alt-1` … `alt-9` | switch to that visible result; out-of-range keys stay in the picker |
 | `alt-p` | toggle preview |
 | `shift-↑` / `shift-↓` | scroll preview by line |
@@ -132,7 +150,7 @@ full coordinate on every row:
 | `Enter` | revalidate the stable pane ID and switch with one tmux client operation |
 | `Esc` | cancel without switching |
 
-All three views emit exactly three TSV fields and every row carries a real,
+All views emit exactly three TSV fields and every row carries a real,
 stable `%pane_id`. Session rows snapshot the session's current pane; window rows
 snapshot that window's active pane; pane and Inbox rows target themselves.
 There are no fake header/background/context targets. Paneless background
@@ -159,7 +177,7 @@ Set these **before** the plugin loads:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `@radar-default-view` | `recent` | Initial view: `recent`, `inbox`, or `tree` (`needinput` and `all` remain compatibility aliases). Invalid values fall back to Recent. |
+| `@radar-default-view` | `recent` | Initial view: `recent`, `inbox`, `agents`, or `tree` (`needinput` and `all` remain compatibility aliases). Invalid values fall back to Recent. |
 | `@radar-ai-console` | `auto` | Supervisor console surface: `auto` (right split when the target pane is ≥121×24, else popup) or `popup` (always overlay — never takes columns away from the work pane). |
 | `@radar-key` | `C-w` | Prefix key that opens the picker. |
 | `@radar-last-key` | `Tab` | Prefix key that jumps to the most recently used **other pane**, across windows and sessions (tmux's own `last-pane` is window-local). Press repeatedly to toggle between your two most recent panes. `none` skips the binding. |
@@ -169,7 +187,9 @@ Set these **before** the plugin loads:
 | `@radar-preview-follow` | `on` | Anchor preview to the bottom (tail-style). |
 | `@radar-expand-panes` | `off` | Open Recent/Tree with pane leaves already expanded; `Ctrl-e` still toggles them. |
 | `@radar-needinput` | `on` | Enable the AI-status system (hooks/bar). |
-| `@radar-needinput-commands` | `codex claude opencode kimi` | Process identities used for registry/mark garbage collection and diagnostics. They do not create Inbox rows. Comma/space/colon separated. |
+| `@radar-needinput-commands` | `codex claude opencode kimi pi` | Process identities used for registry/mark garbage collection, the live scanner, and diagnostics. They do not create Inbox rows. Comma/space/colon separated. |
+| `@radar-scan` | `on` | Live agent scanner: classifies panes hosting watched agent processes as working/stalled/blocked, adopts hookless agent panes into the registry, heals stale ACTION marks, and powers the Agents view and the Recent/Tree badges. |
+| `@radar-scan-interval` | `10` | Seconds between live scans (minimum `5`). Scans run inside `tick`, which the picker, the bar, and session hooks already trigger; the interval keeps repeat reloads cheap. |
 | `@radar-retitle` | `on` | Rename a marked pane's title to a status label (`⚠` action required, `✓` finished, `!` notice), restored on clear. |
 | `@radar-claude-bg` | `on` | Also track Claude sessions running outside tmux panes (background/dashboard/cloud). |
 | `@radar-bar` | `auto` | `auto` renders chips **inline inside your existing status-right** (`#{E:@radar-chips}` is injected once); `pinned` keeps a permanently reserved line 2; `off` tracks marks only. The status line **count never changes at runtime** — no pane resize, no SIGWINCH flicker. |
@@ -287,7 +307,15 @@ shape follow its [official hooks reference](https://moonshotai.github.io/kimi-co
 
 ### Agents without native hooks
 
-A missing hook does not disable supervision. After each idle interval,
+The live scanner covers detection even when no hook ever fires: a pane whose
+foreground process matches `@radar-needinput-commands` shows up in the Agents
+view (and its window carries a badge) with a working/stalled/blocked verdict
+derived from visible change. Claude Code and Codex both publish their task
+and state in the pane title, so hookless sessions still read sensibly. What
+only hooks provide is the *unread event* itself (Inbox rows, chips, retitles)
+— detection is a floor, not a replacement.
+
+For the supervisor, a missing hook does not disable supervision either. After each idle interval,
 tmux-radar captures only the bottom
 `@radar-ai-fallback-capture-lines` lines (20 by default) and compares adjacent
 samples. It projects only lines that remain in order across both samples, which

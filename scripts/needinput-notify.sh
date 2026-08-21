@@ -34,6 +34,22 @@
 # ~/.claude/jobs/*/state.json guessing (those files freeze at "blocked"
 # after a session dies and kept zombie marks alive for hours).
 #
+# Live scanner (ai-live, TSV, 5 fields): hooks are push and miss what they
+# never saw — sessions started before the hooks were installed, agents with
+# no adapter, and permission prompts approved in place (no UserPromptSubmit
+# fires, so the ACTION mark outlives the wait). Every @radar-scan-interval
+# seconds the scanner classifies each pane hosting a watched agent process
+# (same ps argv0 rules as _agent_panes) as `working` (pane title or screen
+# changed since the previous sample), `stalled` (no visible change while the
+# process stays alive), or `blocked` (the agent's own title says action is
+# required, e.g. Codex's animated "Action Required" marker). Output:
+#   "<pane>\t<kind>\t<state>\t<title>\t<epoch>"
+# The scanner never creates Inbox marks (events stay hook truth); it heals
+# stale ACTION marks after two consecutive working verdicts, downgrades
+# registry rows whose `waiting` the screen contradicts, and adopts untracked
+# agent panes into the registry as "p:<pid>" rows so every surface reads one
+# model. Disable with `set -g @radar-scan off`.
+#
 # Safe to call outside tmux (no-op unless a server is reachable).
 set -euo pipefail
 
@@ -44,6 +60,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
 STATE_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
 REG_FILE="${TMUX_RADAR_REGISTRY_FILE:-$STATE_DIR/agent-registry}"
+LIVE_FILE="${TMUX_RADAR_LIVE_FILE:-$STATE_DIR/ai-live}"
+LIVE_SAMPLES="$STATE_DIR/.ai-live-samples"
+LIVE_STAMP="$STATE_DIR/.ai-live-at"
 OC_EVENTS_FILE="${TMUX_RADAR_OPENCODE_EVENTS_FILE:-$STATE_DIR/opencode-events}"
 BG_TTL="${TMUX_RADAR_BG_TTL:-${TMUX_SWITCHER_BG_TTL:-86400}}"   # paneless marks expire after 24h
 LOCK="$STATE_DIR/.need-input.lock"    # one lock guards need-input AND agent-registry
@@ -256,6 +275,12 @@ _pane_map() {
     tr '\n' '\001' || true
 }
 
+# Watched agent commands, one place: process scans, registry synthesis and the
+# live scanner all match against this list.
+_watched_commands() {
+  printf '%s' "${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude opencode kimi pi')}}"
+}
+
 # Panes currently hosting a watched AI agent (claude/codex/…). Prints
 # "OK\001%id\001%id\001…" — "OK\001" alone means the scan RAN and found none;
 # EMPTY output means the scan failed and the caller must not GC on it.
@@ -267,7 +292,7 @@ _pane_map() {
 _agent_panes() {
   have_tmux || return 0
   local cmds panes ps_rows
-  cmds="${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude opencode kimi')}}"
+  cmds="$(_watched_commands)"
   panes="$(tmux list-panes -a -F '#{pane_id} #{pane_pid} #{pane_tty}' 2>/dev/null)" || return 0
   [ -n "$panes" ] || return 0
   ps_rows="${1:-}"
@@ -762,16 +787,228 @@ cmd_tick() {
     #    (a background session that cannot take input any more). Requires
     #    regok, and only touches agent sources — a `mark - tool ...` from a
     #    user script has no registry row by design and must survive.
-    _drop_rows '( $1 != "-" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "kimi" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 && ag != "" && index(ag, "\001" $1 "\001") == 0 ) ||
-      ( $1 == "-" && regok != "" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "kimi" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 )' \
+    _drop_rows '( $1 != "-" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "kimi" || $3 == "pi" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 && ag != "" && index(ag, "\001" $1 "\001") == 0 ) ||
+      ( $1 == "-" && regok != "" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "kimi" || $3 == "pi" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 )' \
       -v rk="$(printf '\001%s' "$registry_keys")" -v ag="${agents#OK}" \
       -v regok="$reg_ok"
   else
     _rewrite ''
   fi
   unlock
+  _scan_live "$snapshot"
   _refresh_titles
   _sync_bar
+}
+
+# --- live agent scanner (see file header) ------------------------------------
+# Pull-based complement to the push hooks: classify every pane hosting a
+# watched agent process as working/stalled from visible change, adopt
+# untracked panes into the registry, heal stale ACTION marks, downgrade
+# contradicted waiting rows, and re-home registry rows whose pane belongs to
+# a foreign tmux server (or is otherwise dead) when their pid is still alive.
+_scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
+  have_tmux || return 0
+  if [ "$(opt @radar-scan on)" = "off" ]; then
+    rm -f "$LIVE_FILE" "$LIVE_SAMPLES" 2>/dev/null || true   # no stale badges
+    return 0
+  fi
+  local interval now last snapshot panes sep rows
+  interval="$(opt @radar-scan-interval 10)"
+  case "$interval" in ''|*[!0-9]*) interval=10 ;; esac
+  [ "$interval" -lt 5 ] && interval=5
+  now="$(date +%s)"
+  last="$(cat "$LIVE_STAMP" 2>/dev/null || printf '0\n')"
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ $((now - last)) -lt "$interval" ] && return 0
+  # Claim the slot before doing any work: concurrent ticks skip, a crashed
+  # scan costs at most one interval of staleness.
+  printf '%s\n' "$now" > "$LIVE_STAMP" 2>/dev/null || return 0
+
+  snapshot="${1:-}"
+  if [ "$#" -eq 0 ]; then
+    snapshot="$("$PS_BIN" -axo pid=,ppid=,tty=,command= 2>/dev/null || true)"
+  fi
+  [ -n "$snapshot" ] || return 0
+  sep=$'\037'
+  panes="$(tmux list-panes -a -F "#{pane_id}${sep}#{pane_pid}${sep}#{pane_tty}${sep}#{pane_current_path}${sep}#{pane_title}" 2>/dev/null)"
+  [ -n "$panes" ] || return 0
+
+  # One awk joins panes, ps, previous samples, marks and registry; emits
+  # tagged rows:  A = agent-hosting pane to classify, HEAL = ACTION mark whose
+  # pane is already working (candidate, streak checked in the shell loop),
+  # REHOME = registry row on a pane this server does not have.
+  rows="$({ printf '__PANES__\n%s\n__PS__\n%s\n__SAMPLES__\n' "$panes" "$snapshot"
+            [ -r "$LIVE_SAMPLES" ] && cat "$LIVE_SAMPLES"
+            printf '__MARKS__\n'
+            [ -r "$STATE_FILE" ] && cat "$STATE_FILE"
+            printf '__REG__\n'
+            [ -r "$REG_FILE" ] && cat "$REG_FILE"
+            printf '__END__\n'
+          } | LC_ALL=C awk -F '\t' -v sep="$sep" -v cmds="$(_watched_commands)" '
+    function cleantty(t) { sub(/^\/dev\//, "", t); return t }
+    function clean(s) { gsub(/[[:cntrl:]]/, " ", s); gsub(/[[:space:]][[:space:]]+/, " ", s)
+                        sub(/^ /, "", s); sub(/ $/, "", s); return s }
+    function agent_kind(a0,    low, n, parts, i, c, w) {
+      low = tolower(a0); gsub(/\\/, "/", low)
+      n = split(low, parts, "/")
+      for (w in want) for (i = 1; i <= n; i++) { c = parts[i]; sub(/\.app$/, "", c); if (c == w) return w }
+      return ""
+    }
+    function basename(a0,    n, parts) { n = split(a0, parts, "/"); return parts[n] }
+    BEGIN { m = split(tolower(cmds), raw, /[[:space:],:]+/); for (i = 1; i <= m; i++) if (raw[i] != "") want[raw[i]] = 1 }
+    $0 == "__PANES__"   { mode = 1; next }
+    $0 == "__PS__"      { mode = 2; next }
+    $0 == "__SAMPLES__" { mode = 3; next }
+    $0 == "__MARKS__"   { mode = 4; next }
+    $0 == "__REG__"     { mode = 5; next }
+    $0 == "__END__"     { mode = 0; next }
+    mode == 1 {
+      split($0, f, sep)
+      if (f[1] == "") next
+      bypid[f[2]] = f[1]; bytty[cleantty(f[3])] = f[1]; livepane[f[1]] = 1
+      ppath[f[1]] = f[4]; ptitle[f[1]] = clean(f[5])
+      # our own retitle (or one from the user) carries no state signal; strip
+      # the status prefix so marks being set/cleared never flip the activity hash
+      sub(/^(⚠|✓|!|·) /, "", ptitle[f[1]])
+      next
+    }
+    mode == 2 && $1 != "" {
+      rest = $0; sub(/^[[:space:]]+/, "", rest)
+      pid = rest; sub(/[[:space:]].*/, "", pid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
+      ppid = rest; sub(/[[:space:]].*/, "", ppid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
+      tty = rest; sub(/[[:space:]].*/, "", tty); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
+      a0 = rest; sub(/[[:space:]].*/, "", a0)
+      par[pid] = ppid
+      k = agent_kind(a0)
+      if (k != "") { akind[pid] = k; atty[pid] = cleantty(tty); aproc[pid] = basename(a0) }
+      next
+    }
+    mode == 3 && NF >= 4 { pth[$1] = $2; psh[$1] = $3; pstreak[$1] = $4 + 0; next }
+    mode == 4 && NF >= 5 {
+      l = tolower($3 " " $5)
+      if (l ~ /(needs approval|needs your permission|needs input|waiting.*input|waiting on you|wait.*input|permission|approval|action required|approve|拿不准|需要你|需要.*许可|需要.*批准|等待.*输入)/)
+        actionkey[$1] = $4                       # latest ACTION mark key per pane
+      next
+    }
+    mode == 5 && NF >= 9 {
+      if ($4 != "-") regclaim[$4] = 1
+      if (($3 + 0) > 0) regpid[$3] = 1
+      if ($4 != "-" && !($4 in livepane)) print "REHOME\t" $2
+      if ($7 == "waiting" && $4 != "-") waitkey[$4] = $2
+      next
+    }
+    END {
+      for (pid in akind) {
+        pane = ""; how = ""
+        if (atty[pid] != "" && atty[pid] != "??" && (atty[pid] in bytty)) { pane = bytty[atty[pid]]; how = "tty" }
+        else {
+          cur = pid
+          for (hops = 0; hops < 80 && cur != "" && cur != "0"; hops++) {
+            if (cur in bypid) { pane = bypid[cur]; how = "walk"; break }
+            cur = par[cur]
+          }
+        }
+        if (pane == "") continue
+        # One pane gets one row: a process sitting on the pane tty beats a
+        # parent-chain match, and the binary whose basename IS the kind beats
+        # a launcher/helper that merely carries it as a path component.
+        score = (how == "tty" ? 2 : 0) + (tolower(aproc[pid]) == akind[pid] ? 1 : 0)
+        if (!(pane in bestscore) || score > bestscore[pane]) {
+          bestscore[pane] = score; bestpid[pane] = pid
+        }
+      }
+      for (pane in bestpid) {
+        pid = bestpid[pane]
+        claimed = ((pane in regclaim) || (pid in regpid)) ? 1 : 0
+        # empty fields collapse under IFS=tab reads; "-" marks "no value"
+        t = ptitle[pane]; if (t == "") t = "-"
+        print "A\t" pane "\t" akind[pid] "\t" pid "\t" aproc[pid] "\t" clean(ppath[pane]) "\t" t "\t" \
+              (pane in pth ? pth[pane] : "-") "\t" (pane in psh ? psh[pane] : "-") "\t" (pane in pstreak ? pstreak[pane] : 0) "\t" claimed
+      }
+      for (p in actionkey) print "HEAL\t" p "\t" actionkey[p]
+      for (p in waitkey)   print "DOWN\t" p "\t" waitkey[p]
+    }')"
+
+  local pane kind apid aproc path title pth psh pstreak claimed
+  local live_rows="" sample_rows="" adopt_rows="" heal_keys="" down_keys="" rehome_keys="" working2=""
+  local th sh state streak tag key
+  while IFS=$'\t' read -r tag pane rest; do
+    case "$tag" in
+      REHOME) rehome_keys="${rehome_keys}${pane}"$'\001'; continue ;;   # pane field holds the key
+      A) ;;
+      *) continue ;;                                                    # HEAL/DOWN resolved below
+    esac
+    IFS=$'\t' read -r kind apid aproc path title pth psh pstreak claimed <<< "$rest"
+    [ "$title" = "-" ] && title=""
+    [ "$pth" = "-" ] && pth=""
+    [ "$psh" = "-" ] && psh=""
+    th="$(printf '%s' "$title" | cksum)"; th="${th%% *}"
+    # One capture per agent pane per scan: cheap at scan cadence, and the
+    # working/stalled verdict stays exact even across title-only changes.
+    sh="$(tmux capture-pane -p -t "$pane" 2>/dev/null | cksum)"; sh="${sh%% *}"
+    case "$title" in
+      # Codex animates an attention marker into its native title while blocked
+      # on approval; change detection alone would read it as working.
+      *"Action Required"*|*"action required"*|*"Needs Approval"*|*"needs approval"*)
+        state=blocked ;;
+      *)
+        if { [ -n "$pth" ] && [ "$th" != "$pth" ]; } || { [ -n "$psh" ] && [ "$sh" != "$psh" ]; } || [ -z "$psh" ]; then
+          state=working
+        else
+          state=stalled
+        fi
+        ;;
+    esac
+    streak=0
+    [ "$state" = working ] && streak=$((pstreak + 1))
+    [ "$streak" -ge 2 ] && working2="${working2}${pane} "
+    live_rows="${live_rows}${pane}"$'\t'"${kind}"$'\t'"${state}"$'\t'"$(_san "$title")"$'\t'"${now}"$'\n'
+    sample_rows="${sample_rows}${pane}"$'\t'"${th}"$'\t'"${sh}"$'\t'"${streak}"$'\n'
+    if [ "$claimed" = 0 ]; then
+      adopt_rows="${adopt_rows}${kind}"$'\t'"p:${apid}"$'\t'"${apid}"$'\t'"${pane}"$'\t'"${now}"$'\t'"${now}"$'\t'"${state}"$'\t'"$(_san "$path")"$'\t'"$(_san "$aproc")"$'\n'
+    fi
+  done <<< "$rows"
+
+  # Healing needs the per-pane verdicts: keep only HEAL/DOWN candidates whose
+  # pane sustained working across two consecutive scans.
+  while IFS=$'\t' read -r tag pane key; do
+    case "$tag" in
+      HEAL|DOWN) ;;
+      *) continue ;;
+    esac
+    [ -n "$key" ] || continue
+    case " $working2" in
+      *" ${pane} "*) ;;
+      *) continue ;;
+    esac
+    if [ "$tag" = HEAL ]; then heal_keys="${heal_keys}${key}"$'\001'
+    else down_keys="${down_keys}${key}"$'\001'; fi
+  done <<< "$rows"
+
+  # Publish ai-live + samples atomically (single writer via the stamp).
+  local tmp
+  tmp="$(mktemp "${LIVE_FILE}.XXXXXX")" && printf '%s' "$live_rows" > "$tmp" && mv "$tmp" "$LIVE_FILE"
+  tmp="$(mktemp "${LIVE_SAMPLES}.XXXXXX")" && printf '%s' "$sample_rows" > "$tmp" && mv "$tmp" "$LIVE_SAMPLES"
+
+  [ -n "$heal_keys" ] || [ -n "$down_keys" ] || [ -n "$adopt_rows" ] || [ -n "$rehome_keys" ] || return 0
+  lock_or_error || return 0
+  if [ -n "$heal_keys" ]; then
+    # approved in place / resumed without a prompt: the wait is observably over
+    _drop_rows 'index(hk, "\001" $4 "\001") > 0' -v hk=$'\001'"$heal_keys"
+  fi
+  if [ -n "$down_keys" ] || [ -n "$rehome_keys" ] || [ -n "$adopt_rows" ]; then
+    tmp="$(mktemp "${REG_FILE}.XXXXXX")" || { unlock; return 0; }
+    { if [ -r "$REG_FILE" ]; then
+        awk -F '\t' -v OFS='\t' -v down=$'\001'"$down_keys" -v rehome=$'\001'"$rehome_keys" 'NF >= 9 {
+          if (down != "\001" && $7 == "waiting" && index(down, "\001" $2 "\001") > 0) $7 = "working"
+          if (rehome != "\001" && index(rehome, "\001" $2 "\001") > 0) $4 = "-"
+          print
+        }' "$REG_FILE"
+      fi
+      printf '%s' "$adopt_rows"
+    } > "$tmp" 2>/dev/null && mv "$tmp" "$REG_FILE" || rm -f "$tmp"
+  fi
+  unlock
 }
 
 # Extract a JSON string field (jq if present, else sed best-effort).
@@ -826,6 +1063,14 @@ _claude_target() {  # sets PANE / KEY / WHERE from hook json in $1
     fi
   else
     PANE="$TMUX_PANE"
+    # A pane id inherited from a FOREIGN tmux server (Claude teammate swarms
+    # run under `tmux -L claude-swarm-*`) does not exist here; never record a
+    # destination this server cannot switch to. Re-resolve, else paneless.
+    if ! tmux display-message -p -t "$PANE" '#{pane_id}' >/dev/null 2>&1; then
+      p="$(_resolve_pane_by_proc || true)"
+      if [ -z "$p" ] && [ -n "$cwd" ]; then p="$(_resolve_pane_by_cwd "$cwd" || true)"; fi
+      if [ -n "$p" ]; then PANE="$p"; else PANE="-"; fi
+    fi
   fi
 }
 
@@ -904,6 +1149,11 @@ cmd_claude_end() {  # SessionEnd hook: the native, instant "session is gone"
 _codex_pane() {
   local pane
   pane="${TMUX_PANE:-}"
+  # Same foreign-server guard as _claude_target: an id that does not resolve
+  # on this tmux server is not a switchable destination.
+  if [ -n "$pane" ] && ! tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
+    pane=""
+  fi
   [ -n "$pane" ] || pane="$(_resolve_pane_by_proc || true)"
   printf '%s' "$pane"
 }

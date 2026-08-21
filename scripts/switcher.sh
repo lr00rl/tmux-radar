@@ -24,6 +24,8 @@ NEEDINPUT_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$ST
 # agent-session registry written by needinput-notify.sh hooks (TSV, 9 fields:
 # kind key pid pane started last_event state cwd proc); readers need no lock
 REGISTRY_FILE="${TMUX_RADAR_REGISTRY_FILE:-$STATE_DIR/agent-registry}"
+# live scanner output (TSV, 5 fields: pane kind state title epoch)
+LIVE_FILE="${TMUX_RADAR_LIVE_FILE:-$STATE_DIR/ai-live}"
 MRU_RECORD="$SCRIPT_DIR/mru-record.sh"
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
@@ -61,6 +63,7 @@ normalize_view() {
   case "${1:-}" in
     all|tree) printf tree ;;
     attention|needinput|inbox) printf inbox ;;
+    agents|agent|ai) printf agents ;;
     recent) printf recent ;;
     *) printf recent ;;
   esac
@@ -116,18 +119,98 @@ live_pane_snapshot() {
     '
 }
 
+# Merge the three AI evidence sources into one row per pane:
+#   pane \t sev \t glyph \t word \t kind \t text \t epoch
+# sev: 1 unread ACTION, 2 waiting/blocked, 3 unread DONE/NOTICE (or read DONE),
+# 4 working, 5 idle. Precedence: an unread mark outranks live state; a live
+# blocked/waiting signal outranks a stale registry working; a live working
+# verdict contradicts a registry waiting (the scanner heals the row itself
+# once the activity holds for two scans). Plain text only — list builders add
+# their own colors by sev.
+ai_merged() {
+  local marks=/dev/null reg=/dev/null livef=/dev/null
+  [ -r "$NEEDINPUT_FILE" ] && marks="$NEEDINPUT_FILE"
+  [ -r "$REGISTRY_FILE" ] && reg="$REGISTRY_FILE"
+  [ -r "$LIVE_FILE" ] && livef="$LIVE_FILE"
+  LC_ALL=C awk -F '\t' -v OFS='\t' -v mp="$marks" -v rp="$reg" -v lp="$livef" '
+    FILENAME == mp && NF >= 5 && $1 ~ /^%[0-9]+$/ {
+      p=$1; l=tolower($3 " " $5)
+      if (l ~ /(finished|your turn|turn complete|task complete|done|任务完成|完成)/) { msev[p]=3; mword[p]="DONE" }
+      else if (l ~ /(needs approval|needs your permission|needs input|waiting.*input|waiting on you|wait.*input|permission|approval|action required|approve|拿不准|需要你|需要.*许可|需要.*批准|等待.*输入)/) { msev[p]=1; mword[p]="ACTION" }
+      else { msev[p]=3; mword[p]="NOTICE" }
+      mkind[p]=$3; mtext[p]=$5; mepoch[p]=$2+0; next
+    }
+    FILENAME == rp && NF >= 9 {
+      if ($4 == "-") next
+      p=$4; e=$6+0
+      if (!(p in repoch) || e >= repoch[p]) { repoch[p]=e; rstate[p]=$7; rkind[p]=$1 }
+      next
+    }
+    FILENAME == lp && NF >= 5 {
+      lkind[$1]=$2; lstate[$1]=$3; ltext[$1]=$4; lepoch[$1]=$5+0; next
+    }
+    END {
+      for (p in mtext)  panes[p]=1
+      for (p in rstate) panes[p]=1
+      for (p in lstate) panes[p]=1
+      for (p in panes) {
+        sev=""; glyph=""; word=""; kind=""; text=""; epoch=0
+        if (p in mtext) {
+          sev=msev[p]; word=mword[p]; kind=mkind[p]; text=mtext[p]; epoch=mepoch[p]
+          glyph=(msev[p]==1 ? "⚠" : (mword[p]=="DONE" ? "✓" : "!"))
+        } else if ((p in lstate) && lstate[p] == "blocked") {
+          sev=2; glyph="⚠"; word="BLOCKED"; kind=lkind[p]; text=ltext[p]; epoch=lepoch[p]
+        } else if ((p in rstate) && rstate[p] == "waiting" && !((p in lstate) && lstate[p] == "working")) {
+          sev=2; glyph="⚠"; word="WAITING"; kind=rkind[p]; text=rkind[p] " waiting"; epoch=repoch[p]
+        } else if ((p in lstate) && lstate[p] == "working") {
+          sev=4; glyph="◐"; word="WORKING"; kind=lkind[p]; text=ltext[p]; epoch=lepoch[p]
+        } else if ((p in lstate) && lstate[p] == "stalled") {
+          sev=5; glyph="·"; word="IDLE"; kind=lkind[p]; text=ltext[p]; epoch=lepoch[p]
+        } else if (p in rstate) {
+          if (rstate[p] == "done")         { sev=3; glyph="✓"; word="DONE" }
+          else if (rstate[p] == "waiting") { sev=2; glyph="⚠"; word="WAITING" }
+          else if (rstate[p] == "stalled") { sev=5; glyph="·"; word="IDLE" }
+          else                             { sev=4; glyph="◐"; word="WORKING" }
+          kind=rkind[p]; text=rkind[p] " " rstate[p]; epoch=repoch[p]
+        }
+        if (sev != "") print p, sev, glyph, word, kind, text, epoch
+      }
+    }
+  ' "$marks" "$reg" "$livef"
+}
+
+# colored glyph for a severity; needs the caller awk's color vars
+# (defined here as documentation: 1 magenta, 2 yellow, 3 green, 4 cyan, 5 dim)
+
 list_tree() {
-  local live
+  local live merged
   live="$(live_pane_snapshot)" || return 1
-  printf '%s\n' "$live" | LC_ALL=C awk -F '\t' -v OFS='\t' -v expanded="$EXPANDED" \
+  merged="$(ai_merged)"
+  printf '%s\n%s\n' "$live" "$merged" | LC_ALL=C awk -F '\t' -v OFS='\t' -v expanded="$EXPANDED" \
     -v picker="${TMUX_RADAR_PICKER_ROWS:-0}" -v ZWSP="$ZWSP" \
-    -v C="$C" -v Y="$Y" -v B="$B" -v D="$D" -v R="$R" '
+    -v C="$C" -v Y="$Y" -v G="$G" -v M="$M" -v B="$B" -v D="$D" -v R="$R" '
+    function cg(sev, glyph) { return (sev==1 ? M glyph R : sev==2 ? Y glyph R : sev==3 ? G glyph R : sev==4 ? C glyph R : D glyph R) }
     function runtime_meta(count, cmd, path, show_count,    text) {
       text=""
       if (show_count && count > 1) text=count "p"
       if (cmd != "") text=text (text != "" ? " · " : "") cmd
       if (path != "") text=text (text != "" ? " · " : "") path
       return D text R
+    }
+    function badge_for(link,    i, raw, s, c1, c2, c3, c4, c5, out, e) {
+      c1=c2=c3=c4=c5=0
+      for (i=1; i<=pn[link]; i++) {
+        raw=ptarget[porder[link,i]]
+        if (raw in aisev) { s=aisev[raw]; if (s==1) c1++; else if (s==2) c2++; else if (s==3) c3++; else if (s==4) c4++; else c5++ }
+      }
+      out=""; e=0
+      if (c1 && e<2) { out=out " " cg(1,"⚠") (c1>1?c1:""); e++ }
+      if (c2 && e<2) { out=out " " cg(2,"⚠") (c2>1?c2:""); e++ }
+      if (c3 && e<2) { out=out " " cg(3,"✓") (c3>1?c3:""); e++ }
+      if (c4 && e<2) { out=out " " cg(4,"◐") (c4>1?c4:""); e++ }
+      if (c5 && e<2) { out=out " " cg(5,"·") (c5>1?c5:""); e++ }
+      sub(/^ /, "", out)
+      return out
     }
     function picker_session_name(name,    weighted) {
       if (picker != 1) return name
@@ -147,10 +230,15 @@ list_tree() {
     function window_row(link, branch) {
       return D "  " branch R " " Y sprintf("%2s", widx[link]) R " " wname[link]
     }
-    function pane_row(pk, stem, branch) {
-      return D stem branch R " " Y pidx[pk] R " " ptitle[pk]
+    function window_meta(link,    b) {
+      b=badge_for(link)
+      return (b != "" ? b " " : "") runtime_meta(pn[link], wcmd[link], wpath[link], 1)
     }
-    {
+    function pane_row(pk, stem, branch,    raw, g) {
+      raw=ptarget[pk]; g=(raw in aisev ? cg(aisev[raw], aiglyph[raw]) " " : "")
+      return D stem branch R " " Y pidx[pk] R " " g ptitle[pk]
+    }
+    NF >= 10 {
       p=$1; s=$2; sk=$3; w=$4; link=sk SUBSEP w; pk=link SUBSEP p
       if (!(sk in seen_s)) {
         seen_s[sk]=1; sorder[++sn]=sk; sname[sk]=s; starget[sk]=p
@@ -168,14 +256,16 @@ list_tree() {
       seen_pane_link[pk]=1; porder[link, ++pn[link]]=pk; ptarget[pk]=p
       pidx[pk]=$8
       ptitle[pk]=$10; pcmd[pk]=$11; ppath[pk]=$12
+      next
     }
+    NF == 7 { aisev[$1]=$2+0; aiglyph[$1]=$3; next }
     END {
       for (si=1; si<=sn; si++) {
         sk=sorder[si]
         print starget[sk], session_row(sk), session_meta(sk)
         for (wi=1; wi<=wn[sk]; wi++) {
           link=worder[sk, wi]; wb=(wi == wn[sk] ? "└─" : "├─")
-          print wtarget[link], window_row(link, wb), runtime_meta(pn[link], wcmd[link], wpath[link], 1)
+          print wtarget[link], window_row(link, wb), window_meta(link)
           if (expanded != 1) continue
           stem=(wi == wn[sk] ? "      " : "  │   ")
           for (pi=1; pi<=pn[link]; pi++) {
@@ -189,21 +279,41 @@ list_tree() {
 }
 
 list_recent() {
-  local live mfile="$WINDOW_MRU_FILE"
+  local live merged mfile="$WINDOW_MRU_FILE"
   live="$(live_pane_snapshot)" || return 1
+  merged="$(ai_merged)"
   [ -r "$mfile" ] || mfile=/dev/null
-  LC_ALL=C awk -F '\t' -v OFS='\t' -v expanded="$EXPANDED" -v C="$C" -v D="$D" -v R="$R" '
-    function emit_window(w,    title, p, i) {
+  { printf '%s\n' "$live"; printf '%s\n' "$merged"; cat "$mfile"; } |
+  LC_ALL=C awk -F '\t' -v OFS='\t' -v expanded="$EXPANDED" -v C="$C" -v Y="$Y" -v G="$G" -v M="$M" -v D="$D" -v R="$R" '
+    function cg(sev, glyph) { return (sev==1 ? M glyph R : sev==2 ? Y glyph R : sev==3 ? G glyph R : sev==4 ? C glyph R : D glyph R) }
+    function badge_for(w,    i, pk, s, c1, c2, c3, c4, c5, out, e) {
+      c1=c2=c3=c4=c5=0
+      for (i=1; i<=pn[w]; i++) {
+        pk=porder[w, i]
+        if (pk in aisev) { s=aisev[pk]; if (s==1) c1++; else if (s==2) c2++; else if (s==3) c3++; else if (s==4) c4++; else c5++ }
+      }
+      out=""; e=0
+      if (c1 && e<2) { out=out " " cg(1,"⚠") (c1>1?c1:""); e++ }
+      if (c2 && e<2) { out=out " " cg(2,"⚠") (c2>1?c2:""); e++ }
+      if (c3 && e<2) { out=out " " cg(3,"✓") (c3>1?c3:""); e++ }
+      if (c4 && e<2) { out=out " " cg(4,"◐") (c4>1?c4:""); e++ }
+      if (c5 && e<2) { out=out " " cg(5,"·") (c5>1?c5:""); e++ }
+      sub(/^ /, "", out)
+      return out
+    }
+    function emit_window(w,    title, p, i, b, g) {
       if (shown[w]++) return
       p=wtarget[w]; title=(ptitle[p] != "" && ptitle[p] != wname[w] ? "/" ptitle[p] : "")
-      print p, wname[w] " " C session[w] ":" widx[w] title R, D pcmd[p] " · " ppath[p] R
+      b=badge_for(w)
+      print p, wname[w] " " C session[w] ":" widx[w] title R, (b != "" ? b " " : "") D pcmd[p] " · " ppath[p] R
       if (expanded != 1) return
       for (i=1; i<=pn[w]; i++) {
         p=porder[w, i]; title=(ptitle[p] != "" ? "/" ptitle[p] : "")
-        print p, "   " wname[w] " " C session[w] ":" widx[w] "." pidx[p] title R, D pcmd[p] " · " ppath[p] R
+        g=(p in aisev ? cg(aisev[p], aiglyph[p]) " " : "")
+        print p, "   " wname[w] " " C session[w] ":" widx[w] "." pidx[p] g title R, D pcmd[p] " · " ppath[p] R
       }
     }
-    NR==FNR {
+    NF >= 10 {
       p=$1; w=$4
       if (!(w in seen_w)) {
         seen_w[w]=1; canonical[++walln]=w
@@ -215,12 +325,13 @@ list_recent() {
       porder[w, ++pn[w]]=p; pidx[p]=$8; ptitle[p]=$10; pcmd[p]=$11; ppath[p]=$12
       next
     }
+    NF == 7 { aisev[$1]=$2+0; aiglyph[$1]=$3; next }
     NF >= 1 && $1 != "" { recent[++rn]=$1 }
     END {
       for (i=rn; i>=1; i--) if (recent[i] in seen_w) emit_window(recent[i])
       for (i=1; i<=walln; i++) emit_window(canonical[i])
     }
-  ' <(printf '%s\n' "$live") "$mfile"
+  '
 }
 
 list_inbox() {
@@ -288,12 +399,68 @@ list_inbox() {
   ' <(printf '%s\n' "$live") "$marks"
 }
 
+list_agents() {
+  local live merged now
+  live="$(live_pane_snapshot)" || return 1
+  merged="$(ai_merged)"
+  now="$(date +%s)"
+  printf '%s\n%s\n' "$live" "$merged" | LC_ALL=C awk -F '\t' -v OFS='\t' -v now="$now" \
+    -v C="$C" -v Y="$Y" -v G="$G" -v M="$M" -v B="$B" -v D="$D" -v R="$R" '
+    function cg(sev, glyph) { return (sev==1 ? M glyph R : sev==2 ? Y glyph R : sev==3 ? G glyph R : sev==4 ? C glyph R : D glyph R) }
+    function age(sec) {
+      if (sec < 0) sec=0
+      if (sec < 60) return sec "s"
+      if (sec < 3600) return int(sec/60) "m"
+      if (sec < 86400) return int(sec/3600) "h"
+      return int(sec/86400) "d"
+    }
+    NF >= 10 {
+      p=$1
+      if (p in live) next
+      live[p]=1; order[++n]=p
+      session[p]=$2; widx[p]=$5; wname[p]=$6; pidx[p]=$8
+      ptitle[p]=$10; pcmd[p]=$11; ppath[p]=$12
+      next
+    }
+    NF == 7 {
+      if (!($1 in live)) next
+      asev[$1]=$2+0; aglyph[$1]=$3; aword[$1]=$4; akind[$1]=$5; atext[$1]=$6; aepoch[$1]=$7+0
+      next
+    }
+    END {
+      cn=0
+      for (i=1; i<=n; i++) {
+        p=order[i]; if (!(p in asev)) continue
+        cn++; cr[cn]=asev[p]; ce[cn]=aepoch[p]; cp[cn]=p
+      }
+      # severity asc, then newest first (insertion sort over a tiny set)
+      for (i=2; i<=cn; i++) {
+        r=cr[i]; e=ce[i]; p=cp[i]
+        for (j=i-1; j>=1 && (cr[j] > r || (cr[j] == r && ce[j] < e)); j--) {
+          cr[j+1]=cr[j]; ce[j+1]=ce[j]; cp[j+1]=cp[j]
+        }
+        cr[j+1]=r; ce[j+1]=e; cp[j+1]=p
+      }
+      for (i=1; i<=cn; i++) {
+        p=cp[i]
+        word=aword[p]
+        primary=sprintf("%s " B "%-8s" R " %s " C "%s:%s.%s" R, cg(asev[p], aglyph[p]), word, wname[p], session[p], widx[p], pidx[p])
+        tail=(aepoch[p] > 0 ? " · " age(now-aepoch[p]) : "")
+        text=atext[p]
+        meta=sprintf("%s%s%s " D "· %s · %s%s" R, akind[p], (text != "" ? " · " : ""), text, pcmd[p], ppath[p], tail)
+        print p, primary, meta
+      }
+    }
+  '
+}
+
 do_list() {  # do_list [view] [expanded]
   local rows list_fn
   read_state "${1:-}" "${2:-}"
   case "$VIEW" in
     recent) list_fn=list_recent ;;
     inbox) list_fn=list_inbox ;;
+    agents) list_fn=list_agents ;;
     tree) list_fn=list_tree ;;
   esac
   if ! rows="$("$list_fn")"; then
@@ -331,13 +498,17 @@ _level_for() {  # _level_for <source> <label>; mirrors the list awk level_for
 }
 
 _pane_status_header() {  # $1 = pane %id; tech header + separator when the pane has a mark/registry row
-  local pane="$1" mark="" reg="" level="" icon='·' color="$D" parts kind sid
+  local pane="$1" mark="" reg="" live="" level="" icon='·' color="$D" parts kind sid
   local m_epoch="" m_src="" m_key="" m_label=""
   local r_kind="" r_key="" r_pid="" r_started="" r_state="" r_cwd="" alive
+  local l_state="" l_kind="" l_title=""
   [ -n "$pane" ] || return 0
   [ -r "$NEEDINPUT_FILE" ] && mark="$(awk -F '\t' -v p="$pane" '$1 == p { print; exit }' "$NEEDINPUT_FILE" 2>/dev/null || true)"
-  [ -r "$REGISTRY_FILE" ] && reg="$(awk -F '\t' -v p="$pane" '$4 == p { r=$0 } END { if (r != "") print r }' "$REGISTRY_FILE" 2>/dev/null || true)"
-  [ -n "$mark" ] || [ -n "$reg" ] || return 0
+  # a pane can carry several session rows (parent + adopted/bg children); the
+  # newest event is the only state worth showing
+  [ -r "$REGISTRY_FILE" ] && reg="$(awk -F '\t' -v p="$pane" '$4 == p && ($6+0) >= max { max=$6+0; r=$0 } END { if (r != "") print r }' "$REGISTRY_FILE" 2>/dev/null || true)"
+  [ -r "$LIVE_FILE" ] && live="$(awk -F '\t' -v p="$pane" '$1 == p { print; exit }' "$LIVE_FILE" 2>/dev/null || true)"
+  [ -n "$mark" ] || [ -n "$reg" ] || [ -n "$live" ] || return 0
   # \037-joined field extraction: tab is IFS whitespace, empty fields would collapse
   if [ -n "$mark" ]; then
     IFS=$'\037' read -r m_epoch m_src m_key m_label <<< "$(printf '%s' "$mark" |
@@ -359,8 +530,21 @@ _pane_status_header() {  # $1 = pane %id; tech header + separator when the pane 
   r_state="$(printf '%s' "$r_state" | sanitize_text)"
   r_cwd="$(printf '%s' "$r_cwd" | sanitize_text)"
   kind="${r_kind:-$m_src}"
+  if [ -z "$mark" ] && [ -z "$reg" ]; then
+    # scanner-only pane: no hook ever fired for it
+    l_state="$(printf '%s' "$live" | cut -f3 | sanitize_text)"
+    l_kind="$(printf '%s' "$live" | cut -f2 | sanitize_text)"
+    l_title="$(printf '%s' "$live" | cut -f4 | sanitize_text)"
+    printf '%s%s %s · %s (live scan)%s\n' "$D" "${l_kind:-ai}" "${l_state:-?}" "$l_title" "$R"
+    printf '%s────────────────────────────────────────%s\n' "$D" "$R"
+    return 0
+  fi
   parts="$icon ${kind:-?}"
   [ -n "$r_state" ] && parts="$parts · $r_state"
+  if [ -n "$live" ]; then
+    l_state="$(printf '%s' "$live" | cut -f3 | sanitize_text)"
+    [ -n "$l_state" ] && [ "$l_state" != "$r_state" ] && parts="$parts · live:$l_state"
+  fi
   [ -n "$m_epoch" ] && parts="$parts · mark $(_age_since "$m_epoch") ago"
   sid="$(printf '%s' "${r_key:-$m_key}" | sanitize_text)"
   case "$sid" in
@@ -398,6 +582,7 @@ _prompt() {
   case "$VIEW" in
     recent) [ "$EXPANDED" = 1 ] && printf 'Recent+> ' || printf 'Recent> ' ;;
     inbox) printf 'Inbox> ' ;;
+    agents) printf 'Agents> ' ;;
     tree) [ "$EXPANDED" = 1 ] && printf 'Tree+> ' || printf 'Tree> ' ;;
   esac
 }
@@ -406,7 +591,10 @@ _header() {
   if [ "$VIEW" = inbox ] && [ -n "${SW_ROWS:-}" ] && [ ! -s "$SW_ROWS" ]; then
     printf '%s · ' 'Inbox clear — no unread AI event needs you.'
   fi
-  printf '%s' 'C-r Recent · C-i Inbox · C-t Tree'
+  if [ "$VIEW" = agents ] && [ -n "${SW_ROWS:-}" ] && [ ! -s "$SW_ROWS" ]; then
+    printf '%s · ' 'No live agents — no hook event and no agent process on this tmux server.'
+  fi
+  printf '%s' 'C-r Recent · C-i Inbox · C-a Agents · C-t Tree'
   printf '%s' ' · C-e panes · A-1..9 jump · A-p preview · Enter switch'
 }
 
@@ -463,10 +651,7 @@ cmd_set_view() {  # fzf transform: switch view, reload, repoint prompt
 
 cmd_toggle_expand() {  # fzf transform: toggle pane leaves in Recent/Tree
   read_state
-  if [ "$VIEW" = inbox ]; then
-    printf 'bell\n'
-    return 0
-  fi
+  case "$VIEW" in inbox|agents) printf 'bell\n'; return 0 ;; esac
   [ "$EXPANDED" = 1 ] && EXPANDED=0 || EXPANDED=1
   _reload_picker
 }
@@ -544,6 +729,7 @@ do_menu() {
       --bind="ctrl-t:transform($SELF set-view tree)" \
       --bind="ctrl-r:transform($SELF set-view recent)" \
       --bind="ctrl-i:transform($SELF set-view inbox)" \
+      --bind="ctrl-a:transform($SELF set-view agents)" \
       --bind="ctrl-e:transform($SELF toggle-expand)" \
       --bind="alt-1:transform($SELF jump 1)" \
       --bind="alt-2:transform($SELF jump 2)" \

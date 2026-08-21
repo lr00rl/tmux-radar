@@ -3,14 +3,15 @@
 ## Source of truth
 
 - Status: Active
-- Last refreshed: 2026-08-11
+- Last refreshed: 2026-08-21
 - Primary product surface: the `fzf` popup opened by `prefix + C-w`
-- Supporting surfaces: pane preview, pane MRU toggle, AI lifecycle marks, status chips, and the optional supervisor
+- Supporting surfaces: pane preview, pane MRU toggle, AI lifecycle marks, status chips, live scanner, and the optional supervisor
 - Evidence reviewed:
   - historical picker at `v0.1.3` / `6ee7afc`, especially `scripts/switcher.sh`, `README.md`, and `tests/test_switcher.sh`;
   - the interaction commits `6e27cd4`, `7864f66`, and `4891290`;
   - the current `fdc107d` implementation and its real tmux/fzf regression suite;
   - live tmux state on 2026-08-11: 46 panes, 14 process/registry-detected AI panes, but only 2 pane-backed unread lifecycle marks;
+  - live tmux state on 2026-08-20: a Codex session started before hook install was invisible to every surface; a Claude pane held an ACTION mark while observably working (approved in place); teammate-swarm registry rows pointed at panes of a foreign tmux server;
   - the local `cd-design-skill` Product/Deep design gates;
   - upstream fzf, tmux tree-mode, GitHub Notifications, Raycast, Warp, and Zellij documentation.
 
@@ -76,10 +77,12 @@ The popup has three peer views over live tmux destinations:
 | --- | --- | --- | --- |
 | **Recent** | Where was I working? | All live windows; panes appear on drill-down | window MRU, then remaining live windows |
 | **Inbox** | Which AI result or request needs me? | Pane-backed unread lifecycle events only | ACTION, DONE, NOTICE; newest first within level |
+| **Agents** | What is every live agent doing right now? | Every pane with mark, registry, or scanner evidence | BLOCKED/WAITING, WORKING, DONE, IDLE; newest first within level |
 | **Tree** | Where is this work in tmux? | Session → window; panes appear on drill-down | canonical tmux server order |
 
-Compatibility aliases may remain at the CLI boundary: `needinput` → Inbox and
-`all` → Tree. User-facing copy uses only Recent, Inbox, and Tree.
+Compatibility aliases may remain at the CLI boundary: `needinput` → Inbox,
+`all` → Tree, and `ai`/`agent` → Agents. User-facing copy uses only Recent,
+Inbox, Agents, and Tree.
 
 ### Object model
 
@@ -165,7 +168,7 @@ compact `Np` metadata, while command and compact cwd provide recognition value.
 
 ## Components
 
-- View switcher: `Ctrl-r` Recent, `Ctrl-i` Inbox, `Ctrl-t` Tree.
+- View switcher: `Ctrl-r` Recent, `Ctrl-i` Inbox, `Ctrl-a` Agents, `Ctrl-t` Tree.
 - Recent fast-switch focus: the current MRU window stays on row 1, while the
   initial cursor and every `Ctrl-r` view switch land on row 2—the previous
   window—so opening the picker and pressing `Enter` switches back immediately.
@@ -254,6 +257,43 @@ Explicit exclusions:
 The registry, process scan, and doctor remain valuable for GC and diagnostics.
 They stop being list producers for `Ctrl-i`.
 
+### Live scanner and badges
+
+Hooks are push: they miss sessions started before installation, agents without
+an adapter, approvals given in place (no `UserPromptSubmit` fires), and events
+aimed at a foreign tmux server (Claude teammate swarms run under
+`tmux -L claude-swarm-*`). The scanner is the pull-based floor beneath them:
+
+1. Every `@radar-scan-interval` seconds (default 10, minimum 5) `tick`
+   classifies each pane hosting a watched agent process — same ps argv0 rules
+   as the mark GC — as `working` (pane title or screen changed since the last
+   sample), `stalled` (no visible change while the process lives), or
+   `blocked` (the agent's own title asks for action, e.g. Codex's animated
+   `Action Required` marker). Results publish to `ai-live` (pane, kind, state,
+   title, epoch), atomically, under a claim-stamp that caps scan frequency.
+2. A pane with no hook-claimed registry row is adopted as a `p:<pid>` row with
+   the scanned state, so every surface reads one model. A later native event
+   with a session key supersedes the adopted row exactly as Codex's `p:`→`s:`
+   upgrade already did.
+3. Two consecutive `working` verdicts heal an unread ACTION mark on that pane
+   (approved in place: the wait is observably over) and downgrade a registry
+   `waiting` the screen contradicts. DONE marks never heal: they are a review
+   queue, not a state claim.
+4. A registry row whose pane is not live on this server keeps its liveness
+   (pid + argv identity) but is re-homed to paneless `-`, so no surface ever
+   targets a pane this server cannot switch to. The same validation applies
+   to `$TMUX_PANE` arriving from a foreign server at hook time.
+5. The scanner never creates Inbox marks. Unread semantics stay hook truth;
+   detection is the floor, not a replacement.
+
+Recent and Tree rows aggregate these per-pane states into window badges
+(`⚠` needs you, `✓` done unread, `◐` working, `·` idle; at most the two most
+severe groups, with counts). Agents (`Ctrl-a`) lists the merged per-pane rows
+sorted by severity: unread ACTION, blocked/waiting, unread DONE, working,
+idle. Merge precedence per pane: an unread mark outranks live state; a live
+`blocked`/`waiting` outranks a stale registry `working`; a live `working`
+contradicts and hides a registry `waiting`.
+
 ## Content voice
 
 - Tone: terse, technical, calm.
@@ -334,8 +374,18 @@ Required end-to-end checks:
 12. Entering and leaving an empty Inbox updates and removes the empty-state
     header in the same atomic fzf reload transaction.
 13. Hook migration preserves pre-existing foreign indexed hooks.
-14. Bash syntax, ShellCheck, all repository shell suites, Go test/vet/build, and
-   `git diff --check` pass before delivery.
+14. The scanner adopts a hookless agent pane into `ai-live` and the registry,
+    classifies a changing screen as working and a static one as stalled, and
+    honors an `Action Required` title as blocked; two consecutive working
+    verdicts heal an ACTION mark and downgrade a contradicted waiting row.
+15. A registry row whose pane is absent from this server keeps liveness but is
+    re-homed to paneless; `$TMUX_PANE` values that do not resolve locally are
+    re-resolved before use.
+16. Agents lists marked, registered, and scanner-found panes ordered by
+    severity, and Recent/Tree window rows carry the aggregated badges without
+    changing row targets or the three-field contract.
+17. Bash syntax, ShellCheck, all repository shell suites, Go test/vet/build, and
+    `git diff --check` pass before delivery.
 
 ## Open questions
 

@@ -375,14 +375,14 @@ func (model LiveModel) liveFooter(width int) []string {
 		} else if width < 72 {
 			controls = "1-5 · K keep · Enter target · q close · ?"
 		} else if width < 110 {
-			controls = "1-5 · j/k · e · k · Enter · q · ?"
+			controls = "1-5 · j/k · e · K · Enter · q · ?"
 		}
 	} else if width < 56 {
 		controls = "1-5 view · p · r · Enter · q · ?"
 	} else if width < 72 {
 		controls = "1-5 · p pause · r redo · Enter target · q stop · ?"
 	} else if width < 110 {
-		controls = "1-5 · j/k · e · p · r · k · Enter · q · ?"
+		controls = "1-5 · j/k · e · p · r · K · Enter · q · ?"
 	}
 	message := model.controlNotice
 	if model.controlError != "" {

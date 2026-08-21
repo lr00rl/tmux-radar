@@ -304,6 +304,51 @@ chk "custom adapter malformed payloads cannot block the vendor" \
   "[ '$ADAPTER_MALFORMED_RC' -ne 0 ] && [ '$ADAPTER_MALFORMED_RC' -ne 2 ]"
 
 tmux -L radarreg kill-server 2>/dev/null || true
+
+echo
+echo "### executor allowance: unattended sends are menu answers only"
+tmux -L radarreg -f /dev/null new-session -d -s allow -x 120 -y 40 2>/dev/null
+TMUX="$(tmux -L radarreg display-message -p '#{socket_path}'),99999,0"
+export TMUX
+unset TMUX_PANE CLAUDE_JOB_DIR 2>/dev/null || true
+PANE="$(tmux list-panes -a -F '#{pane_id}' | head -1)"
+for _ in $(seq 1 50); do
+  [ -n "$(tmux capture-pane -p -t "$PANE" 2>/dev/null | tr -d ' \n')" ] && break
+  sleep 0.1
+done
+
+mkbrain() { printf '%s' "$2" > "$T/brain-$1.json"; export TMUX_RADAR_AI_CMD="cat >/dev/null; cat '$T/brain-$1.json'"; }
+export TMUX_RADAR_AI_PAUSE=1
+export TMUX_RADAR_AI_AUTONOMY=auto
+tmux set -g @radar-ai-autonomy auto 2>/dev/null || true
+
+mkbrain freetext '{"action":"send","text":"do something destructive","keys":["Enter"],"safe":true,"persistent":false,"reason":"looks fine","pane_state":"blocked","goal_status":"working","risk":"low","evidence":[]}'
+OUT="$(TMUX_PANE="$PANE" bash "$AI" decide "$PANE" auto '' '' 2>&1)"; RC=$?
+chk "auto send with free-form text escalates (rc=4)" "[ $RC -eq 4 ]"
+chk "free-form text is never typed into the pane" \
+  "! tmux capture-pane -p -t '$PANE' | grep -q 'do something destructive'"
+
+mkbrain ctrlkey '{"action":"send","text":"","keys":["C-c"],"safe":true,"persistent":false,"reason":"cancel it","pane_state":"blocked","goal_status":"working","risk":"low","evidence":[]}'
+OUT="$(TMUX_PANE="$PANE" bash "$AI" decide "$PANE" auto '' '' 2>&1)"; RC=$?
+chk "auto send with a control key escalates (rc=4)" "[ $RC -eq 4 ]"
+chk "control-key rejection escalates to the user" "printf '%s' \"\$OUT\" | grep -q '无人值守'"
+
+mkbrain menu '{"action":"send","text":"1","keys":["Enter"],"safe":true,"persistent":false,"reason":"menu yes","pane_state":"blocked","goal_status":"working","risk":"low","evidence":[]}'
+OUT="$(TMUX_PANE="$PANE" bash "$AI" decide "$PANE" auto '' '' 2>&1)"; RC=$?
+chk "menu answer (digit + Enter) is delivered in auto mode (rc=0)" "[ $RC -eq 0 ]"
+chk "menu answer actually reached the pane" \
+  "tmux capture-pane -p -t '$PANE' | grep -q 'command not found: 1'"
+
+mkbrain persist '{"action":"send","text":"","keys":["Down","Enter"],"safe":true,"persistent":true,"reason":"always allow it","pane_state":"blocked","goal_status":"working","risk":"low","evidence":[]}'
+OUT="$(TMUX_PANE="$PANE" bash "$AI" decide "$PANE" auto safe-auto '' 2>&1)"; RC=$?
+chk "persistent pick without always-allow policy escalates (rc=4)" "[ $RC -eq 4 ]"
+OUT="$(TMUX_PANE="$PANE" bash "$AI" decide "$PANE" auto always-allow '' 2>&1)"; RC=$?
+chk "persistent pick under always-allow is delivered (rc=0)" "[ $RC -eq 0 ]"
+
+tmux set -gu @radar-ai-autonomy 2>/dev/null || true
+unset TMUX_RADAR_AI_CMD TMUX_RADAR_AI_AUTONOMY
+tmux -L radarreg kill-server 2>/dev/null || true
+
 rm -f /tmp/PWNED_BY_ASK
 echo
 echo "=============================="

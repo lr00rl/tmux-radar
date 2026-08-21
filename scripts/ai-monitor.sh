@@ -358,7 +358,12 @@ detail_loop() {
     fi
     [ "$once" -eq 1 ] && { STOP_ON_EXIT=0; break; }
     key=""
-    if IFS= read -rsn1 -t 1 key </dev/tty 2>/dev/null; then
+    if ! IFS= read -rsn1 -t 1 key </dev/tty 2>/dev/null; then
+      # a timeout (rc>128) is the normal 1s pacing; a dead /dev/tty fails
+      # instantly and must not become a busy loop
+      [ "$?" -le 128 ] && sleep 1
+    fi
+    if [ -n "$key" ]; then
       if [ "$key" = $'\033' ]; then IFS= read -rsn2 -t 0.02 _rest </dev/tty 2>/dev/null || true; continue; fi
       handle_key "$key" || break
     fi
@@ -497,7 +502,12 @@ compact_loop() {
     fi
     [ "$once" -eq 1 ] && { STOP_ON_EXIT=0; break; }
     key=""
-    if IFS= read -rsn1 -t 1 key </dev/tty 2>/dev/null; then
+    if ! IFS= read -rsn1 -t 1 key </dev/tty 2>/dev/null; then
+      # a timeout (rc>128) is the normal 1s pacing; a dead /dev/tty fails
+      # instantly and must not become a busy loop
+      [ "$?" -le 128 ] && sleep 1
+    fi
+    if [ -n "$key" ]; then
       old_view="$DETAIL_VIEW"
       case "$key" in
         u)

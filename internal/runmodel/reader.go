@@ -162,40 +162,60 @@ func sameArtifact(previous, current os.FileInfo) bool {
 		previous.ModTime().Equal(current.ModTime())
 }
 
-func (reader *Reader) PollEvents() ([]Event, error) {
+// EventGapError reports journal content the reader skipped over: lines that
+// fail to decode, or one overlong line skipped in capped chunks. It is
+// non-fatal by construction — the read offset has already advanced past the
+// gap, so the stream degrades to one missing segment instead of wedging.
+type EventGapError struct {
+	Offset  int64
+	Skipped int // -1 when an overlong line was skipped in capped chunks
+	Err     error
+}
+
+func (err *EventGapError) Error() string {
+	if err.Skipped < 0 {
+		return fmt.Sprintf("events.jsonl: skipped an overlong line near offset %d: %v", err.Offset, err.Err)
+	}
+	return fmt.Sprintf("events.jsonl: skipped %d undecodable line(s) after offset %d: %v", err.Skipped, err.Offset, err.Err)
+}
+
+func (err *EventGapError) Unwrap() error { return err.Err }
+
+func (reader *Reader) PollEvents() ([]Event, bool, error) {
 	reader.eventsMu.Lock()
 	defer reader.eventsMu.Unlock()
 
 	path := filepath.Join(reader.runDir, "events.jsonl")
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("open events.jsonl: %w", err)
+		return nil, false, fmt.Errorf("open events.jsonl: %w", err)
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat events.jsonl: %w", err)
+		return nil, false, fmt.Errorf("stat events.jsonl: %w", err)
 	}
 	start := reader.eventsOffset
 	prefixMatches, err := committedEventTailMatches(
 		file, info.Size(), reader.eventsOffset, reader.eventsTailOffset, reader.eventsTail,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("verify events.jsonl cursor: %w", err)
+		return nil, false, fmt.Errorf("verify events.jsonl cursor: %w", err)
 	}
-	if !prefixMatches {
+	reset := !prefixMatches
+	if reset {
 		start = 0
 	}
 	if _, err := file.Seek(start, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek events.jsonl: %w", err)
+		return nil, false, fmt.Errorf("seek events.jsonl: %w", err)
 	}
 	payload, err := io.ReadAll(io.LimitReader(file, maxEventPollBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("read events.jsonl: %w", err)
+		return nil, false, fmt.Errorf("read events.jsonl: %w", err)
 	}
 	batch := payload
 	if len(batch) > maxEventPollBytes {
@@ -205,25 +225,49 @@ func (reader *Reader) PollEvents() ([]Event, error) {
 	lastNewline := bytes.LastIndexByte(batch, '\n')
 	if lastNewline < 0 {
 		if len(payload) > maxEventPollBytes {
-			return nil, fmt.Errorf("events.jsonl line exceeds %d bytes at offset %d", maxEventPollBytes, start)
+			// A line larger than the cap can never be decoded here; skipping
+			// capped chunks until it ends beats wedging the timeline forever.
+			next := start + int64(len(batch))
+			tailOffset, tail, tailErr := readCommittedEventTail(file, next)
+			if tailErr != nil {
+				return nil, false, fmt.Errorf("read events.jsonl cursor fingerprint: %w", tailErr)
+			}
+			reader.eventsOffset = next
+			reader.eventsTailOffset = tailOffset
+			reader.eventsTail = tail
+			return nil, reset, &EventGapError{
+				Offset:  start,
+				Skipped: -1,
+				Err:     fmt.Errorf("line exceeds %d bytes", maxEventPollBytes),
+			}
 		}
-		return nil, nil
+		return nil, false, nil
 	}
 
 	complete := batch[:lastNewline+1]
 	lines := bytes.Split(complete, []byte{'\n'})
 	events := make([]Event, 0, len(lines)-1)
+	skipped := 0
+	var firstErr error
 	for lineNumber, line := range lines {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
 		var event Event
-		if err := json.Unmarshal(line, &event); err != nil {
-			return nil, fmt.Errorf("decode events.jsonl line at offset %d (%d): %w", start, lineNumber+1, err)
+		if decodeErr := json.Unmarshal(line, &event); decodeErr != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("line %d: %w", lineNumber+1, decodeErr)
+			}
+			skipped++
+			continue
 		}
-		if err := ValidateSchemaVersion(event.SchemaVersion); err != nil {
-			return nil, fmt.Errorf("decode events.jsonl line at offset %d (%d): %w", start, lineNumber+1, err)
+		if versionErr := ValidateSchemaVersion(event.SchemaVersion); versionErr != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("line %d: %w", lineNumber+1, versionErr)
+			}
+			skipped++
+			continue
 		}
 		events = append(events, event)
 	}
@@ -231,12 +275,15 @@ func (reader *Reader) PollEvents() ([]Event, error) {
 	nextOffset := start + int64(lastNewline+1)
 	tailOffset, tail, err := readCommittedEventTail(file, nextOffset)
 	if err != nil {
-		return nil, fmt.Errorf("read events.jsonl cursor fingerprint: %w", err)
+		return nil, false, fmt.Errorf("read events.jsonl cursor fingerprint: %w", err)
 	}
 	reader.eventsOffset = nextOffset
 	reader.eventsTailOffset = tailOffset
 	reader.eventsTail = tail
-	return events, nil
+	if skipped > 0 {
+		return events, reset, &EventGapError{Offset: start, Skipped: skipped, Err: firstErr}
+	}
+	return events, reset, nil
 }
 
 func committedEventTailMatches(file *os.File, size, offset, tailOffset int64, tail []byte) (bool, error) {

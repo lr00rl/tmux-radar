@@ -6,6 +6,7 @@
     "text",
     "keys",
     "safe",
+    "persistent",
     "reason",
     "pane_state",
     "goal_status",
@@ -30,6 +31,10 @@
     "safe": {
       "type": "boolean",
       "description": "false for destructive/irreversible/ambiguous actions — forces escalation."
+    },
+    "persistent": {
+      "type": "boolean",
+      "description": "true only when the chosen option is a don't-ask-again / always-allow variant. Honored solely when the run policy is always-allow; otherwise it forces escalation."
     },
     "reason": {
       "type": "string",

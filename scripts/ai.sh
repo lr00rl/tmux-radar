@@ -7,8 +7,9 @@
 # Design principle: Codex is a DECISION-ONLY BRAIN. It receives no interactive
 # config, hooks, project workspace, or tool-bearing features. This script is the
 # only actor: it captures a pane, asks Codex for a structured decision, then —
-# gated by autonomy, a safety denylist, and an audit log — sends the keystrokes.
-# A confused or adversarial answer can at most propose keys we still get to veto.
+# gated by autonomy, an executor-side send allowlist (menu answers only for
+# unattended sends), and an audit log — sends the keystrokes.
+# A confused or adversarial answer can at most propose a menu answer.
 #
 # Subcommands:
 #   ask [<request>]     one-shot: arrange tmux from a natural-language request
@@ -831,7 +832,19 @@ have_tmux() { command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2
 need_jq()  { command -v jq >/dev/null 2>&1 || { echo "tmux-radar AI needs 'jq'." >&2; exit 3; }; }
 have_brain() { _ensure_backend_frozen; [ "$BRAIN_BACKEND_OK" -eq 1 ]; }
 now()  { date '+%s'; }
-audit() { printf '%s\t%s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true; }
+audit() {
+  # model-derived fields (reason etc.) can carry newlines/controls: flatten at
+  # the sink so no caller can forge extra audit lines, and keep the log bounded
+  local line
+  line="$(printf '%s' "$*" | tr '\n\t' '  ' | tr -d '\000-\037\177')"
+  printf '%s\t%s\n' "$(date '+%F %T')" "$line" >> "$LOG" 2>/dev/null || return 0
+  [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 2000 ] && {
+    local tmp; tmp="$(mktemp "${LOG}.XXXXXX")" 2>/dev/null &&
+      { tail -n 1000 "$LOG" > "$tmp" && mv "$tmp" "$LOG"; } 2>/dev/null
+    rm -f "$tmp" 2>/dev/null || true
+  }
+  return 0
+}
 
 # ANSI palette for popup / feed output (never routed through tmux formats —
 # some tmux builds vis-escape control chars in -F output).
@@ -969,26 +982,6 @@ _watch_detail() {  # _watch_detail <pane> <title> <body>
     printf '%s\n' "$body"
   } >> "$log" 2>/dev/null || true
   _watch_file_tail "$log" 1200
-}
-
-_watch_state_write() {  # pane started poll goal policy auto maxcalls calls quiet marked status next_at last_decision
-  local pane="$1" started="$2" poll="$3" goal="$4" policy="$5" auto="$6" maxcalls="$7" calls="$8" quiet="$9"
-  shift 9
-  local marked="$1" status="$2" next_at="$3" last_decision="$4" wf tmp
-  wf="$(_wf "$pane")"
-  tmp="$(mktemp "${wf}.XXXXXX")" || return 0
-  {
-    printf 'pid=%s\npane=%s\nstarted=%s\npoll=%s\ngoal=%s\n' "$$" "$pane" "$started" "$poll" "$(_flat "$goal")"
-    printf 'policy=%s\nautonomy=%s\nmaxcalls=%s\ncalls=%s\nquiet=%s\nmarked=%s\n' \
-      "${policy:-safe-auto}" "$auto" "$maxcalls" "$calls" "$quiet" "$marked"
-    printf 'status=%s\nnext_at=%s\nlast_decision=%s\nupdated=%s\n' \
-      "$(_flat "$status")" "$next_at" "$last_decision" "$(now)"
-  } > "$tmp" 2>/dev/null
-  if [ -s "$tmp" ]; then
-    mv "$tmp" "$wf" || rm -f "$tmp"
-  else
-    rm -f "$tmp"
-  fi
 }
 
 _watch_pointer_write() {
@@ -1303,7 +1296,15 @@ _terminate_brain_file() {  # _terminate_brain_file <brain-pidfile>
   output="$(_state_get "$file" output)"
   if _pid_effectively_alive "$pid" && [ -n "$identity" ]; then
     current_identity="$(_process_identity "$pid" || true)"
-    [ "$current_identity" = "$identity" ] || return 1
+    # A live pid with a different identity is a REUSED pid: the recorded brain
+    # is provably gone, so the pidfile is stale evidence, not a live target.
+    # An empty identity means ps failed; keep the file and report unproven.
+    if [ "$current_identity" != "$identity" ]; then
+      [ -n "$current_identity" ] || return 1
+      [ -n "$output" ] && rm -f "$output"
+      rm -f "$file"
+      return 0
+    fi
   fi
   _terminate_process_tree "$pid" "$pgid" || return 1
   [ -n "$output" ] && rm -f "$output"
@@ -1788,7 +1789,24 @@ _send() {  # _send <pane> <text> <key> <key> ...
   local k
   for k in "$@"; do
     [ -n "$k" ] || continue
-    tmux send-keys -t "$pane" "$k" 2>/dev/null || return 1
+    tmux send-keys -t "$pane" -- "$k" 2>/dev/null || return 1
+  done
+  return 0
+}
+
+# Unattended sends are menu answers, never free-form input: single-character
+# text (1-9 / y/n) and navigation keys only. Anything richer goes through a
+# human (confirm mode) or escalates. This executor-side allowance is the floor
+# the model's self-reported `safe` flag cannot widen.
+_decision_menu_safe() {  # _decision_menu_safe <text> <keys...>
+  local text="$1" k
+  case "$text" in ''|[1-9ynNY]) ;; *) return 1 ;; esac
+  shift || true
+  for k in "$@"; do
+    case "$k" in
+      Enter|Up|Down|Left|Right|Space|Tab|Escape|BSpace) ;;
+      *) return 1 ;;
+    esac
   done
   return 0
 }
@@ -1801,7 +1819,7 @@ _send() {  # _send <pane> <text> <key> <key> ...
 # ---------------------------------------------------------------------------
 cmd_decide() {
   need_jq
-  local pane autonomy policy goal cap cap_tail where json pretty_json action text safe reason extra="" prompt backend
+  local pane autonomy policy goal cap cap_tail where json pretty_json action text safe reason persistent extra="" prompt backend
   local capture_lines event_kind excerpt_lines errfile err_tail call_tag="" logging snapshots
   local capture_file=""
   local TMUX_RADAR_AI_ERR="" TMUX_SWITCHER_AI_ERR=""
@@ -1931,6 +1949,7 @@ cmd_decide() {
     and (.text | type == "string")
     and (.keys | type == "array" and all(.[]; type == "string"))
     and (.safe | type == "boolean")
+    and ((.persistent? // null) == null or (.persistent | type == "boolean"))
     and (.reason | type == "string")
     and ((.pane_state? // null) == null or (.pane_state | IN("working","blocked","idle","done","unknown")))
     and ((.goal_status? // null) == null or (.goal_status | IN("working","blocked","done","unclear")))
@@ -1944,9 +1963,10 @@ cmd_decide() {
     action="$(printf '%s' "$json" | jq -r '.action')"
     text="$(printf '%s' "$json" | jq -r '.text')"
     safe="$(printf '%s' "$json" | jq -r 'if .safe == true then "1" else "0" end')"
-    reason="$(printf '%s' "$json" | jq -r '.reason')"
+    reason="$(printf '%s' "$json" | jq -r '.reason' | tr '\000-\011\013-\037\177' ' ')"
+    persistent="$(printf '%s' "$json" | jq -r 'if .persistent == true then "1" else "0" end')"
   else
-    action="unknown"; text=""; safe=0; reason="$DECISION_SCHEMA_ERROR"
+    action="unknown"; text=""; safe=0; reason="$DECISION_SCHEMA_ERROR"; persistent=0
   fi
   if [ -n "$call_tag" ] && [ "$DECISION_MODEL_LAUNCHED" -eq 1 ]; then
     _persist_decision_call "$call_tag" "$json" "$backend" "$autonomy" "$policy"
@@ -1963,6 +1983,7 @@ cmd_decide() {
   DECISION_TEXT="$text"
   DECISION_SAFE="$safe"
   DECISION_REASON="$reason"
+  DECISION_PERSISTENT="$persistent"
   DECISION_KEYS=()
   for _k in ${keys[@]+"${keys[@]}"}; do DECISION_KEYS+=("$_k"); done
   DECISION_READY=1
@@ -2015,7 +2036,21 @@ cmd_decide() {
       printf '%s→ %s:%s %s\n   发送: %s\n' "$CC" "$pane" "$CR" "$reason" "$plan"
       printf '   执行? [y/N] '; local ans=""; readline_tty ans
       case "$ans" in y|Y|yes) ;; *) printf '   %s已跳过%s\n' "$CD" "$CR"; return 6 ;; esac ;;
-    auto-safe|auto) : ;;   # safe already ensured above
+    auto-safe|auto)
+      # Unattended means menu answers only; the model's `safe` flag cannot
+      # widen what the executor will type, and a don't-ask-again choice needs
+      # an explicit always-allow policy behind it.
+      if ! _decision_menu_safe "$text" ${keys[@]+"${keys[@]}"}; then
+        printf '%s⚠ %s 超出无人值守可发送范围%s — %s\n' "$CM" "$pane" "$CR" "$reason"
+        _escalate "$pane" "AI 决策超出无人值守范围: $reason"
+        audit "escalate\t$pane\tpayload-not-menu-safe\t$reason"; return 4
+      fi
+      if [ "$persistent" = "1" ] && [ "$policy" != "always-allow" ]; then
+        printf '%s⚠ %s 勿再询问类选项需要 always-allow 策略%s — %s\n' "$CM" "$pane" "$CR" "$reason"
+        _escalate "$pane" "AI 选择了勿再询问选项但策略未允许: $reason"
+        audit "escalate\t$pane\tpersistent-without-always-allow\t$reason"; return 4
+      fi
+      ;;
     *) echo "unknown autonomy: $autonomy" >&2; return 5 ;;
   esac
   if ! _send "$pane" "$text" ${keys[@]+"${keys[@]}"}; then
@@ -2212,8 +2247,6 @@ _watch_reset_fallback_dedup() {
 
 _watch_kill_waiters() {
   WATCH_WAITER_PID=""; WATCH_TIMER_PID=""
-  [ -n "${WATCH_WAITER_DONE:-}" ] && rm -f "$WATCH_WAITER_DONE"
-  [ -n "${WATCH_TIMER_DONE:-}" ] && rm -f "$WATCH_TIMER_DONE"
 }
 
 _watch_pause() {
@@ -2283,18 +2316,37 @@ _watch_event_id() {
 
 _watch_next_event_order() {
   local lock="$RADAR_RUN_DIR/.event-order.lock" counter="$RADAR_RUN_DIR/.event-order"
-  local attempt=0 value=0 tmp
+  local attempt=0 value=0 tmp owner tomb
   while ! mkdir "$lock" 2>/dev/null; do
+    # mkdir locks outlive a kill -9; reap by recorded owner, tombstone-renamed
+    # so a brand-new owner is never swept away by a slow reaper (ABA).
+    owner="$(cat "$lock/pid" 2>/dev/null || true)"
+    case "$owner" in ''|*[!0-9]*) ;; *)
+      if ! kill -0 "$owner" 2>/dev/null; then
+        tomb="${lock}.stale.$$"
+        if mv "$lock" "$tomb" 2>/dev/null; then
+          if [ "$(cat "$tomb/pid" 2>/dev/null || true)" = "$owner" ]; then
+            rm -rf "$tomb"
+          else
+            [ -e "$lock" ] || mv "$tomb" "$lock" 2>/dev/null || true
+          fi
+        fi
+        continue
+      fi
+      ;;
+    esac
     attempt=$((attempt + 1))
     [ "$attempt" -lt 200 ] || return 1
     sleep 0.005
   done
+  printf '%s\n' "$$" > "$lock/pid" 2>/dev/null || true
   [ -s "$counter" ] && value="$(cat "$counter" 2>/dev/null || echo 0)"
   case "$value" in ''|*[!0-9]*) value=0 ;; esac
   value=$((value + 1))
-  tmp="$(mktemp "$RADAR_RUN_DIR/.event-order.XXXXXX")" || { rmdir "$lock"; return 1; }
+  tmp="$(mktemp "$RADAR_RUN_DIR/.event-order.XXXXXX")" || { rm -f "$lock/pid"; rmdir "$lock"; return 1; }
   printf '%s\n' "$value" > "$tmp"
   mv "$tmp" "$counter"
+  rm -f "$lock/pid"
   rmdir "$lock"
   printf '%s' "$value"
 }
@@ -2329,7 +2381,7 @@ _delivery_gate_reap_stale() {
 }
 
 _delivery_gate_acquire() {
-  local attempts="${TMUX_RADAR_TEST_GATE_ATTEMPTS:-500}" attempt=0 pid token private written_pid written_token
+  local attempts="${1:-${TMUX_RADAR_TEST_GATE_ATTEMPTS:-500}}" attempt=0 pid token private written_pid written_token
   [ -n "${RADAR_RUN_DIR:-}" ] || return 1
   case "$attempts" in ''|*[!0-9]*) attempts=500 ;; esac
   [ "$attempts" -gt 0 ] || attempts=1
@@ -2391,9 +2443,19 @@ _delivery_cleanup() {
 }
 
 _delivery_pending_exists() {
-  local pending
+  local pending pid
   for pending in "$RADAR_RUN_DIR"/.delivery-pending.*; do
-    [ -e "$pending" ] && return 0
+    [ -e "$pending" ] || continue
+    pid="$(_delivery_owner_field "$pending" pid)"
+    case "$pid" in ''|*[!0-9]*) pid="" ;; esac
+    # A publisher that died before its append finished (kill -9 is untrappable)
+    # would otherwise park every future delivery behind a 25s wait that then
+    # fails the run. An empty pid means a mid-write file: wait, do not reap.
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$pending"
+      continue
+    fi
+    return 0
   done
   return 1
 }
@@ -2641,6 +2703,7 @@ _watch_retry_delay() {
         rm -f "$batch"; return 10
       fi
     fi
+    if [ -e "$RADAR_RUN_DIR/paused" ]; then rm -f "$batch"; return 3; fi
     _watch_lifecycle_live || { rm -f "$batch"; return 2; }
     if radar_inbox_pending; then
       radar_inbox_drain > "$batch"
@@ -2982,7 +3045,7 @@ _watch_signal_exit() {
 cmd_watch_loop() {
   local pane goal policy poll auto maxcalls config supplied_config="${6:-}" precreated_run="${7:-}"
   local batch wait_rc coalesce_rc event_kind requested_backend frozen_backend run_id generation channel resume_request_id
-  local rc valid failure evidence_fingerprint delivery_fingerprint guard_rc decide_capture_lines
+  local rc valid failure evidence_fingerprint delivery_fingerprint guard_rc decide_capture_lines halt_reason
   local retry_rc retry_cancelled verify_rc classification error_class retryable summary detail stderr_path failure_kind repair_reason
   local requested_policy requested_poll requested_auto always_allow_source
   local fallback_before fallback_after fallback_projection projection_hash stable_lines fallback_sequence
@@ -3458,7 +3521,9 @@ cmd_watch_loop() {
         0) : ;;
         10) retry_cancelled=1; break ;;
         2) _watch_finalize stopped STOPPED "${WATCH_LIFECYCLE_REASON:-target pane disappeared during retry delay}"; break 2 ;;
-        *) _watch_finalize paused_error PAUSED_ERROR "retry wait failed"; break 2 ;;
+        3) retry_cancelled=1; break ;;   # pause requested mid-backoff: land it at the next batch wait
+        *) _escalate "$pane" "AI 监控重试等待失败，已暂停"
+          _watch_finalize paused_error PAUSED_ERROR "retry wait failed"; break 2 ;;
       esac
     done
 
@@ -3514,15 +3579,23 @@ cmd_watch_loop() {
         break
         ;;
       send)
+        halt_reason=""
         if [ "$DECISION_SAFE" != 1 ] || [ "$auto" = suggest ] || [ "$auto" = confirm ]; then
+          halt_reason="${DECISION_REASON:-unsafe or non-auto action}"
+        elif ! _decision_menu_safe "$DECISION_TEXT" ${DECISION_KEYS[@]+"${DECISION_KEYS[@]}"}; then
+          halt_reason="payload outside the unattended send allowance"
+        elif [ "$DECISION_PERSISTENT" = 1 ] && [ "$policy" != always-allow ]; then
+          halt_reason="persistent approval without an always-allow policy"
+        fi
+        if [ -n "$halt_reason" ]; then
           _watch_clear_decision_capture
-          classification="$(_classify_outcome policy-halt "${DECISION_REASON:-unsafe or non-auto action}")"
-          radar_event_append policy_halt policy "${DECISION_REASON:-unsafe or non-auto action}" "$(jq -cn \
+          classification="$(_classify_outcome policy-halt "$halt_reason")"
+          radar_event_append policy_halt policy "$halt_reason" "$(jq -cn \
             --arg event_id "$WATCH_EVENT_ID" --argjson classification "$classification" \
             '{record:"policy_halt",event_id:$event_id,sent:false,outcome_class:$classification.class,
               retryable:$classification.retryable}')"
-          _watch_phase PAUSED_POLICY "policy requires user: ${DECISION_REASON:-unsafe or non-auto action}" none 0
-          _escalate "$pane" "AI 需要你确认: ${DECISION_REASON:-操作未自动执行}"
+          _watch_phase PAUSED_POLICY "policy requires user: $halt_reason" none 0
+          _escalate "$pane" "AI 需要你确认: $halt_reason"
           radar_run_finalize policy_halt "policy gate"
           WATCH_FINALIZED=1; rm -f "$WATCH_WF"
           break
@@ -3544,8 +3617,11 @@ cmd_watch_loop() {
         _watch_finalize delivery_error PAUSED_ERROR "tmux send-keys delivery failed"
         break
         ;;
-      20) _watch_finalize paused_error PAUSED_ERROR "delivery gate acquisition failed"; break ;;
-      *) _watch_finalize paused_error PAUSED_ERROR "final delivery guard failed"; break ;;
+      20)
+        _escalate "$pane" "AI 监控投递门获取失败，已暂停"
+        _watch_finalize paused_error PAUSED_ERROR "delivery gate acquisition failed"; break ;;
+      *) _escalate "$pane" "AI 监控投递前检查失败，已暂停"
+        _watch_finalize paused_error PAUSED_ERROR "final delivery guard failed"; break ;;
     esac
     delivery_fingerprint="$WATCH_DELIVERY_FINGERPRINT"
     radar_event_append sent watcher "${DECISION_REASON:-safe action sent}" "$(jq -cn --arg event_id "$WATCH_EVENT_ID" \
@@ -3561,7 +3637,8 @@ cmd_watch_loop() {
         _watch_finalize verification_timeout PAUSED_ERROR "verification timeout: no observable send effect"
         break
         ;;
-      *) _watch_finalize paused_error PAUSED_ERROR "verification failed"; break ;;
+      *) _escalate "$pane" "AI 监控发送校验失败，已暂停"
+        _watch_finalize paused_error PAUSED_ERROR "verification failed"; break ;;
     esac
     WATCH_EVENT_ID=""; WATCH_RETRY=0
   done
@@ -3692,7 +3769,7 @@ _launch_monitor() {  # _launch_monitor <target-pane> <watch-file>
 }
 
 cmd_watch() {  # detach the loop so the caller (popup/menu) can return
-  local pane goal policy poll auto config_json="${6:-}" wf base feed watch_pid existing_detail existing_overview
+  local pane goal policy poll auto config_json="${6:-}" wf base feed watch_pid existing_detail existing_overview locked=0
   pane="$(_resolve_pane "${1:-}")" || { echo "watch: no target pane"; return 1; }
   goal="${2:-}"; policy="${3:-}"; poll="${4:-}"; auto="${5:-}"
   if [ -n "$config_json" ]; then
@@ -3704,7 +3781,15 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
     auto="$TMUX_RADAR_RUN_AUTONOMY"
   fi
   wf="$(_wf "$pane")"; base="${wf%.watch}"; feed="$base.out"
+  # the legacy path must not be a check-then-spawn race: the native engine
+  # holds this lock across the same sequence
+  if ! radar_launch_lock_acquire "$pane" >/dev/null 2>&1; then
+    echo "watch: launch lock busy for $pane" >&2
+    return 1
+  fi
+  locked=1
   if [ -f "$wf" ] && kill -0 "$(awk -F= '/^pid=/{print $2}' "$wf" 2>/dev/null)" 2>/dev/null; then
+    radar_launch_lock_release >/dev/null 2>&1 || true
     existing_detail="$(_state_get "$wf" monitor_detail_pane)"
     existing_overview="$(_state_get "$wf" monitor_overview_pane)"
     case "$existing_detail" in %*) tmux select-pane -t "$existing_detail" >/dev/null 2>&1 || true ;;
@@ -3726,6 +3811,7 @@ cmd_watch() {  # detach the loop so the caller (popup/menu) can return
     kill -0 "$watch_pid" 2>/dev/null || break
     sleep 0.01
   done
+  radar_launch_lock_release >/dev/null 2>&1 || true; locked=0
   if ! have_tmux || ! _launch_monitor "$pane" "$wf"; then
     printf '%s⚠ 无法创建可见监控控制台，已停止 watch%s\n' "$CY" "$CR"
     audit "monitor-fail\t$pane\tresponsive-launch"
@@ -4919,8 +5005,10 @@ cmd_cleanup() {
   if have_tmux; then
     tmux list-panes -a -F '#{pane_id}'$'\t''#{pane_start_command}' 2>/dev/null |
       while IFS=$'\t' read -r mon start; do
-        case "$start" in *"$SELF"*"' monitor"*"' "*) ;; *) continue ;; esac
-        watched="$(printf '%s' "$start" | sed -n "s/.* monitor[-a-z]* '\(%[0-9][0-9]*\)'.*/\1/p")"
+        # monitors run `exec bash '<ai-monitor.sh>' <mode> '<pane>'`: match the
+        # monitor script path; the watched pane is the last quoted argument
+        case "$start" in *"$AI_MONITOR "*) ;; *) continue ;; esac
+        watched="$(printf '%s' "$start" | sed -n "s/.* '\(%[0-9][0-9]*\)' *$/\1/p")"
         [ -n "$watched" ] || continue
         [ -f "$(_wf "$watched")" ] || tmux kill-pane -t "$mon" 2>/dev/null || true
       done
@@ -4993,7 +5081,10 @@ cmd_emit_event() {
   intent_token="$$-${RANDOM:-0}-$(date '+%s')"
   DELIVERY_PENDING_FILE="$RADAR_RUN_DIR/.delivery-pending.$intent_token"
   printf 'pid=%s\ntoken=%s\nevent_id=%s\n' "$$" "$intent_token" "$event_id" > "$DELIVERY_PENDING_FILE"
-  if ! _delivery_gate_acquire; then
+  # Hooks run on a ~5s budget before the agent kills the subtree, and a killed
+  # publisher leaves its intent file behind. Fail fast instead: the caller's
+  # error path is a logged drop, and dead-publisher intents are reaped.
+  if ! _delivery_gate_acquire 120; then
     rm -f "$DELIVERY_PENDING_FILE"
     DELIVERY_PENDING_FILE=""
     echo "emit-event: delivery gate acquisition failed" >&2

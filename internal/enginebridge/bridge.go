@@ -212,6 +212,26 @@ func (bridge Bridge) control(ctx context.Context, runID, pane, action, requestID
 	return result, nil
 }
 
+// cappedBuffer bounds how much subprocess output the TUI will buffer: past
+// the limit it records the overflow and discards the rest, so a spewing
+// engine cannot grow TUI memory for the whole call timeout.
+type cappedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+	over  bool
+}
+
+func (w *cappedBuffer) Write(p []byte) (int, error) {
+	if remaining := w.limit - w.buf.Len(); remaining < len(p) {
+		if remaining > 0 {
+			_, _ = w.buf.Write(p[:remaining])
+		}
+		w.over = true
+		return len(p), nil
+	}
+	return w.buf.Write(p)
+}
+
 func (bridge Bridge) invoke(ctx context.Context, timeout time.Duration, stdin []byte, args ...string) ([]byte, error, error) {
 	if bridge.EngineScript == "" {
 		return nil, nil, errors.New("engine bridge: script is required")
@@ -222,20 +242,24 @@ func (bridge Bridge) invoke(ctx context.Context, timeout time.Duration, stdin []
 	configureProcessGroup(command)
 	command.Env = mergeEnv(os.Environ(), bridge.Env)
 	command.Stdin = bytes.NewReader(stdin)
-	var stdout, stderr bytes.Buffer
-	command.Stdout = &stdout
-	command.Stderr = &stderr
+	stdout := &cappedBuffer{limit: maxOutputBytes}
+	stderr := &cappedBuffer{limit: maxOutputBytes}
+	command.Stdout = stdout
+	command.Stderr = stderr
 	commandErr := command.Run()
 	if callCtx.Err() != nil {
-		return nil, commandErr, fmt.Errorf("engine bridge timed out: %w", callCtx.Err())
+		if errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+			return nil, commandErr, fmt.Errorf("engine bridge timed out after %s", timeout)
+		}
+		return nil, commandErr, fmt.Errorf("engine bridge canceled: %w", callCtx.Err())
 	}
-	if stdout.Len() > maxOutputBytes || stderr.Len() > maxOutputBytes {
+	if stdout.over || stderr.over {
 		return nil, commandErr, errors.New("engine bridge output exceeded 1 MiB")
 	}
-	if commandErr != nil && stdout.Len() == 0 {
-		return nil, commandErr, fmt.Errorf("engine bridge failed: %w: %s", commandErr, bytes.TrimSpace(stderr.Bytes()))
+	if commandErr != nil && stdout.buf.Len() == 0 {
+		return nil, commandErr, fmt.Errorf("engine bridge failed: %w: %s", commandErr, bytes.TrimSpace(stderr.buf.Bytes()))
 	}
-	return stdout.Bytes(), commandErr, nil
+	return stdout.buf.Bytes(), commandErr, nil
 }
 
 func configureProcessGroup(command *exec.Cmd) {

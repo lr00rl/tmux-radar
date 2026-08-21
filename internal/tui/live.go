@@ -85,6 +85,8 @@ type runPollMsg struct {
 	Snapshot        runmodel.Snapshot
 	SnapshotChanged bool
 	Events          []runmodel.Event
+	ResetEvents     bool
+	Warning         error
 	Details         *runDetails
 	Err             error
 }
@@ -201,6 +203,9 @@ func (model LiveModel) Update(message tea.Msg) (LiveModel, tea.Cmd) {
 			model.controlError = "Run reader: " + message.Err.Error()
 			return model, waitForRunChange(model.pollContext, model.reader, model.runDir)
 		}
+		if message.Warning != nil {
+			model.controlError = "Run reader: " + message.Warning.Error()
+		}
 		model.applyRunUpdate(message)
 		if model.snapshot.Final != nil {
 			model.pollCancel()
@@ -257,9 +262,13 @@ func (model *LiveModel) applyRunUpdate(message runPollMsg) {
 	if message.Details != nil {
 		model.details = *message.Details
 	}
-	if len(message.Events) > 0 {
-		model.events = append(model.events, message.Events...)
-		model.rebuildGroups()
+	if len(message.Events) > 0 || message.ResetEvents {
+		if message.ResetEvents {
+			model.events = nil
+			model.groups = nil
+			model.selectedGroup = 0
+		}
+		model.appendEvents(message.Events)
 		if model.timelineFollow {
 			model.selectedGroup = max(0, len(model.groups)-1)
 		} else {
@@ -273,6 +282,23 @@ func (model *LiveModel) applyRunUpdate(message runPollMsg) {
 	} else if model.activeView == ViewTimeline && model.timelineFollow {
 		model.viewport.GotoBottom()
 		model.viewOffsets[ViewTimeline] = model.viewport.YOffset()
+	}
+}
+
+// appendEvents folds new events into the timeline groups incrementally.
+// Events only ever append, so revisiting the whole history per batch was
+// O(n²) over a long run; group state (Expanded) survives untouched here.
+func (model *LiveModel) appendEvents(events []runmodel.Event) {
+	model.events = append(model.events, events...)
+	for _, event := range events {
+		signature := eventSignature(event)
+		if count := len(model.groups); count > 0 && model.groups[count-1].Signature == signature {
+			group := &model.groups[count-1]
+			group.Events = append(group.Events, event)
+			group.Count = len(group.Events)
+			continue
+		}
+		model.groups = append(model.groups, TimelineGroup{Signature: signature, Events: []runmodel.Event{event}, Count: 1})
 	}
 }
 
@@ -585,7 +611,7 @@ func waitForRunChange(ctx context.Context, reader *runmodel.Reader, runDir strin
 			case <-ticker.C:
 			}
 			message := pollRun(reader, runDir)
-			if message.Err != nil || message.SnapshotChanged || len(message.Events) > 0 {
+			if message.Err != nil || message.Warning != nil || message.SnapshotChanged || len(message.Events) > 0 {
 				return message
 			}
 		}
@@ -597,11 +623,15 @@ func pollRun(reader *runmodel.Reader, runDir string) runPollMsg {
 	if err != nil {
 		return runPollMsg{Err: err}
 	}
-	events, err := reader.PollEvents()
-	if err != nil {
-		return runPollMsg{Err: err}
+	events, reset, pollErr := reader.PollEvents()
+	var gap *runmodel.EventGapError
+	if pollErr != nil && !errors.As(pollErr, &gap) {
+		return runPollMsg{Err: pollErr}
 	}
-	message := runPollMsg{Snapshot: snapshot, SnapshotChanged: changed, Events: events}
+	message := runPollMsg{Snapshot: snapshot, SnapshotChanged: changed, Events: events, ResetEvents: reset}
+	if pollErr != nil {
+		message.Warning = pollErr
+	}
 	if changed || len(events) > 0 {
 		details, err := loadRunDetails(runDir)
 		if err != nil {

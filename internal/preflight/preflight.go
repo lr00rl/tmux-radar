@@ -103,6 +103,26 @@ func (checker Checker) check(ctx context.Context, stdin []byte, args ...string) 
 	return result, nil
 }
 
+// cappedBuffer bounds how much subprocess output preflight will buffer: past
+// the limit it records the overflow and discards the rest. Same contract as
+// the copy in enginebridge; keep both in sync.
+type cappedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+	over  bool
+}
+
+func (w *cappedBuffer) Write(p []byte) (int, error) {
+	if remaining := w.limit - w.buf.Len(); remaining < len(p) {
+		if remaining > 0 {
+			_, _ = w.buf.Write(p[:remaining])
+		}
+		w.over = true
+		return len(p), nil
+	}
+	return w.buf.Write(p)
+}
+
 func (checker Checker) invoke(ctx context.Context, stdin []byte, args ...string) ([]byte, []byte, error) {
 	if checker.EngineScript == "" {
 		return nil, nil, errors.New("preflight: engine script is required")
@@ -124,22 +144,26 @@ func (checker Checker) invoke(ctx context.Context, stdin []byte, args ...string)
 	if stdin != nil {
 		command.Stdin = bytes.NewReader(stdin)
 	}
-	var stdout, stderr bytes.Buffer
-	command.Stdout = &stdout
-	command.Stderr = &stderr
+	stdout := &cappedBuffer{limit: maxOutputBytes}
+	stderr := &cappedBuffer{limit: maxOutputBytes}
+	command.Stdout = stdout
+	command.Stderr = stderr
 	err := command.Run()
 	if callCtx.Err() != nil {
-		return nil, nil, fmt.Errorf("preflight: %s timed out: %w", operation, callCtx.Err())
+		if errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+			return nil, nil, fmt.Errorf("preflight: %s timed out after %s", operation, timeout)
+		}
+		return nil, nil, fmt.Errorf("preflight: %s canceled: %w", operation, callCtx.Err())
 	}
-	if stdout.Len() > maxOutputBytes || stderr.Len() > maxOutputBytes {
+	if stdout.over || stderr.over {
 		return nil, nil, fmt.Errorf("preflight: %s output exceeded 1 MiB", operation)
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf(
-			"preflight: %s failed: %w: %s", operation, err, bytes.TrimSpace(stderr.Bytes()),
+			"preflight: %s failed: %w: %s", operation, err, bytes.TrimSpace(stderr.buf.Bytes()),
 		)
 	}
-	return stdout.Bytes(), stderr.Bytes(), nil
+	return stdout.buf.Bytes(), stderr.buf.Bytes(), nil
 }
 
 func configureProcessGroup(command *exec.Cmd) {

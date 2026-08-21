@@ -1,6 +1,7 @@
 package runmodel
 
 import (
+	"errors"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -171,14 +172,14 @@ func TestReaderPollEventsWaitsForPartialLineAndAppendsFromOffset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := reader.PollEvents()
+	events, _, err := reader.PollEvents()
 	if err != nil {
 		t.Fatalf("first PollEvents: %v", err)
 	}
 	if len(events) != 1 || events[0].Kind != "phase" {
 		t.Fatalf("first events = %#v", events)
 	}
-	if events, err = reader.PollEvents(); err != nil || len(events) != 0 {
+	if events, _, err = reader.PollEvents(); err != nil || len(events) != 0 {
 		t.Fatalf("duplicate partial poll = %#v err=%v", events, err)
 	}
 
@@ -194,15 +195,49 @@ func TestReaderPollEventsWaitsForPartialLineAndAppendsFromOffset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err = reader.PollEvents()
+	events, _, err = reader.PollEvents()
 	if err != nil {
 		t.Fatalf("appended PollEvents: %v", err)
 	}
 	if len(events) != 2 || events[0].Kind != "model_started" || events[1].Label != "armed again" {
 		t.Fatalf("appended events = %#v", events)
 	}
-	if events, err = reader.PollEvents(); err != nil || len(events) != 0 {
+	if events, _, err = reader.PollEvents(); err != nil || len(events) != 0 {
 		t.Fatalf("offset replayed events = %#v err=%v", events, err)
+	}
+}
+
+func TestReaderPollEventsSkipsUndecodableLines(t *testing.T) {
+	t.Parallel()
+
+	dir := makeRunDir(t)
+	eventsPath := filepath.Join(dir, "events.jsonl")
+	good := `{"schema_version":1,"kind":"phase","label":"armed"}` + "\n"
+	bad := `{"schema_version":1,"kind":` + "\n"
+	later := `{"schema_version":1,"kind":"phase","label":"after the gap"}` + "\n"
+	if err := os.WriteFile(eventsPath, []byte(good+bad+later), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events, _, err := reader.PollEvents()
+	var gap *EventGapError
+	if !errors.As(err, &gap) {
+		t.Fatalf("expected EventGapError, got %v", err)
+	}
+	if gap.Skipped != 1 {
+		t.Fatalf("skipped = %d, want 1", gap.Skipped)
+	}
+	if len(events) != 2 || events[0].Label != "armed" || events[1].Label != "after the gap" {
+		t.Fatalf("events past the gap = %#v", events)
+	}
+
+	events, _, err = reader.PollEvents()
+	if err != nil || len(events) != 0 {
+		t.Fatalf("the gap wedged the stream: events=%#v err=%v", events, err)
 	}
 }
 
@@ -218,14 +253,14 @@ func TestReaderPollEventsRecoversFromTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if events, err := reader.PollEvents(); err != nil || len(events) != 1 {
+	if events, _, err := reader.PollEvents(); err != nil || len(events) != 1 {
 		t.Fatalf("initial events = %#v err=%v", events, err)
 	}
 
 	if err := os.WriteFile(eventsPath, []byte(`{"kind":"new"}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	events, err := reader.PollEvents()
+	events, _, err := reader.PollEvents()
 	if err != nil || len(events) != 1 || events[0].Kind != "new" || events[0].SchemaVersion != 0 {
 		t.Fatalf("truncated events = %#v err=%v", events, err)
 	}
@@ -243,7 +278,7 @@ func TestReaderPollEventsRecoversFromInodeReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = reader.PollEvents(); err != nil {
+	if _, _, err = reader.PollEvents(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -254,7 +289,7 @@ func TestReaderPollEventsRecoversFromInodeReplacement(t *testing.T) {
 	if err := os.Rename(replacement, eventsPath); err != nil {
 		t.Fatal(err)
 	}
-	events, err := reader.PollEvents()
+	events, _, err := reader.PollEvents()
 	if err != nil || len(events) != 1 || events[0].Kind != "replacement" {
 		t.Fatalf("replacement events = %#v err=%v", events, err)
 	}
@@ -277,7 +312,7 @@ func TestReaderPollEventsRecoversFromSameSizeRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = reader.PollEvents(); err != nil {
+	if _, _, err = reader.PollEvents(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -288,7 +323,7 @@ func TestReaderPollEventsRecoversFromSameSizeRewrite(t *testing.T) {
 	if err := os.Chtimes(eventsPath, future, future); err != nil {
 		t.Fatal(err)
 	}
-	events, err := reader.PollEvents()
+	events, _, err := reader.PollEvents()
 	if err != nil || len(events) != 1 || events[0].Kind != "new" {
 		t.Fatalf("same-size rewritten events = %#v err=%v", events, err)
 	}
@@ -306,7 +341,7 @@ func TestReaderPollEventsDetectsTruncateAndLargerRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = reader.PollEvents(); err != nil {
+	if _, _, err = reader.PollEvents(); err != nil {
 		t.Fatal(err)
 	}
 	replacement := `{"schema_version":1,"kind":"new"}` + "\n" +
@@ -314,7 +349,7 @@ func TestReaderPollEventsDetectsTruncateAndLargerRewrite(t *testing.T) {
 	if err := os.WriteFile(eventsPath, []byte(replacement), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	events, err := reader.PollEvents()
+	events, _, err := reader.PollEvents()
 	if err != nil || len(events) != 2 || events[0].Kind != "new" || events[1].Kind != "tail" {
 		t.Fatalf("truncate+larger rewrite events = %#v err=%v", events, err)
 	}
@@ -333,14 +368,14 @@ func TestReaderPollEventsPreservesCursorAcrossTemporaryDisappearance(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = reader.PollEvents(); err != nil {
+	if _, _, err = reader.PollEvents(); err != nil {
 		t.Fatal(err)
 	}
 	hidden := eventsPath + ".hidden"
 	if err := os.Rename(eventsPath, hidden); err != nil {
 		t.Fatal(err)
 	}
-	if events, err := reader.PollEvents(); err != nil || len(events) != 0 {
+	if events, _, err := reader.PollEvents(); err != nil || len(events) != 0 {
 		t.Fatalf("temporary disappearance = %#v err=%v", events, err)
 	}
 	if err := os.Rename(hidden, eventsPath); err != nil {
@@ -355,7 +390,7 @@ func TestReaderPollEventsPreservesCursorAcrossTemporaryDisappearance(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := reader.PollEvents()
+	events, _, err := reader.PollEvents()
 	if err != nil || len(events) != 1 || events[0].Kind != "second" {
 		t.Fatalf("restored journal replayed history: %#v err=%v", events, err)
 	}
@@ -374,7 +409,7 @@ func TestReaderPollEventsContinuesAcrossReplacementWithRetainedPrefix(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = reader.PollEvents(); err != nil {
+	if _, _, err = reader.PollEvents(); err != nil {
 		t.Fatal(err)
 	}
 	replacement := eventsPath + ".replacement"
@@ -384,7 +419,7 @@ func TestReaderPollEventsContinuesAcrossReplacementWithRetainedPrefix(t *testing
 	if err := os.Rename(replacement, eventsPath); err != nil {
 		t.Fatal(err)
 	}
-	events, err := reader.PollEvents()
+	events, _, err := reader.PollEvents()
 	if err != nil || len(events) != 1 || events[0].Kind != "second" {
 		t.Fatalf("retained-prefix replacement = %#v err=%v", events, err)
 	}
@@ -414,7 +449,7 @@ func TestReaderPollEventsBoundsLargeJournalBatches(t *testing.T) {
 	seen := 0
 	polls := 0
 	for seen < total {
-		events, err := reader.PollEvents()
+		events, _, err := reader.PollEvents()
 		if err != nil {
 			t.Fatalf("PollEvents batch %d: %v", polls+1, err)
 		}
@@ -436,7 +471,7 @@ func TestReaderPollEventsAllowsMissingOptionalJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := reader.PollEvents()
+	events, _, err := reader.PollEvents()
 	if err != nil || len(events) != 0 {
 		t.Fatalf("missing events journal = %#v err=%v", events, err)
 	}
@@ -454,14 +489,14 @@ func TestReaderPollEventsDoesNotCommitMalformedCompleteLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = reader.PollEvents(); err == nil {
+	if _, _, err = reader.PollEvents(); err == nil {
 		t.Fatal("malformed complete event was accepted")
 	}
 
 	if err := os.WriteFile(eventsPath, []byte(`{"schema_version":1,"kind":"recovered"}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	events, err := reader.PollEvents()
+	events, _, err := reader.PollEvents()
 	if err != nil || len(events) != 1 || events[0].Kind != "recovered" {
 		t.Fatalf("recovered events = %#v err=%v", events, err)
 	}
@@ -483,7 +518,7 @@ func TestReaderRejectsUnsupportedArtifactVersion(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "events.jsonl"), []byte(`{"schema_version":2,"kind":"future"}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = reader.PollEvents(); err == nil {
+	if _, _, err = reader.PollEvents(); err == nil {
 		t.Fatal("unsupported event schema was accepted")
 	}
 }

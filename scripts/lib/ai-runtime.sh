@@ -457,8 +457,14 @@ radar_cleanup_runs() {
     final_epoch="$(jq -r '.finalized_epoch // 0' "$run_dir/final.json" 2>/dev/null || printf 0)"
     case "$final_epoch" in ''|*[!0-9]*) final_epoch=0 ;; esac
     if [ "$final_epoch" -le 0 ]; then
+      # a run that died before final.json (kill -9, reboot) must still age
+      # out; the run dir's own mtime is the last write it ever made
       mtime="$(stat -f '%m' "$run_dir/final.json" 2>/dev/null || stat -c '%Y' "$run_dir/final.json" 2>/dev/null || printf 0)"
       case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac
+      if [ "$mtime" -le 0 ]; then
+        mtime="$(stat -f '%m' "$run_dir" 2>/dev/null || stat -c '%Y' "$run_dir" 2>/dev/null || printf 0)"
+        case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac
+      fi
       final_epoch="$mtime"
     fi
     [ "$final_epoch" -gt 0 ] || continue

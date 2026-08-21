@@ -57,6 +57,16 @@ the goal, policy, and pane excerpt supplied below.
 
 ## `text` vs `keys`
 
+- **Executor allowance (hard rule, enforced outside the model).** Unattended
+  sends accept only menu answers: `text` empty or a single `1-9`/`y`/`n`
+  character, and `keys` drawn from Enter, the four arrows, Space, Tab, Escape,
+  BSpace. A decision that needs anything else (free text, control combos like
+  `C-c`) is not deliverable without a human — return `escalate` yourself, or
+  the executor escalates for you.
+- **`persistent`** — set `persistent:true` when (and only when) the option you
+  picked is a "don't ask again / always allow" variant. It is honored only
+  when a `POLICY:` line enables always-allow; without one, a persistent pick
+  is escalated to the human.
 - `text` — literal characters to type (sent with tmux `send-keys -l`). May be
   empty; may contain spaces. Use for typed replies or single menu digits.
 - `keys` — tmux key names sent AFTER the text, in order. Common: `Enter`,

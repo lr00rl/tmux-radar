@@ -644,6 +644,27 @@ done
 grep -q '^Tree+>' "$TMP/keyboard-tree-restored" || fail 'Ctrl-e inside Inbox mutated the remembered Tree expansion'
 grep -q 'Inbox clear.*no unread AI event' "$TMP/keyboard-tree-restored" &&
   fail 'leaving Inbox retained a stale empty-state header'
+# Agents is pane-level too: the view key transforms, the empty state is
+# truthful, and Ctrl-e is a structural no-op.
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-a
+for _ in $(seq 1 50); do
+  tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-agents"
+  grep -q '^Agents>' "$TMP/keyboard-agents" && break
+  sleep 0.1
+done
+grep -q '^Agents>' "$TMP/keyboard-agents" || fail 'real Ctrl-a key event did not change the picker to Agents'
+grep -q 'No live agents' "$TMP/keyboard-agents" || fail 'empty Agents view did not publish its truthful empty state'
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-e
+sleep 0.2
+tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-agents-expand"
+grep -q '^Agents>' "$TMP/keyboard-agents-expand" || fail 'Ctrl-e escaped or reloaded the pane-level Agents view'
+tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-t
+for _ in $(seq 1 50); do
+  tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-tree-after-agents"
+  grep -q '^Tree+>' "$TMP/keyboard-tree-after-agents" && break
+  sleep 0.1
+done
+grep -q '^Tree+>' "$TMP/keyboard-tree-after-agents" || fail 'leaving Agents did not restore the expanded Tree'
 # Collapse back to the six structural results. fzf must not clamp Alt-9 to the
 # last visible row and accept it.
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-e

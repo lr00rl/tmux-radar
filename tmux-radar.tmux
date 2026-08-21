@@ -58,8 +58,7 @@ if [ "$(opt @radar-ai off)" = "on" ]; then
     "" \
     "状态 / 最近决策"                  s "$POP \"TMUX_RADAR_AI_PAUSE=1 $SCRIPTS/ai.sh status\"" \
     "停止全部监控"                     S "run-shell \"$SCRIPTS/ai.sh stop all\"" \
-    "打开 Agents（全部 agent 实时状态）"  g "$POP \"$SCRIPTS/switcher.sh menu agents\"" \
-    "打开 AI Inbox"                   l "$POP \"$SCRIPTS/switcher.sh menu inbox\""
+    "打开 Agents（全部 agent 实时状态）"  g "$POP \"$SCRIPTS/switcher.sh menu agents\""
   # housekeeping on every (re)load: GC stale watcher files / monitor panes /
   # AI-status marks — also what a tmux-resurrect post-restore hook should run
   tmux run-shell -b "$SCRIPTS/ai.sh cleanup >/dev/null 2>&1" 2>/dev/null || true

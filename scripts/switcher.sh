@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tmux-radar — window-first tmux switcher with Recent / Inbox / Tree views and
+# tmux-radar — window-first tmux switcher with Recent / Agents / Tree views and
 # a live pane preview.
 #
 # Subcommands (the script calls itself for fzf reload/preview/binds):
@@ -62,8 +62,7 @@ short_path() {  # short_path <path> -> compact display path
 normalize_view() {
   case "${1:-}" in
     all|tree) printf tree ;;
-    attention|needinput|inbox) printf inbox ;;
-    agents|agent|ai) printf agents ;;
+    attention|needinput|inbox|agents|agent|ai) printf agents ;;
     recent) printf recent ;;
     *) printf recent ;;
   esac
@@ -133,21 +132,23 @@ ai_merged() {
   [ -r "$REGISTRY_FILE" ] && reg="$REGISTRY_FILE"
   [ -r "$LIVE_FILE" ] && livef="$LIVE_FILE"
   LC_ALL=C awk -F '\t' -v OFS='\t' -v mp="$marks" -v rp="$reg" -v lp="$livef" '
+    function clean(s) { gsub(/[[:cntrl:]]/, " ", s); gsub(/[[:space:]][[:space:]]+/, " ", s)
+                        sub(/^ /, "", s); sub(/ $/, "", s); return s }
     FILENAME == mp && NF >= 5 && $1 ~ /^%[0-9]+$/ {
-      p=$1; l=tolower($3 " " $5)
+      p=$1; l=tolower(clean($3) " " clean($5))
       if (l ~ /(finished|your turn|turn complete|task complete|done|任务完成|完成)/) { msev[p]=3; mword[p]="DONE" }
       else if (l ~ /(needs approval|needs your permission|needs input|waiting.*input|waiting on you|wait.*input|permission|approval|action required|approve|拿不准|需要你|需要.*许可|需要.*批准|等待.*输入)/) { msev[p]=1; mword[p]="ACTION" }
       else { msev[p]=3; mword[p]="NOTICE" }
-      mkind[p]=$3; mtext[p]=$5; mepoch[p]=$2+0; next
+      mkind[p]=clean($3); mtext[p]=clean($5); mepoch[p]=$2+0; next
     }
     FILENAME == rp && NF >= 9 {
       if ($4 == "-") next
       p=$4; e=$6+0
-      if (!(p in repoch) || e >= repoch[p]) { repoch[p]=e; rstate[p]=$7; rkind[p]=$1 }
+      if (!(p in repoch) || e >= repoch[p]) { repoch[p]=e; rstate[p]=clean($7); rkind[p]=clean($1) }
       next
     }
     FILENAME == lp && NF >= 5 {
-      lkind[$1]=$2; lstate[$1]=$3; ltext[$1]=$4; lepoch[$1]=$5+0; next
+      lkind[$1]=clean($2); lstate[$1]=$3; ltext[$1]=clean($4); lepoch[$1]=$5+0; next
     }
     END {
       for (p in mtext)  panes[p]=1
@@ -161,7 +162,7 @@ ai_merged() {
         } else if ((p in lstate) && lstate[p] == "blocked") {
           sev=2; glyph="⚠"; word="BLOCKED"; kind=lkind[p]; text=ltext[p]; epoch=lepoch[p]
         } else if ((p in rstate) && rstate[p] == "waiting" && !((p in lstate) && lstate[p] == "working")) {
-          sev=2; glyph="⚠"; word="WAITING"; kind=rkind[p]; text=rkind[p] " waiting"; epoch=repoch[p]
+          sev=2; glyph="⚠"; word="WAITING"; kind=rkind[p]; text="waiting"; epoch=repoch[p]
         } else if ((p in lstate) && lstate[p] == "working") {
           sev=4; glyph="◐"; word="WORKING"; kind=lkind[p]; text=ltext[p]; epoch=lepoch[p]
         } else if ((p in lstate) && lstate[p] == "stalled") {
@@ -171,7 +172,7 @@ ai_merged() {
           else if (rstate[p] == "waiting") { sev=2; glyph="⚠"; word="WAITING" }
           else if (rstate[p] == "stalled") { sev=5; glyph="·"; word="IDLE" }
           else                             { sev=4; glyph="◐"; word="WORKING" }
-          kind=rkind[p]; text=rkind[p] " " rstate[p]; epoch=repoch[p]
+          kind=rkind[p]; text=rstate[p]; epoch=repoch[p]
         }
         if (sev != "") print p, sev, glyph, word, kind, text, epoch
       }
@@ -336,71 +337,6 @@ list_recent() {
   '
 }
 
-list_inbox() {
-  local live marks=/dev/null now
-  live="$(live_pane_snapshot)" || return 1
-  [ -r "$NEEDINPUT_FILE" ] && marks="$NEEDINPUT_FILE"
-  now="$(date +%s)"
-  LC_ALL=C awk -F '\t' -v OFS='\t' -v now="$now" -v C="$C" -v Y="$Y" -v G="$G" -v M="$M" -v D="$D" -v R="$R" '
-    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-    function clean(s) { gsub(/[[:cntrl:]]/, " ", s); gsub(/[[:space:]][[:space:]]+/, " ", s); return trim(s) }
-    function level_for(src, label,    l) {
-      l=tolower(src " " label)
-      if (l ~ /(finished|your turn|turn complete|task complete|done|任务完成|完成)/) return "done"
-      if (l ~ /(needs approval|needs your permission|needs input|waiting.*input|waiting on you|wait.*input|permission|approval|action required|approve|拿不准|需要你|需要.*许可|需要.*批准|等待.*输入)/) return "action"
-      return "notice"
-    }
-    function rank(l) { return (l == "action" ? 1 : (l == "done" ? 2 : 3)) }
-    function word(l) { return (l == "action" ? "ACTION" : (l == "done" ? "DONE" : "NOTICE")) }
-    function icon(l) { return (l == "action" ? "⚠" : (l == "done" ? "✓" : "!")) }
-    function color(l) { return (l == "action" ? M : (l == "done" ? G : Y)) }
-    function age(sec) {
-      if (sec < 0) sec=0
-      if (sec < 60) return sec "s"
-      if (sec < 3600) return int(sec/60) "m"
-      if (sec < 86400) return int(sec/3600) "h"
-      return int(sec/86400) "d"
-    }
-    NR==FNR {
-      p=$1
-      if (p in live) next
-      live[p]=1; order[++n]=p
-      session[p]=$2; widx[p]=$5; wname[p]=$6; pidx[p]=$8
-      ptitle[p]=$10; pcmd[p]=$11; ppath[p]=$12
-      next
-    }
-    NF >= 5 && $1 ~ /^%[0-9]+$/ {
-      p=$1
-      if (!(p in live)) next
-      marked[p]=1; epoch[p]=$2+0; source[p]=clean($3); label[p]=clean($5)
-      saved[p]=(NF >= 6 ? clean($6) : ""); level[p]=level_for(source[p], label[p])
-    }
-    END {
-      cn=0
-      for (i=1; i<=n; i++) {
-        p=order[i]; if (!(p in marked)) continue
-        cn++; cr[cn]=rank(level[p]); ce[cn]=epoch[p]; cp[cn]=p
-      }
-      for (i=2; i<=cn; i++) {
-        r=cr[i]; e=ce[i]; p=cp[i]
-        for (j=i-1; j>=1 && (cr[j] > r || (cr[j] == r && ce[j] < e)); j--) {
-          cr[j+1]=cr[j]; ce[j+1]=ce[j]; cp[j+1]=cp[j]
-        }
-        cr[j+1]=r; ce[j+1]=e; cp[j+1]=p
-      }
-      for (i=1; i<=cn; i++) {
-        p=cp[i]; title=(saved[p] != "" ? saved[p] : ptitle[p])
-        sub(/^(⚠|✓|!|·) /, "", title)
-        title=(title != "" && title != wname[p] ? "/" title : "")
-        badge=color(level[p]) icon(level[p]) " " word(level[p]) R
-        hint=source[p] (source[p] != "" && label[p] != "" ? ": " : "") label[p]
-        tail=(epoch[p] > 0 ? " · " age(now-epoch[p]) : "")
-        print p, wname[p] " " C session[p] ":" widx[p] "." pidx[p] title R, badge " " hint " " D "· " pcmd[p] " · " ppath[p] tail R
-      }
-    }
-  ' <(printf '%s\n' "$live") "$marks"
-}
-
 list_agents() {
   local live merged now
   live="$(live_pane_snapshot)" || return 1
@@ -433,10 +369,10 @@ list_agents() {
       cn=0
       for (i=1; i<=n; i++) {
         p=order[i]; if (!(p in asev)) continue
-        # the board is for the live fleet: blocked/waiting and working panes,
-        # plus unread ACTION events. DONE/NOTICE belong to the Inbox review
-        # queue and IDLE panes are just free shells — both stay out.
-        if (asev[p] != 1 && asev[p] != 2 && asev[p] != 4) continue
+        # one AI surface: needs-you rows (unread ACTION, blocked/waiting),
+        # the unread DONE/NOTICE review queue, and the in-flight working set.
+        # Only IDLE panes stay out: an idle agent reads as a free shell.
+        if (asev[p] == 5) continue
         cn++; cr[cn]=asev[p]; ce[cn]=aepoch[p]; cp[cn]=p
       }
       # severity asc, then newest first (insertion sort over a tiny set)
@@ -465,7 +401,6 @@ do_list() {  # do_list [view] [expanded]
   read_state "${1:-}" "${2:-}"
   case "$VIEW" in
     recent) list_fn=list_recent ;;
-    inbox) list_fn=list_inbox ;;
     agents) list_fn=list_agents ;;
     tree) list_fn=list_tree ;;
   esac
@@ -587,20 +522,16 @@ do_preview() {
 _prompt() {
   case "$VIEW" in
     recent) [ "$EXPANDED" = 1 ] && printf 'Recent+> ' || printf 'Recent> ' ;;
-    inbox) printf 'Inbox> ' ;;
     agents) printf 'Agents> ' ;;
     tree) [ "$EXPANDED" = 1 ] && printf 'Tree+> ' || printf 'Tree> ' ;;
   esac
 }
 
 _header() {
-  if [ "$VIEW" = inbox ] && [ -n "${SW_ROWS:-}" ] && [ ! -s "$SW_ROWS" ]; then
-    printf '%s · ' 'Inbox clear — no unread AI event needs you.'
-  fi
   if [ "$VIEW" = agents ] && [ -n "${SW_ROWS:-}" ] && [ ! -s "$SW_ROWS" ]; then
-    printf '%s · ' 'Agents clear — nothing blocked, waiting, or working.'
+    printf '%s · ' 'Agents clear — nothing needs you, is working, or is awaiting review.'
   fi
-  printf '%s' 'C-r Recent · C-i Inbox · C-a Agents · C-t Tree'
+  printf '%s' 'C-r Recent · C-a Agents · C-t Tree'
   printf '%s' ' · C-e panes · A-1..9 jump · A-p preview · Enter switch'
 }
 
@@ -657,7 +588,7 @@ cmd_set_view() {  # fzf transform: switch view, reload, repoint prompt
 
 cmd_toggle_expand() {  # fzf transform: toggle pane leaves in Recent/Tree
   read_state
-  case "$VIEW" in inbox|agents) printf 'bell\n'; return 0 ;; esac
+  case "$VIEW" in agents) printf 'bell\n'; return 0 ;; esac
   [ "$EXPANDED" = 1 ] && EXPANDED=0 || EXPANDED=1
   _reload_picker
 }
@@ -734,7 +665,7 @@ do_menu() {
       --bind='change:pos(1)' \
       --bind="ctrl-t:transform($SELF set-view tree)" \
       --bind="ctrl-r:transform($SELF set-view recent)" \
-      --bind="ctrl-i:transform($SELF set-view inbox)" \
+      --bind="ctrl-i:transform($SELF set-view agents)" \
       --bind="ctrl-a:transform($SELF set-view agents)" \
       --bind="ctrl-e:transform($SELF toggle-expand)" \
       --bind="alt-1:transform($SELF jump 1)" \

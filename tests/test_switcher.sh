@@ -132,6 +132,9 @@ assert_live_rows() { # assert_live_rows <label> <file>
 
 tmux -L "$SOCKET" kill-server >/dev/null 2>&1 || true
 tmux -L "$SOCKET" -f /dev/null new-session -d -s alpha -n zero -x 120 -y 40
+# fixture shells must not source a user rc: an rc running stty mid-snapshot
+# makes pane_current_command nondeterministic across two list captures
+tmux -L "$SOCKET" set -g default-command 'bash --norc'
 TMUX="$(tmux -L "$SOCKET" display-message -p '#{socket_path}'),$$,0"
 tmux -L "$SOCKET" split-window -d -t alpha:0
 tmux -L "$SOCKET" new-window -d -t alpha:1 -n one
@@ -178,7 +181,7 @@ awk -F '\t' '
 # `all` is accepted for old callers, but resolves to the Tree product surface.
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list all 0 > "$TMP/all-alias.rows"
 strip_ansi < "$TMP/all-alias.rows" > "$TMP/all-alias.plain"
-cmp -s "$TMP/tree.plain" "$TMP/all-alias.plain" || fail 'all compatibility alias does not resolve to Tree'
+cmp -s "$TMP/tree.plain" "$TMP/all-alias.plain" || { diff "$TMP/tree.plain" "$TMP/all-alias.plain" >&2; fail 'all compatibility alias does not resolve to Tree'; }
 printf 'PASS: Tree rests at window level, expands exact panes, and every row is switchable\n'
 
 # A tmux window may be linked into multiple sessions. Tree represents each
@@ -206,14 +209,14 @@ strip_ansi < "$TMP/recent-linked.rows" > "$TMP/recent-linked.plain"
 printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
   "$LINKED_PANE" "$(date +%s)" claude linked-window 'Claude is waiting for your input' one \
   > "$TMP/state/need-input"
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/inbox-linked.rows"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list agents > "$TMP/inbox-linked.rows"
 strip_ansi < "$TMP/inbox-linked.rows" > "$TMP/inbox-linked.plain"
-assert_live_rows 'linked-window Inbox' "$TMP/inbox-linked.plain"
+assert_live_rows 'linked-window Agents' "$TMP/inbox-linked.plain"
 [ "$(awk -F '\t' -v p="$LINKED_PANE" '$1 == p { n++ } END { print n+0 }' "$TMP/inbox-linked.plain")" -eq 1 ] ||
-  fail 'Inbox duplicated one unread event through multiple session links'
+  fail 'Agents duplicated one unread event through multiple session links'
 : > "$TMP/state/need-input"
 tmux -L "$SOCKET" unlink-window -t beta:1
-printf 'PASS: linked windows preserve Tree links and stay deduplicated in Recent and Inbox\n'
+printf 'PASS: linked windows preserve Tree links and stay deduplicated in Recent and Agents\n'
 
 # The rendered Tree shape must honor the same window-name-first search contract
 # as Recent/Inbox, even when a session has the identical name.
@@ -278,7 +281,7 @@ assert_live_rows 'expanded Recent' "$TMP/recent-expanded.plain"
   fail 'expanded Recent did not reveal every pane'
 printf 'PASS: Recent is window-first, complete, MRU-ordered, and pane-expandable\n'
 
-# --- Inbox ordering, noise rejection, and empty state -----------------------
+# --- Agents ordering, membership, and empty state -----------------------------
 now="$(date +%s)"
 sleep 300 & ATT_REG_PID=$!
 cat > "$TMP/state/need-input" <<EOF
@@ -290,9 +293,10 @@ $P_BETA_0	$((now - 40))	test	notice	informational update
 malformed-state-row-without-tabs
 %999999	$((now - 5))	test	dead-pane	needs input
 EOF
-# Registry/process evidence may enrich a marked row, but never creates an Inbox
-# row by itself. The last two registry rows deliberately model long-lived
-# working/done Claude shells with no unread lifecycle mark.
+# On the unified board, a registry row with a live pid earns a row even without
+# an unread mark: it is a member of the live fleet, shown with its state rather
+# than as an unread event. The last two rows model one such pane (latest event
+# wins: done).
 {
   printf 'codex\ta:action-1\t%s\t%s\t%s\t%s\twaiting\t/tmp\tsleep\n' \
     "$ATT_REG_PID" "$P_BETA_1" "$((now - 100))" "$((now - 1))"
@@ -308,27 +312,27 @@ EOF
     "$ATT_REG_PID" "$P_ALPHA_0" "$((now - 100))" "$((now - 1))"
 } > "$TMP/state/agent-registry"
 
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/inbox.rows"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list agents > "$TMP/inbox.rows"
 strip_ansi < "$TMP/inbox.rows" > "$TMP/inbox.plain"
-assert_live_rows 'Inbox' "$TMP/inbox.plain"
+assert_live_rows 'Agents' "$TMP/inbox.plain"
 inbox_targets="$(cut -f1 "$TMP/inbox.plain" | paste -sd ' ' -)"
-[ "$inbox_targets" = "$P_ALPHA_1 $P_BETA_1 $P_ALPHA_W1 $P_BETA_0" ] ||
-  fail "Inbox is not marked ACTION/DONE/NOTICE only: $inbox_targets"
+[ "$inbox_targets" = "$P_ALPHA_1 $P_BETA_1 $P_ALPHA_0 $P_ALPHA_W1 $P_BETA_0" ] ||
+  fail "Agents board order/membership wrong: $inbox_targets"
 if ! grep -q 'ACTION' "$TMP/inbox.plain" ||
    ! grep -q 'DONE' "$TMP/inbox.plain" ||
    ! grep -q 'NOTICE' "$TMP/inbox.plain"; then
-  fail 'Inbox lost semantic ACTION/DONE/NOTICE labels'
+  fail 'Agents lost semantic ACTION/DONE/NOTICE labels'
 fi
 if grep -q 'ACTIVE\|__bg__\|background session\|not a tmux pane' "$TMP/inbox.plain"; then
-  fail 'Inbox exposed an unmarked ACTIVE or paneless/background row'
+  fail 'Agents exposed an ACTIVE oddity or paneless/background row'
 fi
 grep -q 'malformed-state-row\|dead-pane' "$TMP/inbox.plain" &&
-  fail 'Inbox exposed malformed or dead-target mark input'
+  fail 'Agents exposed malformed or dead-target mark input'
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list needinput > "$TMP/needinput-alias.rows"
 cut -f1 "$TMP/inbox.rows" > "$TMP/inbox.targets"
 cut -f1 "$TMP/needinput-alias.rows" > "$TMP/needinput-alias.targets"
-cmp -s "$TMP/inbox.targets" "$TMP/needinput-alias.targets" || fail 'legacy needinput alias does not resolve to Inbox'
-printf 'PASS: Inbox contains unread pane events and rejects unmarked AI shells\n'
+cmp -s "$TMP/inbox.targets" "$TMP/needinput-alias.targets" || fail 'legacy needinput alias does not resolve to Agents'
+printf 'PASS: Agents carries unread events plus live fleet state, ordered by severity\n'
 
 # Inbox mark fields are user-controlled. Strip CR/ESC/control bytes from
 # source, label, saved title, and session keys while retaining renderer-owned
@@ -344,24 +348,28 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
     $'co\033dex' $'s:reg\rkey\033X' "$ATT_REG_PID" "$P_ALPHA_0" "$((now - 100))" "$((now - 1))" \
     $'active\rstate\033X' '/tmp' 'sleep'
 } > "$TMP/state/agent-registry"
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/inbox-controls.rows"
-grep -q $'\033\[' "$TMP/inbox-controls.rows" || fail 'Inbox sanitization removed renderer-owned ANSI'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list agents > "$TMP/inbox-controls.rows"
+grep -q $'\033\[' "$TMP/inbox-controls.rows" || fail 'Agents sanitization removed renderer-owned ANSI'
 strip_ansi < "$TMP/inbox-controls.rows" > "$TMP/inbox-controls.plain"
-assert_live_rows 'Inbox control fixture' "$TMP/inbox-controls.plain"
+assert_live_rows 'Agents control fixture' "$TMP/inbox-controls.plain"
 if LC_ALL=C grep -q $'\r\|\033' "$TMP/inbox-controls.plain"; then
-  fail 'Inbox leaked CR/ESC from mark source, label, or saved title'
+  fail 'Agents leaked CR/ESC from mark source, label, or registry metadata'
 fi
-grep -q 'hook source' "$TMP/inbox-controls.plain" || fail 'Inbox lost sanitized source text'
-grep -q 'your turn' "$TMP/inbox-controls.plain" || fail 'Inbox lost sanitized label text'
-grep -q 'saved title' "$TMP/inbox-controls.plain" || fail 'Inbox lost sanitized saved-title text'
-grep -q 'DONE' "$TMP/inbox-controls.plain" || fail 'Inbox classified sanitized completion label incorrectly'
-[ "$(wc -l < "$TMP/inbox-controls.plain" | tr -d ' ')" -eq 1 ] || fail 'unmarked registry metadata created an Inbox row'
+grep -q 'hook source' "$TMP/inbox-controls.plain" || fail 'Agents lost sanitized source text'
+grep -q 'your turn' "$TMP/inbox-controls.plain" || fail 'Agents lost sanitized label text'
+grep -q 'DONE' "$TMP/inbox-controls.plain" || fail 'Agents classified sanitized completion label incorrectly'
+# the second fixture pane has only registry metadata (odd bytes in kind/state):
+# on the board it renders exactly one sanitized WORKING row
+[ "$(wc -l < "$TMP/inbox-controls.plain" | tr -d ' ')" -eq 2 ] ||
+  fail 'Agents row count drifted for marked + registry-only panes'
+grep -q 'co dex · active state' "$TMP/inbox-controls.plain" ||
+  fail 'Agents lost sanitized registry kind/state text'
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" preview "$P_ALPHA_1" > "$TMP/preview-controls.out"
 strip_ansi < "$TMP/preview-controls.out" > "$TMP/preview-controls.plain"
 if LC_ALL=C grep -q $'\r\|\033' "$TMP/preview-controls.plain"; then
   fail 'preview leaked CR/ESC from Inbox metadata'
 fi
-grep -q '^✓' "$TMP/preview-controls.plain" || fail 'preview semantics diverged from sanitized Inbox completion label'
+grep -q '^✓' "$TMP/preview-controls.plain" || fail 'preview semantics diverged from sanitized completion label'
 grep -q 'sid mark key' "$TMP/preview-controls.plain" || fail 'preview lost the sanitized mark session key'
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" preview "$P_ALPHA_0" > "$TMP/preview-registry-controls.out"
 strip_ansi < "$TMP/preview-registry-controls.out" > "$TMP/preview-registry-controls.plain"
@@ -369,7 +377,7 @@ if LC_ALL=C grep -q $'\r\|\033' "$TMP/preview-registry-controls.plain"; then
   fail 'preview leaked CR/ESC from the registry session key'
 fi
 grep -q 'sid reg key ' "$TMP/preview-registry-controls.plain" || fail 'preview lost the sanitized registry session key'
-printf 'PASS: Inbox and preview sanitize control bytes without promoting registry-only rows\n'
+printf 'PASS: Agents and preview sanitize control bytes without losing registry-only rows\n'
 
 # The public notifier API must keep its persisted TSV safe, not merely rely on
 # the switcher renderer to repair unsafe hook data on read.
@@ -401,14 +409,14 @@ IFS=$'\t' read -r _mark_pane _mark_epoch mark_source mark_key mark_label mark_ti
 # DONE remains reviewable after the agent process/registry row exits; the unread
 # pane-backed mark and live pane are sufficient until focus handles it.
 : > "$TMP/state/agent-registry"
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/public-mark.rows"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list agents > "$TMP/public-mark.rows"
 strip_ansi < "$TMP/public-mark.rows" > "$TMP/public-mark.plain"
-assert_live_rows 'public mark Inbox fixture' "$TMP/public-mark.plain"
-grep -q 'DONE' "$TMP/public-mark.plain" || fail 'public mark API normalization changed Inbox semantics'
+assert_live_rows 'public mark Agents fixture' "$TMP/public-mark.plain"
+grep -q 'DONE' "$TMP/public-mark.plain" || fail 'public mark API normalization changed Agents semantics'
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" preview "$P_ALPHA_1" > "$TMP/public-mark-preview.out"
 strip_ansi < "$TMP/public-mark-preview.out" > "$TMP/public-mark-preview.plain"
 if { cat "$TMP/public-mark.plain" "$TMP/public-mark-preview.plain" | LC_ALL=C tr -d '\t\n' | LC_ALL=C grep -q '[[:cntrl:]]'; }; then
-  fail 'public mark API leaked unsafe controls into Inbox or preview'
+  fail 'public mark API leaked unsafe controls into Agents or preview'
 fi
 grep -q 'sid mark key' "$TMP/public-mark-preview.plain" || fail 'preview lost the normalized public mark session key'
 printf 'PASS: public DONE marks survive agent exit with safe six-field metadata\n'
@@ -428,32 +436,36 @@ EOF
   printf 'codex\ta:tie-b\t%s\t%s\t%s\t%s\twaiting\t/tmp\tsleep\n' \
     "$ATT_REG_PID" "$P_BETA_1" "$((now - 100))" "$((now - 1))"
 } > "$TMP/state/agent-registry"
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/inbox-ties.rows"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list agents > "$TMP/inbox-ties.rows"
 tie_targets="$(cut -f1 "$TMP/inbox-ties.rows" | paste -sd ' ' -)"
 [ "$tie_targets" = "$P_AARDVARK_0 $P_BETA_1" ] ||
-  fail "equal-epoch Inbox ties did not preserve canonical server order: $tie_targets"
+  fail "equal-epoch Agents ties did not preserve canonical server order: $tie_targets"
 tmux -L "$SOCKET" kill-session -t aardvark
-printf 'PASS: equal-epoch Inbox ties preserve canonical server order\n'
+printf 'PASS: equal-epoch Agents ties preserve canonical server order\n'
 
-# A real Kimi process and a live working registry row are still not unread
-# events. Process detection belongs to GC/doctor, not to Inbox membership.
+# A real Kimi process plus a live working registry row is fleet state, not an
+# unread event: the board shows it as WORKING, never as ACTION/DONE.
 ln -sf /bin/sleep "$FAKE_BIN/kimi"
 tmux -L "$SOCKET" respawn-pane -k -t beta:0.0 "$FAKE_BIN/kimi 120"
 : > "$TMP/state/need-input"
 printf 'kimi\ts:kimi-working\t0\t%s\t%s\t%s\tworking\t/tmp\tkimi\n' \
   "$P_BETA_0" "$((now - 100))" "$((now - 1))" > "$TMP/state/agent-registry"
 sleep 0.1
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/kimi.rows"
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list agents > "$TMP/kimi.rows"
 strip_ansi < "$TMP/kimi.rows" > "$TMP/kimi.plain"
-[ ! -s "$TMP/kimi.plain" ] || fail 'process-only Kimi session polluted Inbox'
-printf 'PASS: live unmarked AI processes remain outside Inbox\n'
+grep -q "$P_BETA_0" "$TMP/kimi.plain" || fail 'live unmarked Kimi process missing from Agents'
+grep -q 'WORKING' "$TMP/kimi.plain" || fail 'unmarked live agent did not render as WORKING'
+if grep -q 'ACTION\|DONE' "$TMP/kimi.plain"; then
+  fail 'unmarked process-only row masqueraded as an unread event'
+fi
+printf 'PASS: live unmarked AI processes appear as state, never as unread events\n'
 
-# Empty Inbox has no synthetic row and explains unread-event semantics.
+# Empty board has no synthetic row and explains its semantics.
 : > "$TMP/state/need-input"
 : > "$TMP/state/agent-registry"
 tmux -L "$SOCKET" respawn-pane -k -t beta:0.0 'sleep 120'
-PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list inbox > "$TMP/empty-inbox.rows"
-[ ! -s "$TMP/empty-inbox.rows" ] || fail 'empty Inbox emitted a selectable or synthetic row'
+PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list agents > "$TMP/empty-inbox.rows"
+[ ! -s "$TMP/empty-inbox.rows" ] || fail 'empty Agents emitted a selectable or synthetic row'
 
 cat > "$FAKE_BIN/fzf" <<'SH'
 #!/usr/bin/env bash
@@ -466,10 +478,10 @@ export TMUX_RADAR_FZF_ARGS="$TMP/fzf.args"
 export TMUX_RADAR_FZF_INPUT="$TMP/fzf.input"
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" menu inbox >/dev/null 2>"$TMP/menu-inbox.err" ||
   fail 'menu inbox failed while rendering its empty state'
-grep -q 'Inbox>' "$TMP/fzf.args" || fail 'menu inbox did not open with the Inbox prompt'
-grep -Eqi 'Inbox clear|no unread AI event' "$TMP/fzf.args" || fail 'empty Inbox omitted its unread-event explanation'
-[ ! -s "$TMP/fzf.input" ] || fail 'empty Inbox passed a synthetic row to fzf'
-printf 'PASS: menu Inbox opens directly with a truthful nonselectable empty state\n'
+grep -q 'Agents>' "$TMP/fzf.args" || fail 'menu inbox did not open the Agents surface'
+grep -Eqi 'Agents clear' "$TMP/fzf.args" || fail 'empty Agents omitted its explanation'
+[ ! -s "$TMP/fzf.input" ] || fail 'empty Agents passed a synthetic row to fzf'
+printf 'PASS: menu inbox opens the Agents surface with a truthful nonselectable empty state\n'
 
 mkdir -p "$TMP/old-fzf-bin"
 cat > "$TMP/old-fzf-bin/fzf" <<'SH'
@@ -511,7 +523,9 @@ grep -Eq -- '--tiebreak(=|$).*begin,index|--tiebreak=begin,index' "$TMP/fzf.args
 ! grep -qx -- '--nth=2..' "$TMP/fzf.args" ||
   fail 'fzf excludes the window-name search field after applying with-nth'
 grep -q 'C-t Tree' "$TMP/fzf.args" || fail 'picker header does not advertise C-t Tree'
-grep -q 'C-i Inbox' "$TMP/fzf.args" || fail 'picker header does not advertise C-i Inbox'
+grep -q 'C-a Agents' "$TMP/fzf.args" || fail 'picker header does not advertise C-a Agents'
+grep -Eq 'ctrl-i:transform\([^)]*set-view agents\)' "$TMP/fzf.args" ||
+  fail 'C-i does not alias to the Agents view'
 grep -q 'C-e panes' "$TMP/fzf.args" || fail 'picker header does not advertise C-e pane drill-down'
 grep -q 'A-1..9' "$TMP/fzf.args" || fail 'picker header does not advertise direct row jumps'
 grep -Eq 'ctrl-t:transform\([^)]*set-view tree\)' "$TMP/fzf.args" ||
@@ -623,29 +637,28 @@ grep -q 'keyboard-pane-leaf' "$TMP/keyboard-expanded" || fail 'real Ctrl-e key e
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-i
 for _ in $(seq 1 50); do
   tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-inbox"
-  grep -q '^Inbox>' "$TMP/keyboard-inbox" && break
+  grep -q '^Agents>' "$TMP/keyboard-inbox" && break
   sleep 0.1
 done
-grep -q '^Inbox>' "$TMP/keyboard-inbox" || fail 'real Ctrl-i key event did not change the picker to Inbox'
-grep -q 'Inbox clear.*no unread AI event' "$TMP/keyboard-inbox" ||
-  fail 'switching into an empty Inbox did not publish its truthful empty state'
-# Inbox is already pane-level. Ctrl-e is a no-op here and must not mutate the
+grep -q '^Agents>' "$TMP/keyboard-inbox" || fail 'real Ctrl-i key event did not alias to the Agents view'
+grep -q 'Agents clear' "$TMP/keyboard-inbox" ||
+  fail 'switching into an empty Agents view did not publish its truthful empty state'
+# Agents is already pane-level. Ctrl-e is a no-op here and must not mutate the
 # remembered Tree expansion state behind the current view.
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-e
 sleep 0.2
 tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-inbox-after-expand"
-grep -q '^Inbox>' "$TMP/keyboard-inbox-after-expand" || fail 'Ctrl-e escaped or reloaded the pane-level Inbox'
+grep -q '^Agents>' "$TMP/keyboard-inbox-after-expand" || fail 'Ctrl-e escaped or reloaded the pane-level Agents view'
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-t
 for _ in $(seq 1 50); do
   tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-tree-restored"
   grep -q '^Tree+>' "$TMP/keyboard-tree-restored" && break
   sleep 0.1
 done
-grep -q '^Tree+>' "$TMP/keyboard-tree-restored" || fail 'Ctrl-e inside Inbox mutated the remembered Tree expansion'
-grep -q 'Inbox clear.*no unread AI event' "$TMP/keyboard-tree-restored" &&
-  fail 'leaving Inbox retained a stale empty-state header'
-# Agents is pane-level too: the view key transforms, the empty state is
-# truthful, and Ctrl-e is a structural no-op.
+grep -q '^Tree+>' "$TMP/keyboard-tree-restored" || fail 'Ctrl-e inside Agents mutated the remembered Tree expansion'
+grep -q 'Agents clear' "$TMP/keyboard-tree-restored" &&
+  fail 'leaving Agents retained a stale empty-state header'
+# The canonical view key lands on the same surface.
 tmux -L "$SOCKET" send-keys -t "$KEYBOARD_TARGET" C-a
 for _ in $(seq 1 50); do
   tmux -L "$SOCKET" capture-pane -p -t "$KEYBOARD_TARGET" > "$TMP/keyboard-agents"

@@ -83,8 +83,8 @@ chk "looping agent stays working across scans" \
 # the isolated server is detached, so every pane counts as off-screen here
 chk "working to stalled transition synthesizes one DONE mark" \
   "awk -F'\t' -v p='$SPANE' '\$1==p && \$5 ~ /finished.*scan/' '$MARKS' | grep -q ."
-chk "synthesized DONE mark is Inbox-eligible" \
-  "'$SW' list inbox | grep -q '$SPANE'"
+chk "synthesized DONE mark appears on the Agents board" \
+  "'$SW' list agents | grep -q '$SPANE'"
 chk "an agent that keeps working synthesizes nothing" \
   "! awk -F'\t' -v p='$WPANE' '\$1==p' '$MARKS' | grep -q ."
 
@@ -128,17 +128,56 @@ force_scan   # still blocked: transition already consumed
 chk "a held blocked state does not re-fire" \
   "[ \"\$(awk -F'\t' -v p='$SPANE' '\$1==p' '$MARKS' | wc -l | tr -d ' ')\" = 1 ]"
 
-# --- 4. stale ACTION mark healing ---------------------------------------------
+# --- 4. stale mark healing (post-mark working streak) ---------------------------
 # fresh streak: prior scans already proved this pane works; healing needs two
 # consecutive working verdicts counted from the mark's own lifetime
 rm -f "$LIVE_SAMPLES"
 env -u CLAUDE_JOB_DIR "$N" mark "$WPANE" claude "Claude needs your permission" s:heal1
-force_scan   # working streak 1: mark must survive
-chk "ACTION mark survives the first working scan" \
+force_scan   # first post-mark working scan: mark must survive
+chk "ACTION mark survives the first post-mark working scan" \
   "grep -q 's:heal1' '$MARKS'"
-force_scan   # working streak 2: the wait is observably over
+force_scan   # second post-mark working scan: the wait is observably over
 chk "sustained working heals the stale ACTION mark" \
   "! grep -q 's:heal1' '$MARKS'"
+
+# DONE marks heal by the same rule when the agent demonstrably works again
+env -u CLAUDE_JOB_DIR "$N" mark "$WPANE" claude "Claude finished — your turn" s:heal2
+force_scan
+chk "DONE mark survives the first post-mark scan" \
+  "grep -q 's:heal2' '$MARKS'"
+force_scan
+chk "renewed working heals the superseded DONE mark" \
+  "! grep -q 's:heal2' '$MARKS'"
+
+# A static pane whose title flips once (one activity signal, like a freshly
+# rendered permission prompt) must NOT heal: two in a row is the contract.
+rm -f "$LIVE_SAMPLES"
+tmux select-pane -t "$SPANE" -T 'plain title'
+force_scan   # baseline sample for the new title
+"$N" clear "$SPANE" 2>/dev/null || true
+env -u CLAUDE_JOB_DIR "$N" mark "$SPANE" claude "Claude needs your permission" s:prompt1
+tmux select-pane -t "$SPANE" -T '[ . ] Action Required | proj'   # the prompt renders
+force_scan   # one screen change since the mark: working verdict, no heal
+chk "a freshly rendered prompt does not heal after one changed scan" \
+  "grep -q 's:prompt1' '$MARKS'"
+force_scan   # unchanged ever since: stalled, streak resets
+force_scan
+chk "a held permission prompt never heals" \
+  "grep -q 's:prompt1' '$MARKS'"
+"$N" clear "$SPANE" 2>/dev/null || true
+
+# --- 4.5 done-ttl expiry --------------------------------------------------------
+tmux set -g @radar-done-ttl 60
+OLD=$(($(date +%s) - 3700))
+printf '%s\t%s\tclaude\ts:old-done\tClaude finished — your turn\t\n' "$WPANE" "$OLD" > "$MARKS"
+printf '%s\t%s\tclaude\ts:fresh-done\tClaude finished — your turn\t\n' "$WPANE" "$(date +%s)" >> "$MARKS"
+"$N" tick
+chk "DONE marks older than @radar-done-ttl expire" \
+  "! grep -q 's:old-done' '$MARKS'"
+chk "fresh DONE marks survive done-ttl" \
+  "grep -q 's:fresh-done' '$MARKS'"
+tmux set -gu @radar-done-ttl
+"$N" clear-all 2>/dev/null || true
 
 # --- 5. contradicted waiting row downgraded -----------------------------------
 WPID="$(tmux display-message -p -t "$WPANE" '#{pane_pid}')"

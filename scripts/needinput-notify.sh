@@ -45,10 +45,11 @@
 # required, e.g. Codex's animated "Action Required" marker). Output:
 #   "<pane>\t<kind>\t<state>\t<title>\t<epoch>"
 # Untracked agent panes are adopted into the registry as "p:<pid>" rows so
-# every surface reads one model; two consecutive working verdicts heal a
-# stale ACTION mark and downgrade a registry `waiting` the screen
-# contradicts; rows whose pane lives on a foreign tmux server keep liveness
-# but are re-homed to paneless.
+# every surface reads one model; an agent-sourced mark heals once its pane has
+# been seen working in two scans SINCE the mark was written (a freshly
+# rendered permission prompt explains one screen change, never two in a row);
+# a registry `waiting` the screen contradicts is downgraded; rows whose pane
+# lives on a foreign tmux server keep liveness but are re-homed to paneless.
 # The scanner never invents events, but an OBSERVED transition is one: for a
 # pane with no unread mark whose window is off-screen, a flip into `blocked`,
 # or from `working` into `stalled`, synthesizes exactly one mark (keyed by the
@@ -726,6 +727,17 @@ cmd_tick() {
   local snapshot verdicts dead_specs="" dead_keys="" registry_keys="" agents agent_scan="" tmp reg_ok=""
   # replay events that hook processes spooled under lock contention
   _drain_spool
+  # finished-turn marks are a review queue, not an archive: past
+  # @radar-done-ttl seconds they stop earning attention (0 = keep forever)
+  local donettl
+  donettl="$(opt @radar-done-ttl 0)"
+  case "$donettl" in ''|*[!0-9]*) donettl=0 ;; esac
+  if [ "$donettl" -gt 0 ] && [ -r "$STATE_FILE" ]; then
+    lock_or_error || return 1
+    _drop_rows 'now - $2 > dt && (tolower($3 " " $5) ~ /(finished|your turn|turn complete|task complete|done|任务完成|完成)/)' \
+      -v dt="$donettl"
+    unlock
+  fi
   # GC atomic-write temp files orphaned by killed hook processes (mktemp->mv
   # interrupted by a hook timeout), and keep the diagnostics log bounded
   find "$STATE_DIR" -maxdepth 1 \
@@ -835,13 +847,12 @@ cmd_tick() {
   _refresh_titles
   _sync_bar
 }
-
 # --- live agent scanner (see file header) ------------------------------------
 # Pull-based complement to the push hooks: classify every pane hosting a
-# watched agent process as working/stalled from visible change, adopt
-# untracked panes into the registry, heal stale ACTION marks, downgrade
-# contradicted waiting rows, and re-home registry rows whose pane belongs to
-# a foreign tmux server (or is otherwise dead) when their pid is still alive.
+# watched agent process as working/stalled/blocked from visible change, adopt
+# untracked panes into the registry, heal marks the screen proves stale (two
+# post-mark working scans), downgrade contradicted waiting rows, and re-home
+# registry rows whose pane belongs to a foreign tmux server.
 _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
   have_tmux || return 0
   if [ "$(opt @radar-scan on)" = "off" ]; then
@@ -935,13 +946,19 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       }
       next
     }
-    mode == 3 && NF >= 4 { pth[$1] = $2; psh[$1] = $3; pstreak[$1] = $4 + 0; next }
+    mode == 3 && NF >= 4 {
+      pth[$1] = $2; psh[$1] = $3; pstreak[$1] = $4 + 0
+      phstreak[$1] = (NF >= 5 ? $5 + 0 : 0); phepoch[$1] = (NF >= 6 ? $6 + 0 : 0)
+      next
+    }
     mode == 6 && NF >= 3 { oldstate[$1] = $3; next }
     mode == 4 && NF >= 5 {
       markseen[$1] = 1
-      l = tolower($3 " " $5)
-      if (l ~ /(needs approval|needs your permission|needs input|waiting.*input|waiting on you|wait.*input|permission|approval|action required|approve|拿不准|需要你|需要.*许可|需要.*批准|等待.*输入)/)
-        actionkey[$1] = $4                       # latest ACTION mark key per pane
+      # only agent-sourced marks are eligible for activity-based healing; a
+      # mark written through the public API by a user script is their contract
+      if ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "kimi" || $3 == "pi" || $3 == "ai") {
+        markkey[$1] = $4; markepoch[$1] = $2 + 0
+      }
       next
     }
     mode == 5 && NF >= 9 {
@@ -982,11 +999,13 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
         # empty fields collapse under IFS=tab reads; "-" marks "no value"
         t = ptitle[pane]; if (t == "") t = "-"
         prev = (pane in oldstate ? oldstate[pane] : "-")
+        mk = (pane in markkey) ? markkey[pane] : "-"
+        me = (pane in markepoch) ? markepoch[pane] : 0
         print "A\t" pane "\t" akind[pid] "\t" pid "\t" aproc[pid] "\t" clean(ppath[pane]) "\t" t "\t" \
               (pane in pth ? pth[pane] : "-") "\t" (pane in psh ? psh[pane] : "-") "\t" (pane in pstreak ? pstreak[pane] : 0) "\t" \
-              claimed "\t" prev "\t" ponscreen[pane] "\t" ((pane in markseen) ? 1 : 0)
+              (pane in phstreak ? phstreak[pane] : 0) "\t" (pane in phepoch ? phepoch[pane] : 0) "\t" \
+              claimed "\t" prev "\t" ponscreen[pane] "\t" ((pane in markseen) ? 1 : 0) "\t" mk "\t" me
       }
-      for (p in actionkey) print "HEAL\t" p "\t" actionkey[p]
       for (p in waitkey)   print "DOWN\t" p "\t" waitkey[p]
     }')"
 
@@ -1046,20 +1065,85 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
     [ -n "${TMUX_RADAR_SCAN_DEBUG:-}" ] && printf 'SCANDBG %s claimed=%s onscreen=%s hasmark=%s prev=%s state=%s synth=%s\n' "$pane" "$claimed" "$onscreen" "$hasmark" "$prev" "$state" "${#synth_rows}" >&2
   done <<< "$rows"
 
-  # Healing needs the per-pane verdicts: keep only HEAL/DOWN candidates whose
-  # pane sustained working across two consecutive scans.
-  while IFS=$'\t' read -r tag pane key; do
+  local pane kind apid aproc path title pth psh pstreak phstreak phepoch claimed prev onscreen hasmark mkey mepoch
+  local live_rows="" sample_rows="" adopt_rows="" heal_keys="" down_keys="" rehome_keys="" working2="" synth_rows=""
+  local th sh state streak hstreak tag key kn s_pane s_kind s_label s_key
+  while IFS=$'\t' read -r tag pane rest; do
     case "$tag" in
-      HEAL|DOWN) ;;
-      *) continue ;;
+      REHOME) rehome_keys="${rehome_keys}${pane}"$'\001'; continue ;;   # pane field holds the key
+      A) ;;
+      *) continue ;;                                                    # DOWN resolved below
     esac
+    IFS=$'\t' read -r kind apid aproc path title pth psh pstreak phstreak phepoch claimed prev onscreen hasmark mkey mepoch <<< "$rest"
+    [ "$title" = "-" ] && title=""
+    [ "$pth" = "-" ] && pth=""
+    [ "$psh" = "-" ] && psh=""
+    th="$(printf '%s' "$title" | cksum)"; th="${th%% *}"
+    # One capture per agent pane per scan: cheap at scan cadence, and the
+    # working/stalled verdict stays exact even across title-only changes.
+    sh="$(tmux capture-pane -p -t "$pane" 2>/dev/null | cksum)"; sh="${sh%% *}"
+    case "$title" in
+      # Codex animates an attention marker into its native title while blocked
+      # on approval; change detection alone would read it as working.
+      *"Action Required"*|*"action required"*|*"Needs Approval"*|*"needs approval"*)
+        state=blocked ;;
+      *)
+        if { [ -n "$pth" ] && [ "$th" != "$pth" ]; } || { [ -n "$psh" ] && [ "$sh" != "$psh" ]; } || [ -z "$psh" ]; then
+          state=working
+        else
+          state=stalled
+        fi
+        ;;
+    esac
+    streak=0
+    [ "$state" = working ] && streak=$((pstreak + 1))
+    [ "$streak" -ge 2 ] && working2="${working2}${pane} "
+    # Post-mark healing: an agent mark is dropped once the pane has been seen
+    # working in two scans SINCE the mark was written. A freshly rendered
+    # permission prompt explains one screen change, never two in a row, so a
+    # genuine "needs you" never heals under the user.
+    hstreak=0
+    if [ "$mkey" != "-" ]; then
+      [ "$mepoch" = "$phepoch" ] && hstreak="$phstreak"
+      [ "$state" = working ] && hstreak=$((hstreak + 1))
+      if [ "$hstreak" -ge 2 ]; then
+        heal_keys="${heal_keys}${mkey}"$'\001'
+        hasmark=0
+      fi
+    fi
+    live_rows="${live_rows}${pane}"$'\t'"${kind}"$'\t'"${state}"$'\t'"$(_san "$title")"$'\t'"${now}"$'\n'
+    sample_rows="${sample_rows}${pane}"$'\t'"${th}"$'\t'"${sh}"$'\t'"${streak}"$'\t'"${hstreak}"$'\t'"${mepoch}"$'\n'
+    if [ "$claimed" = 0 ]; then
+      adopt_rows="${adopt_rows}${kind}"$'\t'"p:${apid}"$'\t'"${apid}"$'\t'"${pane}"$'\t'"${now}"$'\t'"${now}"$'\t'"${state}"$'\t'"$(_san "$path")"$'\t'"$(_san "$aproc")"$'\n'
+      claimed=1   # adopted now: event synthesis below applies from this scan on
+    fi
+    # Hookless (or hook-gapped) panes still produce no events of their own.
+    # An observed transition into blocked, or from working into stalled, IS
+    # the event — synthesize it once, off-screen only, never over an
+    # existing unread mark.
+    if [ "$claimed" -ge 1 ] && [ "$onscreen" = 0 ] && [ "$hasmark" = 0 ]; then
+      case "$kind" in
+        claude) kn=Claude ;; codex) kn=Codex ;; kimi) kn=Kimi ;; pi) kn=Pi ;; *) kn=Agent ;;
+      esac
+      if [ "$state" = blocked ] && [ "$prev" != blocked ]; then
+        synth_rows="${synth_rows}${pane}"$'\t'"${kind}"$'\t'"${kn} needs approval (scan)"$'\t'"p:${apid}"$'\n'
+      elif [ "$state" = stalled ] && [ "$prev" = working ]; then
+        synth_rows="${synth_rows}${pane}"$'\t'"${kind}"$'\t'"${kn} finished — your turn (scan)"$'\t'"p:${apid}"$'\n'
+      fi
+    fi
+    [ -n "${TMUX_RADAR_SCAN_DEBUG:-}" ] && printf 'SCANDBG %s claimed=%s onscreen=%s hasmark=%s prev=%s state=%s synth=%s\n' "$pane" "$claimed" "$onscreen" "$hasmark" "$prev" "$state" "${#synth_rows}" >&2
+  done <<< "$rows"
+
+  # Registry rows whose waiting claim the screen contradicts (agent working
+  # across two consecutive scans) are downgraded to working.
+  while IFS=$'\t' read -r tag pane key; do
+    [ "$tag" = "DOWN" ] || continue
     [ -n "$key" ] || continue
     case " $working2" in
       *" ${pane} "*) ;;
       *) continue ;;
     esac
-    if [ "$tag" = HEAL ]; then heal_keys="${heal_keys}${key}"$'\001'
-    else down_keys="${down_keys}${key}"$'\001'; fi
+    down_keys="${down_keys}${key}"$'\001'
   done <<< "$rows"
 
   # Publish ai-live + samples atomically (single writer via the stamp).

@@ -33,13 +33,14 @@ keyboard behavior, and exact state—not decoration.
 - Make the user-assigned window name the fastest and strongest way to find work.
 - Restore the useful `v0.1.3` switcher model: window-first Recent, a real Tree,
   pane drill-down, numeric quick jumps, preview, and exact pane switching.
-- Make `Ctrl-i` an actionable AI inbox, not a process monitor.
+- Make the Agents board the single, accurate answer to "which agent needs me,
+  and what is the fleet doing".
 - Ensure every visible result can switch to one real live pane.
 - Keep the popup fast and predictable at 40–100+ panes.
 
 Non-goals:
 
-- Listing every `claude`, `codex`, `kimi`, or `opencode` process in the inbox.
+- Presenting idle or long-finished agent panes as if they were active work.
 - Auto-killing or closing user panes because an agent appears idle or finished.
 - Showing paneless/background sessions as fake tmux destinations.
 - Replacing the existing notifier, registry, supervisor, or fzf dependency.
@@ -53,8 +54,8 @@ Success signals:
   fuzzy matches; the UI does not pretend to implement a hidden weighted index.
 - `Ctrl-t`, `Ctrl-r`, `Ctrl-i`, and `Ctrl-e` work through real tmux key events
   with the installed fzf version.
-- On the 2026-08-11 live fixture, Inbox shows the 2 unread pane-backed events,
-  not the 12 additional process-only `ACTIVE` shells.
+- On the 2026-08-11 live fixture, the AI surface shows the 2 unread pane-backed
+  events, not the 12 additional process-only `ACTIVE` shells.
 - Tree and Recent never expose an unopenable structural or synthetic row.
 
 ## Personas and jobs
@@ -76,13 +77,17 @@ The popup has three peer views over live tmux destinations:
 | View | Question | Resting model | Default order |
 | --- | --- | --- | --- |
 | **Recent** | Where was I working? | All live windows; panes appear on drill-down | window MRU, then remaining live windows |
-| **Inbox** | Which AI result or request needs me? | Pane-backed unread lifecycle events only | ACTION, DONE, NOTICE; newest first within level |
-| **Agents** | What is every live agent doing right now? | Every pane with mark, registry, or scanner evidence | BLOCKED/WAITING, WORKING, DONE, IDLE; newest first within level |
+| **Agents** | Which agent needs me, and what is the fleet doing? | Unread marks, blocked/waiting rows, and working panes | ACTION, BLOCKED/WAITING, DONE unread, WORKING; newest first within level |
 | **Tree** | Where is this work in tmux? | Session → window; panes appear on drill-down | canonical tmux server order |
 
-Compatibility aliases may remain at the CLI boundary: `needinput` → Inbox,
-`all` → Tree, and `ai`/`agent` → Agents. User-facing copy uses only Recent,
-Inbox, Agents, and Tree.
+Compatibility aliases may remain at the CLI boundary: `needinput`, `inbox`,
+`attention`, and `ai`/`agent` all resolve to Agents; `all` resolves to Tree.
+User-facing copy uses only Recent, Agents, and Tree.
+
+There is deliberately one AI surface. A separate unread-events inbox was tried
+and rejected in practice: it duplicated the board with weaker accuracy, and
+its rows aged into noise. Unread events live on the board, kept truthful by
+the scanner's post-mark healing.
 
 ### Object model
 
@@ -91,7 +96,7 @@ Inbox, Agents, and Tree.
   linked window may appear under more than one session in Tree but only once in
   Recent.
 - **Pane** is the exact terminal destination and preview source.
-- **Inbox event** is an unread lifecycle mark attached to a live pane.
+- **Unread mark** is an unread lifecycle event attached to a live pane.
 - **Registry/process evidence** proves lifecycle and liveness; it is supporting
   machinery, not an inbox item by itself.
 
@@ -101,7 +106,7 @@ in the same bulk snapshot as the row's visible metadata:
 - a session row targets that session's current live pane;
 - a window row targets that window's active live pane;
 - a pane row targets itself;
-- an Inbox row targets the pane named by its unread mark.
+- an unread-mark row targets the pane named by its mark.
 
 Session and window targets are render-time snapshots, not late-bound aliases.
 If a window's active pane changes while the picker is open, accepting the old
@@ -115,11 +120,11 @@ Hierarchy is presentation; destination identity is always a real pane.
 
 1. **Names before coordinates.** User-authored window names are primary;
    `session:window.pane`, command, cwd, and process state are supporting evidence.
-2. **Inbox means unread work.** A running or leftover AI process is not an
-   interruption. Only an unread lifecycle event earns a `Ctrl-i` row.
+2. **Unread means unread.** A running or leftover AI process is not an
+   interruption. Unread marks rank above the working set on the board.
 3. **Complexity available, not mandatory.** Recent and Tree rest at window
    granularity; `Ctrl-e` reveals exact panes without making every scan dense.
-4. **Every row goes somewhere.** Session, window, pane, and Inbox rows all
+4. **Every row goes somewhere.** Session, window, pane, and mark rows all
    resolve to one stable live pane or fail explicitly before navigation.
 5. **Search may flatten; rest preserves structure.** With an empty query, input
    order communicates MRU or hierarchy. While typing, fzf relevance may reorder
@@ -145,7 +150,7 @@ still preserve destination correctness underneath.
 - Signature details:
   - a continuous Tree rail with aligned two-column window indexes;
   - one compact keyboard legend that changes with the active view;
-  - state words plus restrained icons in Inbox;
+  - state words plus restrained icons on the Agents board;
   - direct row jumps (`Alt-1`…`Alt-9`) as visible expert affordances.
 
 Recommended row hierarchy:
@@ -157,7 +162,7 @@ Tree:   ▾ session-name                         8w
           └─  7 multi-pane-window    3p · command · ~/cwd
 ```
 
-Recent and Inbox keep the window name as the first displayed term. Tree uses a
+Recent keeps the window name as the first displayed term; Agents leads with the state word. Tree uses a
 structural prefix before the same primary identity: disclosure/branch glyphs
 and a two-column window index. Session names are primary; their compact window
 count moves to the dim metadata column. Picker-only search weighting keeps an
@@ -168,15 +173,15 @@ compact `Np` metadata, while command and compact cwd provide recognition value.
 
 ## Components
 
-- View switcher: `Ctrl-r` Recent, `Ctrl-i` Inbox, `Ctrl-a` Agents, `Ctrl-t` Tree.
+- View switcher: `Ctrl-r` Recent, `Ctrl-a` Agents, `Ctrl-t` Tree; `Ctrl-i` is a kept alias for Agents.
 - Recent fast-switch focus: the current MRU window stays on row 1, while the
   initial cursor and every `Ctrl-r` view switch land on row 2—the previous
   window—so opening the picker and pressing `Enter` switches back immediately.
-- Hierarchy drill-down: `Ctrl-e` toggles pane rows in Recent and Tree; Inbox is
+- Hierarchy drill-down: `Ctrl-e` toggles pane rows in Recent and Tree; Agents is
   already pane-level and leaves the toggle unavailable.
 - Result list: one hidden stable pane target plus two visible fields.
-- Preview: the selected pane's recent output; Inbox adds event/registry details
-  above the capture without becoming a second navigation surface.
+- Preview: the selected pane's recent output; marked/registered panes add event
+  and registry details above the capture without a second navigation surface.
 - Fast actions: `Enter` switches; `Alt-1`…`Alt-9` switches directly only when
   that numbered row exists in the current filtered result set; an out-of-range
   jump rings the terminal bell and leaves the picker open. `Alt-p` toggles
@@ -190,7 +195,7 @@ No new component framework or dependency is introduced.
 - Target standard: complete keyboard operation and truthful text state in the
   terminal medium; color is never the sole state channel.
 - Focus/selection: fzf's pointer and highlight remain visible. Recent starts on
-  the previous window at row 2; Tree and Inbox start on row 1. Query changes
+  the previous window at row 2; Tree and Agents start on row 1. Query changes
   return to the first match, and no view accepts implicitly.
 - Keyboard behavior: shortcuts are shown in the popup; `Esc` always cancels;
   preview scrolling retains standard documented keys.
@@ -214,19 +219,19 @@ No new component framework or dependency is introduced.
 
 ### Loading
 
-Run notifier cleanup synchronously before first render and Inbox reload. The
+Run notifier cleanup synchronously before first render and view reload. The
 surface either publishes a coherent snapshot or reports a concise failure.
 
 ### Empty
 
 - Recent/Tree with a reachable tmux server normally contain live destinations.
-- Empty Inbox means: `Inbox clear — no unread AI event needs you.` It emits zero
-  selectable rows; it does not invent a placeholder target.
+- Empty Agents means: `Agents clear — nothing needs you, is working, or is awaiting review.`
+  It emits zero selectable rows; it does not invent a placeholder target.
 
 ### Success
 
 Revalidate the stable pane ID, switch with one tmux client operation, record MRU
-only after success, and clear only the selected pane's Inbox mark. Focusing one
+only after success, and clear only the selected pane's mark. Focusing one
 pane must not clear unread sibling panes in the same window.
 
 ### Error
@@ -235,27 +240,30 @@ If the selected pane vanished or the switch failed, remain honest: concise
 diagnostic, nonzero result, no raw tmux stderr, no partial navigation, and no
 false MRU update.
 
-### AI Inbox eligibility
+### Agents board membership
 
-Inbox inclusion is intentionally narrower than AI detection:
+The board shows one row per live pane that has current AI significance:
 
-1. A normalized unread mark exists for a concrete `%pane_id`.
-2. That pane is live in the current tmux snapshot.
-3. The mark classifies as ACTION, DONE, or NOTICE.
-4. ACTION/NOTICE liveness is checked by the notifier/registry GC before render;
-   DONE may remain after the agent exits so the completed output can be reviewed.
-5. Marks created through the public `mark` API are eligible when they meet the
-   same pane-backed, live, ACTION/DONE/NOTICE contract.
+1. an unread mark (ACTION, DONE, or NOTICE) attached to a live pane;
+2. a registry row with a live pid (blocked/waiting/working/done session state);
+3. a scanner verdict of `working` or `blocked` on a pane hosting a watched
+   agent process.
+
+Marks keep their historical eligibility rules: a normalized unread mark on a
+live pane; ACTION/NOTICE liveness is revalidated by the notifier/registry GC;
+DONE may remain after the agent exits so the completed output can be
+reviewed; public `mark` API rows are eligible on the same contract.
 
 Explicit exclusions:
 
-- unmarked registry rows, even when their state is `working` or `done`;
-- process/TTY/parent-chain matches without an unread mark;
-- generic Claude/Codex shells and long-lived finished TUI processes;
-- paneless/background marks and supervisor-only sessions.
+- paneless/background marks and supervisor-only sessions (they notify through
+  the chip strip, never through a fake destination);
+- IDLE panes — an idle agent reads as a free shell and earns no row;
+- stale claims the scanner has already contradicted (healed marks, waiting
+  rows downgraded by observed working).
 
-The registry, process scan, and doctor remain valuable for GC and diagnostics.
-They stop being list producers for `Ctrl-i`.
+The registry, process scan, and doctor remain valuable for GC and diagnostics,
+and now also feed the board's working/blocked rows.
 
 ### Live scanner and badges
 
@@ -305,12 +313,12 @@ severe first, at most two groups with counts: `⚠` needs you, `✓` done unread
 ## Content voice
 
 - Tone: terse, technical, calm.
-- View terms: Recent, Inbox, Tree. Do not mix AI status, Attention, Need Input,
-  and Inbox in the same user-facing surface.
+- View terms: Recent, Agents, Tree. Do not mix AI status, Attention, Need Input,
+  or Inbox into the user-facing surface.
 - Actions: use outcome labels—`Enter switch`, `C-e panes`, `A-p preview`.
 - Errors state what happened and the next useful action.
-- Empty Inbox copy must say that no unread event needs the user; it must not
-  claim there are no AI processes or panes.
+- Empty Agents copy must say that nothing needs the user; it must not claim
+  there are no AI processes or panes.
 
 ## Implementation constraints
 
@@ -364,28 +372,31 @@ Required end-to-end checks:
    another row's cwd or metadata.
 3. Recent begins with all live windows in MRU order, then remaining windows.
 4. Tree rests session → window and expands panes without synthetic rows.
-5. Inbox emits only marked pane-backed ACTION/DONE/NOTICE rows; unmarked
-   working/done registry rows and process-only detections stay absent.
+5. Agents emits only pane-backed rows with current significance: unread
+   marks, live registry sessions, and scanner working/blocked verdicts;
+   idle panes and paneless/background rows stay absent.
 6. In-range `Alt-N` and Enter switch to the exact stable pane target;
    out-of-range `Alt-N` before and after filtering leaves the picker open.
 7. Session/window targets remain the rendered pane snapshot even when the
    active pane changes later; disappearance and switch failure are nonzero,
    concise, and atomic.
 8. Two unread panes in one window remain independent: focusing one clears only
-   that pane's event, while `Ctrl-e` inside Inbox is a structural no-op.
+   that pane's event, while `Ctrl-e` inside Agents is a structural no-op.
 9. Cleanup failure, malformed mark input, missing tmux/fzf, fzf no-match, and
-   user cancellation remain distinguishable from an honestly empty Inbox.
+   user cancellation remain distinguishable from an honestly empty Agents view.
 10. A 100-pane fixture is complete and proves the producer uses no more than
     one bulk window call plus one bulk pane call per reload.
 11. Linked windows appear once per session link in Tree, once per underlying
     window in Recent, and never duplicate pane leaves within one link/group.
-12. Entering and leaving an empty Inbox updates and removes the empty-state
-    header in the same atomic fzf reload transaction.
+12. Entering and leaving an empty Agents view updates and removes the
+    empty-state header in the same atomic fzf reload transaction.
 13. Hook migration preserves pre-existing foreign indexed hooks.
 14. The scanner adopts a hookless agent pane into `ai-live` and the registry,
     classifies a changing screen as working and a static one as stalled, and
-    honors an `Action Required` title as blocked; two consecutive working
-    verdicts heal an ACTION mark and downgrade a contradicted waiting row.
+    honors an `Action Required` title as blocked; an agent-sourced mark heals
+    only after two working scans counted from the mark's own epoch, so a
+    freshly rendered permission prompt (one screen change) never heals, and a
+    contradicted waiting row downgrades to working.
 15. A registry row whose pane is absent from this server keeps liveness but is
     re-homed to paneless; `$TMUX_PANE` values that do not resolve locally are
     re-resolved before use.

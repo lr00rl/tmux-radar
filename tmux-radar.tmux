@@ -38,32 +38,6 @@ case "$LAST_KEY" in none|off|'') ;; *)
   tmux bind-key "$LAST_KEY" run-shell "$SCRIPTS/switcher.sh last-pane" ;;
 esac
 
-# AI supervisor (Codex-driven), opt-in via `set -g @radar-ai on`. prefix +
-# <@radar-ai-key> (default `A` — capital, so a stray prefix+a can't launch
-# it by accident) opens a menu: arrange tmux from natural language,
-# decide/answer a waiting AI pane, or run a resident watcher that auto-approves
-# safe prompts until a pane's task is done. display-menu is bound natively
-# (client context) rather than through the script for reliability; keep the
-# items in sync with cmd_menu in scripts/ai.sh (the CLI fallback).
-if [ "$(opt @radar-ai off)" = "on" ]; then
-  AI_KEY="$(opt @radar-ai-key A)"
-  POP="display-popup -E -w 80% -h 70%"
-  tmux bind-key "$AI_KEY" display-menu -T "#[align=centre] tmux AI 主管 " -x C -y C \
-    "指挥 tmux（自然语言）"            a "$POP \"TMUX_RADAR_AI_PAUSE=1 $SCRIPTS/ai.sh ask\"" \
-    "让当前 pane 继续 / 决定一次"       c "$POP \"TMUX_RADAR_AI_PAUSE=1 $SCRIPTS/ai.sh decide '#{pane_id}'\"" \
-    "" \
-    "常驻监控当前 pane 直到完成"        w "run-shell \"$SCRIPTS/native-launcher.sh '#{pane_id}' quick\"" \
-    "常驻监控 + always-allow（更省心）"  W "run-shell \"$SCRIPTS/native-launcher.sh '#{pane_id}' always-allow\"" \
-    "自定义监控（目标 / 间隔 / 策略）…"  v "run-shell \"$SCRIPTS/native-launcher.sh '#{pane_id}' advanced\"" \
-    "" \
-    "状态 / 最近决策"                  s "$POP \"TMUX_RADAR_AI_PAUSE=1 $SCRIPTS/ai.sh status\"" \
-    "停止全部监控"                     S "run-shell \"$SCRIPTS/ai.sh stop all\"" \
-    "打开 Agents（全部 agent 实时状态）"  g "$POP \"$SCRIPTS/switcher.sh menu agents\""
-  # housekeeping on every (re)load: GC stale watcher files / monitor panes /
-  # AI-status marks — also what a tmux-resurrect post-restore hook should run
-  tmux run-shell -b "$SCRIPTS/ai.sh cleanup >/dev/null 2>&1" 2>/dev/null || true
-fi
-
 # Hooks use reserved high array indexes so reloads replace only tmux-radar's
 # entries and never clobber another plugin or a user hook on the same event.
 # The one-time migration removes only legacy entries whose command points at a

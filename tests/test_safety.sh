@@ -4,7 +4,6 @@
 set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 N="$WT/scripts/needinput-notify.sh"
-AI="$WT/scripts/ai.sh"
 T="$(mktemp -d /tmp/radar-regress.XXXXXX)"
 export TMUX_RADAR_STATE_DIR="$T/state"
 MARKS="$TMUX_RADAR_STATE_DIR/need-input"
@@ -25,57 +24,6 @@ export TMUX
 unset TMUX_PANE CLAUDE_JOB_DIR 2>/dev/null || true
 PANE="$(tmux list-panes -a -F '#{pane_id}' | head -1)"
 mkdir -p "$TMUX_RADAR_STATE_DIR"
-
-echo "### #1 CRITICAL: cmd_ask ';'-chain allowlist bypass"
-rm -f /tmp/PWNED_BY_ASK
-# stub brain reads its JSON from a file: printf would eat the \" escapes
-cat > "$T/evil.json" <<'JSON'
-{"explain":"x","commands":["split-window -d ; run-shell \"touch /tmp/PWNED_BY_ASK\""]}
-JSON
-cat > "$T/clean.json" <<'JSON'
-{"explain":"x","commands":["# a comment","split-window -d"]}
-JSON
-cat > "$T/shell-arg.json" <<'JSON'
-{"explain":"x","commands":["split-window -d touch /tmp/PWNED_BY_ASK"]}
-JSON
-export TMUX_RADAR_AI_PAUSE=1
-tmux set -g @radar-ai-autonomy auto     # worst case: no confirmation gate
-export TMUX_RADAR_AI_CMD="cat >/dev/null; cat '$T/evil.json'"
-OUT="$(TMUX_PANE="$PANE" bash "$AI" ask "make a split" 2>&1)"; RC=$?
-sleep 0.5
-chk "';'-chained run-shell is rejected (rc=4)" "[ $RC -eq 4 ]"
-chk "';'-chain never executed (no PWNED file)" "[ ! -f /tmp/PWNED_BY_ASK ]"
-chk "rejection names the chain reason" "printf '%s' \"\$OUT\" | grep -q '链式'"
-# An allowed tmux verb can itself accept a shell command. Reject that positional
-# argument even when it contains no separator or shell metacharacter.
-export TMUX_RADAR_AI_CMD="cat >/dev/null; cat '$T/shell-arg.json'"
-OUT_SHELL="$(TMUX_PANE="$PANE" bash "$AI" ask "make a split" 2>&1)"; RC_SHELL=$?
-sleep 0.2
-chk "split-window positional shell command is rejected" "[ $RC_SHELL -eq 4 ]"
-chk "split-window shell argument never executed" "[ ! -f /tmp/PWNED_BY_ASK ]"
-# a clean layout batch still passes the allowlist (no false rejection)
-export TMUX_RADAR_AI_CMD="cat >/dev/null; cat '$T/clean.json'"
-OUT2="$(TMUX_PANE="$PANE" bash "$AI" ask "split" 2>&1)"; RC2=$?
-chk "clean layout batch + comment line still executes (rc=0)" "[ $RC2 -eq 0 ]"
-chk "the split really happened" "[ \$(tmux list-panes -t '$PANE' | wc -l | tr -d ' ') -ge 2 ]"
-# empty command list must not spew "[: integer expression expected"
-printf '{"explain":"nothing to do","commands":[]}' > "$T/empty.json"
-export TMUX_RADAR_AI_CMD="cat >/dev/null; cat '$T/empty.json'"
-OUT3="$(TMUX_PANE="$PANE" bash "$AI" ask "nothing" 2>&1)"; RC3=$?
-chk "empty command list exits 0 cleanly (no integer-expression error)" \
-  "[ $RC3 -eq 0 ] && ! printf '%s' \"\$OUT3\" | grep -q 'integer expression'"
-unset TMUX_RADAR_AI_CMD TMUX_RADAR_AI_PAUSE
-
-echo
-echo "### #2 HIGH: cleanup must not kill a user pane whose %id matches a stale watch file"
-USERPANE="$(tmux list-panes -a -F '#{pane_id}' | tail -1)"   # a real, non-monitor pane
-WD="$TMUX_RADAR_STATE_DIR/ai-watch"; mkdir -p "$WD"
-# stale watch file: dead pid, monitors= pointing at the user's live pane (id reuse after restart)
-printf 'pid=999999\npane=%%99\nstarted=1\nmonitors=%s\n' "$USERPANE" > "$WD/_99.watch"
-bash "$AI" cleanup >/dev/null 2>&1
-chk "user pane with reused %id SURVIVES cleanup" \
-  "tmux list-panes -a -F '#{pane_id}' | grep -qx '$USERPANE'"
-chk "stale watch file was still GCd" "[ ! -f '$WD/_99.watch' ]"
 
 echo
 echo "### #3 HIGH: paneless marks are not wiped without a registry snapshot"
@@ -305,51 +253,10 @@ chk "custom adapter malformed payloads cannot block the vendor" \
 
 tmux -L radarreg kill-server 2>/dev/null || true
 
-echo
-echo "### executor allowance: unattended sends are menu answers only"
-tmux -L radarreg -f /dev/null new-session -d -s allow -x 120 -y 40 2>/dev/null
-TMUX="$(tmux -L radarreg display-message -p '#{socket_path}'),99999,0"
-export TMUX
-unset TMUX_PANE CLAUDE_JOB_DIR 2>/dev/null || true
-PANE="$(tmux list-panes -a -F '#{pane_id}' | head -1)"
-for _ in $(seq 1 50); do
-  [ -n "$(tmux capture-pane -p -t "$PANE" 2>/dev/null | tr -d ' \n')" ] && break
-  sleep 0.1
-done
-
-mkbrain() { printf '%s' "$2" > "$T/brain-$1.json"; export TMUX_RADAR_AI_CMD="cat >/dev/null; cat '$T/brain-$1.json'"; }
-export TMUX_RADAR_AI_PAUSE=1
-export TMUX_RADAR_AI_AUTONOMY=auto
-tmux set -g @radar-ai-autonomy auto 2>/dev/null || true
-
-mkbrain freetext '{"action":"send","text":"do something destructive","keys":["Enter"],"safe":true,"persistent":false,"reason":"looks fine","pane_state":"blocked","goal_status":"working","risk":"low","evidence":[]}'
-OUT="$(TMUX_PANE="$PANE" bash "$AI" decide "$PANE" auto '' '' 2>&1)"; RC=$?
-chk "auto send with free-form text escalates (rc=4)" "[ $RC -eq 4 ]"
-chk "free-form text is never typed into the pane" \
-  "! tmux capture-pane -p -t '$PANE' | grep -q 'do something destructive'"
-
-mkbrain ctrlkey '{"action":"send","text":"","keys":["C-c"],"safe":true,"persistent":false,"reason":"cancel it","pane_state":"blocked","goal_status":"working","risk":"low","evidence":[]}'
-OUT="$(TMUX_PANE="$PANE" bash "$AI" decide "$PANE" auto '' '' 2>&1)"; RC=$?
-chk "auto send with a control key escalates (rc=4)" "[ $RC -eq 4 ]"
-chk "control-key rejection escalates to the user" "printf '%s' \"\$OUT\" | grep -q '无人值守'"
-
-mkbrain menu '{"action":"send","text":"1","keys":["Enter"],"safe":true,"persistent":false,"reason":"menu yes","pane_state":"blocked","goal_status":"working","risk":"low","evidence":[]}'
-OUT="$(TMUX_PANE="$PANE" bash "$AI" decide "$PANE" auto '' '' 2>&1)"; RC=$?
-chk "menu answer (digit + Enter) is delivered in auto mode (rc=0)" "[ $RC -eq 0 ]"
-chk "menu answer actually reached the pane" \
-  "tmux capture-pane -p -t '$PANE' | grep -q 'command not found: 1'"
-
-mkbrain persist '{"action":"send","text":"","keys":["Down","Enter"],"safe":true,"persistent":true,"reason":"always allow it","pane_state":"blocked","goal_status":"working","risk":"low","evidence":[]}'
-OUT="$(TMUX_PANE="$PANE" bash "$AI" decide "$PANE" auto safe-auto '' 2>&1)"; RC=$?
-chk "persistent pick without always-allow policy escalates (rc=4)" "[ $RC -eq 4 ]"
-OUT="$(TMUX_PANE="$PANE" bash "$AI" decide "$PANE" auto always-allow '' 2>&1)"; RC=$?
-chk "persistent pick under always-allow is delivered (rc=0)" "[ $RC -eq 0 ]"
-
-tmux set -gu @radar-ai-autonomy 2>/dev/null || true
-unset TMUX_RADAR_AI_CMD TMUX_RADAR_AI_AUTONOMY
 tmux -L radarreg kill-server 2>/dev/null || true
 
-rm -f /tmp/PWNED_BY_ASK
+tmux -L radarreg kill-server 2>/dev/null || true
+
 echo
 echo "=============================="
 echo "PASS=$PASS FAIL=$FAIL"

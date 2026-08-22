@@ -5,7 +5,7 @@
 - Status: Active
 - Last refreshed: 2026-08-21
 - Primary product surface: the `fzf` popup opened by `prefix + C-w`
-- Supporting surfaces: pane preview, pane MRU toggle, AI lifecycle marks, status chips, live scanner, and the optional supervisor
+- Supporting surfaces: pane preview, pane MRU toggle, AI lifecycle marks, status chips, and the live scanner
 - Evidence reviewed:
   - historical picker at `v0.1.3` / `6ee7afc`, especially `scripts/switcher.sh`, `README.md`, and `tests/test_switcher.sh`;
   - the interaction commits `6e27cd4`, `7864f66`, and `4891290`;
@@ -43,7 +43,7 @@ Non-goals:
 - Presenting idle or long-finished agent panes as if they were active work.
 - Auto-killing or closing user panes because an agent appears idle or finished.
 - Showing paneless/background sessions as fake tmux destinations.
-- Replacing the existing notifier, registry, supervisor, or fzf dependency.
+- Replacing the existing notifier, registry, or fzf dependency.
 - Rewriting the picker as a native Go TUI.
 
 Success signals:
@@ -256,8 +256,8 @@ reviewed; public `mark` API rows are eligible on the same contract.
 
 Explicit exclusions:
 
-- paneless/background marks and supervisor-only sessions (they notify through
-  the chip strip, never through a fake destination);
+- paneless/background marks (they notify through the chip strip, never
+  through a fake destination);
 - IDLE panes — an idle agent reads as a free shell and earns no row;
 - stale claims the scanner has already contradicted (healed marks, waiting
   rows downgraded by observed working).

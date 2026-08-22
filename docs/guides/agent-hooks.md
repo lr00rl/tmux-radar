@@ -197,5 +197,5 @@ vendor configuration file and lifecycle mapping.
    interrupts, completion, and session cleanup.
 
 Do not add vendor-specific state mutations beside the shared event layer. A
-single normalized path keeps session identity, notification semantics, and
-supervisor delivery consistent across agents.
+single normalized path keeps session identity and notification semantics
+consistent across agents.

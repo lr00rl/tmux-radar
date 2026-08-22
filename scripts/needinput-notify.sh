@@ -249,30 +249,6 @@ _drain_spool() {  # replay spooled events; call WITHOUT the lock held
   RADAR_DRAINING=0
 }
 
-_watch_field() {
-  awk -F= -v key="$2" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$1" 2>/dev/null || true
-}
-
-_watch_event() {  # _watch_event <pane> <kind> <source> <label>
-  local pane="$1" kind="$2" source="$3" label="$4" wf run_dir run_id
-  [ -n "$pane" ] || return 0
-  wf="$STATE_DIR/ai-watch/$(printf '%s' "$pane" | tr -c 'A-Za-z0-9' '_').watch"
-  [ -r "$wf" ] || return 0
-  run_dir="$(_watch_field "$wf" run_dir)"
-  run_id="$(_watch_field "$wf" run_id)"
-  [ -d "$run_dir" ] && [ -n "$run_id" ] || return 0
-  if [ -n "${TMUX_RADAR_TEST_BEFORE_WATCH_EMIT:-}" ]; then
-    printf 'ready\n' > "$TMUX_RADAR_TEST_BEFORE_WATCH_EMIT.ready"
-    while [ -e "$TMUX_RADAR_TEST_BEFORE_WATCH_EMIT" ]; do sleep 0.01; done
-    rm -f "$TMUX_RADAR_TEST_BEFORE_WATCH_EMIT.ready"
-  fi
-  if ! TMUX_RADAR_EXPECT_RUN_ID="$run_id" \
-    "$SCRIPT_DIR/ai.sh" emit-event "$pane" "$kind" "$source" "$(_san "$label")" >/dev/null; then
-    echo "tmux-radar: failed to enqueue $kind for $pane (run $run_id)" >&2
-    return 1
-  fi
-}
-
 # One tmux round-trip: "<pane_id> <on_screen 0|1>" per live pane, records
 # joined with \001 (BSD awk rejects newlines in -v values).
 _pane_map() {
@@ -1241,8 +1217,6 @@ cmd_claude_mark() {  # Notification hook (permission request / waiting on you)
   if [ "$PANE" = "-" ]; then
     [ "$(opt @radar-claude-bg on)" = "on" ] || exit 0
     msg="Claude·${WHERE:-bg}: ${msg}"
-  else
-    _watch_event "$PANE" input_required claude "$msg"
   fi
   [ "$(opt @radar-needinput on)" = "on" ] || exit 0
   cmd_mark "$PANE" claude "$msg" "$KEY"
@@ -1256,8 +1230,6 @@ cmd_claude_stop() {  # Stop hook (turn finished — your move)
   if [ "$PANE" = "-" ]; then
     [ "$(opt @radar-claude-bg on)" = "on" ] || exit 0
     msg="Claude·${WHERE:-bg}: finished — your turn"
-  else
-    _watch_event "$PANE" turn_complete claude "$msg"
   fi
   [ "$(opt @radar-needinput on)" = "on" ] || exit 0
   cmd_mark "$PANE" claude "$msg" "$KEY"
@@ -1267,9 +1239,6 @@ cmd_claude_clear() {  # UserPromptSubmit hook (you replied)
   local json; json="$(cat 2>/dev/null || true)"
   _claude_target "$json"
   _claude_adopt working "$json"
-  if [ "$PANE" != "-" ] && [ -n "$PANE" ]; then
-    _watch_event "$PANE" user_resumed claude 'Claude resumed by user'
-  fi
   if [ -n "$KEY" ] && [ "${KEY#s:}" != "$KEY" ]; then cmd_clear_key "$KEY"
   elif [ "$PANE" != "-" ] && [ -n "$PANE" ]; then cmd_clear_pane "$PANE"
   fi
@@ -1376,8 +1345,6 @@ cmd_codex_hook() {  # Codex native hooks pass JSON on stdin
     UserPromptSubmit)
       _codex_adopt working "$json" "$pane"
       if [ -n "$pane" ]; then
-        label="$(_codex_label "$event" "$json")"
-        _watch_event "$pane" user_resumed codex "$label"
         [ -n "$CODEX_KEY" ] && cmd_clear_key "$CODEX_KEY"
         cmd_clear_pane "$pane"  # also clears pre-registry pane-keyed marks
       fi
@@ -1388,7 +1355,6 @@ cmd_codex_hook() {  # Codex native hooks pass JSON on stdin
       label="$(_codex_label "$event" "$json")"
       if [ "$kind" = "turn_complete" ]; then _codex_adopt "done" "$json" "$pane"
       else _codex_adopt waiting "$json" "$pane"; fi
-      _watch_event "$pane" "$kind" codex "$label"
       [ "$(opt @radar-needinput on)" = "on" ] || exit 0
       cmd_mark "$pane" codex "$label" "$CODEX_KEY"
       ;;
@@ -1404,8 +1370,6 @@ cmd_codex() {  # Codex notify passes its event JSON as the last argv argument
     UserPromptSubmit)
       _codex_adopt working "$json" "$pane"
       if [ -n "$pane" ]; then
-        label="$(_codex_label "$type" "$json")"
-        _watch_event "$pane" user_resumed codex "$label"
         [ -n "$CODEX_KEY" ] && cmd_clear_key "$CODEX_KEY"
         cmd_clear_pane "$pane"  # also clears pre-registry pane-keyed marks
       fi
@@ -1416,7 +1380,6 @@ cmd_codex() {  # Codex notify passes its event JSON as the last argv argument
       label="$(_codex_label "$type" "$json")"
       if [ "$kind" = "turn_complete" ]; then _codex_adopt "done" "$json" "$pane"
       else _codex_adopt waiting "$json" "$pane"; fi
-      _watch_event "$pane" "$kind" codex "$label"
       [ "$(opt @radar-needinput on)" = "on" ] || exit 0
       cmd_mark "$pane" codex "$label" "$CODEX_KEY"
       ;;
@@ -1491,7 +1454,6 @@ _opencode_mark_locked() {  # <pane|-> <label> <key>
 
 _opencode_event() {  # _opencode_event <one JSON object>
   local json="$1" event sid key pane pid cwd msg where label
-  local generation generation_started sequence watch_kind=""
   event="$(_json_field event "$json")"
   [ -n "$event" ] || return 0
   sid="$(_json_field session_id "$json")"
@@ -1521,17 +1483,14 @@ _opencode_event() {  # _opencode_event <one JSON object>
     user)
       _reg_upsert_locked opencode "$key" "$pid" "${pane:--}" working "$cwd" opencode
       _drop_rows '$4 == k' -v k="$key"
-      watch_kind=user_resumed
       ;;
     permission|input)
       _reg_upsert_locked opencode "$key" "$pid" "${pane:--}" waiting "$cwd" opencode
       if [ "$(opt @radar-needinput on)" = "on" ]; then
         if [ "$event" = "input" ]; then
           label="opencode needs your input${msg:+: $msg}"
-          watch_kind=input_required
         else
           label="opencode needs approval${msg:+: $msg}"
-          watch_kind=approval
         fi
         [ -n "$pane" ] || label="opencode·${where:-bg}: ${label#opencode }"
         _opencode_mark_locked "${pane:--}" "$label" "$key"
@@ -1543,7 +1502,6 @@ _opencode_event() {  # _opencode_event <one JSON object>
         label="opencode finished — your turn"
         [ -n "$pane" ] || label="opencode·${where:-bg}: finished — your turn"
         _opencode_mark_locked "${pane:--}" "$label" "$key"
-        watch_kind=turn_complete
       fi
       ;;
     error)
@@ -1559,8 +1517,6 @@ _opencode_event() {  # _opencode_event <one JSON object>
       ;;
   esac
   unlock
-  [ -n "$watch_kind" ] && [ -n "$pane" ] &&
-    _watch_event "$pane" "$watch_kind" opencode "${label:-opencode resumed}"
   _refresh_titles
   _sync_bar
 }
@@ -1645,7 +1601,7 @@ _agent_display_name() {
 
 _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
   local kind="$1" event="$2" json="$3" sid key pane pid cwd proc detail
-  local agent display label="" watch_kind="" state=working event_rc=0
+  local agent display label="" state=working
   _agent_kind_valid "$kind" || {
     echo "agent-event: invalid agent kind" >&2
     return 2
@@ -1697,14 +1653,12 @@ _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
       label="$display needs approval${detail:+: $detail}"
       [ "$(opt @radar-needinput on)" = "on" ] &&
         _session_mark_locked "$pane" "$kind" "$label" "$key"
-      watch_kind=approval
       ;;
     input_required)
       _reg_upsert_locked "$kind" "$key" "$pid" "$pane" waiting "$cwd" "$proc"
       label="$display needs your input${detail:+: $detail}"
       [ "$(opt @radar-needinput on)" = "on" ] &&
         _session_mark_locked "$pane" "$kind" "$label" "$key"
-      watch_kind=input_required
       ;;
     approval_resolved|user_resumed|interrupt)
       _reg_upsert_locked "$kind" "$key" "$pid" "$pane" working "$cwd" "$proc"
@@ -1714,14 +1668,12 @@ _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
         interrupt) label="$display interrupted by user" ;;
         *) label="$display resumed by user" ;;
       esac
-      watch_kind=user_resumed
       ;;
     turn_complete)
       _reg_upsert_locked "$kind" "$key" "$pid" "$pane" "done" "$cwd" "$proc"
       label="$display finished - your turn${detail:+: $detail}"
       [ "$(opt @radar-needinput on)" = "on" ] &&
         _session_mark_locked "$pane" "$kind" "$label" "$key"
-      watch_kind=turn_complete
       ;;
     session_end)
       _reg_remove_locked "$key"
@@ -1730,12 +1682,9 @@ _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
   esac
   unlock
 
-  if [ -n "$watch_kind" ] && [ "$pane" != "-" ]; then
-    _watch_event "$pane" "$watch_kind" "$kind" "$label" || event_rc=$?
-  fi
   _refresh_titles || true
   _sync_bar || true
-  return "$event_rc"
+  return 0
 }
 
 cmd_agent_event() {  # agent-event <agent-kind> <normalized-event>

@@ -81,6 +81,13 @@ mkdir -p "$STATE_DIR"
 
 have_tmux() { command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2>&1; }
 
+# tmux-resurrect / continuum restore creates sessions and switches windows in a
+# burst. Those events are topology, not user focus: skip focus-clears and
+# hook-driven ticks until restore-end. Set by restore-begin.
+_restoring() {
+  [ "$(tmux show-option -gqv @radar-restoring 2>/dev/null || true)" = 1 ]
+}
+
 # Use an OS lock primitive instead of a shell-level reaper protocol. macOS
 # shlock publishes with link(2) and reaps dead PIDs; Linux flock is released by
 # the kernel when the process exits. Legacy directory locks are migrated only
@@ -200,8 +207,10 @@ _schedule_tick() {  # _schedule_tick <delay-seconds> <stamp-file>
   [ "$due" -le "$now" ] || return 0               # one pending tick is enough
   printf '%s\n' "$((now + delay))" > "$stamp" 2>/dev/null || true
   # embed the state env: run-shell executes in the tmux server's environment,
-  # which does not carry a custom TMUX_RADAR_* setup
-  tmux run-shell -b "sleep $delay; TMUX_RADAR_STATE_DIR=$(printf '%q' "$STATE_DIR") TMUX_RADAR_NEEDINPUT_FILE=$(printf '%q' "$STATE_FILE") TMUX_RADAR_REGISTRY_FILE=$(printf '%q' "$REG_FILE") $(printf '%q' "$SCRIPT_DIR/needinput-notify.sh") tick" \
+  # which does not carry a custom TMUX_RADAR_* setup. hook-tick (not tick): a
+  # delayed resync is a tmux run-shell, and a non-zero exit becomes
+  # `'… tick' returned 1` on every attached client.
+  tmux run-shell -b "sleep $delay; TMUX_RADAR_STATE_DIR=$(printf '%q' "$STATE_DIR") TMUX_RADAR_NEEDINPUT_FILE=$(printf '%q' "$STATE_FILE") TMUX_RADAR_REGISTRY_FILE=$(printf '%q' "$REG_FILE") $(printf '%q' "$SCRIPT_DIR/needinput-notify.sh") hook-tick || true" \
     >/dev/null 2>&1 || true
 }
 
@@ -662,6 +671,11 @@ cmd_clear_key()  { [ -n "${1:-}" ] || exit 0; lock_or_error || return 1; _drop_r
 cmd_clear_pane() {
   local target="${1:-${TMUX_PANE:-}}" pane="" resolved=""
   [ -n "$target" ] || exit 0
+  # ':' is tmux's "current session". An empty #{hook_session_name} produces it
+  # and would clear whatever pane is focused now, not the session that changed.
+  case "$target" in :) return 0 ;; esac
+  # Restore creates and selects windows; that is topology, not "the user read this".
+  _restoring && return 0
   # Hooks may provide a pane, window, or session target. Resolve it once to the
   # currently focused pane, then clear that exact unread item. Never broaden a
   # focus event to every pane in the window.
@@ -670,9 +684,14 @@ cmd_clear_pane() {
   fi
   case "$resolved" in %*) pane="$resolved" ;; esac
   if [ -z "$pane" ]; then
-    case "$target" in %*) pane="$target" ;; *) exit 0 ;; esac
+    case "$target" in %*) pane="$target" ;; *) return 0 ;; esac
   fi
-  lock_or_error || return 1
+  if ! lock_or_error; then
+    # Focus-clear is best-effort: a later real focus or tick retries. Never
+    # exit 1 here — tmux run-shell would print `'… clear' returned 1`.
+    _schedule_tick 2 "$STATE_DIR/.drain-at"
+    return 0
+  fi
   _drop_rows '$1 == p' -v p="$pane"
   unlock
   _sync_bar
@@ -822,6 +841,28 @@ cmd_tick() {
   _scan_live "$snapshot"
   _refresh_titles
   _sync_bar
+}
+
+# Hook-facing tick: never report failure to tmux. Lock miss or a set -e abort
+# inside tick becomes a short scheduled retry. Picker still calls cmd_tick
+# directly so a stuck lock remains a visible cleanup failure there.
+cmd_hook_tick() {
+  _restoring && return 0
+  ( cmd_tick ) && return 0
+  _schedule_tick 2 "$STATE_DIR/.drain-at"
+  return 0
+}
+
+cmd_restore_begin() {
+  have_tmux || return 0
+  tmux set-option -g @radar-restoring 1 >/dev/null 2>&1 || true
+  return 0
+}
+
+cmd_restore_end() {
+  have_tmux && tmux set-option -gu @radar-restoring >/dev/null 2>&1 || true
+  _schedule_tick 1 "$STATE_DIR/.restore-at"
+  return 0
 }
 # --- live agent scanner (see file header) ------------------------------------
 # Pull-based complement to the push hooks: classify every pane hosting a
@@ -1023,7 +1064,7 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
     th="$(printf '%s' "$title" | cksum)"; th="${th%% *}"
     # One capture per agent pane per scan: cheap at scan cadence, and the
     # working/stalled verdict stays exact even across title-only changes.
-    sh="$(tmux capture-pane -p -t "$pane" 2>/dev/null | cksum)"; sh="${sh%% *}"
+    sh="$(tmux capture-pane -p -t "$pane" 2>/dev/null | cksum || true)"; sh="${sh%% *}"
     case "$title" in
       # Codex animates an attention marker into its native title while blocked
       # on approval; change detection alone would read it as working.
@@ -1831,6 +1872,9 @@ case "${1:-}" in
   clear-window)  shift; cmd_clear_window "${1:-}" ;;
   clear-all)     cmd_clear_all ;;
   tick)          cmd_tick ;;
+  hook-tick)       cmd_hook_tick ;;
+  restore-begin)   cmd_restore_begin ;;
+  restore-end)     cmd_restore_end ;;
   claude-mark)     cmd_claude_mark ;;
   claude-stop)     cmd_claude_stop ;;
   claude-clear)    cmd_claude_clear ;;
@@ -1849,5 +1893,5 @@ case "${1:-}" in
   agent-panes)     _agent_panes | tr '\001' '\n' ;;  # debug: which panes host an agent
   resolve-pane)    _resolve_pane_by_proc ;;          # debug: pane of this process tree
   resolve-cwd)     shift; _resolve_pane_by_cwd "${1:-$PWD}" ;;  # debug: pane owning a cwd
-  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|claude-mark|claude-stop|claude-clear|claude-register|claude-end|codex-hook|codex <json>|opencode-hook|opencode-stream|kimi-hook|agent-event <kind> <event>|agent-register <kind> <key> <pid> <pane> [cwd]|agent-end <kind> <key>|registry|doctor|agent-panes|resolve-pane|resolve-cwd [cwd]}" >&2; exit 2 ;;
+  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|hook-tick|restore-begin|restore-end|claude-mark|claude-stop|claude-clear|claude-register|claude-end|codex-hook|codex <json>|opencode-hook|opencode-stream|kimi-hook|agent-event <kind> <event>|agent-register <kind> <key> <pid> <pane> [cwd]|agent-end <kind> <key>|registry|doctor|agent-panes|resolve-pane|resolve-cwd [cwd]}" >&2; exit 2 ;;
 esac

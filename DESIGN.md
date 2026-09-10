@@ -355,6 +355,12 @@ severe first, at most two groups with counts: `⚠` needs you, `✓` done unread
   `clear-window`. The explicit public `clear-window` command remains available.
 - Focus/MRU hooks occupy fixed high indexed slots. Upgrade migration removes
   only legacy commands owned by tmux-radar and preserves foreign hooks.
+- tmux-resurrect / continuum restore is topology, not focus. The plugin sets
+  `@radar-restoring` around restore, skips focus-clears, MRU writes, and
+  hook-ticks, then schedules one quiet GC. An empty `#{hook_session_name}`
+  (`clear ':'`) is not the current session. Hook-invoked `run-shell` commands
+  exit 0; the picker still calls `tick` synchronously so a stuck lock remains
+  a visible cleanup failure there.
 - Tests must cover current and dense fixtures without relying on fixed shared
   tmux sockets.
 
@@ -390,7 +396,11 @@ Required end-to-end checks:
     window in Recent, and never duplicate pane leaves within one link/group.
 12. Entering and leaving an empty Agents view updates and removes the
     empty-state header in the same atomic fzf reload transaction.
-13. Hook migration preserves pre-existing foreign indexed hooks.
+13. Hook migration preserves pre-existing foreign indexed hooks. Restore
+    compose prepends `restore-begin` / `restore-end`, replaces a radar `tick`
+    workaround, keeps a foreign resurrect hook, and does not stack on reload.
+    A restore-time focus storm leaves unread marks in place and never prints
+    `'… returned 1'`; `clear ':'` is a no-op.
 14. The scanner adopts a hookless agent pane into `ai-live` and the registry,
     classifies a changing screen as working and a static one as stalled, and
     honors an `Action Required` title as blocked; an agent-sourced mark heals

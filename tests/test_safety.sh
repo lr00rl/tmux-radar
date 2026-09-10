@@ -206,6 +206,56 @@ chk "invalid Kimi Stop payload cannot block turn completion" \
 chk "invalid Kimi Stop payload leaves state untouched" "[ ! -s '$REG' ] && [ ! -s '$MARKS' ]"
 
 echo
+echo "### restore / hook silence: colon target, lock miss, focus storm"
+"$N" clear-all >/dev/null 2>&1 || true
+rm -rf "$LOCK"
+"$N" mark "$PANE" tool "keep-colon" k:colon
+COLON_RC=0
+"$N" clear ':' >/dev/null 2>&1 || COLON_RC=$?
+chk "clear ':' exits 0" "[ '$COLON_RC' -eq 0 ]"
+chk "clear ':' does not alias the current session pane" "grep -q 'k:colon' '$MARKS'"
+
+"$N" restore-begin
+RESTORE_CLEAR_RC=0
+"$N" clear "$PANE" >/dev/null 2>&1 || RESTORE_CLEAR_RC=$?
+chk "clear during restore exits 0" "[ '$RESTORE_CLEAR_RC' -eq 0 ]"
+chk "restore is not user focus: marks survive the storm" "grep -q 'k:colon' '$MARKS'"
+PIDS=""
+for i in 1 2 3 4 5 6 7 8; do
+  "$N" clear "$PANE" >/dev/null 2>&1 &
+  PIDS="$PIDS $!"
+  "$N" hook-tick >/dev/null 2>&1 &
+  PIDS="$PIDS $!"
+done
+STORM_RC=0
+for p in $PIDS; do
+  wait "$p" || STORM_RC=1
+done
+chk "restore hook storm never reports failure" "[ '$STORM_RC' -eq 0 ]"
+chk "restore hook storm does not consume the unread mark" "grep -q 'k:colon' '$MARKS'"
+"$N" restore-end
+chk "restore-end drops the restoring flag" \
+  "[ -z \"\$(tmux show-option -gqv @radar-restoring 2>/dev/null || true)\" ]"
+"$N" clear "$PANE"
+chk "after restore, a real focus-clear still works" \
+  "! grep -q 'k:colon' '$MARKS' 2>/dev/null || ! [ -s '$MARKS' ]"
+
+sleep 30 & HOOK_LOCK_HOLDER=$!
+mkdir -p "$LOCK"; printf '%s' "$HOOK_LOCK_HOLDER" > "$LOCK/pid"
+TICK_RC=0
+"$N" tick >/dev/null 2>&1 || TICK_RC=$?
+HOOK_TICK_RC=0
+"$N" hook-tick >/dev/null 2>&1 || HOOK_TICK_RC=$?
+CLEAR_LOCK_RC=0
+"$N" clear "$PANE" >/dev/null 2>&1 || CLEAR_LOCK_RC=$?
+chk "picker tick still fails when the state lock is held" "[ '$TICK_RC' -ne 0 ]"
+chk "hook-tick lock miss is silent" "[ '$HOOK_TICK_RC' -eq 0 ]"
+chk "hook clear lock miss is silent" "[ '$CLEAR_LOCK_RC' -eq 0 ]"
+kill "$HOOK_LOCK_HOLDER" 2>/dev/null
+wait "$HOOK_LOCK_HOLDER" 2>/dev/null || true
+rm -rf "$LOCK"
+
+echo
 echo "### #12 HIGH: custom vendor adapters fail open on validation/notifier errors"
 ADAPTER="$WT/examples/hooks/custom-agent-adapter.sh"
 cat > "$T/adapter-notify" <<'EOF'

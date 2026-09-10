@@ -9,10 +9,17 @@
 # this one recorder.
 set -euo pipefail
 
+if [ "$(tmux show-option -gqv @radar-restoring 2>/dev/null || true)" = 1 ]; then
+  exit 0
+fi
+
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
 MRU_FILE="${TMUX_RADAR_MRU_FILE:-${TMUX_SWITCHER_MRU_FILE:-$STATE_DIR/window-mru}}"
 PANE_MRU_FILE="${TMUX_RADAR_PANE_MRU_FILE:-$STATE_DIR/pane-mru}"
 target="${1:-}"
+# Empty #{hook_session_name} expands to ':'. That is "current session", not a
+# session-changed event we can record.
+case "$target" in :) exit 0 ;; esac
 
 if [ -n "$target" ]; then
   ids="$(tmux display-message -p -t "$target" '#{window_id} #{pane_id}' 2>/dev/null || true)"

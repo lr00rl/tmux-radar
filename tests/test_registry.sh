@@ -361,6 +361,33 @@ chk "pane-change hook clears the selected pane" \
   "printf '%s\n' \"\$HOOK_TEXT\" | grep 'window-pane-changed' | grep -q \"needinput-notify.sh clear '#{hook_pane}'\""
 chk "window-change hook resolves only the newly active pane" \
   "printf '%s\n' \"\$HOOK_TEXT\" | grep 'session-window-changed' | grep -q \"needinput-notify.sh clear '#{hook_window}'\""
+chk "session-change bar resync uses the silent hook-tick" \
+  "printf '%s\n' \"\$HOOK_TEXT\" | grep 'client-session-changed' | grep -q 'needinput-notify.sh hook-tick'"
+chk "focus/MRU/tick hooks never report a failing run-shell to tmux" \
+  "! printf '%s\n' \"\$HOOK_TEXT\" | grep -F '$WT/scripts' | grep -v '|| true'"
+
+# Plugin owns the resurrect handshake so continuum restore is a bulk
+# topology change, not a storm of focus-clears. A documented tick
+# workaround is replaced; a foreign hook is preserved beside ours.
+tmux set -g @resurrect-hook-pre-restore-all 'echo user-pre-restore'
+tmux set -g @resurrect-hook-post-restore-all "run-shell -b \"$WT/scripts/needinput-notify.sh tick >/dev/null 2>&1\""
+bash "$WT/tmux-radar.tmux"
+PRE_HOOK="$(tmux show-option -gqv @resurrect-hook-pre-restore-all)"
+POST_HOOK="$(tmux show-option -gqv @resurrect-hook-post-restore-all)"
+chk "plugin prepends restore-begin and keeps a foreign pre-restore hook" \
+  "printf '%s' \"\$PRE_HOOK\" | grep -q 'needinput-notify.sh restore-begin' && printf '%s' \"\$PRE_HOOK\" | grep -q 'echo user-pre-restore'"
+chk "plugin replaces the README tick workaround with restore-end" \
+  "printf '%s' \"\$POST_HOOK\" | grep -q 'needinput-notify.sh restore-end' && ! printf '%s' \"\$POST_HOOK\" | grep -q 'needinput-notify.sh tick'"
+tmux set -g @resurrect-hook-post-restore-all 'echo user-post-restore'
+bash "$WT/tmux-radar.tmux"
+POST_HOOK="$(tmux show-option -gqv @resurrect-hook-post-restore-all)"
+chk "plugin prepends restore-end and keeps a foreign post-restore hook" \
+  "printf '%s' \"\$POST_HOOK\" | grep -q 'needinput-notify.sh restore-end' && printf '%s' \"\$POST_HOOK\" | grep -q 'echo user-post-restore'"
+# reload must not stack the wrap
+bash "$WT/tmux-radar.tmux"
+POST_HOOK2="$(tmux show-option -gqv @resurrect-hook-post-restore-all)"
+chk "resurrect wrap is idempotent across plugin reloads" \
+  "[ \"\$(printf '%s' \"\$POST_HOOK2\" | grep -o 'restore-end' | wc -l | tr -d ' ')\" -eq 1 ]"
 
 # --- 10. doctor runs clean ----------------------------------------------------
 "$N" doctor > "$T/doctor.out" 2>"$T/doctor.err"

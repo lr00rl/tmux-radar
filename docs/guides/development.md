@@ -10,7 +10,7 @@ tmux-radar has four cooperating parts:
 
 | Part | Main paths | Responsibility |
 | --- | --- | --- |
-| tmux entry | `tmux-radar.tmux` | Binds the picker and last-pane keys, installs the focus/MRU hooks, wires the chip strip. |
+| tmux entry | `tmux-radar.tmux` | Binds the picker and last-pane keys, installs the focus/MRU hooks, wires the chip strip, composes resurrect pre/post-restore so a restore storm is not treated as user focus. |
 | picker | `scripts/switcher.sh` | Builds Recent/Agents/Tree rows from one bulk tmux snapshot plus the state files, drives fzf, switches to exact pane targets. |
 | notifier | `scripts/needinput-notify.sh`, `scripts/needinput-toast.sh`, `scripts/mru-record.sh` | Owns the mark file, the agent registry, and the live scanner; renders the chip strip; records MRU. |
 | agent bridges | `scripts/install-hooks.sh`, `scripts/codex-notify-wrap.sh`, `scripts/opencode-tmux-notify.js`, `scripts/pi-tmux-notify.ts`, `examples/hooks/custom-agent-adapter.sh` | Normalize vendor lifecycle events into the notifier's `agent-event` API and keep vendor config edits owned and reversible. |

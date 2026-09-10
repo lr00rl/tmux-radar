@@ -319,7 +319,10 @@ switcher.sh menu [recent|agents|tree]   # the picker (inbox/needinput are kept a
 switcher.sh last-pane                   # cross-session pane-MRU toggle
 needinput-notify.sh mark <pane|-> <source> <label> [key]
 needinput-notify.sh clear <target>      # clear marks for a pane/window/session target
-needinput-notify.sh tick                # GC + live scan + bar republish
+needinput-notify.sh tick                # GC + live scan + bar republish (picker; may fail)
+needinput-notify.sh hook-tick           # same work, never a non-zero exit (tmux hooks)
+needinput-notify.sh restore-begin       # @radar-restoring on (resurrect pre-restore)
+needinput-notify.sh restore-end         # flag off + one delayed quiet tick
 needinput-notify.sh doctor              # why-is-this-row-here diagnostics
 needinput-notify.sh agent-event <kind> <event>   # normalized lifecycle event API for other agents
 install-hooks.sh install|status|uninstall
@@ -327,14 +330,25 @@ install-hooks.sh install|status|uninstall
 
 ### tmux-resurrect / restarts
 
-The plugin runs a notifier `tick` on every load, which garbage-collects stale
-AI-status marks (dead panes, exited agents) and refreshes the live scan. If you
-use [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect), wire its
-post-restore hook so the same cleanup runs right after a restore:
+The plugin runs a quiet notifier tick on every load, which garbage-collects
+stale AI-status marks (dead panes, exited agents) and refreshes the live scan.
 
-```tmux
-set -g @resurrect-hook-post-restore-all 'run-shell -b "~/.tmux/plugins/tmux-radar/scripts/needinput-notify.sh tick >/dev/null 2>&1"'
-```
+If [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect) (or
+tmux-continuum auto-restore) rebuilds the layout, that burst of
+session/window/pane events is topology, not "the user read this pane". The
+plugin composes `@resurrect-hook-pre-restore-all` / `post-restore-all` so
+that:
+
+1. focus-clears and hook-driven ticks no-op while restore is in progress
+2. one quiet GC runs after the layout exists
+3. a foreign resurrect hook you already set is kept beside radar's
+4. the old README workaround (`run-shell … needinput-notify.sh tick`) is
+   replaced; `>/dev/null` never hid tmux's `'… returned 1'` messages, which
+   come from the command's exit status
+
+You do not need to set those resurrect options yourself. A hook-invoked
+`clear` or `tick` that hits a busy state lock now retries quietly instead of
+printing `'… returned 1'` on every client.
 
 Stale AI-status marks also self-heal continuously: a mark whose agent TUI has
 exited is dropped on plugin load, while the bar renders, and before every

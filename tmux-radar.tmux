@@ -67,18 +67,20 @@ if [ "$(tmux show-option -gqv @radar-hooked 2>/dev/null || true)" != "$HOOK_VERS
   _remove_legacy_hooks window-pane-changed window
 fi
 
-tmux set-hook -g 'session-window-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_window}'\""
-tmux set-hook -g 'client-session-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_session_name}:'\""
+# `|| true` is load-bearing: tmux prints `'cmd' returned 1` for a background
+# run-shell whose command exits non-zero, even when stdout/stderr are redirected.
+tmux set-hook -g 'session-window-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_window}' || true\""
+tmux set-hook -g 'client-session-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_session_name}:' || true\""
 # pane-level MRU: fires when the active pane changes inside a window
-tmux set-hook -g 'window-pane-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_pane}'\""
+tmux set-hook -g 'window-pane-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_pane}' || true\""
 if [ "$NEEDINPUT" = "on" ]; then
   # Read handling is pane-specific. Resolve session/window targets once to
   # their newly active pane; never consume unread sibling panes.
-  tmux set-hook -g 'session-window-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{hook_window}'\""
-  tmux set-hook -g 'window-pane-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{hook_pane}'\""
-  tmux set-hook -g 'client-session-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{hook_session_name}:'\""
+  tmux set-hook -g 'session-window-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{hook_window}' || true\""
+  tmux set-hook -g 'window-pane-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{hook_pane}' || true\""
+  tmux set-hook -g 'client-session-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{hook_session_name}:' || true\""
   # Session switches change which panes are on screen -> resync the bar.
-  tmux set-hook -g 'client-session-changed[9002]' "run-shell -b \"$SCRIPTS/needinput-notify.sh tick\""
+  tmux set-hook -g 'client-session-changed[9002]' "run-shell -b \"$SCRIPTS/needinput-notify.sh hook-tick || true\""
 else
   tmux set-hook -gu 'session-window-changed[9001]' 2>/dev/null || true
   tmux set-hook -gu 'window-pane-changed[9001]' 2>/dev/null || true
@@ -86,6 +88,24 @@ else
   tmux set-hook -gu 'client-session-changed[9002]' 2>/dev/null || true
 fi
 tmux set-option -g @radar-hooked "$HOOK_VERSION"
+
+# tmux-resurrect eval's these options. Restore is a bulk topology change:
+# begin suppresses focus-clears and hook ticks; end schedules one quiet GC
+# after the layout exists. A documented `tick` workaround is replaced; any
+# other user hook is kept beside ours. Idempotent across plugin reloads.
+_radar_compose_resurrect_hook() {
+  local opt="$1" ours="$2" existing
+  existing="$(tmux show-option -gqv "$opt" 2>/dev/null || true)"
+  case "$existing" in
+    "$ours"|*"needinput-notify.sh restore-"*) return 0 ;;
+    *"needinput-notify.sh"*"tick"*) tmux set-option -g "$opt" "$ours" ;;
+    '') tmux set-option -g "$opt" "$ours" ;;
+    *) tmux set-option -g "$opt" "$ours; $existing" ;;
+  esac
+}
+NOTIFY_Q="$(printf '%q' "$SCRIPTS/needinput-notify.sh")"
+_radar_compose_resurrect_hook @resurrect-hook-pre-restore-all "$NOTIFY_Q restore-begin"
+_radar_compose_resurrect_hook @resurrect-hook-post-restore-all "$NOTIFY_Q restore-end"
 
 # AI-status chips. The strip is pure option content (#{E:@radar-chips}) that
 # the notifier republishes on every event, so a notification never changes the
@@ -116,6 +136,6 @@ if [ "$NEEDINPUT" = "on" ]; then
       ;;
   esac
   # prune marks left over from a previous server / restore on every (re)load;
-  # tick also republishes @radar-chips and heals a pre-inline raised bar
-  tmux run-shell -b "$SCRIPTS/needinput-notify.sh tick" 2>/dev/null || true
+  # hook-tick also republishes @radar-chips and heals a pre-inline raised bar
+  tmux run-shell -b "$SCRIPTS/needinput-notify.sh hook-tick || true" 2>/dev/null || true
 fi

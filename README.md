@@ -391,6 +391,11 @@ two live scans.
 - **Colors show as literal `\033[1;32m` (Linux)** — fixed in current versions
   (colors no longer round-trip through tmux); update the plugin (`prefix + I`
   or `git -C ~/.tmux/plugins/tmux-radar pull`).
+- **Tree/Recent names show `\037` (Linux/WSL)** — some tmux builds
+  vis-escape the 0x1F snapshot delimiter (macOS usually leaves it raw).
+  Current versions decode octal/hex vis forms and still accept a raw
+  delimiter. Update the plugin as above. Native Windows has no tmux;
+  use WSL or another Unix tmux.
 - **A pane stays in the AI status list after I closed the AI TUI** — stale
   marks are GC'd automatically (plugin load / bar render / opening the view).
   Force a pass with `scripts/needinput-notify.sh tick`; see which panes are

@@ -523,14 +523,13 @@ _rewrite() {  # _rewrite <awk-filter-body> [extra awk -v args...]
 }
 
 _restore_title() {  # _restore_title <pane> <saved_title>
-  local pane="$1" saved="$2" cur fallback
+  local pane="$1" saved="$2" cur
   [ "$pane" = "-" ] || [ -z "$pane" ] && return 0
   [ "$(opt @radar-retitle on)" = "off" ] && return 0
   cur="$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)"
   if [ -z "$saved" ]; then
-    fallback="$(tmux display-message -p -t "$pane" '#{window_name}'$'\037''#{pane_current_command}' 2>/dev/null || true)"
-    saved="$(_san "${fallback%%$'\037'*}")"
-    [ -n "$saved" ] || saved="$(_san "${fallback#*$'\037'}")"
+    saved="$(_san "$(tmux display-message -p -t "$pane" '#{window_name}' 2>/dev/null || true)")"
+    [ -n "$saved" ] || saved="$(_san "$(tmux display-message -p -t "$pane" '#{pane_current_command}' 2>/dev/null || true)")"
   fi
   case "$cur" in "⚠ "*|"✓ "*|"! "*|"· "*) tmux select-pane -t "$pane" -T "$saved" 2>/dev/null || true ;; esac
 }
@@ -937,6 +936,16 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       }
       return ""
     }
+    function unvis_sep(s,    i) {
+      sub(/\r$/, "", s)
+      while ((i = index(s, "\\037")) > 0)
+        s = substr(s, 1, i - 1) sep substr(s, i + 4)
+      while ((i = index(s, "\\x1f")) > 0)
+        s = substr(s, 1, i - 1) sep substr(s, i + 4)
+      while ((i = index(s, "\\x1F")) > 0)
+        s = substr(s, 1, i - 1) sep substr(s, i + 4)
+      return s
+    }
     BEGIN { m = split(tolower(cmds), raw, /[[:space:],:]+/); for (i = 1; i <= m; i++) if (raw[i] != "") want[raw[i]] = 1 }
     $0 == "__PANES__"   { mode = 1; next }
     $0 == "__PS__"      { mode = 2; next }
@@ -946,7 +955,8 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
     $0 == "__REG__"     { mode = 5; next }
     $0 == "__END__"     { mode = 0; next }
     mode == 1 {
-      split($0, f, sep)
+      # Raw 0x1F (macOS) or vis-escaped \037/\x1f (Linux, WSL, some Windows tmux)
+      split(unvis_sep($0), f, sep)
       if (f[1] == "") next
       bypid[f[2]] = f[1]; bytty[cleantty(f[3])] = f[1]; livepane[f[1]] = 1
       ppath[f[1]] = f[4]; ptitle[f[1]] = clean(f[5]); ponscreen[f[1]] = f[6]

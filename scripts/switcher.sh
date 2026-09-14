@@ -108,10 +108,25 @@ live_pane_snapshot() {
         if (index(p, home "/") == 1) return "~" substr(p, length(home) + 1)
         return p
       }
+      # tmux -F may emit a raw 0x1F (common on macOS) or vis-escape it as
+      # \037 / \x1f (Linux distros, WSL, some Windows builds). Decode then
+      # split so nawk/gawk/mawk all see the same 12 fields. Do not assign $0:
+      # BSD nawk does not reliably resplit on FS after that.
+      function unvis_sep(s,    i) {
+        sub(/\r$/, "", s)
+        while ((i = index(s, "\\037")) > 0)
+          s = substr(s, 1, i - 1) FS substr(s, i + 4)
+        while ((i = index(s, "\\x1f")) > 0)
+          s = substr(s, 1, i - 1) FS substr(s, i + 4)
+        while ((i = index(s, "\\x1F")) > 0)
+          s = substr(s, 1, i - 1) FS substr(s, i + 4)
+        return s
+      }
       {
-        id=$1; session=clean($2); sid=$3; wid=$4; widx=clean($5)
-        window=clean($6); winactive=$7; pidx=clean($8); paneactive=$9
-        title=clean($10); cmd=clean($11); path=spath(clean($12))
+        split(unvis_sep($0), f, FS)
+        id=f[1]; session=clean(f[2]); sid=f[3]; wid=f[4]; widx=clean(f[5])
+        window=clean(f[6]); winactive=f[7]; pidx=clean(f[8]); paneactive=f[9]
+        title=clean(f[10]); cmd=clean(f[11]); path=spath(clean(f[12]))
         if (title == "") title=cmd
         print id, session, sid, wid, widx, window, winactive, pidx, paneactive, title, cmd, path
       }

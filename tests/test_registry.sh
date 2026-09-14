@@ -26,7 +26,17 @@ echo "test server pane: $PANE  state: $TMUX_RADAR_STATE_DIR"
 tmux set -g status off   # baseline for the exact-restore test
 
 # --- 1. registry: register/alive/crash-GC (pid+argv identity) --------------
-sleep 300 & SLEEP_PID=$!
+# The live pid must sit on this pane's tty. A host-shell `sleep &` has a
+# foreign tty; once list-panes fields parse, the scanner re-homes that row
+# and DROPKEYs the mark as a wrong-pane claim.
+tmux send-keys -t "$PANE" 'sleep 300 &' Enter
+SLEEP_PID=""
+for _i in 1 2 3 4 5 6 7 8 9 10; do
+  SLEEP_PID="$(pgrep -P "$(tmux display-message -p -t "$PANE" '#{pane_pid}')" sleep 2>/dev/null | head -n 1)"
+  [ -n "$SLEEP_PID" ] && break
+  sleep 0.1
+done
+[ -n "$SLEEP_PID" ] || { echo "FAIL: pane-local sleep did not start" >&2; exit 1; }
 "$N" agent-register sleep s:live1 "$SLEEP_PID" "$PANE" /tmp/proj
 chk "register writes a 9-field row" \
   "awk -F'\t' 'NF==9 && \$2==\"s:live1\" && \$1==\"sleep\"' '$REG' | grep -q ."

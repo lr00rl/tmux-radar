@@ -167,6 +167,9 @@ awk -F '\t' '
 if LC_ALL=C grep -q $'\r' "$TMP/tree.plain"; then
   fail 'Tree left a carriage return in user-derived display content'
 fi
+if LC_ALL=C grep -F '\037' "$TMP/tree.plain" >/dev/null; then
+  fail 'Tree leaked vis-escaped tmux field separators into the display'
+fi
 
 PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 1 > "$TMP/tree-expanded.rows"
 strip_ansi < "$TMP/tree-expanded.rows" > "$TMP/tree-expanded.plain"
@@ -183,6 +186,34 @@ PATH="$FAKE_BIN:$PATH" bash "$SWITCHER" list all 0 > "$TMP/all-alias.rows"
 strip_ansi < "$TMP/all-alias.rows" > "$TMP/all-alias.plain"
 cmp -s "$TMP/tree.plain" "$TMP/all-alias.plain" || { diff "$TMP/tree.plain" "$TMP/all-alias.plain" >&2; fail 'all compatibility alias does not resolve to Tree'; }
 printf 'PASS: Tree rests at window level, expands exact panes, and every row is switchable\n'
+
+# Some tmux builds vis-escape 0x1F in -F output as \037 (octal) or \x1f (hex).
+# Force each encoding so the decoder is covered on hosts where live tmux
+# leaves the delimiter unescaped (typical macOS).
+mkdir -p "$TMP/vis-bin"
+for vis_enc in '\037' '\x1f'; do
+  export TMUX_RADAR_TEST_VIS_ENC="$vis_enc"
+  cat > "$TMP/vis-bin/tmux" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = list-panes ]; then
+  "$REAL_TMUX" "$@" | LC_ALL=C awk 'BEGIN { r = ENVIRON["TMUX_RADAR_TEST_VIS_ENC"] } { gsub("\037", r); print }'
+  exit "${PIPESTATUS[0]}"
+fi
+exec "$REAL_TMUX" "$@"
+SH
+  chmod +x "$TMP/vis-bin/tmux"
+  PATH="$TMP/vis-bin:$FAKE_BIN:$PATH" bash "$SWITCHER" list tree 0 > "$TMP/tree-vis.rows"
+  strip_ansi < "$TMP/tree-vis.rows" > "$TMP/tree-vis.plain"
+  assert_live_rows "vis-escaped ($vis_enc) Tree" "$TMP/tree-vis.plain"
+  awk -F '\t' '
+    $2 ~ /^▾ (alpha|beta)$/ { sessions++ }
+    $2 ~ /^  [├└]─ [[:space:]][0-9]+ (zero|one)$/ { windows++ }
+    index($2, "\\037") || index($2, "\\x1f") || index($2, "\\x1F") { leaked++ }
+    END { exit !(sessions == 2 && windows == 3 && leaked+0 == 0) }
+  ' "$TMP/tree-vis.plain" || fail "Tree did not decode vis-escaped tmux separators ($vis_enc)"
+done
+unset TMUX_RADAR_TEST_VIS_ENC
+printf 'PASS: Tree decodes vis-escaped tmux field separators\n'
 
 # A tmux window may be linked into multiple sessions. Tree represents each
 # session/window link once with that link's own coordinate; Recent represents
@@ -736,6 +767,9 @@ printf 'PASS: picker first render observes completed stale-AI cleanup\n'
 # A synchronous cleanup failure must fail the render/reload transaction rather
 # than publishing stale rows as if cleanup succeeded.
 sleep 30 & TICK_HOLDER_PID=$!
+# A prior tick may leave a flock lockfile at this path; the fixture is a
+# legacy directory lock, so drop any leftover file first.
+rm -f "$TMP/state/.need-input.lock"
 mkdir -p "$TMP/state/.need-input.lock"
 printf '%s' "$TICK_HOLDER_PID" > "$TMP/state/.need-input.lock/pid"
 cat > "$FAKE_BIN/fzf" <<'SH'

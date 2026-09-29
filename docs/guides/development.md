@@ -13,6 +13,8 @@ tmux-radar has four cooperating parts:
 | tmux entry | `tmux-radar.tmux` | Binds the picker and last-pane keys, installs the focus/MRU hooks, wires the chip strip, composes resurrect pre/post-restore so a restore storm is not treated as user focus. |
 | picker | `scripts/switcher.sh` | Builds Recent/Agents/Tree rows from one bulk tmux snapshot plus the state files, drives fzf, switches to exact pane targets. |
 | notifier | `scripts/needinput-notify.sh`, `scripts/needinput-toast.sh`, `scripts/mru-record.sh` | Owns the mark file, the agent registry, and the live scanner; renders the chip strip; records MRU. |
+| toast plugin | `claude-plugin/` | A Claude Code function-hook module that shows new marks from other panes as toasts. It reads `needinput-toast.sh feed` and writes nothing. |
+| severity | `scripts/radar-level.sh` | The one definition of a mark's level (`done`, `action`, `notice`), sourced by the notifier, the chip renderer and the picker. Change level rules here and nowhere else. |
 | agent bridges | `scripts/install-hooks.sh`, `scripts/codex-notify-wrap.sh`, `scripts/opencode-tmux-notify.js`, `scripts/pi-tmux-notify.ts`, `examples/hooks/custom-agent-adapter.sh` | Normalize vendor lifecycle events into the notifier's `agent-event` API and keep vendor config edits owned and reversible. |
 
 State lives in `~/.local/state/tmux/`: `need-input` (unread marks),
@@ -30,7 +32,10 @@ visible change (title hash + screen cksum), adopts untracked panes into the
 registry as `p:<pid>` rows, heals marks the screen proves stale (two working
 scans counted from the mark's own epoch), downgrades contradicted `waiting`
 rows, re-homes rows whose pid provably lives on another tty, and synthesizes
-one mark for an off-screen transition into blocked or out of working.
+one mark for an off-screen transition into blocked or out of working. It
+synthesizes nothing on a pane owned by a hook-claimed session of an agent
+listed in `_native_events`; add an agent there only when its adapter reports
+both approval waits and finished turns.
 
 Rules that keep it truthful: empty TSV fields collapse under `IFS=tab` reads
 (use `-` placeholders); an apostrophe inside a single-quoted awk program flips
@@ -70,6 +75,10 @@ These commands are the repository test entry points:
 bash tests/test_switcher.sh      # picker: views, rows, real-fzf key transforms
 bash tests/test_scanner.sh       # scanner: classify/adopt/heal/re-home/synthesize
 bash tests/test_registry.sh      # marks, registry, GC, chips, hooks
+bash tests/test_claude_adapter.sh  # Claude payload and environment handling, severity
+bash tests/test_dialects.sh      # Grok, Cursor, Droid, Gemini, Auggie payloads through one adapter
+bash tests/test_nested.sh        # process-tree matcher: who fired an event, nested runs
+CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude plugin test claude-plugin   # toast plugin
 bash tests/test_safety.sh        # fail-closed notifier and adapter behavior
 bash tests/test_install.sh       # installer ownership/idempotency/rollback
 bash tests/test_opencode_plugin.sh
@@ -78,7 +87,10 @@ shellcheck -S warning scripts/*.sh
 ```
 
 The suites spin up isolated tmux servers (`tmux -L <socket>`) and never touch
-the live one. Two timing traps to remember when a picker test flakes: fixture
+the live one. A suite that calls a `claude-*` subcommand unsets
+`CLAUDE_JOB_DIR`, `CLAUDE_CODE_SESSION_ATTENDED`, `CLAUDE_CODE_ENTRYPOINT`,
+`CLAUDE_CODE_SESSION_KIND` and `CLAUDE_CODE_SESSION_ID` first: run from inside
+an agent, those leak in and change what the hooks under test do. Two timing traps to remember when a picker test flakes: fixture
 panes must not source a user shell rc (rc commands make `pane_current_command`
 nondeterministic — the switcher suite sets `default-command 'bash --norc'`),
 and `pgrep -f` matches the test harness's own command line (take pids from

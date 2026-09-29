@@ -16,6 +16,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$SCRIPT_DIR/switcher.sh"
+# shellcheck source=radar-level.sh
+. "$SCRIPT_DIR/radar-level.sh"
 
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
 WINDOW_MRU_FILE="${TMUX_RADAR_MRU_FILE:-${TMUX_SWITCHER_MRU_FILE:-$STATE_DIR/window-mru}}"
@@ -146,13 +148,13 @@ ai_merged() {
   [ -r "$NEEDINPUT_FILE" ] && marks="$NEEDINPUT_FILE"
   [ -r "$REGISTRY_FILE" ] && reg="$REGISTRY_FILE"
   [ -r "$LIVE_FILE" ] && livef="$LIVE_FILE"
-  LC_ALL=C awk -F '\t' -v OFS='\t' -v mp="$marks" -v rp="$reg" -v lp="$livef" '
+  LC_ALL=C awk -F '\t' -v OFS='\t' -v mp="$marks" -v rp="$reg" -v lp="$livef" "$RADAR_LEVEL_AWK"'
     function clean(s) { gsub(/[[:cntrl:]]/, " ", s); gsub(/[[:space:]][[:space:]]+/, " ", s)
                         sub(/^ /, "", s); sub(/ $/, "", s); return s }
     FILENAME == mp && NF >= 5 && $1 ~ /^%[0-9]+$/ {
-      p=$1; l=tolower(clean($3) " " clean($5))
-      if (l ~ /(finished|your turn|turn complete|task complete|done|任务完成|完成)/) { msev[p]=3; mword[p]="DONE" }
-      else if (l ~ /(needs approval|needs your permission|needs input|waiting.*input|waiting on you|wait.*input|permission|approval|action required|approve|拿不准|需要你|需要.*许可|需要.*批准|等待.*输入)/) { msev[p]=1; mword[p]="ACTION" }
+      p=$1; l=radar_level(clean($3), clean($5))
+      if (l == "done") { msev[p]=3; mword[p]="DONE" }
+      else if (l == "action") { msev[p]=1; mword[p]="ACTION" }
       else { msev[p]=3; mword[p]="NOTICE" }
       mkind[p]=clean($3); mtext[p]=clean($5); mepoch[p]=$2+0; next
     }
@@ -439,19 +441,7 @@ _age_since() {  # _age_since <epoch> -> 45s / 3m / 2h / 1d
   else printf '%sd' $(( s / 86400 )); fi
 }
 
-_level_for() {  # _level_for <source> <label>; mirrors the list awk level_for
-  local l
-  l="$(printf '%s %s' "${1:-}" "${2:-}" | tr '[:upper:]' '[:lower:]')"
-  case "$l" in
-    *finished*|*'your turn'*|*'turn complete'*|*'task complete'*|*done*|*任务完成*|*完成*)
-      printf 'done'; return 0 ;;
-  esac
-  case "$l" in
-    *'needs approval'*|*'needs your permission'*|*'needs input'*|*waiting*input*|*'waiting on you'*|*wait*input*|*permission*|*approval*|*'action required'*|*approve*|*拿不准*|*需要你*|*需要*许可*|*需要*批准*|*等待*输入*)
-      printf 'action'; return 0 ;;
-  esac
-  printf 'notice'
-}
+_level_for() { radar_level "${1:-}" "${2:-}"; }  # _level_for <source> <label>
 
 _pane_status_header() {  # $1 = pane %id; tech header + separator when the pane has a mark/registry row
   local pane="$1" mark="" reg="" live="" level="" icon='·' color="$D" parts kind sid

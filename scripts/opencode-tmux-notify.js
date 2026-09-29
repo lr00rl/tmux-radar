@@ -16,8 +16,15 @@ const brief = (value, max = 180) =>
     .trim()
     .slice(0, max);
 
+// `opencode run` is the headless mode: it loads plugins like the TUI does, but
+// a program reads its output. The subcommand is the first argument that is
+// neither a flag nor a path.
+const isHeadless = () =>
+  process.argv.slice(1).find((arg) => !arg.startsWith("-") && !arg.includes("/")) === "run";
+
 export default async ({ directory, client }) => {
   if (!process.env.TMUX_PANE) return {};
+  if (isHeadless()) return {};
 
   const generationStarted = Date.now();
   const generation = `${generationStarted}:${process.pid}`;

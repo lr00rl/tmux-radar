@@ -1,0 +1,16 @@
+{
+  "name": "tmux-radar",
+  "owner": {
+    "name": "lr00rl",
+    "url": "https://github.com/lr00rl"
+  },
+  "plugins": [
+    {
+      "name": "tmux-radar",
+      "source": "./claude-plugin",
+      "description": "Shows a toast in this Claude Code session when an agent in another tmux pane needs you or finishes.",
+      "version": "0.1.0",
+      "license": "MIT"
+    }
+  ]
+}

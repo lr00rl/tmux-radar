@@ -20,7 +20,10 @@ tmux -L "$SOCKET" -f /dev/null kill-server 2>/dev/null || true
 tmux -L "$SOCKET" -f /dev/null new-session -d -s smoke 2>/dev/null
 SOCK="$(tmux -L "$SOCKET" display-message -p '#{socket_path}')"
 export TMUX="$SOCK,99999,0"
-unset TMUX_PANE CLAUDE_JOB_DIR 2>/dev/null || true
+# the suite may itself run inside an agent, attended or not: none of that
+# session's identity may reach the claude-* hooks under test
+unset TMUX_PANE CLAUDE_JOB_DIR CLAUDE_CODE_SESSION_ATTENDED CLAUDE_CODE_ENTRYPOINT \
+  CLAUDE_CODE_SESSION_KIND CLAUDE_CODE_SESSION_ID 2>/dev/null || true
 PANE="$(tmux list-panes -a -F '#{pane_id}' | head -1)"
 echo "test server pane: $PANE  state: $TMUX_RADAR_STATE_DIR"
 tmux set -g status off   # baseline for the exact-restore test
@@ -170,6 +173,37 @@ chk "dead registry liveness restores the pane title" \
   "[ \"\$(tmux display-message -p -t '$PANE' '#{pane_title}')\" = 'dead-done-title' ]"
 "$N" clear-all
 
+# An expired finished mark hands the title back like every other removal.
+# Source `tool`: no liveness GC applies, so only the done-ttl path can drop it.
+tmux set -g @radar-done-ttl 60
+tmux select-pane -t "$PANE" -T '✓ build finished'
+printf '%s\t%s\ttool\t%s\tbuild finished\tttl-native-title\n' \
+  "$PANE" "$(( $(date +%s) - 3700 ))" "$PANE" > "$MARKS"
+"$N" tick
+chk "done-ttl expiry drops the finished mark" "! grep -q 'build finished' '$MARKS'"
+chk "done-ttl expiry restores the pane title" \
+  "[ \"\$(tmux display-message -p -t '$PANE' '#{pane_title}')\" = 'ttl-native-title' ]"
+tmux set -gu @radar-done-ttl
+"$N" clear-all
+
+# A focus-clear landing while a tick is between reading the marks and writing
+# the titles used to leave the status title behind with no mark under it. The
+# window sits a fraction of a second into the tick, so sweep across it.
+ORPHANS=0
+for delay in 0.05 0.10 0.15 0.20 0.25 0.30; do
+  tmux select-pane -t "$PANE" -T 'race-native-title'
+  "$N" mark "$PANE" tool 'needs input' >/dev/null 2>&1
+  "$N" hook-tick >/dev/null 2>&1 &
+  sleep "$delay"
+  "$N" clear "$PANE" >/dev/null 2>&1
+  wait
+  case "$(tmux display-message -p -t "$PANE" '#{pane_title}')" in
+    '⚠ '*|'✓ '*|'! '*) grep -q . "$MARKS" 2>/dev/null || ORPHANS=$((ORPHANS + 1)) ;;
+  esac
+  "$N" clear-all
+done
+chk "a focus-clear racing a tick never strands a status title" "[ '$ORPHANS' -eq 0 ]"
+
 # --- 5. claude-register / SessionStart stale-ask cleanup --------------------
 env -u CLAUDE_JOB_DIR "$N" mark "$PANE" claude "Claude needs your permission" s:rs1
 printf '{"session_id":"rs1","cwd":"/tmp/proj"}' | env -u CLAUDE_JOB_DIR TMUX_PANE="$PANE" "$N" claude-register
@@ -297,6 +331,18 @@ chk "inline mode never records a prev-status marker" \
   "[ -z \"\$(tmux show-option -gqv @radar-prev-status)\" ]"
 "$N" clear-all
 chk "clear-all empties the chip strip" "[ -z \"\$(tmux show-option -gqv @radar-chips)\" ]"
+
+# The strip is expanded as a tmux format. A name that reaches it must print,
+# never run: "#(cmd)" in a format is a shell command.
+"$N" mark - claude "Claude·#(touch $T/chip-pwned): finished — your turn" s:chip-inject
+# shellcheck disable=SC2034 # consumed by chk's evaluated assertion strings below
+CHIPS="$(tmux show-option -gqv @radar-chips)"
+chk "a '#' in chip text is doubled" "printf '%s' \"\$CHIPS\" | grep -qF '##(touch'"
+chk "no chip text opens a tmux command or style" \
+  "! printf '%s' \"\$CHIPS\" | sed 's/##//g' | grep -qF '#('"
+chk "the strip expands to the literal name" \
+  "tmux display-message -p '#{E:@radar-chips}' | grep -qF '#(touch $T/chip-pwned)'"
+"$N" clear-all
 chk "clear-all leaves the status line count untouched (off)" \
   "[ \"\$(tmux show-option -gv status)\" = 'off' ]"
 
@@ -324,6 +370,37 @@ tmux set -g @radar-bar pinned
 bash "$WT/tmux-radar.tmux"
 chk "pinned bar never reduces an existing status 3" "[ \"\$(tmux show-option -gv status)\" = 3 ]"
 tmux set -gu @radar-bar
+
+# --- 7.5 feed: the marks as plain data for a display outside tmux ---------------
+FEED="$WT/scripts/needinput-toast.sh"
+"$N" clear-all
+tmux rename-window -t smoke:0 'feed-window'
+# source `tool`: a scheduled tick from an earlier section may run meanwhile, and
+# its liveness GC drops agent-sourced marks that no registry row backs
+"$N" mark "$PANE" tool 'Claude needs approval: Bash' s:feed-a
+"$N" mark "$PANE_SIBLING" tool 'Codex finished - your turn: ship it' s:feed-b
+"$N" mark - tool 'Claude·lattice: finished: all tests pass' s:feed-bg
+# shellcheck disable=SC2034 # consumed by chk's evaluated assertion strings below
+FEED_OUT="$("$FEED" feed "$PANE" 2>"$T/feed.err")"
+# shellcheck disable=SC2034
+FEED_SELF="$("$FEED" feed "$PANE" feed-bg 2>/dev/null)"
+# shellcheck disable=SC2034
+FEED_ALL="$("$FEED" feed '' 2>/dev/null)"
+chk "feed runs clean" "! [ -s '$T/feed.err' ]"
+chk "feed opens with the caller's own visibility" \
+  "printf '%s\n' \"\$FEED_OUT\" | head -1 | grep -qE '^self	[01]\$'"
+chk "feed leaves out the caller's own pane" \
+  "! printf '%s\n' \"\$FEED_OUT\" | grep -q 's:feed-a'"
+chk "feed row carries level, window name, label, pane and key" \
+  "printf '%s\n' \"\$FEED_OUT\" | awk -F'\t' '\$6==\"s:feed-b\" && \$2==\"done\" && \$3==\"feed-window\" && \$4==\"Codex finished - your turn: ship it\" && \$5==\"$PANE_SIBLING\" && NF==6' | grep -q ."
+chk "feed names the project of a paneless mark and reads its label plainly" \
+  "printf '%s\n' \"\$FEED_OUT\" | awk -F'\t' '\$6==\"s:feed-bg\" && \$2==\"done\" && \$3==\"lattice\" && \$4==\"Claude finished: all tests pass\" && \$5==\"-\"' | grep -q ."
+chk "feed leaves out the caller's own session" \
+  "! printf '%s\n' \"\$FEED_SELF\" | grep -q 's:feed-bg'"
+chk "feed with no pane still lists every off-screen mark" \
+  "[ \"\$(printf '%s\n' \"\$FEED_ALL\" | grep -c 's:feed-')\" = 3 ]"
+"$N" clear-all
+tmux rename-window -t smoke:0 'smoke'
 
 # --- 8. switcher renders + preview ------------------------------------------
 sleep 300 & S3=$!

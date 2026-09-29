@@ -59,11 +59,17 @@ export KIMI_CONFIG="$T/home/.kimi-code/config.toml"
 export TMUX_RADAR_TEST_KIMI_PRESENT=on
 export OPENCODE_CONFIG_DIR="$T/home/.config/opencode"
 export PI_AGENT_DIR="$T/home/.pi/agent"
-mkdir -p "$T/home/.claude" "$T/home/.codex" "$T/home/.kimi-code" "$OPENCODE_CONFIG_DIR" "$PI_AGENT_DIR"
+export CURSOR_HOOKS="$T/home/.cursor/hooks.json"
+export CURSOR_AGENT_HOME="$T/home/.local/share/cursor-agent"
+export DROID_SETTINGS="$T/home/.factory/settings.json"
+export GEMINI_SETTINGS="$T/home/.gemini/settings.json"
+export AUGGIE_SETTINGS="$T/home/.augment/settings.json"
+mkdir -p "$T/home/.claude" "$T/home/.codex" "$T/home/.kimi-code" "$OPENCODE_CONFIG_DIR" "$PI_AGENT_DIR" \
+  "$T/home/.cursor" "$CURSOR_AGENT_HOME" "$T/home/.factory" "$T/home/.gemini" "$T/home/.augment"
 
 # pre-existing user content that must be preserved
 cat > "$CLAUDE_SETTINGS" <<'JSON'
-{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo mine"}]}]}}
+{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo mine"}]},null]}}
 JSON
 cat > "$CODEX_CONFIG" <<'TOML'
 model = "gpt-5.3-codex"
@@ -80,14 +86,30 @@ timeout = 9
 max_context = 1000000
 TOML
 cp "$KIMI_CONFIG" "$T/kimi.user.before"
+# beside the user's hook: shapes radar does not own (a null, a bare string, a
+# flat entry), which install must step around and uninstall must leave as is
+cat > "$CURSOR_HOOKS" <<'JSON'
+{"version":1,"hooks":{"stop":[{"command":"echo mine"},null,"disabled"]}}
+JSON
+cat > "$GEMINI_SETTINGS" <<'JSON'
+{"general":{"vimMode":true},"hooks":{"AfterAgent":[{"hooks":[{"type":"command","command":"echo mine"}]},null,"off",{"type":"command","command":"echo flat"}],"Custom":[]}}
+JSON
+echo '{"logoAnimation":"off"}' > "$DROID_SETTINGS"
+cp "$CURSOR_HOOKS" "$T/cursor.before"; cp "$GEMINI_SETTINGS" "$T/gemini.before"; cp "$DROID_SETTINGS" "$T/droid.before"
+# radar's hooks in an agent's own file, wherever they sit: <file>
+ours() { jq --arg p "$NOTIFY_PATH " '[.. | objects | .command? | strings | select(startswith($p))] | length' "$1"; }
 
 OUT="$(bash "$IH" install 2>&1)"; RC=$?
 chk "install exits 0 under the GNU-sed shim" "[ $RC -eq 0 ]"
 chk "install never invoked 'sed -i'" "! printf '%s' \"\$OUT\" | grep -q 'sed-shim'"
 
-chk "claude: 5 hooks installed" "[ \$(jq '[.hooks[]?[]?.hooks[]?.command | select(startswith(\"$NOTIFY_PATH \"))] | length' '$CLAUDE_SETTINGS') -eq 5 ]"
+chk "claude: 7 hooks installed" "[ \$(jq '[.hooks[]?[]?.hooks[]?.command | select(startswith(\"$NOTIFY_PATH \"))] | length' '$CLAUDE_SETTINGS') -eq 7 ]"
 chk "claude: SessionStart -> claude-register" "jq -e '[.hooks.SessionStart[]?.hooks[]?.command] | any(endswith(\"claude-register\"))' '$CLAUDE_SETTINGS' >/dev/null"
 chk "claude: SessionEnd -> claude-end" "jq -e '[.hooks.SessionEnd[]?.hooks[]?.command] | any(endswith(\"claude-end\"))' '$CLAUDE_SETTINGS' >/dev/null"
+chk "claude: StopFailure -> claude-fail" "jq -e '[.hooks.StopFailure[]?.hooks[]?.command] | any(endswith(\"claude-fail\"))' '$CLAUDE_SETTINGS' >/dev/null"
+chk "claude: PostToolUse -> claude-resolved" "jq -e '[.hooks.PostToolUse[]?.hooks[]?.command] | any(endswith(\"claude-resolved\"))' '$CLAUDE_SETTINGS' >/dev/null"
+chk "claude: every hook is synchronous, so events keep their order" \
+  "jq -e '[.hooks[]?[]?.hooks[]? | select((.command // \"\") | startswith(\"$NOTIFY_PATH \")) | has(\"async\")] | any | not' '$CLAUDE_SETTINGS' >/dev/null"
 chk "claude: user's own Stop hook preserved" "jq -e '[.hooks.Stop[]?.hooks[]?.command] | any(. == \"echo mine\")' '$CLAUDE_SETTINGS' >/dev/null"
 chk "claude: unrelated keys preserved" "[ \$(jq -r .model '$CLAUDE_SETTINGS') = opus ]"
 
@@ -118,10 +140,34 @@ chk "pi: placeholder substituted with the real (&/# laden) path" \
 chk "pi: extension parses after substitution" \
   "! command -v node >/dev/null || node --check '$PI_AGENT_DIR/extensions/tmux-radar.ts' 2>/dev/null"
 
+chk "cursor: 5 hooks installed" "[ \$(ours '$CURSOR_HOOKS') -eq 5 ]"
+# Cursor and Grok drop a Claude hook that repeats one of theirs command for
+# command; a spelling of its own would make every event fire twice.
+chk "cursor: each event runs the very command its Claude twin runs" \
+  "jq -e --arg n '$NOTIFY_PATH' '[.hooks.sessionStart[0].command, .hooks.beforeSubmitPrompt[0].command, (.hooks.stop | map(objects | .command) | .[1]), .hooks.postToolUse[0].command, .hooks.sessionEnd[0].command] == ([\"claude-register\", \"claude-clear\", \"claude-stop\", \"claude-resolved\", \"claude-end\"] | map(\$n + \" \" + .))' '$CURSOR_HOOKS' >/dev/null"
+chk "cursor: only event names Cursor knows (it rejects the file otherwise)" \
+  "jq -e '.hooks | keys - [\"sessionStart\", \"beforeSubmitPrompt\", \"stop\", \"postToolUse\", \"sessionEnd\"] == []' '$CURSOR_HOOKS' >/dev/null"
+chk "cursor: user's stop hook and the version kept" \
+  "jq -e '(.version == 1) and (.hooks.stop[0].command == \"echo mine\")' '$CURSOR_HOOKS' >/dev/null"
+chk "droid: 6 hooks naming droid, timeouts in seconds" \
+  "[ \$(ours '$DROID_SETTINGS') -eq 6 ] && jq -e '[.hooks[][].hooks[] | select(.command | test(\"hook(-resolved)? droid$\")) | .timeout] | unique == [5]' '$DROID_SETTINGS' >/dev/null"
+chk "droid: tool results take the fast path" \
+  "jq -e '.hooks.PostToolUse[0].hooks[0].command | endswith(\"hook-resolved droid\")' '$DROID_SETTINGS' >/dev/null"
+chk "droid: unrelated settings kept" "jq -e '.logoAnimation == \"off\"' '$DROID_SETTINGS' >/dev/null"
+chk "gemini: 6 hooks under Gemini's event names, timeouts in ms" \
+  "[ \$(ours '$GEMINI_SETTINGS') -eq 6 ] && jq -e '(.hooks | has(\"BeforeAgent\") and has(\"AfterAgent\") and has(\"AfterTool\")) and ([.hooks[][] | objects | (.hooks // [])[] | select(.command | test(\"gemini$\")) | .timeout] | unique == [5000])' '$GEMINI_SETTINGS' >/dev/null"
+chk "gemini: user's AfterAgent hook and settings kept" \
+  "jq -e '(.hooks.AfterAgent[0].hooks[0].command == \"echo mine\") and (.general.vimMode == true)' '$GEMINI_SETTINGS' >/dev/null"
+chk "auggie: 4 hooks, settings file created" "[ \$(ours '$AUGGIE_SETTINGS') -eq 4 ]"
+
 echo
 echo "### idempotency: a second install must not duplicate anything"
+ls "$T/home/.gemini" > "$T/gemini.files"
 bash "$IH" install >/dev/null 2>&1
-chk "claude: still exactly 5 hooks after reinstall" "[ \$(jq '[.hooks[]?[]?.hooks[]?.command | select(startswith(\"$NOTIFY_PATH \"))] | length' '$CLAUDE_SETTINGS') -eq 5 ]"
+chk "cursor/droid/gemini/auggie: no duplicates after reinstall" \
+  "[ \$(ours '$CURSOR_HOOKS')\$(ours '$DROID_SETTINGS')\$(ours '$GEMINI_SETTINGS')\$(ours '$AUGGIE_SETTINGS') = 5664 ]"
+chk "an install that changes nothing writes no backup" "[ \"\$(ls '$T/home/.gemini')\" = \"\$(cat '$T/gemini.files')\" ]"
+chk "claude: still exactly 7 hooks after reinstall" "[ \$(jq '[.hooks[]?[]?.hooks[]?.command | select(startswith(\"$NOTIFY_PATH \"))] | length' '$CLAUDE_SETTINGS') -eq 7 ]"
 chk "claude: SessionEnd survived the legacy-migration pass" "jq -e '[.hooks.SessionEnd[]?.hooks[]?.command] | any(endswith(\"claude-end\"))' '$CLAUDE_SETTINGS' >/dev/null"
 chk "codex: still exactly 3 native hook groups" \
   "[ \$(jq '[.hooks.PermissionRequest[], .hooks.Stop[], .hooks.UserPromptSubmit[] | .hooks[]? | select(.command == \"$NOTIFY_PATH codex-hook\")] | length' '$CODEX_HOOKS_JSON') -eq 3 ]"
@@ -130,12 +176,14 @@ chk "kimi: reinstall keeps one seven-event managed block" \
   "[ \$(grep -cF '# >>> tmux-radar kimi hooks >>>' '$KIMI_CONFIG') -eq 1 ] && [ \$(awk '/# >>> tmux-radar kimi hooks >>>/{inside=1;next}/# <<< tmux-radar kimi hooks <<</{inside=0} inside && /^event = /{n++} END{print n+0}' '$KIMI_CONFIG') -eq 7 ]"
 
 STATUS="$(bash "$IH" status 2>&1)"
-chk "status reports 5/5 claude hooks" "printf '%s' \"\$STATUS\" | grep -q 'Claude hooks installed: 5/5'"
+chk "status reports 7/7 claude hooks" "printf '%s' \"\$STATUS\" | grep -q 'Claude hooks installed: 7/7'"
 chk "status reports all 3 Codex hooks" \
   "[ \$(printf '%s' \"\$STATUS\" | grep -Ec '^Codex native (PermissionRequest|Stop|UserPromptSubmit): installed') -eq 3 ]"
 chk "status reports all 7 Kimi hooks" "printf '%s' \"\$STATUS\" | grep -q 'Kimi hooks installed: 7/7'"
 chk "status reports the opencode plugin" "printf '%s' \"\$STATUS\" | grep -qi 'opencode plugin: installed'"
 chk "status reports the pi extension" "printf '%s' \"\$STATUS\" | grep -qi 'pi extension: installed'"
+chk "status reports Cursor, Droid, Gemini and Auggie in full" \
+  "printf '%s' \"\$STATUS\" | grep -q 'Cursor hooks installed: 5/5' && printf '%s' \"\$STATUS\" | grep -q 'Droid hooks installed: 6/6' && printf '%s' \"\$STATUS\" | grep -q 'Gemini hooks installed: 6/6' && printf '%s' \"\$STATUS\" | grep -q 'Auggie hooks installed: 4/4'"
 
 awk '
   /^# >>> tmux-radar kimi hooks >>>$/ { inside=1 }
@@ -171,7 +219,7 @@ echo "### uninstall under the shim leaves the user's config intact"
 OUT2="$(bash "$IH" uninstall 2>&1)"; RC2=$?
 chk "uninstall exits 0 under the GNU-sed shim" "[ $RC2 -eq 0 ]"
 chk "uninstall never invoked 'sed -i'" "! printf '%s' \"\$OUT2\" | grep -q 'sed-shim'"
-chk "claude: all 5 of our hooks removed" "[ \$(jq '[.hooks[]?[]?.hooks[]?.command | select(startswith(\"$NOTIFY_PATH \"))] | length' '$CLAUDE_SETTINGS') -eq 0 ]"
+chk "claude: all 7 of our hooks removed" "[ \$(jq '[.hooks[]?[]?.hooks[]?.command | select(startswith(\"$NOTIFY_PATH \"))] | length' '$CLAUDE_SETTINGS') -eq 0 ]"
 chk "claude: user's own Stop hook still there" "jq -e '[.hooks.Stop[]?.hooks[]?.command] | any(. == \"echo mine\")' '$CLAUDE_SETTINGS' >/dev/null"
 chk "codex: native hook groups gone" \
   "! grep -qF 'needinput-notify.sh codex-hook' '$CODEX_HOOKS_JSON'"
@@ -183,6 +231,25 @@ chk "kimi: user hook and config survive uninstall" \
   "grep -qF 'echo user-kimi-hook' '$KIMI_CONFIG' && grep -qF 'model = \"kimi-k2\"' '$KIMI_CONFIG' && grep -qF 'max_context = 1000000' '$KIMI_CONFIG'"
 chk "opencode: plugin removed" "[ ! -f '$OPENCODE_CONFIG_DIR/plugins/tmux-radar.js' ]"
 chk "pi: extension removed" "[ ! -f '$PI_AGENT_DIR/extensions/tmux-radar.ts' ]"
+chk "cursor: file back to exactly what the user had" "jq -S . '$CURSOR_HOOKS' | cmp -s - <(jq -S . '$T/cursor.before')"
+chk "gemini: file back to exactly what the user had" "jq -S . '$GEMINI_SETTINGS' | cmp -s - <(jq -S . '$T/gemini.before')"
+chk "droid: file back to exactly what the user had" "jq -S . '$DROID_SETTINGS' | cmp -s - <(jq -S . '$T/droid.before')"
+chk "auggie: none of our hooks left" "[ \$(ours '$AUGGIE_SETTINGS') -eq 0 ]"
+
+echo
+echo "### upgrade: a Claude install from before StopFailure and PostToolUse"
+jq -n --arg n "$NOTIFY_PATH" '{hooks: ([
+    ["SessionStart", "claude-register"], ["Notification", "claude-mark"], ["Stop", "claude-stop"],
+    ["UserPromptSubmit", "claude-clear"], ["SessionEnd", "claude-end"]
+  ] | map({key: .[0], value: [{hooks: [{type: "command", command: ($n + " " + .[1])}]}]}) | from_entries)}' \
+  > "$CLAUDE_SETTINGS"
+UP_STATUS="$(bash "$IH" status 2>&1)"
+chk "status names the events an older install lacks" \
+  "printf '%s' \"\$UP_STATUS\" | grep -qF 'Claude hooks installed: 5/7 (missing: StopFailure PostToolUse; run install)'"
+bash "$IH" install >/dev/null 2>&1
+chk "upgrade adds the two new events and duplicates nothing" \
+  "[ \$(jq '[.hooks[]?[]?.hooks[]?.command | select(startswith(\"$NOTIFY_PATH \"))] | length' '$CLAUDE_SETTINGS') -eq 7 ]"
+bash "$IH" uninstall >/dev/null 2>&1
 
 echo
 echo "### symlinked configs (dotfile repos) must stay symlinks"

@@ -192,6 +192,55 @@ done < "$OPENCODE_STUCK_PIDS"
 chk "host exit without dispose synchronously kills the bridge group" \
   "[ '$host_exit_alive' -eq 0 ]"
 
+# `opencode run` loads plugins too, with nobody at the prompt. The bridge reads
+# the subcommand off its own argv and registers nothing.
+cat > "$T/headless.mjs" <<'JS'
+const { default: plugin } = await import(process.argv[2]);
+const hooks = await plugin({
+  directory: "/tmp/opencode-project",
+  client: { app: { log: async () => {} } },
+});
+process.stdout.write(String(Object.keys(hooks).length));
+// a bridge that did start owns a child process: let it go, or node never exits
+if (hooks.dispose) await hooks.dispose();
+process.exit(0);
+JS
+export OPENCODE_PID_LOG="$T/headless-pids"
+: > "$OPENCODE_PID_LOG"
+chk "opencode run registers no hooks" \
+  "[ \"\$(node '$T/headless.mjs' '$T/plugin.mjs' run 'fix the build')\" = 0 ]"
+chk "opencode run starts no notifier process" "! [ -s '$OPENCODE_PID_LOG' ]"
+chk "a flag ahead of the subcommand does not hide it" \
+  "[ \"\$(node '$T/headless.mjs' '$T/plugin.mjs' --print-logs run)\" = 0 ]"
+chk "the word run inside a path is no subcommand" \
+  "[ \"\$(node '$T/headless.mjs' '$T/plugin.mjs' /work/run/project)\" -gt 0 ]"
+
+# pi loads its extensions in print, json and rpc mode as well; only the TUI
+# has a person in front of it.
+sed "s#__TMUX_RADAR_NOTIFY__#$escaped#g" "$WT/scripts/pi-tmux-notify.ts" > "$T/pi-bridge.mjs"
+cat > "$T/pi-run.mjs" <<'JS'
+const { default: bridge } = await import(process.argv[2]);
+const handlers = {};
+bridge({ on: (name, fn) => { handlers[name] = fn; } });
+const ctx = { cwd: "/tmp/pi-project" };
+if (process.argv[3] !== "none") ctx.mode = process.argv[3];
+handlers.session_start({}, ctx);
+handlers.input({ source: "interactive" }, ctx);
+handlers.agent_end({}, ctx);
+await new Promise((resolve) => setTimeout(resolve, 400));
+JS
+pi_events() {  # pi_events <ctx.mode|none>: how many events reached the notifier
+  export OPENCODE_EVENT_LOG="$T/pi-$1.jsonl" OPENCODE_PID_LOG="$T/pi-$1.pids"
+  : > "$OPENCODE_EVENT_LOG"
+  node "$T/pi-run.mjs" "$T/pi-bridge.mjs" "$1"
+  grep -c . "$OPENCODE_EVENT_LOG" || true
+}
+chk "pi in its TUI reports every turn boundary" "[ \"\$(pi_events tui)\" = 3 ]"
+chk "pi in print mode reports nothing" "[ \"\$(pi_events print)\" = 0 ]"
+chk "pi in json mode reports nothing" "[ \"\$(pi_events json)\" = 0 ]"
+chk "pi in rpc mode reports nothing" "[ \"\$(pi_events rpc)\" = 0 ]"
+chk "a pi that does not say its mode is served as before" "[ \"\$(pi_events none)\" = 3 ]"
+
 echo
 echo "=============================="
 echo "PASS=$PASS FAIL=$FAIL"

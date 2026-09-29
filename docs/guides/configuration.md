@@ -25,7 +25,7 @@ set -g @radar-preview-follow 'on'
 | `@radar-preview-follow` | `on` | Keep preview anchored to the selected pane's newest visible content. |
 | `@radar-expand-panes` | `off` | Open Recent/Tree with pane leaves expanded; `Ctrl-e` toggles the state. |
 | `@radar-needinput` | `on` | Enable lifecycle marks, board events, pane retitles, and the status strip. |
-| `@radar-needinput-commands` | `codex claude opencode kimi pi` | Process identities used for the live scanner, liveness GC, and diagnostics. |
+| `@radar-needinput-commands` | `codex claude opencode kimi pi cursor-agent grok gemini amp droid auggie` | Process identities used for the live scanner, liveness GC, and diagnostics. |
 | `@radar-retitle` | `on` | Prefix marked pane titles with a textual status label and restore the mark-owned saved title when cleared. A matching glyph prefix alone is never treated as ownership. |
 | `@radar-claude-bg` | `on` | Track paneless Claude sessions on notification surfaces; they never become selectable picker rows. |
 | `@radar-bar` | `auto` | `auto` adds chips to `status-right`, `pinned` reserves a stable second line, and `off` hides chips while retaining marks. |

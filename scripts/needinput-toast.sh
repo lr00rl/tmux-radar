@@ -7,11 +7,21 @@
 # Reads the need-input state file (see needinput-notify.sh for the format) and
 # prints one styled chip per live mark whose pane is NOT currently on screen
 # (paneless background marks always show), newest first, capped at $MAX with a
-# "+N" overflow counter. Chips are deliberately terse — `⚠ mira-api`, never
+# "+N" overflow counter. Chips are deliberately terse — `⚠ billing-api`, never
 # the full sentence — because they share one line with the window list; the
 # picker (Inbox/Agents) carries the long form.
+#
+# `feed <self-pane> [<self-session-id>]` prints the same marks as plain data
+# for a display that is not a tmux format (the Claude Code toast plugin):
+#   self<TAB><1 when the caller's pane is on screen, else 0>
+#   <epoch><TAB><level><TAB><where><TAB><label><TAB><pane><TAB><key>
+# one row per mark that is off screen or paneless, the caller's own pane and
+# session left out, oldest first. No TTL applies: the reader decides what is new.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=radar-level.sh
+. "$SCRIPT_DIR/radar-level.sh"
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
 STATE_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
 MAX="${TMUX_RADAR_BAR_MAX:-${TMUX_SWITCHER_BAR_MAX:-3}}"
@@ -42,13 +52,7 @@ case "${1:-render}" in
     # chips fade from the bar after @radar-bar-ttl seconds (0 = persistent);
     # the underlying mark stays in the AI status view until handled
     out="$(awk -F '\t' -v max="$MAX" -v panes="$(pane_map)" \
-          -v now="$(date +%s)" -v barttl="$(opt @radar-bar-ttl 60)" '
-      function level_for(src, label,    l) {
-        l = tolower(src " " label)
-        if (l ~ /(finished|your turn|turn complete|task complete|done|任务完成|完成)/) return "done"
-        if (l ~ /(needs approval|needs your permission|needs input|waiting.*input|waiting on you|wait.*input|permission|approval|action required|approve|拿不准|需要你|需要.*许可|需要.*批准|等待.*输入)/) return "action"
-        return "notice"
-      }
+          -v now="$(date +%s)" -v barttl="$(opt @radar-bar-ttl 60)" "$RADAR_LEVEL_AWK"'
       function icon_for(level) {
         return (level == "action" ? "⚠" : (level == "done" ? "✓" : "!"))
       }
@@ -57,17 +61,21 @@ case "${1:-render}" in
       }
       # Terse chip identity. Pane marks: the user-named window (fallback
       # session:window). Paneless bg marks ("Claude·proj: text"): the project.
+      # The strip is expanded as a tmux format (#{E:@radar-chips}), so a "#"
+      # in a window or directory name would be read as one: "#(cmd)" runs cmd.
+      # Doubling it makes tmux print the character instead.
+      function literal(s) { gsub(/#/, "##", s); return s }
       function chip_text(label, pane,    s) {
         if (pane != "-") {
           s = wname[pane]
           if (s == "") s = where[pane]
-          return s
+          return literal(s)
         }
         s = label
         sub(/^[A-Za-z]+·/, "", s)      # strip "Claude·" / "Codex·" source prefix
         sub(/:.*/, "", s)              # drop the ": detail" tail
         if (s == "" || s == label) s = label
-        return s
+        return literal(s)
       }
       BEGIN {
         n = split(panes, pl, "\001")
@@ -83,7 +91,7 @@ case "${1:-render}" in
       NF >= 4 {
         pane = $1
         label = (NF >= 5 ? $5 : $4)
-        level = level_for($3, label)
+        level = radar_level($3, label)
         if (barttl + 0 > 0 && now - $2 > barttl + 0) next
         if (pane == "-") { txt[++c] = chip_text(label, pane); lv[c] = level; next }
         if (!(pane in alive) || (pane in viewed)) next
@@ -100,9 +108,47 @@ case "${1:-render}" in
       }' "$STATE_FILE" 2>/dev/null || true)"
     printf '%s' "$out"
     ;;
+  feed)
+    self_pane="${2:-}"
+    self_key=""; [ -z "${3:-}" ] || self_key="s:${3}"
+    [ -r "$STATE_FILE" ] || { printf 'self\t0\n'; exit 0; }
+    awk -F '\t' -v OFS='\t' -v panes="$(pane_map)" -v self="$self_pane" -v selfkey="$self_key" \
+        "$RADAR_LEVEL_AWK"'
+      # "Claude·proj: finished: x" reads "Claude finished: x" beside its project
+      function plain_label(label,    agent, rest) {
+        if (label !~ /^[A-Za-z]+·[^:]*: /) return label
+        agent = label; sub(/·.*/, "", agent)
+        rest = label; sub(/^[A-Za-z]+·[^:]*: /, "", rest)
+        if (index(tolower(rest), tolower(agent) " ") == 1) return rest
+        return agent " " rest
+      }
+      function project(label,    s) {
+        s = label
+        sub(/^[A-Za-z]+·/, "", s); sub(/:.*/, "", s)
+        return (s == "" || s == label) ? "background" : s
+      }
+      BEGIN {
+        n = split(panes, pl, "\001")
+        for (i = 1; i <= n; i++) {
+          split(pl[i], f, "\t")
+          if (f[1] == "") continue
+          alive[f[1]] = 1
+          if (f[2] == 1) viewed[f[1]] = 1
+          where[f[1]] = (f[4] != "" ? f[4] : f[3])
+        }
+        print "self", ((self in viewed) ? 1 : 0)
+      }
+      NF >= 5 {
+        pane = $1
+        if (pane == self || (selfkey != "" && $4 == selfkey)) next
+        if (pane == "-") { print $2, radar_level($3, $5), project($5), plain_label($5), pane, $4; next }
+        if (!(pane in alive) || (pane in viewed)) next
+        print $2, radar_level($3, $5), where[pane], $5, pane, $4
+      }' "$STATE_FILE" 2>/dev/null || printf 'self\t0\n'
+    ;;
   prune)  # legacy no-op kept for compatibility; state GC lives in the notifier
     exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/needinput-notify.sh" tick
     ;;
   *)
-    echo "usage: needinput-toast.sh [render|prune]" >&2; exit 2 ;;
+    echo "usage: needinput-toast.sh [render|feed <pane> [session-id]|prune]" >&2; exit 2 ;;
 esac

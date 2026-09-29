@@ -3,20 +3,55 @@
 ## Source of truth
 
 - Status: Active
-- Last refreshed: 2026-08-21
+- Last refreshed: 2026-09-28
 - Primary product surface: the `fzf` popup opened by `prefix + C-w`
-- Supporting surfaces: pane preview, pane MRU toggle, AI lifecycle marks, status chips, and the live scanner
+- Supporting surfaces: pane preview, pane MRU toggle, AI lifecycle marks, status chips, the live scanner, and the optional toast inside a Claude Code session
 - Evidence reviewed:
   - historical picker at `v0.1.3` / `6ee7afc`, especially `scripts/switcher.sh`, `README.md`, and `tests/test_switcher.sh`;
   - the interaction commits `6e27cd4`, `7864f66`, and `4891290`;
   - the current `fdc107d` implementation and its real tmux/fzf regression suite;
   - live tmux state on 2026-08-11: 46 panes, 14 process/registry-detected AI panes, but only 2 pane-backed unread lifecycle marks;
   - live tmux state on 2026-08-20: a Codex session started before hook install was invisible to every surface; a Claude pane held an ACTION mark while observably working (approved in place); teammate-swarm registry rows pointed at panes of a foreign tmux server;
+  - live tmux state on 2026-09-28: one pane held five registry rows because headless runs started from its agent's tool calls inherited `TMUX_PANE`; two hook-owned sessions idle for days carried scanner-synthesized DONE marks; one pane kept a `✓` title with no mark under it;
+  - a probe on Claude Code 2.1.283: the hooks of a nested `claude -p` run see `CLAUDE_CODE_SESSION_ATTENDED=0` and `CLAUDE_CODE_ENTRYPOINT=sdk-cli`, and a Stop payload carries `background_tasks` and `session_crons`;
+  - the Claude Code 2.1.274 hook type reference vendored in `fast-jev-compaction` (`types/claude-code.d.ts`), read for the payload fields the adapter did not use;
+  - probes on 2026-09-28 in isolated tmux servers: Grok Build 1.0.41 ran the hooks in `~/.claude/settings.json` with a camelCase payload and did not load `~/.cursor/hooks.json`; Cursor CLI 2026.09.28 ran `~/.cursor/hooks.json` but not Claude's hooks, fired `stop` only in its TUI, and titled a pane `… - 🔐 Waiting for confirmation` during an approval with status indicators on; Droid 0.82.0 ran project hooks with snake_case fields and camelCase twins; Gemini, Auggie and Amp could not run a turn (not logged in, out of credits);
   - the local `cd-design-skill` Product/Deep design gates;
   - upstream fzf, tmux tree-mode, GitHub Notifications, Raycast, Warp, and Zellij documentation.
 
 This document supersedes the pane-first assumptions introduced after `9fd89c4`.
 The historical interaction model is the baseline; process-only AI noise is not.
+
+## Role
+
+tmux-radar routes attention in a tmux workspace that runs many coding agents.
+It works at the multiplexer, the one layer that sees every pane of every agent
+from every vendor. It answers three questions and nothing else: where a piece
+of work lives (Recent, Tree), what state each agent is truthfully in (hooks
+and the scanner), and which exact pane needs the user now (chips, pane titles,
+the Agents board, one key to get there).
+
+What happens inside a single session belongs to the agent and its plugins:
+context, compaction, approvals, the toast a plugin shows in its own
+transcript. An agent plugin such as `fast-jev-compaction` is that layer. It
+speaks to the person already looking at the session. tmux-radar speaks to the
+person looking somewhere else.
+
+The boundaries that follow from this:
+
+- It observes and routes. It never answers a prompt, sends keys to an agent,
+  or closes a pane. The supervisor that did was removed in 2026-08.
+- It reports events, and a running process is no event. An idle agent is a
+  free shell.
+- It reads what the agent states before it infers anything. A hook payload
+  and its environment say what kind of notification this is, whether work is
+  still in flight, and whether anyone sits at the prompt. The screen is the
+  source only for sessions that cannot speak.
+- Only an attended session asks for attention. A headless run is part of the
+  work of whoever started it.
+- One event makes one signal, at one level, with one destination, and the
+  signal ends when its condition does. A reminder of an old event is no new
+  event.
 
 ## Brand
 
@@ -265,6 +300,56 @@ Explicit exclusions:
 The registry, process scan, and doctor remain valuable for GC and diagnostics,
 and now also feed the board's working/blocked rows.
 
+### What a Claude event means
+
+The adapter reads the payload and the hook environment instead of treating
+every event alike.
+
+| Signal | Source | Result |
+| --- | --- | --- |
+| Unattended run | `CLAUDE_CODE_SESSION_ATTENDED=0`, or an `sdk-*` `CLAUDE_CODE_ENTRYPOINT`, outside a background job | Every event is ignored: no row, no mark, no retitle. |
+| Permission prompt | Notification `permission_prompt` | ACTION, `Claude needs approval`, followed by the tool when the message names one. |
+| Question | Notification `elicitation_dialog`, `elicitation_url_dialog`, `agent_needs_input` | ACTION, `Claude needs your input: <message>`. |
+| Answer | Notification `elicitation_complete`, `elicitation_response` | The session mark clears. |
+| Reminder | Notification `idle_prompt`, `auth_success` | Nothing. Stop already said the turn ended. |
+| Other or untyped notification | any other `notification_type`, or none | A mark with the message as given. |
+| Finished turn | Stop | DONE, `Claude finished: <first line of the last message>`. |
+| Paused turn | Stop with a subagent or workflow in `background_tasks`, or with `session_crons` pending in a turn the schedule started | No mark. The session resumes on its own. |
+| Failed turn | StopFailure | NOTICE, `Claude turn failed: <error>`. |
+| Tool result | PostToolUse on the main thread, for a tool that started after the mark was written | The session mark clears: a tool that ran proves nothing is waiting. |
+
+Every hook is synchronous, so events reach the notifier in the order they
+happened. A background shell in `background_tasks` decides nothing, because a
+dev server never exits. A turn the user started is finished even while a loop is armed;
+only the turn a wakeup started is paused by the next wakeup.
+
+### Other agents
+
+Grok, Cursor, Droid, Gemini and Auggie copy Claude's hook design, so the same
+adapter reads them after it rewrites their fields into Claude's names; the
+[agent hooks guide](docs/guides/agent-hooks.md) has the per-agent table. The
+process tree decides who spoke. The nearest watched agent above the hook fired
+the event; if another watched agent stands above that one, the run is part of
+the other's work and reports nothing. A hook written for one agent but fired
+by a different one changes nothing, since that agent reports through hooks of
+its own. Only Claude's paneless hooks are placed by working directory: any
+other agent's event without a pane comes from a desktop app (the Cursor
+editor runs the same hook file) and is dropped. Agents with no approval event
+(pi, Cursor, Auggie) and agents with no hooks (Amp) rely on the scanner for
+waits; Cursor's status title makes its approvals visible when the user turns
+it on.
+
+### Severity
+
+A label reads `<head>[: <detail>]`. Adapters write the head from a fixed
+vocabulary and the detail is free text from the agent. A head that ends in a
+known phrase (`needs approval`, `needs your input`, `finished`, `turn failed`)
+decides the level alone, so no word in the detail changes it. Any other label
+is classified by its whole text, completion before action. One definition in
+`scripts/radar-level.sh` serves the notifier, the chips, the picker and
+doctor. Labels and saved titles are stored at 200 characters at most, cut on
+a character boundary, so no payload field can bloat the state file.
+
 ### Live scanner and badges
 
 Hooks are push: they miss sessions started before installation, agents without
@@ -283,10 +368,11 @@ aimed at a foreign tmux server (Claude teammate swarms run under
    the scanned state, so every surface reads one model. A later native event
    with a session key supersedes the adopted row exactly as Codex's `p:`→`s:`
    upgrade already did.
-3. Two consecutive `working` verdicts heal an unread ACTION mark on that pane
-   (approved in place: the wait is observably over) and downgrade a registry
-   `waiting` the screen contradicts. DONE marks never heal: they are a review
-   queue, not a state claim.
+3. Two consecutive `working` verdicts, counted from the mark's own epoch,
+   heal an unread agent mark on that pane and downgrade a registry `waiting`
+   the screen contradicts. For Claude the same fact now arrives as an event:
+   the first tool result after an approval answered in place clears the mark
+   at once, and the scanner remains the fallback.
 4. A registry row whose pane is not live on this server keeps its liveness
    (pid + argv identity) but is re-homed to paneless `-`, so no surface ever
    targets a pane this server cannot switch to. The same validation applies
@@ -294,10 +380,15 @@ aimed at a foreign tmux server (Claude teammate swarms run under
 5. The scanner does not fabricate events, but an observed transition is one:
    an off-screen pane with no unread mark that flips into `blocked`, or from
    `working` into `stalled`, gets exactly one synthesized mark keyed by its
-   adopted `p:<pid>` row. That is how sessions started before hook install —
-   or agents without an adapter — still reach the Inbox. Hook-owned panes
-   keep their native, richer events; a synthesized mark never replaces an
-   existing unread one.
+   adopted `p:<pid>` row. That is how sessions started before hook install,
+   and agents without an adapter, still reach the board. A pane owned by a
+   hook-claimed session of an agent that reports approvals and finished turns
+   natively (Claude, Codex, Kimi, OpenCode) gets no synthesized mark at all:
+   every real transition there arrives as an event, and the screen adds only
+   redraw (a resize, a banner) read as work. pi has no approval event, so its
+   panes keep the floor, and the mark carries the owning session key so pi's
+   own events clear it. A synthesized mark never replaces an existing unread
+   one.
 6. Recent and Tree rows aggregate per-pane states into window badges, and
    `Ctrl-a` shows the live fleet. Both surfaces are deliberately lossy in the
    same direction: a finished turn stays in the Inbox review queue, and an
@@ -416,7 +507,35 @@ Required end-to-end checks:
 16. Agents lists marked, registered, and scanner-found panes ordered by
     severity, and Recent/Tree window rows carry the aggregated badges without
     changing row targets or the three-field contract.
-17. Bash syntax, ShellCheck, all repository shell suites, Go test/vet/build, and
+17. An unattended Claude run changes nothing: no registry row, no mark, no
+    retitle, and the host session's unread mark survives its whole lifecycle.
+    A background job keeps its paneless mark.
+18. `idle_prompt` leaves a finished mark and its epoch untouched; a typed
+    permission or question notification is ACTION whatever its detail says; a
+    finished mark is DONE whatever its summary says.
+19. A Stop with agent work in flight, or with a wakeup pending in a turn the
+    schedule started, writes no mark; a background shell does not suppress
+    one; a turn the user started is finished while a loop is armed.
+20. A hook-owned pane of a natively reporting agent gets no synthesized mark
+    on a working to stalled transition; a hook-owned pi pane gets one keyed by
+    its session.
+21. Every removal of a mark restores the pane title, done-ttl expiry included,
+    and a focus-clear that lands during a tick strands no status title.
+22. Chip text is literal: a `#` in a window or directory name is doubled
+    before it reaches `@radar-chips`, so tmux prints it and runs nothing.
+23. For every agent, an event fired under another watched agent in the
+    process tree changes nothing on the pane; a launcher and the binary it
+    starts within three seconds count as one agent.
+24. A hook written for one agent and fired by a different one changes
+    nothing, its session end included; an event from no pane is placed by
+    working directory only when Claude sent it.
+25. The Cursor hook entries are Claude's commands byte for byte and use only
+    event names Cursor accepts; every agent config the installer touches keeps
+    the user's own entries, gets a backup only when it changes, and returns to
+    its prior content on uninstall.
+26. The Claude Code toast plugin repeats a new mark from another pane only
+    while its own pane is on screen, and never one of its own pane.
+27. Bash syntax, ShellCheck, all repository shell suites, and
     `git diff --check` pass before delivery.
 
 ## Open questions

@@ -6,6 +6,13 @@ Find a named project window first, drill into panes only when needed, and switch
 to one exact live destination. tmux-radar has three focused views — Recent,
 Agents, and Tree — with a live preview for supporting context.
 
+Its job in a workspace full of coding agents is to route your attention: it
+works at the tmux layer, where every pane of every agent is visible, and tells
+you which exact pane needs you while you are looking somewhere else. What
+happens inside one session (context, compaction, approvals) belongs to that
+agent and its plugins. tmux-radar observes and points. It never answers a
+prompt or sends keys to an agent.
+
 ![views: Recent | Agents | Tree](https://img.shields.io/badge/views-Recent%20%7C%20Agents%20%7C%20Tree-blue)
 
 ## Why not `choose-tree`?
@@ -45,7 +52,16 @@ long-running agents.
   a foreign tmux server (Claude teammate swarms) are re-homed to paneless,
   and an observed transition into `blocked` or out of `working` synthesizes
   exactly one board event for off-screen panes — hookless sessions still
-  reach you.
+  reach you. A pane whose session already reports through hooks is left to
+  them, so a resize or a banner on an idle agent never reads as a finished
+  turn.
+- **Events read for what they say.** A Claude hook carries more than a
+  message. A permission prompt and a question become ACTION; the reminder
+  Claude sends after a minute of idling changes nothing; a turn that stops
+  with a subagent still running is paused, not finished; a turn that died on
+  an API error says so; a finished turn is labelled with the first line of
+  its answer. A headless run (`claude -p`, the Agent SDK) started from an
+  agent's tool call is that agent's work and marks nothing.
 - **Window-name-first search** — the user-assigned window name is the first
   searchable identity; location, title, command, path, and event state follow.
 - **Exact-pane switching** — every selectable row targets one pane. Selection
@@ -56,7 +72,7 @@ long-running agents.
 - **Live preview** — the selected pane's content, no wrap, anchored to the
   bottom (current prompt/state visible), with line/page scroll.
 - **AI status alerts** — Claude/Codex/Kimi/OpenCode/pi flag their pane for action-required
-  prompts and finished-turn notices; a compact chip (`⚠ mira-api`, never a
+  prompts and finished-turn notices; a compact chip (`⚠ billing-api`, never a
   full sentence) appears in the existing
   status area while an off-screen mark is fresh,
   the pane's **title flips to a status label** (`⚠` action required, `✓`
@@ -165,7 +181,7 @@ Set these **before** the plugin loads:
 | `@radar-preview-follow` | `on` | Anchor preview to the bottom (tail-style). |
 | `@radar-expand-panes` | `off` | Open Recent/Tree with pane leaves already expanded; `Ctrl-e` still toggles them. |
 | `@radar-needinput` | `on` | Enable the AI-status system (hooks/bar). |
-| `@radar-needinput-commands` | `codex claude opencode kimi pi` | Process identities used for registry/mark garbage collection, the live scanner, and diagnostics. Comma/space/colon separated. |
+| `@radar-needinput-commands` | `codex claude opencode kimi pi cursor-agent grok gemini amp droid auggie` | Process identities used for registry/mark garbage collection, the live scanner, and diagnostics. Comma/space/colon separated. |
 | `@radar-scan` | `on` | Live agent scanner: classifies panes hosting watched agent processes as working/stalled/blocked, adopts hookless agent panes into the registry, heals stale ACTION marks, and powers the Agents view and the Recent/Tree badges. |
 | `@radar-scan-interval` | `10` | Seconds between live scans (minimum `5`). Scans run inside `tick`, which the picker, the bar, and session hooks already trigger; the interval keeps repeat reloads cheap. |
 | `@radar-retitle` | `on` | Rename a marked pane's title to a status label (`⚠` action required, `✓` finished, `!` notice), restored on clear. |
@@ -181,16 +197,17 @@ Example:
 set -g @radar-default-view 'recent'
 set -g @radar-key 'C-j'
 set -g @radar-preview 'right:55%'
-set -g @radar-needinput-commands 'codex claude opencode kimi pi'
+set -g @radar-needinput-commands 'codex claude opencode kimi pi cursor-agent grok'
 
 set -g @plugin 'lr00rl/tmux-radar'
 ```
 
 For focused walkthroughs, see [configuration](docs/guides/configuration.md),
-[agent hooks](docs/guides/agent-hooks.md), and
+[agent hooks](docs/guides/agent-hooks.md), the
+[Claude Code toast plugin](docs/guides/claude-toast.md), and
 [development](docs/guides/development.md).
 
-## Agents board + alerts (Claude Code / Codex / Kimi / OpenCode / pi)
+## Agents board + alerts
 
 Agents (`ctrl-a`, `ctrl-i` is a kept alias) is the one AI surface: unread
 events first (**ACTION** for permission/input that needs a decision, **DONE**
@@ -200,8 +217,8 @@ set. Idle agent panes and paneless background sessions never become rows;
 background sessions notify through the chip strip instead.
 
 The plugin sets up the tmux side automatically (AI-status strip + exact-pane
-clear on focus). To let Claude Code, Codex, Kimi, and OpenCode flag their
-pane, install the hooks once:
+clear on focus). To let the agents flag their own pane, install the hooks
+once. The installer wires every agent it finds and skips the rest:
 
 ```sh
 ~/.tmux/plugins/tmux-radar/scripts/install-hooks.sh install     # wire hooks
@@ -209,11 +226,40 @@ pane, install the hooks once:
 ~/.tmux/plugins/tmux-radar/scripts/install-hooks.sh uninstall   # remove
 ```
 
-It edits `~/.claude/settings.json` with five lifecycle hooks:
-`SessionStart` registers a live session, `Notification` marks input,
-`Stop` marks a finished turn, `UserPromptSubmit` clears the handled mark, and
+| Agent | Where radar hooks in | Approvals come from | Finished turns come from |
+| --- | --- | --- | --- |
+| Claude Code | `~/.claude/settings.json` | `Notification` | `Stop`, with the answer's first line |
+| Codex | `~/.codex/hooks.json` + `notify` | `PermissionRequest` | `Stop` |
+| Kimi Code | marker block in its `config.toml` | `PermissionRequest` | `Stop` |
+| OpenCode | `~/.config/opencode/plugins/` | permission and question events | idle |
+| pi | `~/.pi/agent/extensions/` | none: a wait reads as a stalled pane | `agent_end` |
+| Grok Build | runs Claude's hooks as they are | `Notification` | `Stop`, with the answer's first line |
+| Cursor CLI | `~/.cursor/hooks.json` | its pane title, with `display.showStatusIndicators` on | `stop` |
+| Factory Droid | `~/.factory/settings.json` | `Notification` | `Stop` |
+| Gemini CLI | `~/.gemini/settings.json` | `Notification` | `AfterAgent`, with the answer's first line |
+| Auggie | `~/.augment/settings.json` | none: a wait reads as a stalled pane | `Stop` |
+| Amp | nothing: it has no shell hooks | none: a wait reads as a stalled pane | the screen scanner |
+
+Grok, Droid, Cursor, Gemini and Auggie all copy Claude's hook schema in some
+form, so one adapter reads them all; the [agent hooks
+guide](docs/guides/agent-hooks.md) lists what each one sends and where it
+differs. Grok and Cursor were checked against live sessions, Droid's session
+start and end too; Gemini and Auggie follow their published schemas.
+
+It edits `~/.claude/settings.json` with seven hooks:
+`SessionStart` registers a live session, `Notification` marks a permission
+prompt or a question by its type, `Stop` marks a finished turn,
+`StopFailure` marks a turn that died on an API error, `UserPromptSubmit`
+clears the handled mark, `PostToolUse` clears a mark the moment a tool runs
+again (an approval answered in place fires no other event), and
 `SessionEnd` removes the live registry row and every automatic mark for that
-session, including a preceding finished-turn mark. Native Codex handlers
+session, including a preceding finished-turn mark. `PostToolUse` leaves
+before it parses anything unless its own session holds a mark (about 5 ms
+per tool call), and it resolves a mark only for a tool that started after
+the mark was written. All seven hooks are synchronous, so events reach the
+notifier in the order they happened. If you installed the hooks before
+this version, run `install` again: `status` names the events an older
+install lacks. Native Codex handlers
 are merged into `~/.codex/hooks.json`; the managed block in
 `~/.codex/config.toml` contains matching trust state plus the wrapped legacy
 `notify` fallback. Kimi receives one owned marker block in the active
@@ -232,12 +278,23 @@ is installed, the installer drops a small in-process extension at
 `~/.pi/agent/extensions/tmux-radar.ts` (auto-discovered; `/reload` picks it up
 in live sessions) bridging `session_start` / interactive `input` / `agent_end`
 / `session_shutdown`. pi exposes no approval-request event, so its permission
-waits are covered by the live scanner instead. Existing
+waits are covered by the live scanner instead. For Cursor, Droid, Gemini and
+Auggie the installer merges hook entries into the files in the table and
+writes a backup only when a file changes. Existing
 user hooks, trust entries, notify chains, and symlinked config paths are
 preserved. Restart the affected Claude/Codex/OpenCode sessions after
 installation, then review `/hooks` if Codex asks you to trust the handlers.
 For Kimi, run `/reload` in the TUI or start a new session. Kimi's event names and TOML
 shape follow its [official hooks reference](https://moonshotai.github.io/kimi-code/en/customization/hooks).
+
+### Toasts inside Claude Code
+
+When the pane you are looking at is a Claude Code session, the optional plugin
+in `claude-plugin/` repeats a new mark from another pane as a toast on
+Claude's own notification line (`tmux-radar: ⚠ billing-api · Claude needs
+approval`). It is a display over the same marks and costs one file stat every
+two seconds. It needs Claude Code's early-access function hooks; see the
+[toast plugin guide](docs/guides/claude-toast.md).
 
 ### Agents without native hooks
 
@@ -251,7 +308,12 @@ only hooks provide is the *unread event* itself (board rows, chips, retitles)
 
 An observed transition on an off-screen pane (into blocked, or from
 working into stalled) also synthesizes exactly one board event, so hookless
-sessions still reach the Inbox-equivalent surface once per real change.
+sessions still reach the Inbox-equivalent surface once per real change. This
+is all radar knows of Amp. pi, Cursor and Auggie report finished turns but
+have no approval event, so a pane waiting on approval reads as stalled and
+is flagged as a finished turn, unless the title says otherwise. Cursor does,
+when `display.showStatusIndicators` is `true` in `~/.cursor/cli-config.json`:
+its "Waiting for confirmation" title makes the pane blocked, an ACTION.
 `install-hooks.sh status` still reports missing hooks, and
 [Agent hooks and custom adapters](docs/guides/agent-hooks.md) documents the
 normalized event contract and a copyable adapter.
@@ -270,6 +332,19 @@ normalized event contract and a copyable adapter.
   panes whose window/title/command looks Claude-related — so daemon jobs with
   a visible parent workspace still get a jumpable pane mark instead of a bare
   "session id" row.
+- **Runs another agent started.** A headless run an agent starts from a tool
+  call (`claude -p`, `codex exec`, `grok -p`, an Agent SDK script) inherits
+  that agent's `$TMUX_PANE`. The notifier walks the process tree up from the
+  hook: when another watched agent stands above the one that fired the event,
+  the run is part of that agent's work and reports nothing. Where an agent
+  says it is headless, that is read too: Claude's
+  `CLAUDE_CODE_SESSION_ATTENDED=0` (or an `sdk-*` `CLAUDE_CODE_ENTRYPOINT`),
+  the originator in a `codex exec` rollout, pi's `ctx.mode`, and OpenCode's
+  `run` subcommand. The pane keeps reporting the agent that owns it.
+- **Desktop apps.** The Cursor editor runs the same `~/.cursor/hooks.json`
+  from no pane. Only Claude's own paneless hooks (its background sessions) are
+  placed on a pane by working directory; any other agent's event without a
+  pane is dropped.
 - **Background Claude sessions** — sessions genuinely outside tmux
   (`$CLAUDE_JOB_DIR` set: the dashboard, background jobs, cloud) get a
   **paneless mark keyed by `session_id`**, labelled `Claude·<project>`. It
@@ -294,7 +369,10 @@ normalized event contract and a copyable adapter.
   failure aborts the picker render explicitly. Dead marks are removed without
   killing panes, and their saved titles are restored (empty saved titles fall
   back to window name, then current command). Prefix glyphs alone never imply
-  notifier ownership, so user-authored titles are preserved.
+  notifier ownership, so user-authored titles are preserved. Every path that
+  removes a mark restores the title, including `@radar-done-ttl` expiry, and
+  all title writes share the state lock, so a focus change that lands during
+  a tick cannot leave a status title behind.
 
 ### Bar position note
 
@@ -309,6 +387,10 @@ permanently so the strip gets a whole row without ever flapping. A bar
 strictly at the top while the main line stays at the bottom is not possible
 natively. If you previously used `auto`'s raised line, note the first `tick`
 after upgrading restores any still-raised `status` to your saved value.
+
+tmux expands the strip as a format, where `#(...)` runs a command. Chip text
+comes from window and directory names, so every `#` in it is doubled before
+it is published and tmux prints the name instead of reading it.
 
 ### CLI reference
 
@@ -325,6 +407,8 @@ needinput-notify.sh restore-begin       # @radar-restoring on (resurrect pre-res
 needinput-notify.sh restore-end         # flag off + one delayed quiet tick
 needinput-notify.sh doctor              # why-is-this-row-here diagnostics
 needinput-notify.sh agent-event <kind> <event>   # normalized lifecycle event API for other agents
+needinput-notify.sh claude-register|claude-mark|claude-stop|claude-fail|claude-clear|claude-resolved|claude-end
+                                        # the seven Claude hooks; each reads the hook JSON on stdin
 install-hooks.sh install|status|uninstall
 ```
 
@@ -401,7 +485,7 @@ two live scans.
   Force a pass with `scripts/needinput-notify.sh tick`; see which panes are
   currently detected as agents with `scripts/needinput-notify.sh agent-panes`.
 - **An agent pane isn't detected as an AI pane** — detection matches ps argv0
-  path components against `@radar-needinput-commands` (`codex claude opencode kimi pi` by
+  path components against `@radar-needinput-commands` (`codex claude opencode kimi pi cursor-agent grok gemini amp droid auggie` by
   default) via the pane's tty and process tree. `pane_current_command` showing
   a version number (`2.1.199`) is normal and does not matter. If you renamed
   the binary, add that name to `@radar-needinput-commands`.
@@ -413,7 +497,9 @@ two live scans.
   temp files (a hook process killed mid-update) are GC'd by `tick`.
 - **Hooks don't fire** — run `scripts/install-hooks.sh status`. It reports
   Claude, Codex, Kimi, and OpenCode coverage separately, including Kimi's seven
-  managed events and Codex's legacy notify fallback. Re-run `install`, then
+  managed events and Codex's legacy notify fallback. A Claude line such as
+  `5/7 (missing: StopFailure PostToolUse; run install)` is an install from an
+  earlier version. Re-run `install`, then
   restart the affected Claude/Codex/OpenCode sessions. Kimi can load the active
   `$KIMI_CODE_HOME/config.toml` (or `~/.kimi-code/config.toml`) with `/reload`.
   A missing native hook remains visible; semantic fallback does not claim native

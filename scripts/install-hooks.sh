@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# Install / uninstall the AI-status hooks for Claude Code, Codex, Kimi and
-# OpenCode so they flag action-required prompts and finished-turn notices.
+# Install / uninstall the AI-status hooks for the agent CLIs radar knows, so
+# they flag action-required prompts and finished-turn notices. An agent that
+# is not installed is skipped.
 #
 # Edits, idempotently and with a timestamped backup:
-#   ~/.claude/settings.json   (Claude hooks)
+#   ~/.claude/settings.json   (Claude hooks; Grok runs these as they are)
 #   ~/.codex/config.toml      (Codex trust marker + legacy notify fallback)
 #   ~/.codex/hooks.json       (Codex native hooks)
 #   $KIMI_CODE_HOME/config.toml, or ~/.kimi-code/config.toml
 #                              (Kimi native lifecycle hooks)
 #   ~/.config/opencode/plugins/tmux-radar.js (OpenCode lifecycle plugin)
 #   ~/.pi/agent/extensions/tmux-radar.ts (pi lifecycle extension)
+#   ~/.cursor/hooks.json      (Cursor CLI hooks)
+#   ~/.factory/settings.json  (Factory Droid hooks)
+#   ~/.gemini/settings.json   (Gemini CLI hooks)
+#   ~/.augment/settings.json  (Auggie hooks)
 #
 # Usage: install-hooks.sh [install|uninstall|status]
 set -euo pipefail
@@ -25,10 +30,13 @@ KIMI_CONFIG="${KIMI_CONFIG:-$KIMI_HOME/config.toml}"
 OPENCODE_DIR="${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}"
 OPENCODE_PLUGIN="$OPENCODE_DIR/plugins/tmux-radar.js"
 
-# SessionEnd removes the session registry row and stale action marks, but the
-# notifier deliberately keeps done-level marks from the preceding Stop event.
-CLAUDE_EVENTS=(SessionStart Notification Stop UserPromptSubmit SessionEnd)
-CLAUDE_SUBCMDS=(claude-register claude-mark claude-stop claude-clear claude-end)
+# SessionEnd removes the session registry row and every mark the session
+# left: a session that is gone has nothing to come back to. Every hook is synchronous: Claude Code waits for each one, so events reach
+# the notifier in the order they happened. An async PostToolUse that ran late
+# could clear the mark of a prompt raised after it. It runs after every tool
+# call and leaves in a few milliseconds unless its session holds a mark.
+CLAUDE_EVENTS=(SessionStart Notification Stop StopFailure UserPromptSubmit PostToolUse SessionEnd)
+CLAUDE_SUBCMDS=(claude-register claude-mark claude-stop claude-fail claude-clear claude-resolved claude-end)
 CODEX_EVENTS=(PermissionRequest Stop UserPromptSubmit)
 CODEX_NOTIFY_JSON="[\"$NOTIFY\", \"codex\"]"
 CODEX_HOOK_CMD="$NOTIFY codex-hook"
@@ -458,7 +466,7 @@ claude_install() {
     alt_cmd=""; [ -n "$alt_notify" ] && alt_cmd="$alt_notify ${CLAUDE_SUBCMDS[$i]}"
     jq --arg ev "$ev" --arg cmd "$cmd" --arg alt "$alt_cmd" '
       .hooks //= {} | .hooks[$ev] //= []
-      | if any(.hooks[$ev][]?; ((.hooks // [])[]?.command) as $c | ($c == $cmd) or (($alt != "") and ($c == $alt))) then .
+      | if any(.hooks[$ev][]? | objects | (.hooks // []) | .[]? | objects; (.command // "") as $c | ($c == $cmd) or (($alt != "") and ($c == $alt))) then .
         else .hooks[$ev] += [ { "hooks": [ { "type": "command", "command": $cmd } ] } ] end
     ' "$CLAUDE_SETTINGS" > "$tmp" && _replace_file "$tmp" "$CLAUDE_SETTINGS"
     info "Claude $ev -> $cmd"
@@ -471,23 +479,30 @@ claude_uninstall() {
   jq empty "$CLAUDE_SETTINGS" >/dev/null 2>&1 || die "$CLAUDE_SETTINGS is not valid JSON"
   backup_file "$CLAUDE_SETTINGS"
   local tmp; tmp="$(mktemp)"
-  jq --arg p "$NOTIFY " '
-    if .hooks then
-      .hooks |= with_entries(
-        .value |= ( map( .hooks |= map(select((.command // "") | startswith($p) | not)) )
-                    | map(select((.hooks // []) | length > 0)) )
-      ) | .hooks |= with_entries(select((.value | length) > 0))
-    else . end
-  ' "$CLAUDE_SETTINGS" > "$tmp" && _replace_file "$tmp" "$CLAUDE_SETTINGS"
+  _json_hooks_strip "$CLAUDE_SETTINGS" > "$tmp" && _replace_file "$tmp" "$CLAUDE_SETTINGS"
   info "removed Claude AI-status hooks"
 }
 
 claude_status() {
   if command -v jq >/dev/null 2>&1 && [ -f "$CLAUDE_SETTINGS" ]; then
     # both the absolute path and the $HOME-prefixed spelling are valid wiring
-    local alt=""; case "$NOTIFY" in "$HOME"/*) alt='$HOME/'"${NOTIFY#"$HOME"/} " ;; esac
-    local c; c="$(jq --arg p "$NOTIFY " --arg alt "$alt" '[.hooks // {} | .. | .command? // empty | select((startswith($p)) or (($alt != "") and startswith($alt)))] | length' "$CLAUDE_SETTINGS" 2>/dev/null || echo 0)"
-    echo "Claude hooks installed: ${c:-0}/5"
+    local alt_notify="" i ev cmd alt n=0 missing=""
+    case "$NOTIFY" in "$HOME"/*) alt_notify='$HOME/'"${NOTIFY#"$HOME"/}" ;; esac
+    for i in "${!CLAUDE_EVENTS[@]}"; do
+      ev="${CLAUDE_EVENTS[$i]}"; cmd="$NOTIFY ${CLAUDE_SUBCMDS[$i]}"
+      alt=""; [ -n "$alt_notify" ] && alt="$alt_notify ${CLAUDE_SUBCMDS[$i]}"
+      if jq -e --arg ev "$ev" --arg cmd "$cmd" --arg alt "$alt" '
+           any((.hooks // {})[$ev][]? | objects | (.hooks // []) | .[]? | objects; (.command // "") as $c
+               | ($c == $cmd) or (($alt != "") and ($c == $alt)))
+         ' "$CLAUDE_SETTINGS" >/dev/null 2>&1; then
+        n=$((n + 1))
+      else
+        missing="$missing $ev"
+      fi
+    done
+    # an install from before an event was added reads as partial, by name
+    if [ -z "$missing" ]; then echo "Claude hooks installed: $n/${#CLAUDE_EVENTS[@]}"
+    else echo "Claude hooks installed: $n/${#CLAUDE_EVENTS[@]} (missing:$missing; run install)"; fi
   else echo "Claude settings: (none / jq missing)"; fi
 }
 
@@ -763,28 +778,236 @@ pi_status() {
   else echo "pi extension: absent"; fi
 }
 
+# Droid, Gemini and Auggie read Claude's hook layout from their own settings
+# files: {"hooks": {"<Event>": [{"hooks": [{"type": "command", "command": ...,
+# "timeout": N}]}]}}. Only the event names and the timeout unit differ. The
+# commands pass the agent's name, since several of these payloads look alike.
+# Each spec is <Event>=<notifier subcommand and args>.
+_json_hooks_merge() {  # _json_hooks_merge <file> <timeout> <spec>... > merged JSON
+  local file="$1" timeout="$2" specs; shift 2
+  specs="$(printf '%s\n' "$@" | jq -R 'capture("^(?<ev>[^=]+)=(?<sub>.*)$")' | jq -s -c .)"
+  jq --arg n "$NOTIFY " --argjson t "$timeout" --argjson specs "$specs" '
+    reduce $specs[] as $s (.;
+      ($n + $s.sub) as $cmd
+      | .hooks //= {} | .hooks[$s.ev] //= []
+      | if any(.hooks[$s.ev][]? | objects | (.hooks // []) | .[]? | objects; (.command // "") == $cmd) then .
+        else .hooks[$s.ev] += [{hooks: [{type: "command", command: $cmd, timeout: $t}]}] end)
+  ' "$file"
+}
+
+# Removes radar's commands and only the groups and events that removal empties.
+# Anything else in the file, whatever its shape, is the user's and stays.
+_json_hooks_strip() {  # _json_hooks_strip <file> > JSON without radar's hooks
+  jq --arg p "$NOTIFY " '
+    def ours: type == "object" and ((.command // "") | tostring | startswith($p));
+    def holds_ours: type == "object" and (.hooks | type) == "array" and any(.hooks[]; ours);
+    def strip_group:
+      if holds_ours
+      then (.hooks | map(select(ours | not))) as $kept
+           | if ($kept | length) == 0 then empty else .hooks = $kept end
+      else . end;
+    if (.hooks | type) == "object" and (.hooks | length) > 0 then
+      .hooks |= with_entries(
+        if (.value | type) == "array" and any(.value[]; holds_ours)
+        then .value |= map(strip_group) | if (.value | length) == 0 then empty else . end
+        else . end)
+      | if (.hooks | length) == 0 then del(.hooks) else . end
+    else . end
+  ' "$1"
+}
+
+json_hooks_install() {  # json_hooks_install <name> <file> <timeout> <spec>...
+  local name="$1" file="$2" timeout="$3" tmp spec; shift 3
+  need_jq
+  mkdir -p "$(dirname "$file")"
+  [ -f "$file" ] || echo '{}' > "$file"
+  jq -e 'type == "object"' "$file" >/dev/null 2>&1 || die "$file is not a JSON object"
+  tmp="$(mktemp)"
+  _json_hooks_merge "$file" "$timeout" "$@" > "$tmp" || { rm -f "$tmp"; die "cannot merge hooks into $file"; }
+  if cmp -s "$tmp" "$file"; then rm -f "$tmp"
+  else backup_file "$file"; _replace_file "$tmp" "$file"; fi
+  for spec in "$@"; do info "$name ${spec%%=*} -> $NOTIFY ${spec#*=}"; done
+}
+
+json_hooks_uninstall() {  # json_hooks_uninstall <name> <file>
+  local name="$1" file="$2" tmp
+  [ -f "$file" ] || { info "no $name hooks installed"; return 0; }
+  need_jq
+  jq empty "$file" >/dev/null 2>&1 || die "$file is not valid JSON"
+  tmp="$(mktemp)"
+  _json_hooks_strip "$file" > "$tmp"
+  if cmp -s "$tmp" "$file"; then rm -f "$tmp"; info "no $name hooks installed"; return 0; fi
+  backup_file "$file"; _replace_file "$tmp" "$file"
+  info "removed $name hooks"
+}
+
+json_hooks_status() {  # json_hooks_status <name> <file> <spec>...
+  local name="$1" file="$2" spec n=0 missing=""; shift 2
+  command -v jq >/dev/null 2>&1 && [ -f "$file" ] || { echo "$name hooks: absent"; return 0; }
+  for spec in "$@"; do
+    if jq -e --arg ev "${spec%%=*}" --arg cmd "$NOTIFY ${spec#*=}" '
+         any((.hooks // {})[$ev][]? | objects | (.hooks // []) | .[]? | objects; (.command // "") == $cmd)' "$file" >/dev/null 2>&1; then
+      n=$((n + 1))
+    else
+      missing="$missing ${spec%%=*}"
+    fi
+  done
+  if [ -z "$missing" ]; then echo "$name hooks installed: $n/$#"
+  else echo "$name hooks installed: $n/$# (missing:$missing; run install)"; fi
+}
+
+# Factory Droid: a near copy of Claude's hooks, timeouts in seconds.
+DROID_SETTINGS="${DROID_SETTINGS:-$HOME/.factory/settings.json}"
+DROID_SPECS=(SessionStart='hook droid' UserPromptSubmit='hook droid' Notification='hook droid'
+             Stop='hook droid' PostToolUse='hook-resolved droid' SessionEnd='hook droid')
+# Gemini CLI: Claude's layout under its own event names, timeouts in ms.
+GEMINI_SETTINGS="${GEMINI_SETTINGS:-$HOME/.gemini/settings.json}"
+GEMINI_SPECS=(SessionStart='hook gemini' BeforeAgent='hook gemini' Notification='hook gemini'
+              AfterAgent='hook gemini' AfterTool='hook-resolved gemini' SessionEnd='hook gemini')
+# Auggie: no prompt and no approval event; the first tool result of the next
+# turn clears a finished mark, and the scanner reads approvals off the screen.
+AUGGIE_SETTINGS="${AUGGIE_SETTINGS:-$HOME/.augment/settings.json}"
+AUGGIE_SPECS=(SessionStart='hook auggie' Stop='hook auggie'
+              PostToolUse='hook-resolved auggie' SessionEnd='hook auggie')
+
+droid_present()  { [ -d "$(dirname "$DROID_SETTINGS")" ] || command -v droid >/dev/null 2>&1; }
+gemini_present() { [ -f "$GEMINI_SETTINGS" ] || command -v gemini >/dev/null 2>&1; }
+auggie_present() { [ -d "$(dirname "$AUGGIE_SETTINGS")" ] || command -v auggie >/dev/null 2>&1; }
+
+droid_install() {
+  droid_present || { info "Droid not found - skipped"; return 0; }
+  json_hooks_install Droid "$DROID_SETTINGS" 5 "${DROID_SPECS[@]}"
+}
+gemini_install() {
+  gemini_present || { info "Gemini CLI not found - skipped"; return 0; }
+  json_hooks_install Gemini "$GEMINI_SETTINGS" 5000 "${GEMINI_SPECS[@]}"
+}
+auggie_install() {
+  auggie_present || { info "Auggie not found - skipped"; return 0; }
+  json_hooks_install Auggie "$AUGGIE_SETTINGS" 5000 "${AUGGIE_SPECS[@]}"
+}
+droid_uninstall()  { json_hooks_uninstall Droid "$DROID_SETTINGS"; }
+gemini_uninstall() { json_hooks_uninstall Gemini "$GEMINI_SETTINGS"; }
+auggie_uninstall() { json_hooks_uninstall Auggie "$AUGGIE_SETTINGS"; }
+droid_status() {
+  if droid_present; then json_hooks_status Droid "$DROID_SETTINGS" "${DROID_SPECS[@]}"
+  else echo "Droid: not installed (skipped)"; fi
+}
+gemini_status() {
+  if gemini_present; then json_hooks_status Gemini "$GEMINI_SETTINGS" "${GEMINI_SPECS[@]}"
+  else echo "Gemini: not installed (skipped)"; fi
+}
+auggie_status() {
+  if auggie_present; then json_hooks_status Auggie "$AUGGIE_SETTINGS" "${AUGGIE_SPECS[@]}"
+  else echo "Auggie: not installed (skipped)"; fi
+}
+
+# Cursor's CLI runs ~/.cursor/hooks.json and also every hook in
+# ~/.claude/settings.json, and drops a Claude hook whose command equals one of
+# its own for the same event. Grok loads both files too and skips a repeated
+# hook the same way. So the Cursor entries are the Claude commands verbatim:
+# each event then fires once, with or without the Claude install. The notifier
+# names Cursor from the process tree, or from cursor_version in the payload.
+# Unknown event names make Cursor reject the whole file, so only these appear.
+CURSOR_HOOKS="${CURSOR_HOOKS:-$HOME/.cursor/hooks.json}"
+CURSOR_EVENTS=(sessionStart beforeSubmitPrompt stop postToolUse sessionEnd)
+CURSOR_SUBCMDS=(claude-register claude-clear claude-stop claude-resolved claude-end)
+
+# The CLI, not the editor: the editor alone gains nothing from these hooks.
+cursor_present() {
+  [ -d "${CURSOR_AGENT_HOME:-$HOME/.local/share/cursor-agent}" ] || command -v cursor-agent >/dev/null 2>&1
+}
+
+cursor_install() {
+  cursor_present || { info "Cursor CLI not found - skipped"; return 0; }
+  need_jq
+  local tmp specs i
+  mkdir -p "$(dirname "$CURSOR_HOOKS")"
+  [ -f "$CURSOR_HOOKS" ] || echo '{"version": 1, "hooks": {}}' > "$CURSOR_HOOKS"
+  jq -e 'type == "object"' "$CURSOR_HOOKS" >/dev/null 2>&1 || die "$CURSOR_HOOKS is not a JSON object"
+  specs="$(for i in "${!CURSOR_EVENTS[@]}"; do
+             jq -n -c --arg ev "${CURSOR_EVENTS[$i]}" --arg cmd "$NOTIFY ${CURSOR_SUBCMDS[$i]}" '{ev: $ev, cmd: $cmd}'
+           done | jq -s -c .)"
+  tmp="$(mktemp)"
+  jq --argjson specs "$specs" '
+    .version //= 1 | .hooks //= {}
+    | reduce $specs[] as $s (.;
+        .hooks[$s.ev] //= []
+        | if any(.hooks[$s.ev][]? | objects; (.command // "") == $s.cmd) then .
+          else .hooks[$s.ev] += [{command: $s.cmd}] end)
+  ' "$CURSOR_HOOKS" > "$tmp" || { rm -f "$tmp"; die "cannot merge hooks into $CURSOR_HOOKS"; }
+  if cmp -s "$tmp" "$CURSOR_HOOKS"; then rm -f "$tmp"
+  else backup_file "$CURSOR_HOOKS"; _replace_file "$tmp" "$CURSOR_HOOKS"; fi
+  for i in "${!CURSOR_EVENTS[@]}"; do info "Cursor ${CURSOR_EVENTS[$i]} -> $NOTIFY ${CURSOR_SUBCMDS[$i]}"; done
+}
+
+cursor_uninstall() {
+  [ -f "$CURSOR_HOOKS" ] || { info "no Cursor hooks installed"; return 0; }
+  need_jq
+  jq empty "$CURSOR_HOOKS" >/dev/null 2>&1 || die "$CURSOR_HOOKS is not valid JSON"
+  local tmp; tmp="$(mktemp)"
+  jq --arg p "$NOTIFY " '
+    def ours: type == "object" and ((.command // "") | tostring | startswith($p));
+    if (.hooks | type) == "object" then
+      .hooks |= with_entries(
+        if (.value | type) == "array" and any(.value[]; ours)
+        then .value |= map(select(ours | not)) | if (.value | length) == 0 then empty else . end
+        else . end)
+    else . end
+  ' "$CURSOR_HOOKS" > "$tmp"
+  if cmp -s "$tmp" "$CURSOR_HOOKS"; then rm -f "$tmp"; info "no Cursor hooks installed"; return 0; fi
+  backup_file "$CURSOR_HOOKS"; _replace_file "$tmp" "$CURSOR_HOOKS"
+  info "removed Cursor hooks"
+}
+
+cursor_status() {
+  cursor_present || { echo "Cursor: not installed (skipped)"; return 0; }
+  command -v jq >/dev/null 2>&1 && [ -f "$CURSOR_HOOKS" ] || { echo "Cursor hooks: absent"; return 0; }
+  local i n=0 missing=""
+  for i in "${!CURSOR_EVENTS[@]}"; do
+    if jq -e --arg ev "${CURSOR_EVENTS[$i]}" --arg cmd "$NOTIFY ${CURSOR_SUBCMDS[$i]}" '
+         any((.hooks // {})[$ev][]? | objects; (.command // "") == $cmd)' "$CURSOR_HOOKS" >/dev/null 2>&1; then
+      n=$((n + 1))
+    else
+      missing="$missing ${CURSOR_EVENTS[$i]}"
+    fi
+  done
+  if [ -z "$missing" ]; then echo "Cursor hooks installed: $n/${#CURSOR_EVENTS[@]}"
+  else echo "Cursor hooks installed: $n/${#CURSOR_EVENTS[@]} (missing:$missing; run install)"; fi
+}
+
 [ -x "$NOTIFY" ] || die "$NOTIFY not found/executable"
 
 case "${1:-install}" in
   install)
     echo "Installing tmux-radar AI-status hooks:"
-    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$KIMI_CONFIG" "$OPENCODE_PLUGIN" "$PI_EXTENSION"
+    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$KIMI_CONFIG" "$OPENCODE_PLUGIN" "$PI_EXTENSION" \
+      "$CURSOR_HOOKS" "$DROID_SETTINGS" "$GEMINI_SETTINGS" "$AUGGIE_SETTINGS"
     codex_install
     kimi_install
     claude_install
     opencode_install
     pi_install
+    cursor_install
+    droid_install
+    gemini_install
+    auggie_install
     transaction_commit
-    echo "Done. Restart Claude/Codex/Kimi/OpenCode sessions (or reload their config) to pick up the hooks."
+    echo "Done. Restart agent sessions (or reload their config) to pick up the hooks."
     ;;
   uninstall)
     echo "Uninstalling tmux-radar AI-status hooks:"
-    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$KIMI_CONFIG" "$OPENCODE_PLUGIN" "$PI_EXTENSION"
+    transaction_start "$CLAUDE_SETTINGS" "$CODEX_CONFIG" "$CODEX_HOOKS_JSON" "$KIMI_CONFIG" "$OPENCODE_PLUGIN" "$PI_EXTENSION" \
+      "$CURSOR_HOOKS" "$DROID_SETTINGS" "$GEMINI_SETTINGS" "$AUGGIE_SETTINGS"
     codex_uninstall
     kimi_uninstall
     claude_uninstall
     opencode_uninstall
     pi_uninstall
+    cursor_uninstall
+    droid_uninstall
+    gemini_uninstall
+    auggie_uninstall
     transaction_commit
     ;;
   status)
@@ -794,6 +1017,10 @@ case "${1:-install}" in
     kimi_status || status_rc=1
     opencode_status || status_rc=1
     pi_status || status_rc=1
+    cursor_status || status_rc=1
+    droid_status || status_rc=1
+    gemini_status || status_rc=1
+    auggie_status || status_rc=1
     exit "$status_rc"
     ;;
   *) die "usage: install-hooks.sh [install|uninstall|status]" ;;

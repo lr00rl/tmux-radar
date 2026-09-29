@@ -33,6 +33,9 @@
 # a reused pid can't fake liveness. The registry replaces the old
 # ~/.claude/jobs/*/state.json guessing (those files freeze at "blocked"
 # after a session dies and kept zombie marks alive for hours).
+# state is working | waiting | done, plus `woken` for a Claude turn that a
+# scheduled wakeup started (every reader treats it as working; claude-stop
+# uses it to tell a loop iteration from a turn the user started).
 #
 # Live scanner (ai-live, TSV, 5 fields): hooks are push and miss what they
 # never saw — sessions started before the hooks were installed, agents with
@@ -54,7 +57,9 @@
 # pane with no unread mark whose window is off-screen, a flip into `blocked`,
 # or from `working` into `stalled`, synthesizes exactly one mark (keyed by the
 # adopted p:<pid> row) — that is how hookless sessions (started before hook
-# install, or without an adapter) still reach the Inbox. Disable with
+# install, or without an adapter) still reach the Inbox. A pane owned by a
+# hook-claimed session of a natively reporting agent (_native_events) gets no
+# synthesized mark: its hooks are the events. Disable with
 # `set -g @radar-scan off`.
 #
 # Safe to call outside tmux (no-op unless a server is reachable).
@@ -62,10 +67,29 @@ set -euo pipefail
 
 # Hooks may run with a minimal PATH.
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 STATE_DIR="${TMUX_RADAR_STATE_DIR:-${TMUX_SWITCHER_STATE_DIR:-$HOME/.local/state/tmux}}"
 STATE_FILE="${TMUX_RADAR_NEEDINPUT_FILE:-${TMUX_SWITCHER_NEEDINPUT_FILE:-$STATE_DIR/need-input}}"
+
+# A tool-result hook runs after every tool call of every session, so it leaves
+# before bash reads the rest of this script: at once when no mark is on file,
+# and after one grep when none carries this session's key. The hook
+# environment names the session. An agent's own variable is asked first:
+# inside Grok, CLAUDE_CODE_SESSION_ID is what some Claude session above left.
+case "${1:-}" in claude-resolved|hook-resolved)
+  [ -s "$STATE_FILE" ] || exit 0
+  RADAR_SID="${GROK_SESSION_ID:-${GEMINI_SESSION_ID:-${AUGMENT_CONVERSATION_ID:-${CLAUDE_CODE_SESSION_ID:-}}}}"
+  if [ -n "$RADAR_SID" ] && ! grep -qF "s:${RADAR_SID}" "$STATE_FILE" 2>/dev/null; then
+    exit 0
+  fi
+  ;;
+esac
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=radar-level.sh
+. "$SCRIPT_DIR/radar-level.sh"
+# shellcheck source=radar-match.sh
+. "$SCRIPT_DIR/radar-match.sh"
 REG_FILE="${TMUX_RADAR_REGISTRY_FILE:-$STATE_DIR/agent-registry}"
 LIVE_FILE="${TMUX_RADAR_LIVE_FILE:-$STATE_DIR/ai-live}"
 LIVE_SAMPLES="$STATE_DIR/.ai-live-samples"
@@ -196,6 +220,23 @@ _san() {
     sed 's/  */ /g; s/^ //; s/ $//'
 }
 
+# Text as a mark may store it (label, saved title): control characters gone,
+# at most 200 characters, cut on a character boundary. Every mark is written
+# through here, so no payload field, window title or error string can bloat
+# the state file that each tick rewrites in full.
+_label() {  # _label <text>
+  local s
+  s="$(_san "${1:-}")"
+  if [ "${#s}" -gt 200 ]; then   # bytes under LC_ALL=C: jq then counts characters
+    if command -v jq >/dev/null 2>&1; then
+      s="$(printf '%s' "$s" | jq -Rrj 'if length > 200 then .[0:199] + "…" else . end' 2>/dev/null || true)"
+    else
+      s="$(printf '%s' "$s" | cut -c 1-200)"
+    fi
+  fi
+  printf '%s' "$s"
+}
+
 _b64d() { printf '%s' "$1" | base64 -d 2>/dev/null || printf '%s' "$1" | base64 -D 2>/dev/null || true; }
 
 _schedule_tick() {  # _schedule_tick <delay-seconds> <stamp-file>
@@ -270,16 +311,34 @@ _pane_map() {
 # Watched agent commands, one place: process scans, registry synthesis and the
 # live scanner all match against this list.
 _watched_commands() {
-  printf '%s' "${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude opencode kimi pi')}}"
+  printf '%s' "${TMUX_RADAR_NEEDINPUT_COMMANDS:-${TMUX_SWITCHER_NEEDINPUT_COMMANDS:-$(opt @radar-needinput-commands 'codex claude opencode kimi pi cursor-agent grok gemini amp droid auggie')}}"
 }
 
-# Component normalization shared by every awk matcher below: strip a trailing
-# ".app", and map known package-directory names to their watched command
-# (pi's cli.js lives under .../pi-coding-agent/... while the watched name is
-# "pi"). Keep the awk copies in sync.
-#   normc(c) { sub(/\.app$/, "", c); if (c == "pi-coding-agent") c = "pi"; return c }
-# Script-runtime wrappers (node/bun/deno) hide the real program in argv[1]:
-# matchers receive argv0 plus the next token and check both.
+# Mark sources that are agents: every watched command, plus the legacy `ai`.
+# Only their marks follow the agent's liveness and heal on renewed work; a
+# mark a user script wrote through the public API is that script's contract.
+# \001-joined, for index() in awk.
+_agent_sources() {
+  printf '\001ai\001'
+  _watched_commands | tr '[:upper:]' '[:lower:]' | tr -s ' ,:\t' '\001\001\001\001'
+  printf '\001'
+}
+
+# Agents whose adapter reports both approval waits and finished turns as native
+# events. The scanner synthesizes nothing on a pane such a session owns. pi,
+# Cursor and Auggie are absent on purpose (no approval event), and so is any
+# agent wired through the generic agent-event adapter, whose coverage radar
+# cannot know.
+_native_events() {  # _native_events <kind>
+  case "${1:-}" in
+    claude|codex|kimi|opencode|grok|droid|gemini) return 0 ;;
+  esac
+  return 1
+}
+
+# Every process matcher below is radar_kind from radar-match.sh: argv0 path
+# components, and behind a wrapper (node/bun/deno, a generic launcher) the
+# program it runs.
 
 # Panes currently hosting a watched AI agent (claude/codex/…). Prints
 # "OK\001%id\001%id\001…" — "OK\001" alone means the scan RAN and found none;
@@ -300,19 +359,11 @@ _agent_panes() {
     ps_rows="$("$PS_BIN" -axo pid=,ppid=,tty=,command= 2>/dev/null)" || return 0
   fi
   [ -n "$ps_rows" ] || return 0
-  { printf '__PANES__\n%s\n__PS__\n%s\n' "$panes" "$ps_rows"; } | LC_ALL=C awk -v cmds="$cmds" '
+  { printf '__PANES__\n%s\n__PS__\n%s\n' "$panes" "$ps_rows"; } | LC_ALL=C awk -v cmds="$cmds" "$RADAR_MATCH_AWK"'
     function cleantty(t) { sub(/^\/dev\//, "", t); return t }
-    function normc(c) { sub(/\.app$/, "", c); if (c == "pi-coding-agent") c = "pi"; return c }
-    function is_agent(a0, a1,    low, n, parts, i, c, w, b, m, p2) {
-      low = tolower(a0); gsub(/\\/, "/", low)
-      n = split(low, parts, "/")
-      for (i = 1; i <= n; i++) { c = normc(parts[i]); if (c in want) return 1 }
-      b = normc(parts[n])
-      if (b == "node" || b == "nodejs" || b == "bun" || b == "deno") {
-        m = split(tolower(a1), p2, "/")
-        for (i = 1; i <= m; i++) { c = normc(p2[i]); if (c in want) return 1 }
-      }
-      return 0
+    function command_of(row) {   # the row past pid, ppid and tty
+      sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", row)
+      return row
     }
     BEGIN {
       m = split(tolower(cmds), raw, /[[:space:],:]+/)
@@ -323,7 +374,7 @@ _agent_panes() {
     mode == 1 && $1 != "" { bypid[$2] = $1; bytty[cleantty($3)] = $1; next }
     mode == 2 && $1 != "" {
       par[$1] = $2
-      if (is_agent($4, $5)) { agent[$1] = 1; atty[$1] = cleantty($3) }
+      if (radar_kind(command_of($0), "", want) != "") { agent[$1] = 1; atty[$1] = cleantty($3) }
       next
     }
     END {
@@ -341,50 +392,51 @@ _agent_panes() {
     }'
 }
 
-# The agent process this hook descends from: hooks run as children of their
-# agent (claude/codex spawn hook commands directly), so walking our own
-# ancestry finds the agent pid even under env-scrubbed launchers. Prints
-# "pid<TAB>argv-basename"; empty when nothing in the chain matches <kind>.
-_resolve_agent_pid() {  # _resolve_agent_pid <kind>
-  local kind="${1:-}" rel
+# Who fired this event. Hooks run as children of their agent, so walking our
+# own ancestry finds the agent even under env-scrubbed launchers, and shows
+# whether that agent runs inside another one (radar_firing in radar-match.sh).
+# One ps snapshot per process, whatever is asked of it afterwards.
+#   AGENT_PID     the agent process, empty when nothing in the chain is <kind>
+#   AGENT_PROC    the argv name recorded for liveness
+#   AGENT_NESTED  1 when another watched agent stands above it
+#   AGENT_KIND    what it is; `*` for <kind> asks for the nearest watched
+#                 agent whatever it is
+AGENT_FOR=""; AGENT_PID=""; AGENT_PROC=""; AGENT_NESTED=0; AGENT_KIND=""
+_agent_identify() {  # _agent_identify <kind|*>
+  local kind out
+  kind="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  [ "$AGENT_FOR" = "$kind" ] && return 0
+  AGENT_FOR="$kind"; AGENT_PID=""; AGENT_PROC=""; AGENT_NESTED=0; AGENT_KIND=""
   [ -n "$kind" ] || return 0
-  rel="$("$PS_BIN" -axo pid=,ppid=,command= 2>/dev/null)" || return 0
-  [ -n "$rel" ] || return 0
-  printf '%s\n' "$rel" | LC_ALL=C awk -v me="$$" -v kind="$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')" '
-    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-    function normc(c) { sub(/\.app$/, "", c); if (c == "pi-coding-agent") c = "pi"; return c }
-    function kindmatch(a0, a1,    low, n, parts, i, c, b, m, p2) {
-      low = tolower(a0); gsub(/\\/, "/", low)
-      n = split(low, parts, "/")
-      for (i = 1; i <= n; i++) { c = normc(parts[i]); if (c == kind) return 1 }
-      b = normc(parts[n])
-      if (b == "node" || b == "nodejs" || b == "bun" || b == "deno") {
-        m = split(tolower(a1), p2, "/")
-        for (i = 1; i <= m; i++) { c = normc(p2[i]); if (c == kind) return 1 }
-      }
-      return 0
+  [ "$kind" != '*' ] || kind=""
+  out="$("$PS_BIN" -axo pid=,ppid=,etime=,command= 2>/dev/null |
+    LC_ALL=C awk -v me="$$" -v kind="$kind" -v cmds="$(_watched_commands)" "$RADAR_MATCH_AWK"'
+    BEGIN {
+      n = split(tolower(cmds), raw, /[[:space:],:]+/)
+      for (i = 1; i <= n; i++) if (raw[i] != "") want[raw[i]] = 1
+      if (kind != "") want[kind] = 1
     }
     {
-      rest = trim($0)
-      pid = rest; sub(/[[:space:]].*/, "", pid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
-      ppid = rest; sub(/[[:space:]].*/, "", ppid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
-      a0 = rest; sub(/[[:space:]].*/, "", a0)
-      a1 = ""
-      if (rest ~ /[[:space:]]/) { a1 = rest; sub(/^[^[:space:]]+[[:space:]]+/, "", a1); sub(/[[:space:]].*/, "", a1) }
-      par[pid] = ppid; argv[pid] = a0; argv1[pid] = a1
+      row = $0; sub(/^[[:space:]]+/, "", row)
+      pid = row; sub(/[[:space:]].*/, "", pid); sub(/^[^[:space:]]+[[:space:]]+/, "", row)
+      ppid = row; sub(/[[:space:]].*/, "", ppid); sub(/^[^[:space:]]+[[:space:]]+/, "", row)
+      et = row; sub(/[[:space:]].*/, "", et); sub(/^[^[:space:]]+[[:space:]]+/, "", row)
+      par[pid] = ppid; age[pid] = radar_elapsed(et); cmd[pid] = row
     }
-    END {
-      cur = me
-      for (hops = 0; hops < 40 && cur != "" && cur != "0" && cur != "1"; hops++) {
-        if (kindmatch(argv[cur], argv1[cur])) {
-          b = normc(argv[cur]); n = split(argv[cur], parts, "/"); b = normc(parts[n])
-          if (b == "node" || b == "nodejs" || b == "bun" || b == "deno") b = kind
-          print cur "\t" b
-          exit
-        }
-        cur = par[cur]
-      }
-    }'
+    END { print radar_firing(me, kind, want) }' || true)"
+  [ -n "$out" ] || return 0
+  IFS=$'\t' read -r AGENT_PID AGENT_PROC AGENT_NESTED AGENT_KIND <<< "$out"
+  case "$AGENT_NESTED" in 1) ;; *) AGENT_NESTED=0 ;; esac
+}
+
+# An event that claims a pane must come from the agent sitting in it. A run
+# an agent started from a tool call (claude -p, codex exec, an SDK script)
+# inherits that agent's $TMUX_PANE: its "finished" would mark a pane whose
+# own agent is mid-turn, and its "prompt submitted" would clear that agent's
+# unread mark. Such a run is part of its host's work and reports nothing.
+_nested_run() {  # _nested_run <kind>
+  _agent_identify "$1"
+  [ "$AGENT_NESTED" = 1 ]
 }
 
 # --- agent-session registry (see header). -----------------------------------
@@ -499,7 +551,7 @@ _rewrite() {  # _rewrite <awk-filter-body> [extra awk -v args...]
   local tmp
   tmp="$(mktemp "${STATE_FILE}.XXXXXX")" || return 1
   if ! { [ -r "$STATE_FILE" ] && cat "$STATE_FILE"; :; } |
-    awk -F '\t' -v OFS='\t' -v now="$(date +%s)" -v bgttl="$BG_TTL" -v panes="$(_pane_map)" "$@" '
+    awk -F '\t' -v OFS='\t' -v now="$(date +%s)" -v bgttl="$BG_TTL" -v panes="$(_pane_map)" "$@" "$RADAR_LEVEL_AWK"'
       BEGIN {
         n = split(panes, pl, "\001")
         have_map = 0
@@ -534,20 +586,18 @@ _restore_title() {  # _restore_title <pane> <saved_title>
   case "$cur" in "⚠ "*|"✓ "*|"! "*|"· "*) tmux select-pane -t "$pane" -T "$saved" 2>/dev/null || true ;; esac
 }
 
-_mark_icon() {  # _mark_icon <source> <label>
-  local text
-  text="$(printf '%s %s' "${1:-}" "${2:-}" | tr '[:upper:]' '[:lower:]')"
-  case "$text" in
-    *finished*|*"your turn"*|*"turn complete"*|*"task complete"*|*done*|*"任务完成"*|*"完成"*) printf '✓' ;;
-    *"needs approval"*|*"needs your permission"*|*"needs input"*|*waiting*input*|*"waiting on you"*|*permission*|*approval*|*"action required"*|*approve*|*"拿不准"*|*"需要你"*|*"等待"*"输入"*) printf '⚠' ;;
-    *) printf '!' ;;
-  esac
-}
+_mark_icon() { radar_icon "${1:-}" "${2:-}"; }  # _mark_icon <source> <label>
 
+# Re-apply the status title of every marked pane. Runs under the state lock:
+# every other title write (the restore in _drop_rows) holds it too, so a
+# focus-clear landing in the middle of a tick can no longer have its restored
+# title overwritten from a row it has just dropped. A busy lock skips the
+# pass; the next tick converges.
 _refresh_titles() {
   have_tmux || return 0
   [ "$(opt @radar-retitle on)" = "off" ] && return 0
   [ -r "$STATE_FILE" ] || return 0
+  lock || return 0
   local pane _epoch source _key label _title
   while IFS=$'\t' read -r pane _epoch source _key label _title; do
     [ -n "$pane" ] || continue
@@ -555,6 +605,7 @@ _refresh_titles() {
     tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1 || continue
     tmux select-pane -t "$pane" -T "$(_mark_icon "$source" "$label") ${label}" 2>/dev/null || true
   done < "$STATE_FILE"
+  unlock
 }
 
 # Restore titles for rows an awk filter is about to drop, then rewrite.
@@ -562,7 +613,9 @@ _drop_rows() {  # _drop_rows <awk-condition-marking-rows-to-DROP> [extra -v args
   local cond="$1"; shift || true
   if [ -r "$STATE_FILE" ] && [ "$(opt @radar-retitle on)" != "off" ]; then
     local victims pane title
-    victims="$(awk -F '\t' "$@" "NF >= 6 && ($cond) { print \$1 \"\t\" \$6 }" "$STATE_FILE" 2>/dev/null || true)"
+    # same variables _rewrite gives the condition: without `now` an age test
+    # selects nothing here and the rows it drops keep their status title
+    victims="$(awk -F '\t' -v now="$(date +%s)" "$@" "$RADAR_LEVEL_AWK""NF >= 6 && ($cond) { print \$1 \"\t\" \$6 }" "$STATE_FILE" 2>/dev/null || true)"
     while IFS=$'\t' read -r pane title; do
       [ -n "$pane" ] && _restore_title "$pane" "$title"
     done <<< "$victims"
@@ -632,7 +685,7 @@ cmd_mark() {  # cmd_mark <pane|-> <source> <label> [key]
   have_tmux || exit 0
   source="$(_san "$source")"
   key="$(_san "$key")"
-  label="$(_san "$label")"
+  label="$(_label "$label")"
   local now saved_title=""
   now="$(date +%s)"
 
@@ -641,7 +694,7 @@ cmd_mark() {  # cmd_mark <pane|-> <source> <label> [key]
     tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1 || exit 0
     [ -n "$key" ] || key="$pane"
     if [ "$(opt @radar-retitle on)" != "off" ]; then
-      saved_title="$(_san "$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)")"
+      saved_title="$(_label "$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)")"
       case "$saved_title" in "⚠ "*|"✓ "*|"! "*|"· "*) saved_title="" ;; esac   # keep original across re-marks
       tmux select-pane -t "$pane" -T "$(_mark_icon "$source" "$label") ${label}" 2>/dev/null || true
     fi
@@ -728,8 +781,7 @@ cmd_tick() {
   case "$donettl" in ''|*[!0-9]*) donettl=0 ;; esac
   if [ "$donettl" -gt 0 ] && [ -r "$STATE_FILE" ]; then
     lock_or_error || return 1
-    _drop_rows 'now - $2 > dt && (tolower($3 " " $5) ~ /(finished|your turn|turn complete|task complete|done|任务完成|完成)/)' \
-      -v dt="$donettl"
+    _drop_rows 'now - $2 > dt && radar_level($3, $5) == "done"' -v dt="$donettl"
     unlock
   fi
   # GC atomic-write temp files orphaned by killed hook processes (mktemp->mv
@@ -753,20 +805,8 @@ cmd_tick() {
   if [ -n "$snapshot" ] && [ -r "$REG_FILE" ]; then
     reg_ok=1
     verdicts="$({ printf '__PS__\n%s\n__REG__\n' "$snapshot"; cat "$REG_FILE"; } |
-      LC_ALL=C awk -F '\t' -v agent_panes="${agents#OK}" -v scan_ok="$agent_scan" '
+      LC_ALL=C awk -F '\t' -v agent_panes="${agents#OK}" -v scan_ok="$agent_scan" "$RADAR_MATCH_AWK"'
       function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-      function normc(c) { sub(/\.app$/, "", c); if (c == "pi-coding-agent") c = "pi"; return c }
-      function argmatch(a0, a1, name,    low, n, parts, i, c, b, m, p2) {
-        low = tolower(a0); gsub(/\\/, "/", low)
-        n = split(low, parts, "/")
-        for (i = 1; i <= n; i++) { c = normc(parts[i]); if (c == name) return 1 }
-        b = normc(parts[n])
-        if (b == "node" || b == "nodejs" || b == "bun" || b == "deno") {
-          m = split(tolower(a1), p2, "/")
-          for (i = 1; i <= m; i++) { c = normc(p2[i]); if (c == name) return 1 }
-        }
-        return 0
-      }
       $0 == "__PS__"  { mode = 1; next }
       $0 == "__REG__" { mode = 2; next }
       mode == 1 && $0 != "" {
@@ -774,10 +814,7 @@ cmd_tick() {
         pid = rest; sub(/[[:space:]].*/, "", pid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
         ppid = rest; sub(/[[:space:]].*/, "", ppid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
         tty = rest; sub(/[[:space:]].*/, "", tty); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
-        a0 = rest; sub(/[[:space:]].*/, "", a0)
-        a1 = ""
-        if (rest ~ /[[:space:]]/) { a1 = rest; sub(/^[^[:space:]]+[[:space:]]+/, "", a1); sub(/[[:space:]].*/, "", a1) }
-        argv[pid] = a0; argv1[pid] = a1; next
+        cmd[pid] = rest; next
       }
       mode == 2 && NF >= 9 {
         pid = $3 + 0
@@ -786,7 +823,7 @@ cmd_tick() {
           if (scan_ok == "") { print "U\t" $0; next }
           if (index(agent_panes, "\001" $4 "\001") > 0) alive = 1
         }
-        else if ((pid in argv) && argmatch(argv[pid], argv1[pid], tolower($9))) alive = 1
+        else if ((pid in cmd) && radar_kind(cmd[pid], tolower($9), none) != "") alive = 1
         print (alive ? "L" : "D") "\t" $0
       }')"
     dead_specs="$(printf '%s\n' "$verdicts" | awk -F '\t' '$1 == "D" { print }')"
@@ -829,10 +866,11 @@ cmd_tick() {
     #    (a background session that cannot take input any more). Requires
     #    regok, and only touches agent sources — a `mark - tool ...` from a
     #    user script has no registry row by design and must survive.
-    _drop_rows '( $1 != "-" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "kimi" || $3 == "pi" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 && ag != "" && index(ag, "\001" $1 "\001") == 0 ) ||
-      ( $1 == "-" && regok != "" && ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "kimi" || $3 == "pi" || $3 == "ai") && index(rk, "\001" $4 "\001") == 0 )' \
+    # (`kinds`, not `src`: _rewrite keeps the row's own source in a variable of that name)
+    _drop_rows '( $1 != "-" && index(kinds, "\001" $3 "\001") > 0 && index(rk, "\001" $4 "\001") == 0 && ag != "" && index(ag, "\001" $1 "\001") == 0 ) ||
+      ( $1 == "-" && regok != "" && index(kinds, "\001" $3 "\001") > 0 && index(rk, "\001" $4 "\001") == 0 )' \
       -v rk="$(printf '\001%s' "$registry_keys")" -v ag="${agents#OK}" \
-      -v regok="$reg_ok"
+      -v regok="$reg_ok" -v kinds="$(_agent_sources)"
   else
     _rewrite ''
   fi
@@ -910,23 +948,10 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
             printf '__REG__\n'
             [ -r "$REG_FILE" ] && cat "$REG_FILE"
             printf '__END__\n'
-          } | LC_ALL=C awk -F '\t' -v sep="$sep" -v cmds="$(_watched_commands)" '
+          } | LC_ALL=C awk -F '\t' -v sep="$sep" -v cmds="$(_watched_commands)" "$RADAR_MATCH_AWK"'
     function cleantty(t) { sub(/^\/dev\//, "", t); return t }
     function clean(s) { gsub(/[[:cntrl:]]/, " ", s); gsub(/[[:space:]][[:space:]]+/, " ", s)
                         sub(/^ /, "", s); sub(/ $/, "", s); return s }
-    function normc(c) { sub(/\.app$/, "", c); if (c == "pi-coding-agent") c = "pi"; return c }
-    function agent_kind(a0, a1,    low, n, parts, i, c, w, b, m, p2) {
-      low = tolower(a0); gsub(/\\/, "/", low)
-      n = split(low, parts, "/")
-      for (i = 1; i <= n; i++) { c = normc(parts[i]); if (c in want) return c }
-      b = normc(parts[n])
-      if (b == "node" || b == "nodejs" || b == "bun" || b == "deno") {
-        m = split(tolower(a1), p2, "/")
-        for (i = 1; i <= m; i++) { c = normc(p2[i]); if (c in want) return c }
-      }
-      return ""
-    }
-    function basename(a0,    n, parts) { n = split(a0, parts, "/"); return parts[n] }
     function pane_of(pid,    cur, hops) {
       if (ptty[pid] != "" && ptty[pid] != "??" && (ptty[pid] in bytty)) return bytty[ptty[pid]]
       cur = pid
@@ -970,15 +995,11 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       pid = rest; sub(/[[:space:]].*/, "", pid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
       ppid = rest; sub(/[[:space:]].*/, "", ppid); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
       tty = rest; sub(/[[:space:]].*/, "", tty); sub(/^[^[:space:]]+[[:space:]]+/, "", rest)
-      a0 = rest; sub(/[[:space:]].*/, "", a0)
-      a1 = ""
-      if (rest ~ /[[:space:]]/) { a1 = rest; sub(/^[^[:space:]]+[[:space:]]+/, "", a1); sub(/[[:space:]].*/, "", a1) }
       par[pid] = ppid; ptty[pid] = cleantty(tty)
-      k = agent_kind(a0, a1)
+      k = radar_kind(rest, "", want)
       if (k != "") {
         akind[pid] = k; atty[pid] = cleantty(tty)
-        aproc[pid] = normc(basename(a0))
-        if (aproc[pid] == "node" || aproc[pid] == "nodejs" || aproc[pid] == "bun" || aproc[pid] == "deno") aproc[pid] = k
+        aproc[pid] = radar_proc(rest, k)
       }
       next
     }
@@ -992,7 +1013,7 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       markseen[$1] = 1
       # only agent-sourced marks are eligible for activity-based healing; a
       # mark written through the public API by a user script is their contract
-      if ($3 == "claude" || $3 == "codex" || $3 == "opencode" || $3 == "kimi" || $3 == "pi" || $3 == "ai") {
+      if (($3 in want) || $3 == "ai") {
         markkey[$1] = $4; markepoch[$1] = $2 + 0
       }
       next
@@ -1000,7 +1021,11 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
     mode == 5 && NF >= 9 {
       if ($4 != "-") {
         anyclaim[$4] = 1
-        if ($2 !~ /^p:/) hookown[$4] = 1
+        if ($2 !~ /^p:/) {
+          hookown[$4] = 1
+          # the session that owns the pane: its newest hook-claimed row
+          if (!($4 in ownepoch) || ($6 + 0) >= ownepoch[$4]) { ownepoch[$4] = $6 + 0; ownkey[$4] = $2; ownkind[$4] = $1 }
+        }
         if (!($4 in livepane)) print "REHOME\t" $2 "\t-"
         else if (($3 + 0) > 0) { nr++; regkey[nr] = $2; regpane[nr] = $4; regpid[nr] = $3 + 0 }
       }
@@ -1052,14 +1077,15 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
         print "A\t" pane "\t" akind[pid] "\t" pid "\t" aproc[pid] "\t" clean(ppath[pane]) "\t" t "\t" \
               (pane in pth ? pth[pane] : "-") "\t" (pane in psh ? psh[pane] : "-") "\t" (pane in pstreak ? pstreak[pane] : 0) "\t" \
               (pane in phstreak ? phstreak[pane] : 0) "\t" (pane in phepoch ? phepoch[pane] : 0) "\t" \
-              claimed "\t" prev "\t" ponscreen[pane] "\t" ((pane in markseen) ? 1 : 0) "\t" mk "\t" me
+              claimed "\t" prev "\t" ponscreen[pane] "\t" ((pane in markseen) ? 1 : 0) "\t" mk "\t" me "\t" \
+              ((pane in ownkey) ? ownkey[pane] : "-") "\t" ((pane in ownkind) ? ownkind[pane] : "-")
       }
       for (p in waitkey)   print "DOWN\t" p "\t" waitkey[p]
     }')"
 
-  local pane kind apid aproc path title pth psh pstreak phstreak phepoch claimed prev onscreen hasmark mkey mepoch
+  local pane kind apid aproc path title pth psh pstreak phstreak phepoch claimed prev onscreen hasmark mkey mepoch okey okind
   local live_rows="" sample_rows="" adopt_rows="" heal_keys="" down_keys="" rehome_spec="" rehome_drop="" working2="" synth_rows=""
-  local th sh state streak hstreak tag key kn s_pane s_kind s_label s_key
+  local th sh state streak hstreak tag key kn skey synth s_pane s_kind s_label s_key
   while IFS=$'\t' read -r tag pane rest; do
     case "$tag" in
       REHOME) rehome_spec="${rehome_spec}${pane}=${rest:-}"$'\001'; continue ;;  # pane=key, rest=new pane
@@ -1067,7 +1093,7 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       A) ;;
       *) continue ;;                                                    # DOWN resolved below
     esac
-    IFS=$'\t' read -r kind apid aproc path title pth psh pstreak phstreak phepoch claimed prev onscreen hasmark mkey mepoch <<< "$rest"
+    IFS=$'\t' read -r kind apid aproc path title pth psh pstreak phstreak phepoch claimed prev onscreen hasmark mkey mepoch okey okind <<< "$rest"
     [ "$title" = "-" ] && title=""
     [ "$pth" = "-" ] && pth=""
     [ "$psh" = "-" ] && psh=""
@@ -1077,8 +1103,10 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
     sh="$(tmux capture-pane -p -t "$pane" 2>/dev/null | cksum || true)"; sh="${sh%% *}"
     case "$title" in
       # Codex animates an attention marker into its native title while blocked
-      # on approval; change detection alone would read it as working.
-      *"Action Required"*|*"action required"*|*"Needs Approval"*|*"needs approval"*)
+      # on approval; change detection alone would read it as working. Cursor
+      # titles the pane "<task> - 🔐 Waiting for confirmation" when
+      # display.showStatusIndicators is on in ~/.cursor/cli-config.json.
+      *"Action Required"*|*"action required"*|*"Needs Approval"*|*"needs approval"*|*"Waiting for confirmation"*)
         state=blocked ;;
       *)
         if { [ -n "$pth" ] && [ "$th" != "$pth" ]; } || { [ -n "$psh" ] && [ "$sh" != "$psh" ]; } || [ -z "$psh" ]; then
@@ -1110,18 +1138,24 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       adopt_rows="${adopt_rows}${kind}"$'\t'"p:${apid}"$'\t'"${apid}"$'\t'"${pane}"$'\t'"${now}"$'\t'"${now}"$'\t'"${state}"$'\t'"$(_san "$path")"$'\t'"$(_san "$aproc")"$'\n'
       claimed=1   # adopted now: event synthesis below applies from this scan on
     fi
-    # Hookless (or hook-gapped) panes still produce no events of their own.
-    # An observed transition into blocked, or from working into stalled, IS
-    # the event — synthesize it once, off-screen only, never over an
-    # existing unread mark.
-    if [ "$claimed" -ge 1 ] && [ "$onscreen" = 0 ] && [ "$hasmark" = 0 ]; then
-      case "$kind" in
-        claude) kn=Claude ;; codex) kn=Codex ;; kimi) kn=Kimi ;; pi) kn=Pi ;; *) kn=Agent ;;
-      esac
+    # Hookless panes produce no events of their own. An observed transition
+    # into blocked, or from working into stalled, IS the event: synthesize it
+    # once, off-screen only, never over an existing unread mark. A pane whose
+    # own session reports natively is left to its hooks: there every real
+    # transition arrives as an event, and what the screen adds is redraw (a
+    # resize, a banner) read as work. Where a hook-owned pane still needs the
+    # floor, the mark carries the session key so native events clear it.
+    skey="p:${apid}"; synth=1
+    if [ "$claimed" = 2 ] && [ "$okind" = "$kind" ] && [ "$okey" != "-" ]; then
+      skey="$okey"
+      _native_events "$kind" && synth=0
+    fi
+    if [ "$synth" = 1 ] && [ "$claimed" -ge 1 ] && [ "$onscreen" = 0 ] && [ "$hasmark" = 0 ]; then
+      kn="$(_agent_display_name "$kind")"
       if [ "$state" = blocked ] && [ "$prev" != blocked ]; then
-        synth_rows="${synth_rows}${pane}"$'\t'"${kind}"$'\t'"${kn} needs approval (scan)"$'\t'"p:${apid}"$'\n'
+        synth_rows="${synth_rows}${pane}"$'\t'"${kind}"$'\t'"${kn} needs approval (scan)"$'\t'"${skey}"$'\n'
       elif [ "$state" = stalled ] && [ "$prev" = working ]; then
-        synth_rows="${synth_rows}${pane}"$'\t'"${kind}"$'\t'"${kn} finished — your turn (scan)"$'\t'"p:${apid}"$'\n'
+        synth_rows="${synth_rows}${pane}"$'\t'"${kind}"$'\t'"${kn} finished — your turn (scan)"$'\t'"${skey}"$'\n'
       fi
     fi
     [ -n "${TMUX_RADAR_SCAN_DEBUG:-}" ] && printf 'SCANDBG %s claimed=%s onscreen=%s hasmark=%s prev=%s state=%s synth=%s\n' "$pane" "$claimed" "$onscreen" "$hasmark" "$prev" "$state" "${#synth_rows}" >&2
@@ -1198,14 +1232,110 @@ _json_field_any() {
   fi
 }
 
-# Claude hooks pass JSON on stdin (session_id, cwd, message, ...).
-# Interactive TUI in a pane: $TMUX_PANE is the claude pane -> pane mark.
-# Background session (dashboard/cloud/job): $CLAUDE_JOB_DIR set or $TMUX_PANE
-# unset -> paneless mark keyed by session_id, labelled with the project dir.
-_claude_target() {  # sets PANE / KEY / WHERE from hook json in $1
-  local json="$1" sid cwd ignore p
-  sid="$(_json_field session_id "$json")"
-  cwd="$(_json_field cwd "$json")"
+# --- hook adapter: one reader for every agent that speaks Claude's dialect -------
+# Claude Code's hook schema is the common tongue of agent CLIs. Grok and Droid
+# copy it (Grok with camelCase fields beside the snake_case ones), Cursor,
+# Gemini and Auggie keep its shape under event names of their own, and Grok
+# runs Claude's very hooks out of ~/.claude/settings.json. So a hook that
+# radar installed for Claude may be fired by another agent, and the payload
+# alone does not say by whom. The adapter therefore
+#   - rewrites the payload into Claude's field names (_hook_normalize),
+#   - reads the agent that fired it off the process tree (_hook_open),
+#   - and only then decides what the event means.
+# The claude-* subcommands name the event themselves, which is how Claude's own
+# settings wire them. `hook [kind]` takes it from the payload.
+HOOK_KIND=claude    # the agent that fired this hook
+HOOK_NAME=Claude    # its name in a label
+HOOK_JSON=""        # the payload, in Claude's field names
+
+_hook_normalize() {  # _hook_normalize <json>
+  command -v jq >/dev/null 2>&1 || { printf '%s' "${1:-}"; return 0; }
+  printf '%s' "${1:-}" | jq -c '
+    def snake: gsub("(?<u>[A-Z])"; "_" + (.u | ascii_downcase));
+    (if type == "object" then . else {} end) as $in
+    # a snake_case key the agent sent itself wins over one derived here
+    | ($in | to_entries | map(.key |= snake) | from_entries)
+      + ($in | with_entries(select(.key | test("[A-Z]") | not)))
+    | .session_id = (.session_id // .conversation_id // .thread_id)
+    | .cwd = (.cwd // .workspace_root // ((.workspace_roots // [])[0]?))
+    | .last_assistant_message = (.last_assistant_message // .prompt_response)
+    | with_entries(select(.value != null))
+  ' 2>/dev/null || printf '%s' "${1:-}"
+}
+
+_hook_field()     { _json_field "$1" "$HOOK_JSON"; }
+_hook_field_any() { _json_field_any "$1" "$HOOK_JSON"; }
+
+# An unattended Claude run (claude -p, the Agent SDK) has nobody at its prompt:
+# a program reads its output. Claude Code says which kind of session a hook
+# belongs to in the hook environment: CLAUDE_CODE_SESSION_ATTENDED, and an
+# sdk-* CLAUDE_CODE_ENTRYPOINT on versions that predate it. Background jobs
+# are unattended too, but they are supervised sessions with paneless marks.
+# Only a hook Claude itself fired may be judged by these variables: inside
+# another agent they are the leftovers of whatever Claude session started it.
+_claude_unattended() {
+  [ -z "${CLAUDE_JOB_DIR:-}" ] || return 1
+  case "${CLAUDE_CODE_SESSION_KIND:-}" in bg|daemon|daemon-worker) return 1 ;; esac
+  case "${CLAUDE_CODE_SESSION_ATTENDED:-}" in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
+  case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-*) return 0 ;; esac
+  return 1
+}
+
+# Reads the payload and names the agent. With a hint (a hook installed in that
+# agent's own config) the agent is known and the tree only says whether it is
+# nested. Without one the nearest watched agent above the hook fired it. When
+# the tree shows nobody, the payload may still name its sender: Cursor stamps
+# cursor_version on every event, and its desktop app, which runs the same hook
+# files, lives in no pane. Claude is the answer otherwise.
+_hook_open() {  # _hook_open [kind-hint]
+  local hint
+  hint="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  HOOK_JSON="$(_hook_normalize "$(cat 2>/dev/null || true)")"
+  if [ -n "$hint" ]; then
+    _agent_kind_valid "$hint" || { echo "hook: invalid agent kind" >&2; exit 1; }
+    _agent_identify "$hint"
+    if [ -z "$AGENT_PID" ]; then
+      # Another agent fired a hook written for this one: it reads that config
+      # (Grok loads ~/.cursor/hooks.json), or the hinted agent runs nested in
+      # it in a shape the matcher misses. Either way the agent in the tree
+      # reports through hooks of its own.
+      _agent_identify '*'
+      [ -z "$AGENT_PID" ] || exit 0
+    fi
+    HOOK_KIND="$hint"
+  else
+    _agent_identify '*'
+    HOOK_KIND="${AGENT_KIND:-}"
+    if [ -z "$HOOK_KIND" ]; then
+      HOOK_KIND=claude
+      [ -z "$(_hook_field cursor_version)" ] || HOOK_KIND=cursor-agent
+    fi
+  fi
+  HOOK_NAME="$(_agent_display_name "$HOOK_KIND")"
+  if [ "$HOOK_KIND" = claude ] && _claude_unattended; then exit 0; fi
+  return 0
+}
+
+# Where the event belongs: sets PANE / KEY / WHERE, and leaves when it belongs
+# nowhere. An interactive TUI sits in $TMUX_PANE. A Claude background session
+# (dashboard, cloud, job: $CLAUDE_JOB_DIR set or $TMUX_PANE unset) gets a
+# paneless mark keyed by session id and labelled with its project. A run that
+# claims a pane from inside another agent reports nothing (_nested_run), and
+# only Claude has background sessions a person supervises.
+_hook_target() {
+  _hook_locate
+  if [ "$PANE" != "-" ] && [ "$AGENT_NESTED" = 1 ]; then exit 0; fi
+  if [ "$PANE" = "-" ] && [ "$HOOK_KIND" != claude ]; then exit 0; fi
+  return 0
+}
+
+_hook_locate() {
+  local sid cwd ignore p
+  sid="$(_hook_field session_id)"
+  cwd="$(_hook_field cwd)"
   KEY=""; [ -n "$sid" ] && KEY="s:${sid}"
   WHERE=""; [ -n "$cwd" ] && WHERE="$(basename "$cwd")"
   if [ -n "${CLAUDE_JOB_DIR:-}" ] || [ -z "${TMUX_PANE:-}" ]; then
@@ -1214,11 +1344,12 @@ _claude_target() {  # sets PANE / KEY / WHERE from hook json in $1
     # own tty / process ancestry before falling back to a paneless mark, so the
     # mark is jumpable instead of a bare "session id + name" row.
     p="$(_resolve_pane_by_proc || true)"
-    # The cwd guess is only for hooks with NO controlling terminal (daemons,
-    # job runners). A hook that owns a tty we cannot place runs on a foreign
-    # tmux server (teammate swarms): guessing by cwd would pin the event on an
+    # The cwd guess is only for Claude hooks with NO controlling terminal
+    # (daemons, job runners). A hook that owns a tty we cannot place runs on a
+    # foreign tmux server (teammate swarms), and another agent's hook with no
+    # pane comes from a desktop app: guessing by cwd would pin the event on an
     # unrelated pane that merely shares the directory.
-    if [ -z "$p" ] && [ -n "$cwd" ]; then
+    if [ -z "$p" ] && [ -n "$cwd" ] && [ "$HOOK_KIND" = claude ]; then
       local mytty
       mytty="$("$PS_BIN" -o tty= -p $$ 2>/dev/null || true)"
       mytty="$(printf '%s' "$mytty" | tr -d '[:space:]')"
@@ -1252,75 +1383,249 @@ _claude_target() {  # sets PANE / KEY / WHERE from hook json in $1
   fi
 }
 
-_claude_adopt() {  # _claude_adopt <state> <json> — registry upsert for this event
-  local state="$1" json="$2" agent pid="" proc=""
+_hook_adopt() {  # _hook_adopt <state>: registry upsert for this event
   [ -n "${KEY:-}" ] || return 0
-  agent="$(_resolve_agent_pid claude || true)"
-  if [ -n "$agent" ]; then pid="${agent%%$'\t'*}"; proc="${agent#*$'\t'}"; fi
-  _reg_upsert claude "$KEY" "${pid:-0}" "${PANE:--}" "$state" "$(_json_field cwd "$json")" "$proc"
+  _reg_upsert "$HOOK_KIND" "$KEY" "${AGENT_PID:-0}" "${PANE:--}" "$1" "$(_hook_field cwd)" "$AGENT_PROC"
 }
 
-cmd_claude_mark() {  # Notification hook (permission request / waiting on you)
-  local json msg; json="$(cat 2>/dev/null || true)"
-  msg="$(_json_field message "$json")"; [ -n "$msg" ] || msg="Claude needs input"
-  _claude_target "$json"
-  _claude_adopt waiting "$json"
+_hook_mark() {  # _hook_mark <what happened>: "needs approval: Bash", "finished — your turn"
+  local msg="$1"
   if [ "$PANE" = "-" ]; then
     [ "$(opt @radar-claude-bg on)" = "on" ] || exit 0
-    msg="Claude·${WHERE:-bg}: ${msg}"
+    msg="${HOOK_NAME}·${WHERE:-bg}: ${msg}"
+  else
+    msg="${HOOK_NAME} ${msg}"
   fi
   [ "$(opt @radar-needinput on)" = "on" ] || exit 0
-  cmd_mark "$PANE" claude "$msg" "$KEY"
+  cmd_mark "$PANE" "$HOOK_KIND" "$msg" "$KEY"
 }
 
-cmd_claude_stop() {  # Stop hook (turn finished — your move)
-  local json; json="$(cat 2>/dev/null || true)"
-  _claude_target "$json"
-  _claude_adopt "done" "$json"
-  local msg="Claude finished — your turn"
-  if [ "$PANE" = "-" ]; then
-    [ "$(opt @radar-claude-bg on)" = "on" ] || exit 0
-    msg="Claude·${WHERE:-bg}: finished — your turn"
-  fi
-  [ "$(opt @radar-needinput on)" = "on" ] || exit 0
-  cmd_mark "$PANE" claude "$msg" "$KEY"
+_reg_state() {  # _reg_state <key>: the recorded state of one session
+  awk -F '\t' -v k="${1:-}" 'NF >= 9 && $2 == k { print $7; exit }' "$REG_FILE" 2>/dev/null || true
 }
 
-cmd_claude_clear() {  # UserPromptSubmit hook (you replied)
-  local json; json="$(cat 2>/dev/null || true)"
-  _claude_target "$json"
-  _claude_adopt working "$json"
+# A stop is the user's turn only when nothing will resume the session. Agent
+# work still in flight (a subagent, a workflow) reports back and wakes it. A
+# scheduled wakeup pauses only the turn the schedule started (state `woken`,
+# set when the prompt arrived): a turn the user started is finished even while
+# a loop is armed. A background shell decides nothing, since a dev server
+# never exits.
+_hook_paused() {  # _hook_paused <registry state at stop>
+  command -v jq >/dev/null 2>&1 || return 1
+  printf '%s' "$HOOK_JSON" | jq -e --arg state "${1:-}" '
+    ([(.background_tasks // [])[]? | select(.type == "subagent" or .type == "workflow")] | length > 0)
+    or ($state == "woken" and ((.session_crons // []) | length > 0))
+  ' >/dev/null 2>&1
+}
+
+# The first line of prose in the last assistant message, past headings and
+# code fences, at most 60 characters. jq slices by code point, so a cut never
+# splits a multibyte character whatever locale the hook runs under.
+_hook_summary() {
+  command -v jq >/dev/null 2>&1 || return 0
+  _san "$(printf '%s' "$HOOK_JSON" | jq -r '
+    def heading: test("^\\s*#") or test("^\\s*\\*\\*[^*]+\\*\\*:?\\s*$");
+    (.last_assistant_message // "")
+    | if type == "string" then . else "" end
+    | split("\n")
+    | map(select(test("\\S") and (test("^\\s*```") | not)))
+    | ((map(select(heading | not)) | .[0]) // .[0] // "")
+    | gsub("^[\\s#>*`-]+"; "") | gsub("[\\s*`:]+$"; "")
+    | if length > 60 then .[0:59] + "…" else . end
+  ' 2>/dev/null || true)"
+}
+
+# The session is working again: record it and drop what it was marked with.
+_hook_resume() {  # _hook_resume [state]; call _hook_target first
+  _hook_adopt "${1:-working}"
   if [ -n "$KEY" ] && [ "${KEY#s:}" != "$KEY" ]; then cmd_clear_key "$KEY"
   elif [ "$PANE" != "-" ] && [ -n "$PANE" ]; then cmd_clear_pane "$PANE"
   fi
 }
 
-cmd_claude_register() {  # SessionStart hook: adopt the session, drop stale asks
-  local json; json="$(cat 2>/dev/null || true)"
-  _claude_target "$json"
+_hook_start() {  # a session began: adopt it, drop what its previous life asked
+  _hook_target
   [ -n "${KEY:-}" ] || exit 0
-  _claude_adopt working "$json"
-  # a session that just (re)started cannot be waiting on you yet; an unseen
-  # "finished — your turn" from its previous life is still worth showing
+  _hook_adopt working
   _drop_session_marks "$KEY"
   _sync_bar
 }
 
-cmd_claude_end() {  # SessionEnd hook: the native, instant "session is gone"
-  local json sid key
-  json="$(cat 2>/dev/null || true)"
-  sid="$(_json_field session_id "$json")"
+_hook_prompt() {  # a prompt was submitted
+  local state=working
+  # a prompt the schedule submitted starts a turn nobody is waiting on
+  case "$(_hook_field source)" in
+    loop_wakeup|schedule_wakeup) state=woken ;;
+  esac
+  _hook_target
+  _hook_resume "$state"
+}
+
+_hook_notify() {  # a notification, read by its type
+  local msg ntype detail
+  ntype="$(_hook_field notification_type | tr '[:upper:]' '[:lower:]' | tr -d '_')"
+  case "$ntype" in
+    # idle_prompt repeats, a minute on, that a turn which already ended is
+    # waiting; Stop said so first, and overwriting its mark would turn every
+    # finished turn into an action. auth_success is housekeeping.
+    idleprompt|authsuccess) exit 0 ;;
+    # the question an elicitation asked has been answered
+    elicitationcomplete|elicitationresponse)
+      _hook_target
+      _hook_resume
+      return 0 ;;
+  esac
+  msg="$(_hook_field message)"
+  case "$ntype" in
+    permissionprompt|toolpermission)
+      # the message names the tool on some versions and nothing on others
+      case "$msg" in
+        *" needs your permission to use "*) detail="${msg#* needs your permission to use }" ;;
+        *" needs your permission"|"") detail="" ;;
+        *) detail="$msg" ;;
+      esac
+      msg="needs approval${detail:+: $detail}" ;;
+    elicitationdialog|elicitationurldialog|agentneedsinput)
+      msg="needs your input${msg:+: $msg}" ;;
+    # no type (older Claude Code) or one not mapped yet: the message as given
+    *)
+      [ -n "$msg" ] || msg="${HOOK_NAME} needs input"
+      _hook_target
+      _hook_adopt waiting
+      if [ "$PANE" = "-" ]; then
+        [ "$(opt @radar-claude-bg on)" = "on" ] || exit 0
+        msg="${HOOK_NAME}·${WHERE:-bg}: ${msg}"
+      fi
+      [ "$(opt @radar-needinput on)" = "on" ] || exit 0
+      cmd_mark "$PANE" "$HOOK_KIND" "$msg" "$KEY"
+      return 0 ;;
+  esac
+  _hook_target
+  _hook_adopt waiting
+  _hook_mark "$msg"
+}
+
+_hook_fail() {  # the turn died: an API error, or the agent's own error stop
+  local err="${1:-}"
+  [ -n "$err" ] || err="$(_hook_field error)"
+  _hook_target
+  _hook_adopt "done"
+  _hook_mark "turn failed${err:+: $err}"
+}
+
+_hook_stop() {  # the turn ended; how decides what it means
+  local outcome summary
+  # Grok names the reason, Cursor the status, Auggie the cause. Claude names
+  # none: its failed and cancelled turns are events of their own.
+  outcome="$(_hook_field reason)"
+  [ -n "$outcome" ] || outcome="$(_hook_field status)"
+  [ -n "$outcome" ] || outcome="$(_hook_field agent_stop_cause)"
+  case "$(printf '%s' "$outcome" | tr '[:upper:]' '[:lower:]')" in
+    # the session is closing, which its end event reports
+    shutdown) exit 0 ;;
+    # the person stopped it and is looking at it
+    aborted|interrupted|cancelled|canceled)
+      _hook_target
+      _hook_resume
+      return 0 ;;
+    error|failed) _hook_fail "$outcome"; return 0 ;;
+  esac
+  _hook_target
+  if _hook_paused "$(_reg_state "$KEY")"; then
+    # not the user's turn, and no longer waiting on the user either
+    _hook_resume
+    return 0
+  fi
+  _hook_adopt "done"
+  summary="$(_hook_summary)"
+  if [ -n "$summary" ]; then _hook_mark "finished: $summary"
+  else _hook_mark "finished — your turn"; fi
+}
+
+# A tool that ran on the main thread proves the session is not blocked. An
+# approval answered in place fires no prompt event, and the scanner needs two
+# scans to see the same thing. The top of this script already left if no mark
+# is on file or none belongs to this session.
+_hook_resolved() {
+  local sid epoch dur started
+  sid="$(_hook_field session_id)"
   [ -n "$sid" ] || exit 0
-  key="s:${sid}"
-  _reg_remove "$key"
-  _drop_session_marks "$key"
+  epoch="$(awk -F '\t' -v k="s:${sid}" '$4 == k { print $2; exit }' "$STATE_FILE" 2>/dev/null || true)"
+  case "$epoch" in ''|*[!0-9]*) exit 0 ;; esac
+  # a subagent's tool call says nothing about the prompt its parent waits on
+  [ -z "$(_hook_field agent_id)" ] || exit 0
+  # Only a tool that started after the mark was written can be the one the
+  # user was asked about. A slower call of the same batch, already running
+  # when the prompt appeared, proves nothing. duration_ms excludes the time
+  # spent on the prompt, so now minus duration is when the tool began.
+  dur="$(_hook_field_any duration_ms)"; dur="${dur%%.*}"
+  case "$dur" in
+    ''|*[!0-9]*) ;;   # not reported: any tool result counts
+    *)
+      started=$(( $(date +%s) - (dur + 999) / 1000 ))
+      [ "$started" -ge $(( epoch - 1 )) ] || exit 0
+      ;;
+  esac
+  _hook_target
+  _hook_resume
+}
+
+_hook_end() {  # the session is gone: its row and its marks go with it
+  [ -n "$(_hook_field session_id)" ] || exit 0
+  # the same gate as every other event: a nested run's end must not remove a
+  # host session that happens to carry its id
+  _hook_target
+  _reg_remove "$KEY"
+  _drop_session_marks "$KEY"
   _sync_bar
+}
+
+_hook_dispatch() {  # _hook_dispatch <event>
+  case "$1" in
+    start)    _hook_start ;;
+    prompt)   _hook_prompt ;;
+    notify)   _hook_notify ;;
+    stop)     _hook_stop ;;
+    fail)     _hook_fail ;;
+    cancel)   _hook_target; _hook_resume ;;
+    resolved) _hook_resolved ;;
+    end)      _hook_end ;;
+  esac
+}
+
+# Event names as each dialect spells them, read without case or underscores:
+# SessionStart, session_start and sessionStart are one name.
+_hook_event() {  # _hook_event <name as the payload gives it>
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '_')" in
+    sessionstart) printf 'start' ;;
+    userpromptsubmit|beforesubmitprompt|beforeagent) printf 'prompt' ;;
+    notification) printf 'notify' ;;
+    stop|afteragent) printf 'stop' ;;
+    stopfailure) printf 'fail' ;;
+    stopcancelled|stopcanceled) printf 'cancel' ;;
+    posttooluse|aftertool) printf 'resolved' ;;
+    sessionend) printf 'end' ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_hook() {  # hook [kind]: a hook installed in an agent's own config; the payload names the event
+  local event
+  _hook_open "${1:-}"
+  # an event radar has no use for is not an error: agents add events freely
+  event="$(_hook_event "$(_hook_field hook_event_name)")" || exit 0
+  _hook_dispatch "$event"
+}
+
+cmd_hook_as() {  # the claude-* subcommands: the event is the subcommand
+  _hook_open ""
+  _hook_dispatch "$1"
 }
 
 _codex_pane() {
   local pane
   pane="${TMUX_PANE:-}"
-  # Same foreign-server guard as _claude_target: an id that does not resolve
+  # Same foreign-server guard as _hook_locate: an id that does not resolve
   # on this tmux server is not a switchable destination.
   if [ -n "$pane" ] && ! tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
     pane=""
@@ -1329,12 +1634,28 @@ _codex_pane() {
   printf '%s' "$pane"
 }
 
+# `codex exec` and `codex review` run the same hooks with nobody at the
+# prompt. Codex says which it is in two places: the legacy notify payload
+# names the client, and the first line of the session's rollout file names
+# who originated it.
+_codex_headless() {  # _codex_headless <json>
+  local path
+  [ "$(_json_field client "$1")" = codex_exec ] && return 0
+  path="$(_json_field transcript_path "$1")"
+  # The payload names the file: only a regular one is read, since a FIFO would
+  # block the hook, and only its first MiB (real first lines run 14 to 46 KB).
+  [ -n "$path" ] && [ -f "$path" ] && [ -r "$path" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  head -c 1048576 "$path" 2>/dev/null | head -n 1 |
+    jq -e '(.payload.originator // "") == "codex_exec" or (.payload.source // "") == "exec"' >/dev/null 2>&1
+}
+
 CODEX_KEY=""
 _codex_adopt() {  # _codex_adopt <state> <json> <pane> — sets CODEX_KEY
-  local state="$1" json="$2" pane="${3:--}" sid key agent pid="" proc=""
+  local state="$1" json="$2" pane="${3:--}" sid key pid proc
   CODEX_KEY=""
-  agent="$(_resolve_agent_pid codex || true)"
-  if [ -n "$agent" ]; then pid="${agent%%$'\t'*}"; proc="${agent#*$'\t'}"; fi
+  _agent_identify codex
+  pid="$AGENT_PID"; proc="$AGENT_PROC"
   # notify payloads carry thread-id / thread_id; hook payloads may not — fall
   # back to a pid key so liveness GC still applies
   sid="$(_json_field thread-id "$json")"
@@ -1391,7 +1712,9 @@ cmd_codex_hook() {  # Codex native hooks pass JSON on stdin
   json="$(cat 2>/dev/null || true)"
   event="$(_json_field hook_event_name "$json")"
   [ -n "$event" ] || exit 0
+  if _codex_headless "$json"; then exit 0; fi
   pane="$(_codex_pane)"
+  if [ -n "$pane" ] && _nested_run codex; then exit 0; fi
   case "$event" in
     UserPromptSubmit)
       _codex_adopt working "$json" "$pane"
@@ -1416,7 +1739,9 @@ cmd_codex() {  # Codex notify passes its event JSON as the last argv argument
   local json="${1:-}" type pane kind label
   type="$(_json_field type "$json")"
   [ -n "$type" ] || exit 0
+  if _codex_headless "$json"; then exit 0; fi
   pane="$(_codex_pane)"
+  if [ -n "$pane" ] && _nested_run codex; then exit 0; fi
   case "$type" in
     UserPromptSubmit)
       _codex_adopt working "$json" "$pane"
@@ -1482,10 +1807,10 @@ _opencode_accept_locked() {  # <key> <generation> <started-ms> <sequence>
 
 _session_mark_locked() {  # <pane|-> <source> <label> <key>
   local pane="$1" source="$2" label key="$4" now saved_title="" prev_title=""
-  label="$(_san "$3")"
+  label="$(_label "$3")"
   now="$(date +%s)"
   if [ "$pane" != "-" ] && [ -n "$pane" ] && [ "$(opt @radar-retitle on)" != "off" ]; then
-    saved_title="$(_san "$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)")"
+    saved_title="$(_label "$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)")"
     case "$saved_title" in "⚠ "*|"✓ "*|"! "*|"· "*) saved_title="" ;; esac
   fi
   prev_title="$(awk -F '\t' -v k="$key" -v p="$pane" \
@@ -1516,6 +1841,7 @@ _opencode_event() {  # _opencode_event <one JSON object>
   generation_started="$(_json_field_any generation_started "$json")"
   sequence="$(_json_field_any sequence "$json")"
   [ -n "$pane" ] || pane="$(_resolve_pane_by_proc || true)"
+  if [ -n "$pane" ] && _nested_run opencode; then return 0; fi
   if [ -n "$sid" ]; then key="oc:s:$(_san "$sid")"
   elif [ -n "$generation" ]; then key="oc:g:$(_san "$generation")"
   elif [ "$pid" -gt 0 ]; then key="oc:p:$pid"
@@ -1646,13 +1972,20 @@ _agent_display_name() {
     codex) printf 'Codex' ;;
     claude) printf 'Claude' ;;
     opencode) printf 'OpenCode' ;;
+    pi) printf 'Pi' ;;
+    cursor-agent) printf 'Cursor' ;;
+    grok) printf 'Grok' ;;
+    gemini) printf 'Gemini' ;;
+    amp) printf 'Amp' ;;
+    droid) printf 'Droid' ;;
+    auggie) printf 'Auggie' ;;
     *) printf '%s' "$1" ;;
   esac
 }
 
 _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
   local kind="$1" event="$2" json="$3" sid key pane pid cwd proc detail
-  local agent display label="" state=working
+  local display label="" state=working
   _agent_kind_valid "$kind" || {
     echo "agent-event: invalid agent kind" >&2
     return 2
@@ -1674,11 +2007,12 @@ _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
   [ -n "$pane" ] || pane="-"
   pid="$(_json_field_any pid "$json")"
   proc="$(_json_field process "$json")"
+  if [ "$pane" != "-" ] && _nested_run "$kind"; then return 0; fi
   if [ -z "$pid" ] || [ "$pid" = 0 ]; then
-    agent="$(_resolve_agent_pid "$kind" || true)"
-    if [ -n "$agent" ]; then
-      pid="${agent%%$'\t'*}"
-      [ -n "$proc" ] || proc="${agent#*$'\t'}"
+    _agent_identify "$kind"
+    if [ -n "$AGENT_PID" ]; then
+      pid="$AGENT_PID"
+      [ -n "$proc" ] || proc="$AGENT_PROC"
     fi
   fi
   case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
@@ -1832,11 +2166,7 @@ cmd_doctor() {  # one-stop "why is this row (not) showing?"
     local pane epoch src key label _title why lvl
     while IFS=$'\t' read -r pane epoch src key label _title; do
       [ -n "$pane" ] || continue
-      lvl=notice
-      case "$(printf '%s %s' "$src" "$label" | tr '[:upper:]' '[:lower:]')" in
-        *finished*|*'your turn'*|*'turn complete'*|*'task complete'*|*done*|*任务完成*|*完成*) lvl="done" ;;
-        *permission*|*approval*|*approve*|*'needs input'*|*waiting*|*'action required'*|*需要你*|*等待*) lvl=action ;;
-      esac
+      lvl="$(radar_level "$src" "$label")"
       why="no liveness source — GC candidate"
       if [ -r "$REG_FILE" ] && awk -F '\t' -v k="$key" 'NF >= 9 && $2 == k { found=1 } END { exit !found }' "$REG_FILE" 2>/dev/null; then
         why="registry row exists (see verdict above)"
@@ -1885,11 +2215,15 @@ case "${1:-}" in
   hook-tick)       cmd_hook_tick ;;
   restore-begin)   cmd_restore_begin ;;
   restore-end)     cmd_restore_end ;;
-  claude-mark)     cmd_claude_mark ;;
-  claude-stop)     cmd_claude_stop ;;
-  claude-clear)    cmd_claude_clear ;;
-  claude-register) cmd_claude_register ;;
-  claude-end)      cmd_claude_end ;;
+  claude-mark)     cmd_hook_as notify ;;
+  claude-stop)     cmd_hook_as stop ;;
+  claude-fail)     cmd_hook_as fail ;;
+  claude-clear)    cmd_hook_as prompt ;;
+  claude-resolved) cmd_hook_as resolved ;;
+  claude-register) cmd_hook_as start ;;
+  claude-end)      cmd_hook_as end ;;
+  hook)            shift; cmd_hook "${1:-}" ;;
+  hook-resolved)   shift; _hook_open "${1:-}"; _hook_dispatch resolved ;;
   codex-hook)      cmd_codex_hook ;;
   codex)           shift; cmd_codex "${1:-}" ;;
   opencode-hook)   cmd_opencode_hook ;;

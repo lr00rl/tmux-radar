@@ -12,6 +12,11 @@
 // (agent_end) / session_end (shutdown). pi exposes no approval-request event,
 // so permission waits are covered by tmux-radar's live screen scanner, not by
 // this bridge.
+//
+// Only the TUI reports. pi loads extensions in print, json and rpc mode too,
+// where a program reads the output and nobody sits at the prompt; started
+// from another agent's tool call such a run inherits that agent's TMUX_PANE.
+// ctx.mode says which it is (ctx.hasUI would not do: rpc reports true).
 import { spawn } from "node:child_process";
 
 const NOTIFY = "__TMUX_RADAR_NOTIFY__";
@@ -19,6 +24,8 @@ const NOTIFY = "__TMUX_RADAR_NOTIFY__";
 function send(event, ctx) {
   const pane = process.env.TMUX_PANE || "";
   if (!pane) return; // pi outside tmux: radar has no destination to mark
+  // a pi that does not say its mode predates the field and is served as before
+  if (ctx && typeof ctx.mode === "string" && ctx.mode !== "tui") return;
   try {
     const child = spawn(NOTIFY, ["agent-event", "pi", event], {
       stdio: ["pipe", "ignore", "ignore"],

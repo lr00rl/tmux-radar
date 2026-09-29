@@ -283,7 +283,10 @@ _drain_spool() {  # replay spooled events; call WITHOUT the lock held
         if lock; then
           _rewrite 'if (key == delkey || (mp != "-" && pane == mp)) next' \
             -v delkey="$f4" -v mp="$f1"
-          printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$f1" "$f2" "$f3" "$f4" "$f5" "$f6" >> "$STATE_FILE"
+          # stamped with the replay time, like a replayed agent event: the
+          # mark arrives now, and only a fresh mark is announced
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$f1" "$(date +%s)" "$f3" "$f4" "$f5" "$f6" >> "$STATE_FILE"
+          ANNOUNCE=1
           unlock
         else
           _spool_row mark "$f1" "$f2" "$f3" "$f4" "$f5" "$f6"
@@ -655,6 +658,125 @@ _schedule_resync() {
   _schedule_tick "$delay" "$STATE_DIR/.resync-at"
 }
 
+# --- announce: say once what a write added ------------------------------------
+# A mark is written by a hook running beside the agent, and the person it is
+# for is usually looking at another pane. After a write, each mark the write
+# added is announced once, in two ways:
+#   - a toast on every attached client that is not on the marked pane. It is
+#     a status-line message (display-message): -C keeps the pane drawing
+#     underneath, and a key press reaches the pane and dismisses the toast,
+#     so it never takes the keyboard the way a popup would.
+#   - @radar-notify-command, with the mark in RADAR_* variables.
+# The hook only hands the job to the tmux server (run-shell -b) and returns:
+# the agent waits for its hooks, and neither a slow command nor the toasts
+# should hold it up, nor should the agent's end of the hook cut them short.
+# "Once" holds across hooks that sync at the same moment: each mark is
+# claimed with an atomic mkdir, and only the claimant announces it. Only marks
+# written in the last 30 seconds qualify, so a restart announces nothing old.
+ANNOUNCE=0
+ANNOUNCED_DIR="$STATE_DIR/.announced"
+
+_fmt_literal() {  # a string tmux prints as it is when it expands formats
+  local h='#' hh='##'
+  printf '%s' "${1//"$h"/$hh}"
+}
+
+_sh_quote_to() {  # _sh_quote_to <var> <string>: one shell word, single-quoted, without a fork
+  local s="$2"
+  case "$s" in *"'"*) s="$(printf '%s' "$s" | sed "s/'/'\\\\''/g")" ;; esac
+  printf -v "$1" "'%s'" "$s"
+}
+
+_announce_later() {  # one tmux call from the hook; the server does the rest
+  local dir file notify h='#' hh='##' cmd
+  _sh_quote_to dir "$STATE_DIR"
+  _sh_quote_to file "$STATE_FILE"
+  _sh_quote_to notify "$SCRIPT_DIR/needinput-notify.sh"
+  cmd="TMUX_RADAR_STATE_DIR=$dir TMUX_RADAR_NEEDINPUT_FILE=$file $notify announce"
+  # run-shell expands its argument as a format before sh reads it
+  tmux run-shell -b "${cmd//"$h"/$hh}" 2>/dev/null || true
+}
+
+_toast_glyph() {  # _toast_glyph <level>
+  case "$1" in action) printf '⚠' ;; done) printf '✓' ;; *) printf '!' ;; esac
+}
+
+_toast_format() {  # _toast_format <level> <where> <label>: the chip colours, then the user's message-style
+  local style
+  case "$1" in
+    action) style='#[fg=colour234,bg=colour208,bold]' ;;
+    done)   style='#[fg=colour234,bg=colour35,bold]' ;;
+    *)      style='#[fg=colour234,bg=colour220,bold]' ;;
+  esac
+  printf '%s %s #[default] #[bold]%s#[nobold] · %s' \
+    "$style" "$(_toast_glyph "$1")" "$(_toast_literal "$2")" "$(_toast_literal "$3")"
+}
+
+_toast_literal() {  # display-message also runs its text through strftime: % too is doubled
+  local s p='%' pp='%%'
+  s="$(_fmt_literal "$1")"
+  printf '%s' "${s//"$p"/$pp}"
+}
+
+cmd_announce() {  # announce: run by the tmux server after a write
+  # run-shell shows any output and any failure on the client: keep both quiet
+  exec </dev/null >/dev/null 2>&1
+  have_tmux || return 0
+  local toast cmd levels dur rows clients epoch level where label pane key source
+  local id watched session cname cpane cctl shown fmt text
+  toast="$(opt @radar-toast on)"
+  cmd="$(opt @radar-notify-command '')"
+  [ "$toast" = on ] || [ -n "$cmd" ] || return 0
+  rows="$("$SCRIPT_DIR/needinput-toast.sh" fresh 30 2>/dev/null || true)"
+  [ -n "$rows" ] || return 0
+  mkdir -p "$ANNOUNCED_DIR" 2>/dev/null || return 0
+  levels=" $(opt @radar-toast-levels 'action done notice') "
+  dur="$(opt @radar-toast-duration 5000)"
+  case "$dur" in ''|*[!0-9]*) dur=5000 ;; esac
+  clients="$(tmux list-clients -F '#{client_name}'$'\t''#{pane_id}'$'\t''#{client_control_mode}' 2>/dev/null || true)"
+  while IFS=$'\t' read -r epoch level where label pane key source; do
+    [ -n "$epoch" ] || continue
+    # the label is in the id: two marks of one pane in one second are two
+    id="${epoch}_${pane}_${key}_$(printf '%s' "$label" | cksum | cut -d' ' -f1)"
+    id="${id//[^A-Za-z0-9._-]/_}"
+    mkdir "$ANNOUNCED_DIR/$id" 2>/dev/null || continue   # announced by another write
+    shown=0
+    case "$levels" in *" $level "*) [ "$toast" != on ] || shown=1 ;; esac
+    fmt="$(_toast_format "$level" "$where" "$label")"
+    watched=0
+    while IFS=$'\t' read -r cname cpane cctl; do
+      # a control-mode client (iTerm2 -CC, an integration) is nobody's screen
+      [ -n "$cname" ] && [ "$cctl" != 1 ] || continue
+      if [ "$cpane" = "$pane" ]; then watched=1; continue; fi
+      [ "$shown" = 1 ] || continue
+      tmux display-message -C -d "$dur" -c "$cname" "$fmt" 2>/dev/null || true
+    done <<< "$clients"
+    [ -n "$cmd" ] || continue
+    session=""
+    [ "$pane" = "-" ] || session="$(tmux display-message -p -t "$pane" '#{session_name}' 2>/dev/null || true)"
+    # each command on its own, so a slow one delays neither the next toast
+    # nor the next command
+    text="$(_toast_glyph "$level") $where · $label"
+    ( export RADAR_LEVEL="$level" RADAR_AGENT="$source" RADAR_LABEL="$label" \
+        RADAR_WHERE="$where" RADAR_PANE="$pane" RADAR_SESSION="$session" RADAR_KEY="$key" \
+        RADAR_WATCHED="$watched" RADAR_TEXT="$text"
+      /bin/sh -c "$cmd" || _notify_err "notify command exited $? for $key" ) &
+  done <<< "$rows"
+  find "$ANNOUNCED_DIR" -mindepth 1 -maxdepth 1 -type d -mmin +10 -exec rmdir {} + 2>/dev/null || true
+  wait
+  return 0
+}
+
+# Publish the chips, then hand what the write before this sync added to the
+# tmux server to announce.
+_sync_bar() {
+  have_tmux || return 0
+  _publish_chips || true
+  [ "$ANNOUNCE" = 1 ] || return 0
+  ANNOUNCE=0
+  _announce_later
+}
+
 # Recompute and publish the chip strip. Chips live INSIDE an existing status
 # line — `auto` injects #{E:@radar-chips} into the user's status-right,
 # `pinned` renders it on a permanently reserved line 2. The status line COUNT
@@ -663,8 +785,7 @@ _schedule_resync() {
 # raise/lower design caused. A chip is visible while its mark is off-screen
 # AND younger than @radar-bar-ttl seconds (0 = until handled); the mark itself
 # persists in the AI status view / pane title until cleared.
-_sync_bar() {
-  have_tmux || return 0
+_publish_chips() {
   local mode chips
   mode="$(opt @radar-bar auto)"
   case "$mode" in auto|pinned|off) ;; *) mode=auto ;; esac
@@ -715,6 +836,7 @@ cmd_mark() {  # cmd_mark <pane|-> <source> <label> [key]
   [ -n "$prev_title" ] && saved_title="$prev_title"
   _rewrite 'if (key == delkey || (mp != "-" && pane == mp)) next' -v delkey="$key" -v mp="$pane"
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pane" "$now" "$source" "$key" "$label" "$saved_title" >> "$STATE_FILE"
+  ANNOUNCE=1
   unlock
   _sync_bar
 }
@@ -1822,6 +1944,7 @@ _session_mark_locked() {  # <pane|-> <source> <label> <key>
   _rewrite 'if (key == delkey) next' -v delkey="$key"
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$pane" "$now" "$source" "$key" "$label" "$saved_title" >> "$STATE_FILE"
+  ANNOUNCE=1
 }
 
 _opencode_mark_locked() {  # <pane|-> <label> <key>
@@ -2153,7 +2276,8 @@ cmd_doctor() {  # one-stop "why is this row (not) showing?"
   echo
   echo "-- options in effect --"
   for o in @radar-needinput @radar-needinput-commands @radar-bar @radar-bar-ttl \
-           @radar-retitle @radar-claude-bg @radar-claude-bg-ignore; do
+           @radar-retitle @radar-claude-bg @radar-claude-bg-ignore \
+           @radar-toast @radar-toast-levels @radar-toast-duration @radar-notify-command; do
     v="$(opt "$o" '(default)')"
     printf '  %-26s %s\n' "$o" "$v"
   done
@@ -2224,6 +2348,7 @@ case "${1:-}" in
   claude-end)      cmd_hook_as end ;;
   hook)            shift; cmd_hook "${1:-}" ;;
   hook-resolved)   shift; _hook_open "${1:-}"; _hook_dispatch resolved ;;
+  announce)        cmd_announce ;;
   codex-hook)      cmd_codex_hook ;;
   codex)           shift; cmd_codex "${1:-}" ;;
   opencode-hook)   cmd_opencode_hook ;;

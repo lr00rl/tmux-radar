@@ -5,7 +5,7 @@
 - Status: Active
 - Last refreshed: 2026-09-28
 - Primary product surface: the `fzf` popup opened by `prefix + C-w`
-- Supporting surfaces: pane preview, pane MRU toggle, AI lifecycle marks, status chips, the live scanner, and the optional toast inside a Claude Code session
+- Supporting surfaces: pane preview, pane MRU toggle, AI lifecycle marks, status chips, status-line toasts and the user's notify command, and the live scanner
 - Evidence reviewed:
   - historical picker at `v0.1.3` / `6ee7afc`, especially `scripts/switcher.sh`, `README.md`, and `tests/test_switcher.sh`;
   - the interaction commits `6e27cd4`, `7864f66`, and `4891290`;
@@ -339,6 +339,28 @@ editor runs the same hook file) and is dropped. Agents with no approval event
 waits; Cursor's status title makes its approvals visible when the user turns
 it on.
 
+### Toasts and the notify command
+
+The chip says a mark exists; the toast says what just happened, once, to the
+person looking elsewhere. After a write, each mark it added is shown as a
+status-line message on every attached client that is not on the marked pane,
+glyph in the chip colour, text in the user's `message-style`:
+` ✓  billing-api · Claude finished: Added the retry and its test.`
+
+The toast is a `display-message`, not a popup, because a popup takes the
+keyboard until it closes and a toast must never swallow typing. With `-C` the
+pane keeps drawing; a key press reaches the pane and dismisses the toast. It
+lasts `@radar-toast-duration` milliseconds, `@radar-toast-levels` filters it,
+and the chip and pane title remain the durable record.
+
+The same announcement runs `@radar-notify-command` through `run-shell -b`,
+with the mark in `RADAR_LEVEL`, `RADAR_AGENT`, `RADAR_LABEL`, `RADAR_WHERE`,
+`RADAR_PANE`, `RADAR_SESSION`, `RADAR_KEY`, `RADAR_WATCHED` and `RADAR_TEXT`.
+It runs for every level whether or not anyone watches, and the command
+decides; this is how a turn-end notification leaves tmux (desktop, sound,
+chat). A claim `mkdir` per mark makes "once" hold across concurrent hooks, and
+only marks from the last 30 seconds qualify, so a restart announces nothing.
+
 ### Severity
 
 A label reads `<head>[: <detail>]`. Adapters write the head from a fixed
@@ -533,8 +555,14 @@ Required end-to-end checks:
     event names Cursor accepts; every agent config the installer touches keeps
     the user's own entries, gets a backup only when it changes, and returns to
     its prior content on uninstall.
-26. The Claude Code toast plugin repeats a new mark from another pane only
-    while its own pane is on screen, and never one of its own pane.
+26. A write announces each mark it added exactly once, whatever wrote it
+    and however many hooks sync at the same moment: a status-line toast on
+    each attached client that is not on the marked pane (the pane keeps
+    drawing, a key press reaches the pane and dismisses the toast), and
+    `@radar-notify-command` run by the tmux server with the mark in `RADAR_*`
+    variables. A mark older than 30 seconds is never announced, text from
+    agents and window names is printed literally, and a slow or failing
+    command holds up no hook and shows nothing on the client.
 27. Bash syntax, ShellCheck, all repository shell suites, and
     `git diff --check` pass before delivery.
 

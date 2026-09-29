@@ -13,7 +13,7 @@ tmux-radar has four cooperating parts:
 | tmux entry | `tmux-radar.tmux` | Binds the picker and last-pane keys, installs the focus/MRU hooks, wires the chip strip, composes resurrect pre/post-restore so a restore storm is not treated as user focus. |
 | picker | `scripts/switcher.sh` | Builds Recent/Agents/Tree rows from one bulk tmux snapshot plus the state files, drives fzf, switches to exact pane targets. |
 | notifier | `scripts/needinput-notify.sh`, `scripts/needinput-toast.sh`, `scripts/mru-record.sh` | Owns the mark file, the agent registry, and the live scanner; renders the chip strip; records MRU. |
-| toast plugin | `claude-plugin/` | A Claude Code function-hook module that shows new marks from other panes as toasts. It reads `needinput-toast.sh feed` and writes nothing. |
+| announce | `scripts/needinput-notify.sh` (`_announce_new`), `scripts/needinput-toast.sh fresh` | After a write, announces each mark it added once: a status-line toast on clients that are not on the pane, and `@radar-notify-command` through `run-shell -b`. |
 | severity | `scripts/radar-level.sh` | The one definition of a mark's level (`done`, `action`, `notice`), sourced by the notifier, the chip renderer and the picker. Change level rules here and nowhere else. |
 | agent bridges | `scripts/install-hooks.sh`, `scripts/codex-notify-wrap.sh`, `scripts/opencode-tmux-notify.js`, `scripts/pi-tmux-notify.ts`, `examples/hooks/custom-agent-adapter.sh` | Normalize vendor lifecycle events into the notifier's `agent-event` API and keep vendor config edits owned and reversible. |
 
@@ -78,7 +78,7 @@ bash tests/test_registry.sh      # marks, registry, GC, chips, hooks
 bash tests/test_claude_adapter.sh  # Claude payload and environment handling, severity
 bash tests/test_dialects.sh      # Grok, Cursor, Droid, Gemini, Auggie payloads through one adapter
 bash tests/test_nested.sh        # process-tree matcher: who fired an event, nested runs
-CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude plugin test claude-plugin   # toast plugin
+bash tests/test_announce.sh      # toasts on a real attached client, the notify command
 bash tests/test_safety.sh        # fail-closed notifier and adapter behavior
 bash tests/test_install.sh       # installer ownership/idempotency/rollback
 bash tests/test_opencode_plugin.sh

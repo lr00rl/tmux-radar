@@ -11,12 +11,11 @@
 # the full sentence — because they share one line with the window list; the
 # picker (Inbox/Agents) carries the long form.
 #
-# `feed <self-pane> [<self-session-id>]` prints the same marks as plain data
-# for a display that is not a tmux format (the Claude Code toast plugin):
-#   self<TAB><1 when the caller's pane is on screen, else 0>
-#   <epoch><TAB><level><TAB><where><TAB><label><TAB><pane><TAB><key>
-# one row per mark that is off screen or paneless, the caller's own pane and
-# session left out, oldest first. No TTL applies: the reader decides what is new.
+# `fresh <max-age>` prints, as plain data for the notifier's toast and notify
+# command, the marks written in the last <max-age> seconds, oldest first:
+#   <epoch><TAB><level><TAB><where><TAB><label><TAB><pane><TAB><key><TAB><source>
+# <where> is the window name (session:index when unnamed), or the project of a
+# paneless mark, whose label is then read without its "Agent·project: " prefix.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -108,11 +107,11 @@ case "${1:-render}" in
       }' "$STATE_FILE" 2>/dev/null || true)"
     printf '%s' "$out"
     ;;
-  feed)
-    self_pane="${2:-}"
-    self_key=""; [ -z "${3:-}" ] || self_key="s:${3}"
-    [ -r "$STATE_FILE" ] || { printf 'self\t0\n'; exit 0; }
-    awk -F '\t' -v OFS='\t' -v panes="$(pane_map)" -v self="$self_pane" -v selfkey="$self_key" \
+  fresh)
+    max_age="${2:-30}"
+    case "$max_age" in ''|*[!0-9]*) max_age=30 ;; esac
+    [ -r "$STATE_FILE" ] || exit 0
+    awk -F '\t' -v OFS='\t' -v panes="$(pane_map)" -v now="$(date +%s)" -v maxage="$max_age" \
         "$RADAR_LEVEL_AWK"'
       # "Claude·proj: finished: x" reads "Claude finished: x" beside its project
       function plain_label(label,    agent, rest) {
@@ -133,22 +132,19 @@ case "${1:-render}" in
           split(pl[i], f, "\t")
           if (f[1] == "") continue
           alive[f[1]] = 1
-          if (f[2] == 1) viewed[f[1]] = 1
           where[f[1]] = (f[4] != "" ? f[4] : f[3])
         }
-        print "self", ((self in viewed) ? 1 : 0)
       }
-      NF >= 5 {
+      NF >= 5 && now - $2 <= maxage {
         pane = $1
-        if (pane == self || (selfkey != "" && $4 == selfkey)) next
-        if (pane == "-") { print $2, radar_level($3, $5), project($5), plain_label($5), pane, $4; next }
-        if (!(pane in alive) || (pane in viewed)) next
-        print $2, radar_level($3, $5), where[pane], $5, pane, $4
-      }' "$STATE_FILE" 2>/dev/null || printf 'self\t0\n'
+        if (pane == "-") { print $2, radar_level($3, $5), project($5), plain_label($5), pane, $4, $3; next }
+        if (!(pane in alive)) next
+        print $2, radar_level($3, $5), where[pane], $5, pane, $4, $3
+      }' "$STATE_FILE" 2>/dev/null || true
     ;;
   prune)  # legacy no-op kept for compatibility; state GC lives in the notifier
     exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/needinput-notify.sh" tick
     ;;
   *)
-    echo "usage: needinput-toast.sh [render|feed <pane> [session-id]|prune]" >&2; exit 2 ;;
+    echo "usage: needinput-toast.sh [render|fresh [max-age]|prune]" >&2; exit 2 ;;
 esac

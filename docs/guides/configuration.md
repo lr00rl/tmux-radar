@@ -31,6 +31,10 @@ set -g @radar-preview-follow 'on'
 | `@radar-bar` | `auto` | `auto` adds chips to `status-right`, `pinned` reserves a stable second line, and `off` hides chips while retaining marks. |
 | `@radar-bar-ttl` | `60` | Seconds before a chip fades (`0` keeps it until handled); the underlying mark remains. |
 | `@radar-done-ttl` | `0` | Seconds a finished-turn (DONE) mark is kept for review (`0` keeps it until focused or cleared). |
+| `@radar-toast` | `on` | Show a new mark once as a status-line toast on clients that are not on its pane. |
+| `@radar-toast-levels` | `action done notice` | Levels that toast. |
+| `@radar-toast-duration` | `5000` | Milliseconds a toast stays up; a key press dismisses it sooner. |
+| `@radar-notify-command` | (none) | Shell command run once per new mark, with the mark in `RADAR_*` variables ([notifications](notifications.md)). |
 | `@radar-scan` | `on` | Live scanner: classifies agent panes working/stalled/blocked, adopts hookless sessions, heals stale marks, synthesizes transition events. |
 | `@radar-scan-interval` | `10` | Seconds between live scans (minimum 5). |
 

@@ -371,34 +371,27 @@ bash "$WT/tmux-radar.tmux"
 chk "pinned bar never reduces an existing status 3" "[ \"\$(tmux show-option -gv status)\" = 3 ]"
 tmux set -gu @radar-bar
 
-# --- 7.5 feed: the marks as plain data for a display outside tmux ---------------
-FEED="$WT/scripts/needinput-toast.sh"
+# --- 7.5 fresh: the marks a write just added, as plain data for announcing -------
+FRESH="$WT/scripts/needinput-toast.sh"
 "$N" clear-all
-tmux rename-window -t smoke:0 'feed-window'
+tmux rename-window -t smoke:0 'fresh-window'
 # source `tool`: a scheduled tick from an earlier section may run meanwhile, and
 # its liveness GC drops agent-sourced marks that no registry row backs
-"$N" mark "$PANE" tool 'Claude needs approval: Bash' s:feed-a
-"$N" mark "$PANE_SIBLING" tool 'Codex finished - your turn: ship it' s:feed-b
-"$N" mark - tool 'Claude·lattice: finished: all tests pass' s:feed-bg
+"$N" mark "$PANE" tool 'Claude needs approval: Bash' s:fresh-a
+"$N" mark "$PANE_SIBLING" tool 'Codex finished - your turn: ship it' s:fresh-b
+"$N" mark - tool 'Claude·lattice: finished: all tests pass' s:fresh-bg
 # shellcheck disable=SC2034 # consumed by chk's evaluated assertion strings below
-FEED_OUT="$("$FEED" feed "$PANE" 2>"$T/feed.err")"
-# shellcheck disable=SC2034
-FEED_SELF="$("$FEED" feed "$PANE" feed-bg 2>/dev/null)"
-# shellcheck disable=SC2034
-FEED_ALL="$("$FEED" feed '' 2>/dev/null)"
-chk "feed runs clean" "! [ -s '$T/feed.err' ]"
-chk "feed opens with the caller's own visibility" \
-  "printf '%s\n' \"\$FEED_OUT\" | head -1 | grep -qE '^self	[01]\$'"
-chk "feed leaves out the caller's own pane" \
-  "! printf '%s\n' \"\$FEED_OUT\" | grep -q 's:feed-a'"
-chk "feed row carries level, window name, label, pane and key" \
-  "printf '%s\n' \"\$FEED_OUT\" | awk -F'\t' '\$6==\"s:feed-b\" && \$2==\"done\" && \$3==\"feed-window\" && \$4==\"Codex finished - your turn: ship it\" && \$5==\"$PANE_SIBLING\" && NF==6' | grep -q ."
-chk "feed names the project of a paneless mark and reads its label plainly" \
-  "printf '%s\n' \"\$FEED_OUT\" | awk -F'\t' '\$6==\"s:feed-bg\" && \$2==\"done\" && \$3==\"lattice\" && \$4==\"Claude finished: all tests pass\" && \$5==\"-\"' | grep -q ."
-chk "feed leaves out the caller's own session" \
-  "! printf '%s\n' \"\$FEED_SELF\" | grep -q 's:feed-bg'"
-chk "feed with no pane still lists every off-screen mark" \
-  "[ \"\$(printf '%s\n' \"\$FEED_ALL\" | grep -c 's:feed-')\" = 3 ]"
+FRESH_OUT="$("$FRESH" fresh 30 2>"$T/fresh.err")"
+chk "fresh runs clean" "! [ -s '$T/fresh.err' ]"
+chk "fresh lists every young mark, the focused pane's too" \
+  "[ \"\$(printf '%s\n' \"\$FRESH_OUT\" | grep -c 's:fresh-')\" = 3 ]"
+chk "fresh row carries level, window name, label, pane, key and source" \
+  "printf '%s\n' \"\$FRESH_OUT\" | awk -F'\t' '\$6==\"s:fresh-b\" && \$2==\"done\" && \$3==\"fresh-window\" && \$4==\"Codex finished - your turn: ship it\" && \$5==\"$PANE_SIBLING\" && \$7==\"tool\" && NF==7' | grep -q ."
+chk "fresh names the project of a paneless mark and reads its label plainly" \
+  "printf '%s\n' \"\$FRESH_OUT\" | awk -F'\t' '\$6==\"s:fresh-bg\" && \$2==\"done\" && \$3==\"lattice\" && \$4==\"Claude finished: all tests pass\" && \$5==\"-\"' | grep -q ."
+awk -F'\t' -v OFS='\t' '$4 == "s:fresh-a" { $2 = $2 - 120 } { print }' "$MARKS" > "$T/aged" && cat "$T/aged" > "$MARKS"
+chk "a mark older than the window is not fresh" \
+  "! \"\$FRESH\" fresh 30 | grep -q 's:fresh-a' && \"\$FRESH\" fresh 30 | grep -q 's:fresh-b'"
 "$N" clear-all
 tmux rename-window -t smoke:0 'smoke'
 

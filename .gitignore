@@ -3,6 +3,3 @@
 .superpowers/
 /bin/tmux-radar
 .ace-tool/
-
-# Claude Code API types for the toast plugin, written by /plugin-types
-claude-plugin/.claude/

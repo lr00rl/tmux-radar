@@ -76,7 +76,10 @@ long-running agents.
   full sentence) appears in the existing
   status area while an off-screen mark is fresh,
   the pane's **title flips to a status label** (`⚠` action required, `✓`
-  finished, `!` notice), and the pane shows up on the Agents board.
+  finished, `!` notice), the pane shows up on the Agents board, and a
+  one-line **toast** on your status line says what just happened (a key press
+  dismisses it). `@radar-notify-command` turns the same event into a desktop,
+  sound or chat notification.
   Only the pane you focus is marked read; sibling agent panes remain unread.
   Marks also clear when you reply — and
   **stale marks self-heal**: a mark whose agent TUI has exited is dropped
@@ -189,6 +192,10 @@ Set these **before** the plugin loads:
 | `@radar-bar` | `auto` | `auto` renders chips **inline inside your existing status-right** (`#{E:@radar-chips}` is injected once); `pinned` keeps a permanently reserved line 2; `off` tracks marks only. The status line **count never changes at runtime** — no pane resize, no SIGWINCH flicker. |
 | `@radar-bar-ttl` | `60` | Seconds a chip stays on the bar before fading (`0` = until handled). The mark itself persists on the board / the pane title until cleared. |
 | `@radar-done-ttl` | `0` | Seconds a finished-turn (DONE) mark is kept for review before expiring (`0` = keep until focused/cleared). |
+| `@radar-toast` | `on` | Show a new mark once as a status-line toast on every client that is not on its pane. A key press dismisses it and reaches the pane. |
+| `@radar-toast-levels` | `action done notice` | Levels that toast. |
+| `@radar-toast-duration` | `5000` | Milliseconds a toast stays up. |
+| `@radar-notify-command` | (none) | Shell command run once per new mark with `RADAR_LEVEL`, `RADAR_AGENT`, `RADAR_LABEL`, `RADAR_WHERE`, `RADAR_PANE`, `RADAR_SESSION`, `RADAR_KEY`, `RADAR_WATCHED` and `RADAR_TEXT` set. See [notifications](docs/guides/notifications.md). |
 | `@radar-claude-bg-ignore` | `~/.claude:~/.claude-mem` | Colon-separated path prefixes; background sessions whose cwd starts with one (plugin observers, SDK helpers) are not tracked. |
 
 Example:
@@ -203,8 +210,8 @@ set -g @plugin 'lr00rl/tmux-radar'
 ```
 
 For focused walkthroughs, see [configuration](docs/guides/configuration.md),
-[agent hooks](docs/guides/agent-hooks.md), the
-[Claude Code toast plugin](docs/guides/claude-toast.md), and
+[agent hooks](docs/guides/agent-hooks.md),
+[toasts and notifications](docs/guides/notifications.md), and
 [development](docs/guides/development.md).
 
 ## Agents board + alerts
@@ -287,14 +294,22 @@ installation, then review `/hooks` if Codex asks you to trust the handlers.
 For Kimi, run `/reload` in the TUI or start a new session. Kimi's event names and TOML
 shape follow its [official hooks reference](https://moonshotai.github.io/kimi-code/en/customization/hooks).
 
-### Toasts inside Claude Code
+### Toasts and turn-end notifications
 
-When the pane you are looking at is a Claude Code session, the optional plugin
-in `claude-plugin/` repeats a new mark from another pane as a toast on
-Claude's own notification line (`tmux-radar: ⚠ billing-api · Claude needs
-approval`). It is a display over the same marks and costs one file stat every
-two seconds. It needs Claude Code's early-access function hooks; see the
-[toast plugin guide](docs/guides/claude-toast.md).
+When an agent needs approval or finishes its turn in a pane you are not on,
+radar says so once on your tmux status line, for any agent:
+
+```
+ ✓  billing-api · Claude finished: Added the retry and its test.
+```
+
+The pane keeps drawing underneath, and a key press goes to the pane as usual
+and dismisses the toast. Tune it with `@radar-toast`, `@radar-toast-levels`
+and `@radar-toast-duration`. For notifications outside tmux (desktop, sound,
+chat), set `@radar-notify-command`: it runs once per new mark with the mark in
+`RADAR_LEVEL`, `RADAR_LABEL`, `RADAR_WHERE` and friends, and
+`examples/notify-desktop.sh` is a ready one. See
+[toasts and notifications](docs/guides/notifications.md).
 
 ### Agents without native hooks
 

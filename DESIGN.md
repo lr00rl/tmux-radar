@@ -342,16 +342,29 @@ it on.
 ### Toasts and the notify command
 
 The chip says a mark exists; the toast says what just happened, once, to the
-person looking elsewhere. After a write, each mark it added is shown as a
-status-line message on every attached client that is not on the marked pane,
-glyph in the chip colour, text in the user's `message-style`:
-` ✓  billing-api · Claude finished: Added the retry and its test.`
+person looking elsewhere. After a write, each mark it added floats as a box in
+the top-right corner of every attached client that is not on the marked pane:
+the border in the chip colour of its level, the window (or project) in the
+title, the label inside. Toasts stack downward.
 
-The toast is a `display-message`, not a popup, because a popup takes the
-keyboard until it closes and a toast must never swallow typing. With `-C` the
-pane keeps drawing; a key press reaches the pane and dismisses the toast. It
-lasts `@radar-toast-duration` milliseconds, `@radar-toast-levels` filters it,
-and the chip and pane title remain the durable record.
+A tmux popup was the obvious tool and the wrong one: while a popup is open
+tmux stops redrawing every pane and sends every key to the popup, so a notice
+would freeze the agents and swallow typing. `scripts/radar-float.sh` writes
+the box to the client's terminal instead (the method of Tarilonte/tmux-toast):
+save the cursor, paint at absolute positions, restore the cursor and the
+colours tmux set. tmux never learns of it, so panes draw and keys pass as
+usual; a repaint every 20 ms restores the box after a pane redraws under it
+(a pane scrolling about 30 lines a second under the corner still tears it a
+third of the time), and `refresh-client` erases it. The toast stops the
+moment its client process exits, so a detached terminal is never painted,
+and up to six stack before the rest fall back to the status line. It reaches a client over SSH because the
+client's terminal is a device on the tmux host, and needs no desktop service.
+Every control character in the text becomes a space before it reaches the
+terminal, and non-ASCII counts as two columns when sizing, so Chinese keeps
+the right edge straight. It lasts `@radar-toast-duration` milliseconds, ends
+within a second of its mark being cleared, and `@radar-toast-levels` filters
+it; `@radar-toast status` shows a `display-message -C` line instead. The chip
+and the pane title remain the durable record.
 
 The same announcement runs `@radar-notify-command` through `run-shell -b`,
 with the mark in `RADAR_LEVEL`, `RADAR_AGENT`, `RADAR_LABEL`, `RADAR_WHERE`,
@@ -556,9 +569,10 @@ Required end-to-end checks:
     the user's own entries, gets a backup only when it changes, and returns to
     its prior content on uninstall.
 26. A write announces each mark it added exactly once, whatever wrote it
-    and however many hooks sync at the same moment: a status-line toast on
-    each attached client that is not on the marked pane (the pane keeps
-    drawing, a key press reaches the pane and dismisses the toast), and
+    and however many hooks sync at the same moment: a floating toast in the
+    top-right corner of each attached client that is not on the marked pane
+    (panes keep drawing, keys reach the pane, Chinese text keeps the box
+    straight, raw escape sequences arrive as text), and
     `@radar-notify-command` run by the tmux server with the mark in `RADAR_*`
     variables. A mark older than 30 seconds is never announced, text from
     agents and window names is printed literally, and a slow or failing

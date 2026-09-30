@@ -9,33 +9,56 @@ Cursor, Droid, Gemini, Auggie, and the panes the scanner watches.
 ## The toast
 
 ```
- ✓  billing-api · Claude finished: Added the retry and its test.
+                                          ╭─ ✓ billing-api ────────────────────────────────╮
+                                          │ Claude finished: Added the retry and its test. │
+                                          ╰────────────────────────────────────────────────╯
 ```
 
-The toast is a tmux status-line message on every attached client that is not
-already on the marked pane. The glyph carries the chip colours (`⚠` action,
-`✓` done, `!` notice); the rest of the line follows your own `message-style`.
+The toast is a box floating in the top-right corner of every attached client
+that is not already on the marked pane. The border takes the chip colour of
+the level (`⚠` action, `✓` done, `!` notice), and the title names the window
+(or the project of a background session). Several toasts stack downward. It is
+drawn by tmux-radar inside tmux, so it looks the same on a laptop and over
+SSH from anywhere, with no desktop notification service involved.
 
-It stays out of your way by design:
+It is not a tmux popup. While a popup is open, tmux stops redrawing every pane
+and sends every key to the popup, which is wrong for a notice that arrives
+while you type. `scripts/radar-float.sh` writes the box straight to the
+client's terminal instead, the method of
+[Tarilonte/tmux-toast](https://github.com/Tarilonte/tmux-toast): it saves the
+cursor, paints the box, and restores the cursor with the colours tmux set.
+tmux knows nothing of the box, so:
 
-- The pane underneath keeps drawing (`display-message -C`).
-- A key press reaches the pane as usual and dismisses the toast; nothing is
-  swallowed. A popup was rejected for this reason: it takes the keyboard
-  until it closes.
+- Panes keep drawing, and every key goes where it always goes.
+- When a pane redraws under the box, the next repaint (every 20 ms) puts it
+  back. A pane that scrolls fast under the corner still tears it between
+  repaints: under a pane printing about 30 lines a second, the box was whole
+  in two samples out of three. Agent screens that redraw in place leave it
+  steady.
+- It leaves after `@radar-toast-duration` milliseconds (60 s at most), as soon
+  as its mark is cleared (such as when you go to that pane), or the moment
+  its client detaches; then tmux repaints the client from its own copy of the
+  screen. A killed toast is erased the same way.
+- Up to six toasts stack in the corner while the screen has room; one more,
+  or a client under 30 columns, gets a status-line message instead.
 - The client that is on the marked pane gets no toast; the pane title already
   says it. Control-mode clients (`tmux -CC`) get none either.
-- It shows for `@radar-toast-duration` milliseconds, then the status line
-  returns. The chip and the pane title stay until you handle the mark.
 
-Text from agents and window names is printed, never interpreted: `#` and `%`
-are doubled before tmux sees them, so `#(cmd)` in a label cannot run anything
-and `%Y` stays `%Y`.
+Bytes that are not UTF-8 are dropped and every control character becomes a
+space before the text reaches the terminal, so no label or window name can
+move the cursor, set a title or write the clipboard. Non-ASCII text counts as two columns when the box is
+sized, so Chinese text keeps the right edge straight.
+
+`@radar-toast status` shows the same announcement as a one-line status-line
+message instead (`display-message -C`): a key press reaches the pane and
+dismisses it. There `#` and `%` are doubled, so `#(cmd)` cannot run and `%Y`
+stays `%Y`.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `@radar-toast` | `on` | `off` stops the toast; the notify command still runs. |
+| `@radar-toast` | `float` | `float` draws the box in the top-right corner, `status` uses the status line, `off` shows nothing (the notify command still runs). `on` means `float`. |
 | `@radar-toast-levels` | `action done notice` | Levels that toast. `action` alone toasts only approvals and questions. |
-| `@radar-toast-duration` | `5000` | Milliseconds the toast stays up, unless a key dismisses it first. |
+| `@radar-toast-duration` | `5000` | Milliseconds the toast stays up. |
 
 ## Your own notification: `@radar-notify-command`
 
@@ -95,11 +118,13 @@ A mark is announced by the write that added it, and only once:
   announcement. The same mark rewritten does not repeat, and an idle reminder
   writes no mark at all.
 
-Several marks in one second each toast in turn and the last one stays up; the
-chips list all of them.
+Floating toasts stack, up to six per client while the screen has room, and
+the rest go to the status line; in status mode a later toast replaces the one
+on screen. The chips list every mark either way.
 
 ## Testing
 
 `tests/test_announce.sh` attaches a real client to an isolated server from a
-pane of a second isolated server, so it checks what a person would see on the
-status line, and it never touches your live server.
+pane of a second isolated server, so it checks what a person would see: the
+box in the corner, its alignment with Chinese text, typing under it, and the
+status line. It never touches your live server.

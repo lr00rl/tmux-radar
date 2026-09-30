@@ -31,7 +31,7 @@ mkdir -p "$TMUX_RADAR_STATE_DIR"
 tmux -L "$INNER" -f /dev/null new-session -d -s work -n billing-api -x 120 -y 20 'bash --norc'
 tmux -L "$INNER" new-window -t work -n notes 'bash --norc'
 tmux -L "$INNER" select-window -t work:notes
-tmux -L "$OUTER" -f /dev/null new-session -d -s view -x 120 -y 20 "env -u TMUX tmux -L $INNER attach -t work"
+tmux -L "$OUTER" -f /dev/null new-session -d -s view -x 120 -y 20 "env -u TMUX tmux -L $INNER attach -t work; exec bash --norc"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   [ -n "$(tmux -L "$INNER" list-clients -F '#{client_name}' 2>/dev/null)" ] && break
   sleep 0.3
@@ -66,6 +66,122 @@ dismiss() { tmux -L "$OUTER" send-keys -t view x C-u; sleep 0.3; }   # a typed k
 
 chk "the viewer client is attached and on the notes pane" \
   "[ \"\$(tmux list-clients -F '#{pane_id}')\" = '$NOTES' ]"
+
+# --- the floating toast, drawn in the top-right corner (the default) ------------------
+# The notify command is not under test here: leave it out so its runs cannot
+# overlap the screen checks.
+tmux set -gu @radar-notify-command
+tmux set -g @radar-toast-duration 1500
+rows() { tmux -L "$OUTER" capture-pane -p -t view | sed -n "$1,$2p"; }
+ends() {  # ends <first> <last>: the display column where each line ends
+  rows "$1" "$2" | perl -CS -ne 'chomp; s/\s+$//; my $w = 0; $w += /\p{EA=W}|\p{EA=F}/ ? 2 : 1 for split //; print "$w\n"'
+}
+shown() {  # shown <text>...: every text is on the screen within 4 s
+  local _ t missing
+  for _ in $(seq 1 20); do
+    missing=0
+    for t in "$@"; do tmux -L "$OUTER" capture-pane -p -t view | grep -qF "$t" || missing=1; done
+    [ "$missing" = 0 ] && return 0
+    sleep 0.2
+  done
+  return 1
+}
+gone() {  # gone <text>: the text left the screen within 4 s
+  local _
+  for _ in $(seq 1 20); do
+    tmux -L "$OUTER" capture-pane -p -t view | grep -qF "$1" || return 0
+    sleep 0.2
+  done
+  return 1
+}
+idle() {  # idle: every floating toast has ended (their slots are free), within 4 s
+  local _
+  for _ in $(seq 1 40); do
+    set -- "$TMUX_RADAR_STATE_DIR"/.toast-slots/*/*
+    [ -e "$1" ] || return 0
+    sleep 0.1
+  done
+  return 1
+}
+"$N" mark "$BILL" claude 'Claude finished: Added the retry and its test.' s:f1
+shown 'Added the retry and its test.'
+chk "a floating toast appears in the top-right corner" \
+  "rows 2 2 | grep -qF '╭─ ✓ billing-api ─' && rows 3 3 | grep -qF '│ Claude finished: Added the retry and its test. │' && rows 4 4 | grep -qF '╰─'"
+chk "its three lines end on one column, two short of the right edge" \
+  "[ \"\$(ends 2 4 | sort -u)\" = 118 ]"
+chk "the status line is left alone" "! screen | grep -q 'Added the retry'"
+chk "it leaves after its duration" "gone 'Added the retry'"
+
+tmux set -g @radar-toast-duration 8000
+"$N" mark "$BILL" claude 'Claude needs approval: Bash' s:f2
+shown 'needs approval: Bash'
+tmux -L "$OUTER" send-keys -t view -l 'echo typed-under-toast'
+tmux -L "$OUTER" send-keys -t view Enter
+sleep 0.8
+chk "typing reaches the pane while the toast is up, and the pane draws it" \
+  "[ \"\$(tmux capture-pane -p -t '$NOTES' | grep -c typed-under-toast)\" = 2 ] && tmux -L \"\$OUTER\" capture-pane -p -t view | grep -q '^typed-under-toast' && rows 3 3 | grep -qF 'needs approval: Bash'"
+"$N" clear "$BILL"
+sleep 0.5
+chk "clearing its mark (going to the pane) takes the toast away within half a second" \
+  "! rows 2 4 | grep -qF 'needs approval: Bash'"
+idle
+
+"$N" mark "$BILL" claude 'Claude finished: first of two' s:f3
+"$N" mark - claude 'Claude·lattice: needs approval: 重构完成，所有测试通过，准备提交' s:f4
+shown 'first of two' '⚠ lattice'
+# two announce jobs race for the first slot, so either may take the top
+chk "two toasts stack, one below the other" \
+  "{ rows 2 4 | grep -qF 'first of two' && rows 5 7 | grep -qF '⚠ lattice'; } || { rows 2 4 | grep -qF '⚠ lattice' && rows 5 7 | grep -qF 'first of two'; }"
+chk "a toast with Chinese text keeps its right edge straight" \
+  "[ \"\$(ends 2 4 | sort -u | wc -l | tr -d ' ')\" = 1 ] && [ \"\$(ends 5 7 | sort -u | wc -l | tr -d ' ')\" = 1 ]"
+"$N" clear-all
+idle
+
+tmux rename-window -t work:billing-api "evil$(printf '\033]0;pwned-title\007')name"
+tmux -L "$OUTER" select-pane -t view -T 'viewer-title'
+"$N" mark "$BILL" claude 'Claude finished: escape check' s:f6
+shown 'escape check'
+chk "an escape sequence in a window name reaches the terminal as text" \
+  "rows 2 2 | grep -qF 'evil' && [ \"\$(tmux -L \"\$OUTER\" display-message -p -t view '#{pane_title}')\" = viewer-title ]"
+tmux rename-window -t work:0 billing-api
+"$N" clear-all
+idle
+# tmux prints a raw ESC in a name as the text \033; hand the renderer one itself
+"$WT/scripts/radar-float.sh" "$(tmux list-clients -F '#{client_name}')" "$(tmux list-clients -F '#{client_tty}')" \
+  "$(tmux list-clients -F '#{client_pid}')" 120 1 19 1 'done' "raw$(printf '\033]0;pwned-title\007')where" "raw$(printf '\342\033]2;pwned-title\007\233')label" \
+  1500 '' /dev/null "$T/slots" &
+sleep 0.6
+chk "the renderer turns raw escape sequences into plain text" \
+  "rows 2 2 | grep -qF 'raw ]0;pwned-title where' && rows 3 3 | grep -qF 'raw ]2;pwned-title' && [ \"\$(tmux -L \"\$OUTER\" display-message -p -t view '#{pane_title}')\" = viewer-title ]"
+chk "a stray UTF-8 lead byte before an escape leaves the box whole" "rows 4 4 | grep -qF '╰─'"
+wait
+
+"$N" mark "$BILL" claude 'Claude finished: signal check' s:f7
+shown 'signal check'
+pkill -TERM -f 'radar-float.sh.*signal check'
+chk "a toast that is killed is erased and frees its slot" "gone 'signal check' && idle"
+"$N" clear-all
+
+for k in 1 2 3 4 5 6 7; do "$N" mark - tool "Test·fill$k: finished: fill-$k" "s:fill$k"; done
+full=0
+for _ in $(seq 1 30); do
+  if [ "$(tmux -L "$OUTER" capture-pane -p -t view | grep -c '╭─ ✓ fill')" = 6 ] && screen | grep -q 'fill-'; then full=1; break; fi
+  sleep 0.2
+done
+chk "six toasts fill the corner and a seventh goes to the status line" "[ $full = 1 ]"
+"$N" clear-all
+idle
+dismiss
+
+"$N" mark "$NOTES" claude 'Claude needs approval: on this pane' s:f5
+settle s:f5
+chk "no floating toast on the client that is on the pane" "! tmux -L \"\$OUTER\" capture-pane -p -t view | grep -qF 'on this pane'"
+"$N" clear-all
+tmux set -gu @radar-toast-duration
+tmux set -g @radar-notify-command "env | grep '^RADAR_' | sort > '$T/notified.'\"\$RADAR_KEY\""
+
+# The status-line toast, for the rest of this suite.
+tmux set -g @radar-toast status
 
 # --- a mark on a pane the person is not looking at ---------------------------------
 "$N" mark "$BILL" claude 'Claude finished: Added the retry and its test.' s:a1
@@ -114,7 +230,7 @@ tmux set -g @radar-toast off
 settle s:a5
 chk "@radar-toast off shows nothing" "! screen | grep -q 'toast is off'"
 chk "and leaves the notify command on" "[ \"\$(notified s:a5 RADAR_LEVEL)\" = done ]"
-tmux set -gu @radar-toast
+tmux set -g @radar-toast status
 "$N" clear-all
 
 # --- paneless marks and old marks -----------------------------------------------------
@@ -171,6 +287,19 @@ tmux set -g @radar-notify-command 'exit 3'
 settle s:a8
 chk "a failing notify command shows nothing on the client" "! screen | grep -q 'returned'"
 dismiss
+
+# --- a client that detaches is not painted after it leaves ----------------------------
+tmux set -gu @radar-notify-command
+tmux set -g @radar-toast float
+tmux set -g @radar-toast-duration 8000
+"$N" mark "$BILL" claude 'Claude finished: detach check' s:f9
+shown 'detach check'
+tmux detach-client -t "$(tmux list-clients -F '#{client_name}')"
+sleep 0.3
+tmux -L "$OUTER" send-keys -t view 'echo shell-is-back' Enter
+sleep 1
+chk "after a detach the toast stops and paints nothing over the shell" \
+  "tmux -L \"\$OUTER\" capture-pane -p -t view | grep -q '^shell-is-back' && ! tmux -L \"\$OUTER\" capture-pane -p -t view | grep -qF 'detach check' && idle"
 
 echo
 echo "=============================="

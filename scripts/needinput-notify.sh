@@ -723,17 +723,25 @@ cmd_announce() {  # announce: run by the tmux server after a write
   exec </dev/null >/dev/null 2>&1
   have_tmux || return 0
   local toast cmd levels dur rows clients epoch level where label pane key source
-  local id watched session cname cpane cctl shown fmt text
-  toast="$(opt @radar-toast on)"
+  local id watched session cname cpane cctl ctty cpid ccols crows cstatus cpos cutf8 shown fmt text
+  local nstatus top bottom
+  # float: a box drawn in the top-right corner (radar-float.sh); status: a
+  # status-line message; off. `on` is float, which is the default.
+  toast="$(opt @radar-toast float)"
+  case "$toast" in on|float|popup) toast=float ;; status) ;; *) toast=off ;; esac
   cmd="$(opt @radar-notify-command '')"
-  [ "$toast" = on ] || [ -n "$cmd" ] || return 0
+  [ "$toast" != off ] || [ -n "$cmd" ] || return 0
   rows="$("$SCRIPT_DIR/needinput-toast.sh" fresh 30 2>/dev/null || true)"
   [ -n "$rows" ] || return 0
   mkdir -p "$ANNOUNCED_DIR" 2>/dev/null || return 0
   levels=" $(opt @radar-toast-levels 'action done notice') "
   dur="$(opt @radar-toast-duration 5000)"
   case "$dur" in ''|*[!0-9]*) dur=5000 ;; esac
-  clients="$(tmux list-clients -F '#{client_name}'$'\t''#{pane_id}'$'\t''#{client_control_mode}' 2>/dev/null || true)"
+  if [ "$toast" = float ]; then
+    RADAR_UTF8_LOCALE="$(locale -a 2>/dev/null | grep -m1 -xE 'C\.UTF-8|en_US\.UTF-8|C\.utf8|en_US\.utf8' || true)"
+    export RADAR_UTF8_LOCALE
+  fi
+  clients="$(tmux list-clients -F '#{client_name}'$'\t''#{pane_id}'$'\t''#{client_control_mode}'$'\t''#{client_tty}'$'\t''#{client_pid}'$'\t''#{client_width}'$'\t''#{client_height}'$'\t''#{status}'$'\t''#{status-position}'$'\t''#{client_utf8}' 2>/dev/null || true)"
   while IFS=$'\t' read -r epoch level where label pane key source; do
     [ -n "$epoch" ] || continue
     # the label is in the id: two marks of one pane in one second are two
@@ -741,15 +749,23 @@ cmd_announce() {  # announce: run by the tmux server after a write
     id="${id//[^A-Za-z0-9._-]/_}"
     mkdir "$ANNOUNCED_DIR/$id" 2>/dev/null || continue   # announced by another write
     shown=0
-    case "$levels" in *" $level "*) [ "$toast" != on ] || shown=1 ;; esac
+    case "$levels" in *" $level "*) [ "$toast" = off ] || shown=1 ;; esac
     fmt="$(_toast_format "$level" "$where" "$label")"
     watched=0
-    while IFS=$'\t' read -r cname cpane cctl; do
+    while IFS=$'\t' read -r cname cpane cctl ctty cpid ccols crows cstatus cpos cutf8; do
       # a control-mode client (iTerm2 -CC, an integration) is nobody's screen
       [ -n "$cname" ] && [ "$cctl" != 1 ] || continue
       if [ "$cpane" = "$pane" ]; then watched=1; continue; fi
       [ "$shown" = 1 ] || continue
-      tmux display-message -C -d "$dur" -c "$cname" "$fmt" 2>/dev/null || true
+      if [ "$toast" = status ]; then
+        tmux display-message -C -d "$dur" -c "$cname" "$fmt" 2>/dev/null || true
+        continue
+      fi
+      case "$cstatus" in on) nstatus=1 ;; off|'') nstatus=0 ;; *[!0-9]*) nstatus=1 ;; *) nstatus=$cstatus ;; esac
+      if [ "$cpos" = top ]; then top=$((nstatus + 1)); bottom=$crows
+      else top=1; bottom=$((crows - nstatus)); fi
+      "$SCRIPT_DIR/radar-float.sh" "$cname" "$ctty" "$cpid" "$ccols" "$top" "$bottom" "$cutf8" \
+        "$level" "$where" "$label" "$dur" "$key" "$STATE_FILE" "$STATE_DIR/.toast-slots" &
     done <<< "$clients"
     [ -n "$cmd" ] || continue
     session=""

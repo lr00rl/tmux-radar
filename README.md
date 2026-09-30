@@ -77,9 +77,9 @@ long-running agents.
   status area while an off-screen mark is fresh,
   the pane's **title flips to a status label** (`⚠` action required, `✓`
   finished, `!` notice), the pane shows up on the Agents board, and a
-  one-line **toast** on your status line says what just happened (a key press
-  dismisses it). `@radar-notify-command` turns the same event into a desktop,
-  sound or chat notification.
+  **toast** floats in the top-right corner to say what just happened, over
+  SSH too. `@radar-notify-command` turns the same event into a desktop, sound
+  or chat notification.
   Only the pane you focus is marked read; sibling agent panes remain unread.
   Marks also clear when you reply — and
   **stale marks self-heal**: a mark whose agent TUI has exited is dropped
@@ -192,7 +192,7 @@ Set these **before** the plugin loads:
 | `@radar-bar` | `auto` | `auto` renders chips **inline inside your existing status-right** (`#{E:@radar-chips}` is injected once); `pinned` keeps a permanently reserved line 2; `off` tracks marks only. The status line **count never changes at runtime** — no pane resize, no SIGWINCH flicker. |
 | `@radar-bar-ttl` | `60` | Seconds a chip stays on the bar before fading (`0` = until handled). The mark itself persists on the board / the pane title until cleared. |
 | `@radar-done-ttl` | `0` | Seconds a finished-turn (DONE) mark is kept for review before expiring (`0` = keep until focused/cleared). |
-| `@radar-toast` | `on` | Show a new mark once as a status-line toast on every client that is not on its pane. A key press dismisses it and reaches the pane. |
+| `@radar-toast` | `float` | Show a new mark once on every client that is not on its pane: `float` draws a box in the top-right corner (panes keep drawing, keys pass through), `status` uses the status line, `off` shows nothing. |
 | `@radar-toast-levels` | `action done notice` | Levels that toast. |
 | `@radar-toast-duration` | `5000` | Milliseconds a toast stays up. |
 | `@radar-notify-command` | (none) | Shell command run once per new mark with `RADAR_LEVEL`, `RADAR_AGENT`, `RADAR_LABEL`, `RADAR_WHERE`, `RADAR_PANE`, `RADAR_SESSION`, `RADAR_KEY`, `RADAR_WATCHED` and `RADAR_TEXT` set. See [notifications](docs/guides/notifications.md). |
@@ -297,15 +297,20 @@ shape follow its [official hooks reference](https://moonshotai.github.io/kimi-co
 ### Toasts and turn-end notifications
 
 When an agent needs approval or finishes its turn in a pane you are not on,
-radar says so once on your tmux status line, for any agent:
+radar floats a toast in the top-right corner of your tmux client, for any
+agent, locally or over SSH:
 
 ```
- ✓  billing-api · Claude finished: Added the retry and its test.
+╭─ ✓ billing-api ────────────────────────────────╮
+│ Claude finished: Added the retry and its test. │
+╰────────────────────────────────────────────────╯
 ```
 
-The pane keeps drawing underneath, and a key press goes to the pane as usual
-and dismisses the toast. Tune it with `@radar-toast`, `@radar-toast-levels`
-and `@radar-toast-duration`. For notifications outside tmux (desktop, sound,
+It is drawn on your terminal rather than as a tmux popup, so panes keep
+drawing and your typing goes where it always does. It leaves after a few
+seconds, or as soon as you go to that pane. `@radar-toast status` puts it on
+the status line instead; `@radar-toast-levels` and `@radar-toast-duration`
+tune it. For notifications outside tmux (desktop, sound,
 chat), set `@radar-notify-command`: it runs once per new mark with the mark in
 `RADAR_LEVEL`, `RADAR_LABEL`, `RADAR_WHERE` and friends, and
 `examples/notify-desktop.sh` is a ready one. See

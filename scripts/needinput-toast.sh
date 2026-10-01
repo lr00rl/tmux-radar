@@ -53,12 +53,13 @@ opt() {  # opt <option> <default>
 # Records joined with \001 (BSD awk rejects newlines in -v values).
 pane_map() {
   tmux list-panes -a -F \
-    '#{pane_id}'$'\t''#{&&:#{pane_active},#{&&:#{window_active},#{!=:#{session_attached},0}}}'$'\t''#{session_name}:#{window_index}'$'\t''#{window_name}' 2>/dev/null |
+    '#{pane_id}'$'\t''#{&&:#{pane_active},#{&&:#{window_active},#{!=:#{session_attached},0}}}'$'\t''#{session_name}:#{window_index}'$'\t''#{window_name}'$'\t''#{window_id}' 2>/dev/null |
     tr '\n' '\001' || true
 }
 
 case "${1:-render}" in
-  render)  # render [auto|pinned]
+  render|publish)  # render [auto|pinned] | publish [auto|pinned]
+    what="$1"
     [ -r "$STATE_FILE" ] || exit 0
     click=0
     if [ "$(opt @radar-click on)" != off ]; then
@@ -73,7 +74,7 @@ case "${1:-render}" in
     fi
     out="$(awk -F '\t' -v max="$MAX" -v panes="$(pane_map)" -v now="$(date +%s)" \
           -v ttls="$(opt @radar-bar-ttl 'action=0 done=600 notice=600')" \
-          -v click="$click" -v mode="${2:-auto}" "$RADAR_LEVEL_AWK"'
+          -v click="$click" -v mode="${2:-auto}" -v what="$what" "$RADAR_LEVEL_AWK"'
       function icon_for(level) {
         return (level == "action" ? "⚠" : (level == "done" ? "✓" : "!"))
       }
@@ -81,6 +82,8 @@ case "${1:-render}" in
         return (level == "action" ? "#[fg=colour234,bg=colour208,bold]" : (level == "done" ? "#[fg=colour234,bg=colour35,bold]" : "#[fg=colour234,bg=colour220,bold]"))
       }
       function rank_of(level) { return (level == "action" ? 3 : (level == "notice" ? 2 : 1)) }
+      function colour_for(level) { return (level == "action" ? "colour208" : (level == "done" ? "colour35" : "colour220")) }
+      function target(pane) { return (pane == "-" ? "-" : substr(pane, 2)) }
       # Terse chip identity. Pane marks: the user-named window (fallback
       # session:window). Paneless bg marks ("Claude·proj: text"): the project.
       # The strip is expanded as a tmux format (#{E:@radar-chips}), so a "#"
@@ -116,6 +119,7 @@ case "${1:-render}" in
           if (f[2] == 1) viewed[f[1]] = 1
           where[f[1]] = f[3]
           wname[f[1]] = f[4]
+          wid[f[1]] = f[5]
         }
       }
       NF >= 4 {
@@ -134,6 +138,10 @@ case "${1:-render}" in
         if (at > gnew[k]) gnew[k] = at
         # the chip shows, and a click goes to, the newest of its most urgent marks
         if (r > grank[k] || (r == grank[k] && at >= gat[k])) { grank[k] = r; glevel[k] = level; gpane[k] = pane; gat[k] = at }
+        # the counts for narrow screens, and the colour each window carries
+        lcount[level]++
+        if (at >= lat[level]) { lat[level] = at; lpane[level] = pane }
+        if (pane != "-" && wid[pane] != "" && r > wrank[wid[pane]]) { wrank[wid[pane]] = r; wlevel[wid[pane]] = level }
       }
       END {
         for (i = 1; i <= g; i++) {
@@ -141,22 +149,37 @@ case "${1:-render}" in
           while (j > 1 && (grank[ord[j-1]] < grank[x] || (grank[ord[j-1]] == grank[x] && gnew[ord[j-1]] < gnew[x]))) { ord[j] = ord[j-1]; j-- }
           ord[j] = x
         }
-        shown = 0
+        full = ""; shown = 0
         for (i = 1; i <= g && shown < max; i++) {
           k = ord[i]
-          if (shown) printf " "
-          if (click) printf "#[range=user|radar%s]", (gpane[k] == "-" ? "-" : substr(gpane[k], 2))
-          printf "%s %s %s%s #[default]", style_for(glevel[k]), icon_for(glevel[k]), gtext[k], (gcount[k] > 1 ? " ×" gcount[k] : "")
-          if (click) printf "#[norange]"
+          if (shown) full = full " "
+          if (click) full = full "#[range=user|radar" target(gpane[k]) "]"
+          full = full style_for(glevel[k]) " " icon_for(glevel[k]) " " gtext[k] (gcount[k] > 1 ? " ×" gcount[k] : "") " #[default]"
+          if (click) full = full "#[norange]"
           shown++
         }
         if (g > max) {
-          printf " "
-          if (click) printf "#[range=user|radar-]"
-          printf "#[fg=colour244]+%d#[default]", g - max
-          if (click) printf "#[norange]"
+          full = full " "
+          if (click) full = full "#[range=user|radar-]"
+          full = full "#[fg=colour244]+" (g - max) "#[default]"
+          if (click) full = full "#[norange]"
         }
-        if (click && shown && mode == "auto") printf "#[range=right]"
+        if (click && shown && mode == "auto") full = full "#[range=right]"
+        if (what == "render") { printf "%s", full; exit }
+        # Narrow screens: one count per level, most urgent first. A count of
+        # one goes to its pane; a larger one opens the picker to choose.
+        short = ""; nl = split("action notice done", lv, " ")
+        for (i = 1; i <= nl; i++) {
+          l = lv[i]
+          if (!(l in lcount)) continue
+          if (short != "") short = short " "
+          if (click) short = short "#[range=user|radar" (lcount[l] == 1 ? target(lpane[l]) : "-") "]"
+          short = short "#[fg=" colour_for(l) ",bold]" icon_for(l) lcount[l] "#[default]"
+          if (click) short = short "#[norange]"
+        }
+        if (click && short != "" && mode == "auto") short = short "#[range=right]"
+        printf "%s\n%s\n", full, short
+        for (win in wlevel) printf "W\t%s\t%s\n", win, colour_for(wlevel[win])
       }' "$STATE_FILE" 2>/dev/null || true)"
     printf '%s' "$out"
     ;;

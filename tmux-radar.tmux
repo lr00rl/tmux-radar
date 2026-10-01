@@ -123,7 +123,7 @@ _radar_compose_resurrect_hook @resurrect-hook-post-restore-all "$NOTIFY_Q restor
 # existing status-right) | pinned (chips on a permanently reserved line 2) |
 # off (track marks only).
 if [ "$NEEDINPUT" = "on" ]; then
-  tmux set-option -g @radar-chips "" 2>/dev/null || true
+  tmux set-option -g @radar-chips "" \; set-option -g @radar-chips-short "" 2>/dev/null || true
   case "$(opt @radar-bar auto)" in
     off) ;;
     pinned)
@@ -136,11 +136,17 @@ if [ "$NEEDINPUT" = "on" ]; then
       ;;
     *)
       # inline: wrap the user's status-right once (config reload resets the
-      # option to the user's raw value, so re-wrapping stays idempotent)
+      # option to the user's raw value, so re-wrapping stays idempotent). A
+      # client under 120 columns gets the counts instead of the chips.
       CUR_RIGHT="$(tmux show-option -gv status-right 2>/dev/null || true)"
+      CHIPS_FMT='#{?#{e|<:#{client_width},120},#{E:@radar-chips-short},#{E:@radar-chips}}'
       case "$CUR_RIGHT" in
+        *'@radar-chips-short'*) ;;
+        # the wrapper of an earlier version, left by a reload of the plugin
+        # without one of the config
+        '#{E:@radar-chips}'*) tmux set-option -g status-right "$CHIPS_FMT${CUR_RIGHT#'#{E:@radar-chips}'}" ;;
         *'@radar-chips'*) ;;
-        *) tmux set-option -g status-right "#{E:@radar-chips}$CUR_RIGHT" ;;
+        *) tmux set-option -g status-right "$CHIPS_FMT$CUR_RIGHT" ;;
       esac
       ;;
   esac

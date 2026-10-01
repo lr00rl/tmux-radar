@@ -392,6 +392,27 @@ tmux set -g @radar-click off
 chk "@radar-click off leaves the chips as plain text" "! chips_now | grep -qF 'range='"
 tmux set -gu @radar-click
 tmux set -gu @radar-bar-ttl
+
+# --- 7.45 narrow clients: counts per level; windows carry their level ------------
+"$N" clear-all
+"$N" mark "$A1" tool 'Claude needs approval: Bash' s:n-a1
+"$N" mark "$A2" tool 'Claude finished: tests pass' s:n-a2
+"$N" mark "$B1" tool 'Codex finished - your turn' s:n-b1
+# shellcheck disable=SC2034 # consumed by chk's evaluated assertion strings below
+SHORT="$(tmux show-option -gqv @radar-chips-short)"
+chk "narrow clients get one count per level, most urgent first" \
+  "printf '%s' \"\$SHORT\" | sed 's/#\\[[^]]*\\]//g' | grep -qx '⚠1 ✓2 '"
+chk "a count of one goes to its pane, a larger one opens the picker" \
+  "printf '%s' \"\$SHORT\" | grep -qF '#[range=user|radar${A1#%}]#[fg=colour208,bold]⚠1' && printf '%s' \"\$SHORT\" | grep -qF '#[range=user|radar-]#[fg=colour35,bold]✓2'"
+win_colour() { tmux show-options -wqv -t "$1" @radar-color; }
+chk "a window with an approval carries the action colour" "[ \"\$(win_colour smoke:alpha)\" = colour208 ]"
+chk "a window with only a finished turn carries the done colour" "[ \"\$(win_colour '$B1')\" = colour35 ]"
+chk "a window with nothing unread carries none" "[ -z \"\$(win_colour smoke:0)\" ]"
+"$N" clear-key s:n-a1
+chk "handling the approval drops its window to the next level" "[ \"\$(win_colour smoke:alpha)\" = colour35 ]"
+"$N" clear-all
+chk "with nothing unread, no window keeps a colour" \
+  "[ -z \"\$(tmux list-windows -a -F '#{@radar-color}' | tr -d '\n')\" ] && [ -z \"\$(tmux show-option -gqv @radar-chips-short)\" ]"
 tmux kill-window -t smoke:alpha
 tmux kill-window -t "$B1"
 "$N" clear-all
@@ -495,6 +516,12 @@ chk "window-change hook clears only the newly active pane, while a client shows 
   "printf '%s\n' \"\$HOOK_TEXT\" | grep 'session-window-changed' | grep -qF \"needinput-notify.sh clear '#{?window_active_clients,#{pane_id},-}'\""
 chk "no radar hook reads the hook_* formats tmux 3.6 leaves empty" \
   "! printf '%s\n' \"\$HOOK_TEXT\" | grep -F '$WT/scripts' | grep -qE 'hook_(window|pane|session_name)'"
+tmux set -g status-right '#{E:@radar-chips}%H:%M'
+bash "$WT/tmux-radar.tmux"
+chk "a reload of the plugin alone upgrades an earlier chip wrapper" \
+  "[ \"\$(tmux show-option -gv status-right)\" = '#{?#{e|<:#{client_width},120},#{E:@radar-chips-short},#{E:@radar-chips}}%H:%M' ]"
+chk "status-right shows chips, or counts on a client under 120 columns" \
+  "tmux show-option -gv status-right | grep -qF '#{?#{e|<:#{client_width},120},#{E:@radar-chips-short},#{E:@radar-chips}}'"
 chk "session-change bar resync uses the silent hook-tick" \
   "printf '%s\n' \"\$HOOK_TEXT\" | grep 'client-session-changed' | grep -q 'needinput-notify.sh hook-tick'"
 chk "focus/MRU/tick hooks never report a failing run-shell to tmux" \

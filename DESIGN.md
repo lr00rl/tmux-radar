@@ -377,6 +377,14 @@ only marks from the last 30 seconds qualify, so a restart announces nothing.
 
 ### Chips, focus and clicks
 
+On a narrow client (under 120 columns) the strip is `@radar-chips-short`: one
+count per level, most urgent first, a count of one clickable to its pane and a
+larger one to the picker. The same pass writes each window's level to the
+window option `@radar-color`, so a window-status format can light window
+numbers; the window list then carries the attention map and the counts only
+summarise it. The choice is a format conditional on `#{client_width}`, so each
+client gets its own variant with no resize and no script.
+
 A chip stands for a window, not a mark: the most urgent level among the
 window's unread marks, a count when there are several, approvals first. Before
 2026-09-30 every mark had its own chip, and the eleven idle teammates of one

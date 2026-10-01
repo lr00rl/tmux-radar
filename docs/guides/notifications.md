@@ -95,6 +95,42 @@ other click; while no toast is up, a click in a pane costs nothing extra.
 `@radar-click off` puts your original bindings back. A status-line toast
 (`@radar-toast status`) cannot be clicked: tmux owns that line.
 
+## Narrow screens and the window list
+
+On a client under 120 columns the chips give way to one count per level,
+most urgent first, in the level's colour:
+
+```
+ ⚠1 ✓2
+```
+
+A count of one goes to its pane when clicked; a larger count opens the picker
+so you can choose. Each client picks for itself, so a laptop and a wide
+monitor attached to the same session each get what fits.
+
+radar also writes the level of every window that holds an unread mark into
+the window option `@radar-color` (`colour208` for an approval, `colour35` for
+a finished turn, `colour220` for a notice; unset otherwise), under the same
+rules as the chips. A window-status format can use it to light the window's
+number, so the window list itself shows what needs you. With catppuccin:
+
+```tmux
+set -g @catppuccin_window_number_color '#{?#{@radar-color},#{@radar-color},#{@thm_overlay_2}}'
+```
+
+and with a plain format:
+
+```tmux
+set -g window-status-format '#[bg=#{?#{@radar-color},#{@radar-color},colour238}] #I #[default] #W '
+```
+
+To keep every window visible on a small screen, a window-status format can
+also cut names to a share of the width. One recipe gives each
+window `(client_width - status-left - chips - clock - 20) / (windows - 1)`
+columns and cuts the name to the largest of 16, 12, 10, 8, 6 or 4
+characters that fits, or shows the number alone; `#{w:#{E:@radar-chips}}`
+and `#{w:#{E:@radar-chips-short}}` give the width the chips take.
+
 ## Your own notification: `@radar-notify-command`
 
 ```tmux

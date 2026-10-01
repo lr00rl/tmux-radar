@@ -892,20 +892,55 @@ _sync_bar() {
 # AND younger than its level's lifetime in @radar-bar-ttl (by default an
 # approval stays until handled, a finished turn for ten minutes); the mark
 # itself persists in the AI status view / pane title until cleared.
+#
+# The same pass publishes @radar-chips-short (one count per level, for narrow
+# clients; `auto` picks it below 120 columns) and the level of every window
+# with an unread mark as the window option @radar-color (colour208 action,
+# colour35 done, colour220 notice), which a window-status-format can use to
+# light that window's number. Both follow the chips' rules: off-screen panes,
+# per-level lifetime.
 _publish_chips() {
-  local mode chips
+  local mode out chips short windows
   mode="$(opt @radar-bar auto)"
   case "$mode" in auto|pinned|off) ;; *) mode=auto ;; esac
   _bar_lower                                     # heal pre-inline leftovers
-  if [ "$mode" = off ]; then
-    tmux set -g @radar-chips "" >/dev/null 2>&1 || true
-    return 0
-  fi
-  chips="$("$SCRIPT_DIR/needinput-toast.sh" render "$mode" 2>/dev/null || true)"
+  out="$("$SCRIPT_DIR/needinput-toast.sh" publish "$mode" 2>/dev/null || true)"
+  chips="$(printf '%s\n' "$out" | sed -n 1p)"
+  short="$(printf '%s\n' "$out" | sed -n 2p)"
+  windows="$(printf '%s\n' "$out" | awk -F '\t' '$1 == "W" { print $2 "\t" $3 }')"
+  if [ "$mode" = off ]; then chips=""; short=""; fi
   [ -z "$chips" ] || chips="$chips "
-  tmux set -g @radar-chips "$chips" >/dev/null 2>&1 || true
-  [ -z "$chips" ] || _schedule_resync
+  [ -z "$short" ] || short="$short "
+  tmux set -g @radar-chips "$chips" \; set -g @radar-chips-short "$short" >/dev/null 2>&1 || true
+  _publish_window_colours "$windows"
+  [ -z "$chips$windows" ] || _schedule_resync
   _refresh_status
+}
+
+# Bring each window's @radar-color to what the marks say, touching only the
+# windows that change: one call to read, one batched call to write.
+_publish_window_colours() {  # _publish_window_colours <"@id<TAB>colour" lines>
+  local plan op id val
+  local -a args=()
+  plan="$( { printf '__WANT__\n%s\n__HAVE__\n' "${1:-}"
+             tmux list-windows -a -F '#{window_id}'$'\t''#{@radar-color}' 2>/dev/null || true; } |
+    awk -F '\t' '
+      $0 == "__WANT__" { m = 1; next }
+      $0 == "__HAVE__" { m = 2; next }
+      m == 1 && $1 != "" { want[$1] = $2; next }
+      m == 2 && $1 != "" { have[$1] = $2; seen[$1] = 1 }
+      END {
+        for (w in want) if ((w in seen) && have[w] != want[w]) print "set\t" w "\t" want[w]
+        for (w in seen) if (have[w] != "" && !(w in want)) print "unset\t" w
+      }')"
+  [ -n "$plan" ] || return 0
+  while IFS=$'\t' read -r op id val; do
+    [ -n "$id" ] || continue
+    [ "${#args[@]}" -eq 0 ] || args+=(";")
+    if [ "$op" = set ]; then args+=(set-option -wq -t "$id" @radar-color "$val")
+    else args+=(set-option -wqu -t "$id" @radar-color); fi
+  done <<< "$plan"
+  [ "${#args[@]}" -eq 0 ] || tmux "${args[@]}" >/dev/null 2>&1 || true
 }
 
 cmd_mark() {  # cmd_mark <pane|-> <source> <label> [key]

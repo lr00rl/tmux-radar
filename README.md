@@ -189,8 +189,9 @@ Set these **before** the plugin loads:
 | `@radar-scan-interval` | `10` | Seconds between live scans (minimum `5`). Scans run inside `tick`, which the picker, the bar, and session hooks already trigger; the interval keeps repeat reloads cheap. |
 | `@radar-retitle` | `on` | Rename a marked pane's title to a status label (`⚠` action required, `✓` finished, `!` notice), restored on clear. |
 | `@radar-claude-bg` | `on` | Also track Claude sessions running outside tmux panes (background/dashboard/cloud). |
-| `@radar-bar` | `auto` | `auto` renders chips **inline inside your existing status-right** (`#{E:@radar-chips}` is injected once); `pinned` keeps a permanently reserved line 2; `off` tracks marks only. The status line **count never changes at runtime** — no pane resize, no SIGWINCH flicker. |
-| `@radar-bar-ttl` | `60` | Seconds a chip stays on the bar before fading (`0` = until handled). The mark itself persists on the board / the pane title until cleared. |
+| `@radar-bar` | `auto` | One chip per window that holds unread marks, approvals first, with a count when the window has several (`⚠ api ×2`). `auto` renders chips **inline inside your existing status-right** (`#{E:@radar-chips}` is injected once); `pinned` keeps a permanently reserved line 2; `off` tracks marks only. The status line **count never changes at runtime** — no pane resize, no SIGWINCH flicker. |
+| `@radar-bar-ttl` | `action=0 done=600 notice=600` | How long a chip stays on the bar, per level, in seconds: an approval until you handle it, a finished turn or a notice for ten minutes. `0` keeps a chip until its mark is handled; one number (`300`) sets every level, and a level left out keeps its default. The mark itself stays in the picker and the pane title until you go to the pane. |
+| `@radar-click` | `on` | A click on a chip or a floating toast jumps to its pane on the client you clicked (needs `mouse on`; chips need tmux 3.4 or later). A paneless chip and `+N` open the picker. Every other click keeps the binding it had. `off` restores your original `MouseDown1Status` and `MouseDown1Pane` bindings. |
 | `@radar-done-ttl` | `0` | Seconds a finished-turn (DONE) mark is kept for review before expiring (`0` = keep until focused/cleared). |
 | `@radar-toast` | `float` | Show a new mark once on every client that is not on its pane: `float` draws a box in the top-right corner (panes keep drawing, keys pass through), `status` uses the status line, `off` shows nothing. |
 | `@radar-toast-levels` | `action done notice` | Levels that toast. |
@@ -308,9 +309,13 @@ agent, locally or over SSH:
 
 It is drawn on your terminal rather than as a tmux popup, so panes keep
 drawing and your typing goes where it always does. It leaves after a few
-seconds, or as soon as you go to that pane. `@radar-toast status` puts it on
-the status line instead; `@radar-toast-levels` and `@radar-toast-duration`
-tune it. For notifications outside tmux (desktop, sound,
+seconds, or as soon as you go to that pane; click it to go there. Until you
+do, the window keeps a chip on the status line (click that too), and a
+finished turn's chip fades after ten minutes. Choose where alerts show with
+`@radar-toast float` (the box) or `@radar-toast status` (a status line
+message), and how long things stay with `@radar-toast-duration` (the toast,
+in milliseconds) and `@radar-bar-ttl` (the chips, in seconds per level);
+`@radar-toast-levels` picks the levels that toast. For notifications outside tmux (desktop, sound,
 chat), set `@radar-notify-command`: it runs once per new mark with the mark in
 `RADAR_LEVEL`, `RADAR_LABEL`, `RADAR_WHERE` and friends, and
 `examples/notify-desktop.sh` is a ready one. See
@@ -361,6 +366,11 @@ normalized event contract and a copyable adapter.
   `CLAUDE_CODE_SESSION_ATTENDED=0` (or an `sdk-*` `CLAUDE_CODE_ENTRYPOINT`),
   the originator in a `codex exec` rollout, pi's `ctx.mode`, and OpenCode's
   `run` subcommand. The pane keeps reporting the agent that owns it.
+- **Members of a Claude agent team.** The lead starts each member as
+  `claude --agent-id … --agent-name … --team-name …`, often in a pane of its
+  own. A member reports to its lead, and the lead's turn reports to you, so a
+  member's finished turn, or its pane going quiet, raises no mark. A member
+  that waits for approval is still marked.
 - **Desktop apps.** The Cursor editor runs the same `~/.cursor/hooks.json`
   from no pane. Only Claude's own paneless hooks (its background sessions) are
   placed on a pane by working directory; any other agent's event without a

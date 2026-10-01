@@ -8,7 +8,8 @@ set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 N="$WT/scripts/needinput-notify.sh"
 T="$(mktemp -d /tmp/radar-announce.XXXXXX)"
-export TMUX_RADAR_STATE_DIR="$T/state" TMUX_RADAR_NO_SCHEDULE=1
+# the servers' sockets live in $T too, so cleanup removes them with the rest
+export TMUX_RADAR_STATE_DIR="$T/state" TMUX_RADAR_NO_SCHEDULE=1 TMUX_TMPDIR="$T"
 INNER="radarann$$"
 OUTER="radarannview$$"
 
@@ -287,6 +288,115 @@ tmux set -g @radar-notify-command 'exit 3'
 settle s:a8
 chk "a failing notify command shows nothing on the client" "! screen | grep -q 'returned'"
 dismiss
+
+# --- a click on a chip or a toast goes to its pane ------------------------------------
+# Marks go on the pane a window does NOT show (BILL2): going to the window
+# shows its active pane, going to the mark shows the marked one.
+tmux set -gu @radar-notify-command
+tmux set -g @radar-toast float
+tmux set -g @radar-toast-duration 8000
+tmux set -g mouse on
+"$N" clear-all
+BILL2="$(tmux split-window -d -P -F '#{pane_id}' -t work:billing-api 'bash --norc')"
+NOTES2="$(tmux split-window -d -P -F '#{pane_id}' -t work:notes 'bash --norc')"   # notes: top and bottom
+ORIG_PANE="$(tmux list-keys -T root MouseDown1Pane | sed -E 's/^bind-key +(-[rn] +)*-T +root +[^ ]+ +//')"
+ORIG_STATUS="$(tmux list-keys -T root MouseDown1Status | sed -E 's/^bind-key +(-[rn] +)*-T +root +[^ ]+ +//')"
+bash "$WT/tmux-radar.tmux"
+BOUND="$(tmux list-keys -T root MouseDown1Pane)"
+chk "the plugin wraps the pane click and keeps what was bound there" \
+  "printf '%s' \"\$BOUND\" | grep -qF 'toast-click' && [ \"\$(tmux show -gqv @radar-click-orig-MouseDown1Pane)\" = \"\$ORIG_PANE\" ]"
+bash "$WT/tmux-radar.tmux"
+chk "a reload wraps the original again, never the wrapper" \
+  "[ \"\$(tmux list-keys -T root MouseDown1Pane)\" = \"\$BOUND\" ]"
+click() { tmux -L "$OUTER" send-keys -t view -l "$(printf '\033[<0;%d;%dM\033[<0;%d;%dm' "$1" "$2" "$1" "$2")"; sleep 0.6; }
+on_pane() { [ "$(tmux list-clients -F '#{pane_id}')" = "$1" ]; }
+to_notes() { tmux switch-client -t "$NOTES"; sleep 0.3; }
+MARKS="$TMUX_RADAR_STATE_DIR/need-input"
+
+# the plugin's focus hooks: going to a pane reads its mark, and nothing else
+"$N" mark "$BILL2" tool 'Claude finished: focus check' s:fc
+tmux select-window -t work:billing-api     # shows BILL, the window's active pane
+sleep 0.8
+chk "going to a window leaves the mark of a pane it does not show" "grep -q 's:fc' '$MARKS'"
+tmux select-pane -t "$BILL2"
+sleep 0.8
+chk "going to the pane clears its mark" "! grep -q 's:fc' '$MARKS'"
+to_notes
+"$N" mark "$BILL2" tool 'Claude finished: by session switch' s:fs
+tmux new-session -d -s side 'bash --norc'
+tmux switch-client -t side; sleep 0.3
+tmux select-window -t work:billing-api; tmux select-pane -t "$BILL2"; sleep 0.8
+chk "a pane brought forward in a session nobody is attached to stays unread" "grep -q 's:fs' '$MARKS'"
+tmux switch-client -t work; sleep 0.8
+chk "coming back to that session clears the pane it shows" "! grep -q 's:fs' '$MARKS'"
+tmux new-window -d -t side: -n two 'bash --norc'
+SIDE2="$(tmux display-message -p -t side:two '#{pane_id}')"
+# side's window two, linked into work too. A second client on side, attached
+# last, makes side the session tmux runs the pane hook in, and side shows
+# another window: the client on work is the one looking.
+tmux link-window -d -s side:two -t work:
+SIDE3="$(tmux split-window -d -P -F '#{pane_id}' -t side:two 'bash --norc')"
+tmux select-window -t work:two; sleep 0.3
+tmux -L "$OUTER" new-window -d -n side "env -u TMUX tmux -L $INNER attach -t side:0"
+for _ in $(seq 1 20); do [ "$(tmux list-clients | wc -l | tr -d ' ')" = 2 ] && break; sleep 0.2; done
+"$N" mark "$SIDE3" tool 'Claude finished: linked' s:link
+tmux select-pane -t "$SIDE3"; sleep 0.8
+chk "a pane in a linked window is read by the client that shows it" "! grep -q 's:link' '$MARKS'"
+tmux detach-client -s side; sleep 0.3
+tmux unlink-window -t work:two; tmux select-window -t work:notes; sleep 0.3
+"$N" mark "$SIDE2" tool 'Claude finished: unseen' s:side
+tmux select-window -t side:two; sleep 0.8
+chk "a window change in a session nobody is attached to clears nothing" "grep -q 's:side' '$MARKS'"
+tmux kill-session -t side
+to_notes
+"$N" clear-all
+idle
+chip_col() {  # chip_col <text>: the screen column of the last <text> on the status line
+  tmux -L "$OUTER" capture-pane -p -t view | tail -1 | perl -CS -ne "print rindex(\$_, '$1') + 1"
+}
+
+"$N" mark "$BILL2" tool 'Claude finished: chip click' s:c1
+shown 'chip click'
+for _ in $(seq 1 20); do [ "$(chip_col billing-api)" -gt 40 ] && break; sleep 0.2; done
+click "$(chip_col billing-api)" 20
+chk "a click on a chip goes to the marked pane" "on_pane '$BILL2'"
+to_notes
+
+"$N" mark "$BILL2" tool 'Claude needs approval: toast click' s:c2
+shown 'toast click'
+click 100 3
+chk "a click on a floating toast goes to the marked pane" "on_pane '$BILL2'"
+chk "and the toast leaves" "gone 'toast click'"
+to_notes
+idle
+
+tmux select-pane -t "$NOTES"
+"$N" mark "$BILL2" tool 'Claude finished: pass-through' s:c3
+shown 'pass-through'
+click 10 15
+chk "while a toast is up, a click elsewhere does what it always did" "on_pane '$NOTES2'"
+"$N" clear-all
+idle
+chk "with every toast gone, clicks fork nothing again" "[ -z \"\$(tmux show -gqv @radar-toast-live)\" ]"
+
+tmux select-pane -t "$NOTES"
+CL="$(tmux list-clients -F '#{client_name}')"
+mkdir -p "$TMUX_RADAR_STATE_DIR/.toast-slots/${CL//[^A-Za-z0-9._-]/_}/9"
+printf '90 2 28 %s 999999\n' "$BILL2" > "$TMUX_RADAR_STATE_DIR/.toast-slots/${CL//[^A-Za-z0-9._-]/_}/9/hit"
+tmux set -g @radar-toast-live 1
+click 100 3
+chk "the box of a toast that was killed is no click target" "on_pane '$NOTES'"
+rm -rf "$TMUX_RADAR_STATE_DIR/.toast-slots/${CL//[^A-Za-z0-9._-]/_}/9"
+tmux set -gu @radar-toast-live
+
+tmux set -g @radar-click off
+bash "$WT/tmux-radar.tmux"
+chk "@radar-click off puts the original bindings back" \
+  "[ \"\$(tmux list-keys -T root MouseDown1Pane | sed -E 's/^bind-key +(-[rn] +)*-T +root +[^ ]+ +//')\" = \"\$ORIG_PANE\" ] && [ \"\$(tmux list-keys -T root MouseDown1Status | sed -E 's/^bind-key +(-[rn] +)*-T +root +[^ ]+ +//')\" = \"\$ORIG_STATUS\" ] && [ -z \"\$(tmux show -gqv @radar-click-orig-MouseDown1Pane)\" ]"
+tmux set -gu @radar-click
+tmux kill-pane -t "$BILL2"
+tmux kill-pane -t "$NOTES2"
+"$N" clear-all
 
 # --- a client that detaches is not painted after it leaves ----------------------------
 tmux set -gu @radar-notify-command

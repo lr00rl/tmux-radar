@@ -5,11 +5,23 @@
 # — inside the user's status-right (`auto`) or on a pinned line 2 (`pinned`).
 #
 # Reads the need-input state file (see needinput-notify.sh for the format) and
-# prints one styled chip per live mark whose pane is NOT currently on screen
-# (paneless background marks always show), newest first, capped at $MAX with a
-# "+N" overflow counter. Chips are deliberately terse — `⚠ billing-api`, never
-# the full sentence — because they share one line with the window list; the
-# picker (Inbox/Agents) carries the long form.
+# prints one styled chip per window (or per project, for paneless background
+# marks) holding live marks whose pane is NOT currently on screen: the most
+# urgent level of the window, and a count when it holds more than one mark.
+# Approvals come first, then newest first; at most $MAX chips, then a "+N"
+# for the windows left out. Chips are deliberately terse — `⚠ billing-api`,
+# never the full sentence — because they share one line with the window list;
+# the picker (Inbox/Agents) carries the long form.
+#
+# A chip leaves the bar after its level's lifetime in @radar-bar-ttl: one
+# number for every level, or words such as `action=0 done=600 notice=600`
+# (seconds; 0 keeps the chip until the mark is handled, a level left out keeps
+# its default). The mark itself stays in the picker and the pane title.
+#
+# On tmux 3.4 and later each chip is a status range of type user named
+# radar<pane number> (radar- for a paneless chip or "+N"), so a click on it can
+# jump there (@radar-click, needinput-notify.sh click). `render auto` then
+# reopens the right range after the strip, which sits inside status-right.
 #
 # `fresh <max-age>` prints, as plain data for the notifier's toast and notify
 # command, the marks written in the last <max-age> seconds, oldest first:
@@ -46,24 +58,36 @@ pane_map() {
 }
 
 case "${1:-render}" in
-  render)
+  render)  # render [auto|pinned]
     [ -r "$STATE_FILE" ] || exit 0
-    # chips fade from the bar after @radar-bar-ttl seconds (0 = persistent);
-    # the underlying mark stays in the AI status view until handled
-    out="$(awk -F '\t' -v max="$MAX" -v panes="$(pane_map)" \
-          -v now="$(date +%s)" -v barttl="$(opt @radar-bar-ttl 60)" "$RADAR_LEVEL_AWK"'
+    click=0
+    if [ "$(opt @radar-click on)" != off ]; then
+      v="$(tmux -V 2>/dev/null || true)"; v="${v#tmux }"; v="${v#next-}"
+      case "$v" in
+        master*) click=1 ;;
+        [0-9]*.[0-9]*)
+          maj="${v%%.*}"; min="${v#*.}"; min="${min%%[!0-9]*}"
+          if [ "$maj" -gt 3 ] || { [ "$maj" -eq 3 ] && [ "${min:-0}" -ge 4 ]; }; then click=1; fi
+          ;;
+      esac
+    fi
+    out="$(awk -F '\t' -v max="$MAX" -v panes="$(pane_map)" -v now="$(date +%s)" \
+          -v ttls="$(opt @radar-bar-ttl 'action=0 done=600 notice=600')" \
+          -v click="$click" -v mode="${2:-auto}" "$RADAR_LEVEL_AWK"'
       function icon_for(level) {
         return (level == "action" ? "⚠" : (level == "done" ? "✓" : "!"))
       }
       function style_for(level) {
         return (level == "action" ? "#[fg=colour234,bg=colour208,bold]" : (level == "done" ? "#[fg=colour234,bg=colour35,bold]" : "#[fg=colour234,bg=colour220,bold]"))
       }
+      function rank_of(level) { return (level == "action" ? 3 : (level == "notice" ? 2 : 1)) }
       # Terse chip identity. Pane marks: the user-named window (fallback
       # session:window). Paneless bg marks ("Claude·proj: text"): the project.
       # The strip is expanded as a tmux format (#{E:@radar-chips}), so a "#"
       # in a window or directory name would be read as one: "#(cmd)" runs cmd.
-      # Doubling it makes tmux print the character instead.
-      function literal(s) { gsub(/#/, "##", s); return s }
+      # The status line also runs through strftime, which eats a "%". Doubling
+      # both makes tmux print the character instead.
+      function literal(s) { gsub(/#/, "##", s); gsub(/%/, "%%", s); return s }
       function chip_text(label, pane,    s) {
         if (pane != "-") {
           s = wname[pane]
@@ -77,6 +101,13 @@ case "${1:-render}" in
         return literal(s)
       }
       BEGIN {
+        ttl["action"] = 0; ttl["done"] = 600; ttl["notice"] = 600
+        if (ttls ~ /^[0-9]+$/) ttl["action"] = ttl["done"] = ttl["notice"] = ttls + 0
+        else {
+          n = split(ttls, w, /[[:space:],]+/)
+          for (i = 1; i <= n; i++)
+            if (w[i] ~ /^(action|done|notice)=[0-9]+$/) { split(w[i], kv, "="); ttl[kv[1]] = kv[2] + 0 }
+        }
         n = split(panes, pl, "\001")
         for (i = 1; i <= n; i++) {
           split(pl[i], f, "\t")
@@ -91,19 +122,41 @@ case "${1:-render}" in
         pane = $1
         label = (NF >= 5 ? $5 : $4)
         level = radar_level($3, label)
-        if (barttl + 0 > 0 && now - $2 > barttl + 0) next
-        if (pane == "-") { txt[++c] = chip_text(label, pane); lv[c] = level; next }
-        if (!(pane in alive) || (pane in viewed)) next
-        txt[++c] = chip_text(label, pane)
-        lv[c] = level
+        if (ttl[level] > 0 && now - $2 > ttl[level]) next
+        if (pane != "-" && (!(pane in alive) || (pane in viewed))) next
+        # a window is its session:index, whatever it is called (two windows
+        # named claude are two chips); a paneless mark is its project
+        t = chip_text(label, pane)
+        id = (pane != "-" ? where[pane] : "-" t)
+        if (!(id in gi)) { gi[id] = ++g; gtext[g] = t; grank[g] = 0; gcount[g] = 0; gnew[g] = 0; gat[g] = 0 }
+        k = gi[id]; r = rank_of(level); at = $2 + 0
+        gcount[k]++
+        if (at > gnew[k]) gnew[k] = at
+        # the chip shows, and a click goes to, the newest of its most urgent marks
+        if (r > grank[k] || (r == grank[k] && at >= gat[k])) { grank[k] = r; glevel[k] = level; gpane[k] = pane; gat[k] = at }
       }
       END {
+        for (i = 1; i <= g; i++) {
+          x = i; j = i
+          while (j > 1 && (grank[ord[j-1]] < grank[x] || (grank[ord[j-1]] == grank[x] && gnew[ord[j-1]] < gnew[x]))) { ord[j] = ord[j-1]; j-- }
+          ord[j] = x
+        }
         shown = 0
-        for (i = c; i >= 1 && shown < max; i--) {
-          printf "%s%s %s %s #[default]", (shown ? " " : ""), style_for(lv[i]), icon_for(lv[i]), txt[i]
+        for (i = 1; i <= g && shown < max; i++) {
+          k = ord[i]
+          if (shown) printf " "
+          if (click) printf "#[range=user|radar%s]", (gpane[k] == "-" ? "-" : substr(gpane[k], 2))
+          printf "%s %s %s%s #[default]", style_for(glevel[k]), icon_for(glevel[k]), gtext[k], (gcount[k] > 1 ? " ×" gcount[k] : "")
+          if (click) printf "#[norange]"
           shown++
         }
-        if (c > max) printf " #[fg=colour244]+%d#[default]", c - max
+        if (g > max) {
+          printf " "
+          if (click) printf "#[range=user|radar-]"
+          printf "#[fg=colour244]+%d#[default]", g - max
+          if (click) printf "#[norange]"
+        }
+        if (click && shown && mode == "auto") printf "#[range=right]"
       }' "$STATE_FILE" 2>/dev/null || true)"
     printf '%s' "$out"
     ;;
@@ -146,5 +199,5 @@ case "${1:-render}" in
     exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/needinput-notify.sh" tick
     ;;
   *)
-    echo "usage: needinput-toast.sh [render|fresh [max-age]|prune]" >&2; exit 2 ;;
+    echo "usage: needinput-toast.sh [render [auto|pinned]|fresh [max-age]|prune]" >&2; exit 2 ;;
 esac

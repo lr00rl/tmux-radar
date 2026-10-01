@@ -6,10 +6,13 @@ WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 N="$WT/scripts/needinput-notify.sh"
 SW="$WT/scripts/switcher.sh"
 T="$(mktemp -d /tmp/radar-smoke.XXXXXX)"
+export TMUX_TMPDIR="$T"   # the test servers' sockets go with $T at cleanup
 export TMUX_RADAR_STATE_DIR="$T/state"
 MARKS="$TMUX_RADAR_STATE_DIR/need-input"
 REG="$TMUX_RADAR_STATE_DIR/agent-registry"
 SOCKET="radarreg$$"
+cleanup() { tmux -L "$SOCKET" kill-server 2>/dev/null || true; rm -rf "$T" 2>/dev/null || true; }
+trap cleanup EXIT
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -343,6 +346,55 @@ chk "no chip text opens a tmux command or style" \
 chk "the strip expands to the literal name" \
   "tmux display-message -p '#{E:@radar-chips}' | grep -qF '#(touch $T/chip-pwned)'"
 "$N" clear-all
+
+# --- 7.4 chips: one per window, approvals first, timed per level, clickable ------
+# source `tool`: a scheduled tick's liveness GC would drop agent-sourced marks
+# that no registry row backs. The server is detached, so no pane is on screen.
+chips_now() { "$WT/scripts/needinput-toast.sh" render "${1:-auto}"; }
+tmux new-window -d -t smoke: -n alpha 'sleep 600'
+A1="$(tmux display-message -p -t smoke:alpha '#{pane_id}')"
+A2="$(tmux split-window -d -P -F '#{pane_id}' -t smoke:alpha 'sleep 600')"
+tmux new-window -d -t smoke: -n beta 'sleep 600'
+B1="$(tmux display-message -p -t smoke:beta '#{pane_id}')"
+"$N" mark "$A1" tool 'Claude needs approval: Bash' s:chip-a1
+"$N" mark "$A2" tool 'Claude finished: tests pass' s:chip-a2
+"$N" mark "$B1" tool 'Codex finished - your turn' s:chip-b1
+# shellcheck disable=SC2034 # consumed by chk's evaluated assertion strings below
+CH="$(chips_now)"
+chk "two marks in one window make one chip with their count" \
+  "[ \"\$(printf '%s' \"\$CH\" | grep -o 'alpha' | wc -l | tr -d ' ')\" = 1 ] && printf '%s' \"\$CH\" | grep -qF '⚠ alpha ×2'"
+chk "an approval chip comes before a newer finished one" \
+  "[ \"\$(printf '%s' \"\$CH\" | awk '{ print (index(\$0, \"alpha\") < index(\$0, \"beta\")) }')\" = 1 ]"
+chk "a click on the chip goes to the approval pane" \
+  "printf '%s' \"\$CH\" | grep -qF '#[range=user|radar${A1#%}]#[fg=colour234,bg=colour208,bold] ⚠ alpha ×2 #[default]#[norange]'"
+chk "after the strip, the rest of status-right is the right range again" \
+  "printf '%s' \"\$CH\" | grep -q '#\[range=right\]\$' && ! chips_now pinned | grep -qF 'range=right'"
+tmux rename-window -t "$B1" 'alpha'
+chk "two windows with one name are two chips" \
+  "[ \"\$(chips_now | grep -o 'alpha' | wc -l | tr -d ' ')\" = 2 ]"
+tmux rename-window -t "$B1" 'cpu%Y'
+# shellcheck disable=SC2034 # consumed by chk's evaluated assertion strings below
+CH="$(chips_now)"
+chk "a '%' in a window name survives the status line's strftime" \
+  "printf '%s' \"\$CH\" | grep -qF 'cpu%%Y' && tmux display-message -p \"\$CH\" | grep -qF 'cpu%Y'"
+chk "past the last chip, +N counts windows and opens the picker" \
+  "TMUX_RADAR_BAR_MAX=1 chips_now | grep -qF ' #[range=user|radar-]#[fg=colour244]+1#[default]#[norange]'"
+"$N" mark - tool 'Claude·lattice: finished: all tests pass' s:chip-bg
+chk "a paneless chip opens the picker" "chips_now | grep -qF '#[range=user|radar-]#[fg=colour234,bg=colour35,bold] ✓ lattice #[default]'"
+"$N" clear-key s:chip-bg
+awk -F'\t' -v OFS='\t' '$4 == "s:chip-b1" { $2 = $2 - 120 } $4 == "s:chip-a1" { $2 = $2 - 100000 } { print }' "$MARKS" > "$T/aged" && cat "$T/aged" > "$MARKS"
+tmux set -g @radar-bar-ttl 'done=60'
+chk "a finished chip leaves after its level's lifetime" "! chips_now | grep -qF 'cpu%%Y'"
+chk "an approval chip stays until handled by default" "chips_now | grep -qF '⚠ alpha ×2'"
+tmux set -g @radar-bar-ttl 30
+chk "one number sets every level's lifetime" "chips_now | grep -qF '✓ alpha #[default]' && ! chips_now | grep -qF '⚠'"
+tmux set -g @radar-click off
+chk "@radar-click off leaves the chips as plain text" "! chips_now | grep -qF 'range='"
+tmux set -gu @radar-click
+tmux set -gu @radar-bar-ttl
+tmux kill-window -t smoke:alpha
+tmux kill-window -t "$B1"
+"$N" clear-all
 chk "clear-all leaves the status line count untouched (off)" \
   "[ \"\$(tmux show-option -gv status)\" = 'off' ]"
 
@@ -437,10 +489,12 @@ chk "hook upgrade removes only legacy radar append slots" \
   "! printf '%s\n' \"\$HOOK_TEXT\" | grep -E '\\[(0)\\].*(mru-record|needinput-notify)'"
 chk "radar hook slots are singular and indexed" \
   "[ \"\$(printf '%s\n' \"\$HOOK_TEXT\" | grep -c '\\[9000\\].*mru-record.sh')\" -eq 3 ] && [ \"\$(printf '%s\n' \"\$HOOK_TEXT\" | grep -c '\\[9001\\].*needinput-notify.sh clear')\" -eq 3 ]"
-chk "pane-change hook clears the selected pane" \
-  "printf '%s\n' \"\$HOOK_TEXT\" | grep 'window-pane-changed' | grep -q \"needinput-notify.sh clear '#{hook_pane}'\""
-chk "window-change hook resolves only the newly active pane" \
-  "printf '%s\n' \"\$HOOK_TEXT\" | grep 'session-window-changed' | grep -q \"needinput-notify.sh clear '#{hook_window}'\""
+chk "pane-change hook clears the pane that came into view, while a client shows it" \
+  "printf '%s\n' \"\$HOOK_TEXT\" | grep 'window-pane-changed' | grep -qF \"needinput-notify.sh clear '#{?window_active_clients,#{pane_id},-}'\""
+chk "window-change hook clears only the newly active pane, while a client shows it" \
+  "printf '%s\n' \"\$HOOK_TEXT\" | grep 'session-window-changed' | grep -qF \"needinput-notify.sh clear '#{?window_active_clients,#{pane_id},-}'\""
+chk "no radar hook reads the hook_* formats tmux 3.6 leaves empty" \
+  "! printf '%s\n' \"\$HOOK_TEXT\" | grep -F '$WT/scripts' | grep -qE 'hook_(window|pane|session_name)'"
 chk "session-change bar resync uses the silent hook-tick" \
   "printf '%s\n' \"\$HOOK_TEXT\" | grep 'client-session-changed' | grep -q 'needinput-notify.sh hook-tick'"
 chk "focus/MRU/tick hooks never report a failing run-shell to tmux" \

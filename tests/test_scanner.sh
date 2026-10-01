@@ -7,6 +7,7 @@ WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 N="$WT/scripts/needinput-notify.sh"
 SW="$WT/scripts/switcher.sh"
 T="$(mktemp -d /tmp/radar-scan.XXXXXX)"
+export TMUX_TMPDIR="$T"   # the test servers' sockets go with $T at cleanup
 export TMUX_RADAR_STATE_DIR="$T/state"
 MARKS="$TMUX_RADAR_STATE_DIR/need-input"
 REG="$TMUX_RADAR_STATE_DIR/agent-registry"
@@ -246,7 +247,28 @@ chk "a hook-owned pi pane still gets the synthesized mark" \
 chk "that mark is keyed by the owning session, not the pid" \
   "awk -F'\t' -v p='$PO_PANE' '\$1==p && \$4==\"s:pi-owned\"' '$MARKS' | grep -q ."
 tmux kill-window -t "$PO_PANE" 2>/dev/null || true
-"$N" tick   # both fixtures are gone: GC their rows before the next section
+
+# a member of a Claude agent team going quiet is its lead's news, not yours
+cat > "$T/start-teammate.sh" <<EOF
+#!/usr/bin/env bash
+printf 'reviewer idle\n'
+exec -a "$T/bin3/claude" bash -c 'while :; do sleep 60; done' _ --agent-id reviewer@audit --agent-name reviewer --team-name audit
+EOF
+mkdir -p "$T/bin3"
+tmux new-window -n team "bash $T/start-teammate.sh"
+TM_PANE="$(tmux display-message -p '#{pane_id}')"
+tmux select-window -t 0
+sleep 1
+force_scan   # first observation: working
+force_scan   # unchanged since: stalled
+chk "the teammate pane made the working to stalled transition" \
+  "awk -F'\t' -v p='$TM_PANE' '\$1==p && \$3==\"stalled\"' '$LIVE' | grep -q ."
+chk "a teammate pane gets no synthesized finished mark" \
+  "! awk -F'\t' -v p='$TM_PANE' '\$1==p' '$MARKS' | grep -q ."
+chk "the teammate is still listed as an agent" \
+  "awk -F'\t' -v p='$TM_PANE' '\$4==p && \$2 ~ /^p:/' '$REG' | grep -q ."
+tmux kill-window -t "$TM_PANE" 2>/dev/null || true
+"$N" tick   # the fixtures are gone: GC their rows before the next section
 
 # --- 3. blocked title beats change detection ---------------------------------
 tmux select-pane -t "$SPANE" -T '[ . ] Action Required | proj'
@@ -295,8 +317,13 @@ force_scan   # second post-mark working scan: the wait is observably over
 chk "sustained working heals the stale ACTION mark" \
   "! grep -q 's:heal1' '$MARKS'"
 
-# DONE marks heal by the same rule when the agent demonstrably works again
+# DONE marks heal by the same rule when the agent demonstrably works again.
+# The new mark is pinned to the second of the one just healed: a streak counted
+# for heal1 must not carry over to it (it used to whenever both writes fell in
+# one second).
+HEAL1_AT="$(awk -F'\t' -v p="$WPANE" '$1==p { print $6 }' "$LIVE_SAMPLES")"
 env -u CLAUDE_JOB_DIR "$N" mark "$WPANE" claude "Claude finished — your turn" s:heal2
+awk -F'\t' -v OFS='\t' -v at="$HEAL1_AT" '$4=="s:heal2" { $2 = at } { print }' "$MARKS" > "$MARKS.tmp" && mv "$MARKS.tmp" "$MARKS"
 force_scan
 chk "DONE mark survives the first post-mark scan" \
   "grep -q 's:heal2' '$MARKS'"

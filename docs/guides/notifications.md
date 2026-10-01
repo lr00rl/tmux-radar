@@ -60,6 +60,41 @@ stays `%Y`.
 | `@radar-toast-levels` | `action done notice` | Levels that toast. `action` alone toasts only approvals and questions. |
 | `@radar-toast-duration` | `5000` | Milliseconds the toast stays up. |
 
+## The chips, and clicking to go there
+
+The toast says what just happened; a chip on the status line says what is
+still unread. Each window that holds unread marks gets one chip: the most
+urgent level among its marks, and a count when it has several. Approvals come
+first, then the newest, three at most, then `+N` for the windows left out.
+
+```
+ ⚠ billing-api ×2   ✓ lattice   +1
+```
+
+A chip goes when you go to the pane, and on its own after its level's
+lifetime in `@radar-bar-ttl`, in seconds. The default keeps an approval until
+you handle it, since an agent is blocked on it, and lets a finished turn or a
+notice go after ten minutes, since the toast already told you:
+
+```tmux
+set -g @radar-bar-ttl 'action=0 done=600 notice=600'   # the default
+set -g @radar-bar-ttl 'done=120'                       # finished turns fade after two minutes
+set -g @radar-bar-ttl 300                              # every chip fades after five minutes
+set -g @radar-bar-ttl 0                                # every chip stays until handled
+```
+
+The mark behind a faded chip stays in the picker and in the pane title until
+you go to the pane.
+
+With `mouse on`, a click on a chip or on a floating toast takes the client you
+clicked to the marked pane, across windows and sessions. A paneless chip
+(a background session) and `+N` open the picker. Chips are click targets on
+tmux 3.4 and later; the toast on any version. radar wraps the first mouse
+button's root bindings for this and keeps what was bound there for every
+other click; while no toast is up, a click in a pane costs nothing extra.
+`@radar-click off` puts your original bindings back. A status-line toast
+(`@radar-toast status`) cannot be clicked: tmux owns that line.
+
 ## Your own notification: `@radar-notify-command`
 
 ```tmux
@@ -120,7 +155,7 @@ A mark is announced by the write that added it, and only once:
 
 Floating toasts stack, up to six per client while the screen has room, and
 the rest go to the status line; in status mode a later toast replaces the one
-on screen. The chips list every mark either way.
+on screen. The chips still show every window with unread marks.
 
 ## Testing
 

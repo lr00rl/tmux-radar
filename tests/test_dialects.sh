@@ -9,6 +9,7 @@ set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 N="$WT/scripts/needinput-notify.sh"
 T="$(mktemp -d /tmp/radar-dialects.XXXXXX)"
+export TMUX_TMPDIR="$T"   # the test servers' sockets go with $T at cleanup
 export TMUX_RADAR_STATE_DIR="$T/state" TMUX_RADAR_NO_SCHEDULE=1
 MARKS="$TMUX_RADAR_STATE_DIR/need-input"
 REG="$TMUX_RADAR_STATE_DIR/agent-registry"

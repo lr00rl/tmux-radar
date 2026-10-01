@@ -315,6 +315,7 @@ every event alike.
 | Other or untyped notification | any other `notification_type`, or none | A mark with the message as given. |
 | Finished turn | Stop | DONE, `Claude finished: <first line of the last message>`. |
 | Paused turn | Stop with a subagent or workflow in `background_tasks`, or with `session_crons` pending in a turn the schedule started | No mark. The session resumes on its own. |
+| Team member's turn | Stop from a process started with `--agent-id` (a member of an agent team) | No mark: the member reports to its lead. The registry records it as done, and an approval mark it had clears. Its approval requests are still marked. |
 | Failed turn | StopFailure | NOTICE, `Claude turn failed: <error>`. |
 | Tool result | PostToolUse on the main thread, for a tool that started after the mark was written | The session mark clears: a tool that ran proves nothing is waiting. |
 
@@ -373,6 +374,40 @@ It runs for every level whether or not anyone watches, and the command
 decides; this is how a turn-end notification leaves tmux (desktop, sound,
 chat). A claim `mkdir` per mark makes "once" hold across concurrent hooks, and
 only marks from the last 30 seconds qualify, so a restart announces nothing.
+
+### Chips, focus and clicks
+
+A chip stands for a window, not a mark: the most urgent level among the
+window's unread marks, a count when there are several, approvals first. Before
+2026-09-30 every mark had its own chip, and the eleven idle teammates of one
+agent team filled the bar with identical `✓ <window>` chips. Each level has
+its own lifetime on the bar (`@radar-bar-ttl`, default `action=0 done=600
+notice=600`): an approval blocks an agent and stays until handled, while a
+finished turn was already announced by its toast. The strip goes through
+format expansion and strftime, so `#` and `%` in names are doubled.
+
+Reading a mark means a client shows its pane. The focus hooks
+(`session-window-changed`, `window-pane-changed`, `client-session-changed`)
+pass `#{pane_id}` from their own context, which is the pane that just came
+into view, and clear it only while some client shows its window
+(`window_active_clients`, which also counts a window linked into another
+session); otherwise they pass `-`, never an empty argument that would fall
+back to `$TMUX_PANE`. They used to pass `#{hook_window}`, `#{hook_pane}` and
+`#{hook_session_name}`; tmux 3.6 leaves all three empty in these hooks, so
+going to a pane cleared nothing and a chip came back each time you left. The
+MRU recorder had the same gap. `tests/test_announce.sh` now checks focus
+through a real client.
+
+A click on a chip or a floating toast takes the clicked client to the mark's
+pane (`needinput-notify.sh click`). A chip is a status range of type user,
+`radar<pane number>` (tmux 3.4 and later). The toast is invisible to tmux, so
+`MouseDown1Pane` asks `toast-click` whether the click landed inside a box,
+using the geometry each toast writes to `.toast-slots/<client>/<slot>/hit`
+with its own pid, which rules out the box of a killed toast. That question
+forks a shell, so it is asked only while `@radar-toast-live` says a toast is
+up. The plugin wraps the root `MouseDown1Status` and `MouseDown1Pane`
+bindings, keeps the original under `@radar-click-orig-<key>`, and runs it for
+every click that is not radar's; `@radar-click off` restores it.
 
 ### Severity
 

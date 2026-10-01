@@ -59,8 +59,9 @@
 # adopted p:<pid> row) — that is how hookless sessions (started before hook
 # install, or without an adapter) still reach the Inbox. A pane owned by a
 # hook-claimed session of a natively reporting agent (_native_events) gets no
-# synthesized mark: its hooks are the events. Disable with
-# `set -g @radar-scan off`.
+# synthesized mark: its hooks are the events. Nor does a member of a Claude
+# agent team going quiet: the member reports to its lead, and the lead's turn
+# reports to you. Disable with `set -g @radar-scan off`.
 #
 # Safe to call outside tmux (no-op unless a server is reachable).
 set -euo pipefail
@@ -404,12 +405,13 @@ _agent_panes() {
 #   AGENT_NESTED  1 when another watched agent stands above it
 #   AGENT_KIND    what it is; `*` for <kind> asks for the nearest watched
 #                 agent whatever it is
-AGENT_FOR=""; AGENT_PID=""; AGENT_PROC=""; AGENT_NESTED=0; AGENT_KIND=""
+#   AGENT_TEAM    1 when it is a member of a Claude agent team (radar_teammate)
+AGENT_FOR=""; AGENT_PID=""; AGENT_PROC=""; AGENT_NESTED=0; AGENT_KIND=""; AGENT_TEAM=0
 _agent_identify() {  # _agent_identify <kind|*>
   local kind out
   kind="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
   [ "$AGENT_FOR" = "$kind" ] && return 0
-  AGENT_FOR="$kind"; AGENT_PID=""; AGENT_PROC=""; AGENT_NESTED=0; AGENT_KIND=""
+  AGENT_FOR="$kind"; AGENT_PID=""; AGENT_PROC=""; AGENT_NESTED=0; AGENT_KIND=""; AGENT_TEAM=0
   [ -n "$kind" ] || return 0
   [ "$kind" != '*' ] || kind=""
   out="$("$PS_BIN" -axo pid=,ppid=,etime=,command= 2>/dev/null |
@@ -426,10 +428,15 @@ _agent_identify() {  # _agent_identify <kind|*>
       et = row; sub(/[[:space:]].*/, "", et); sub(/^[^[:space:]]+[[:space:]]+/, "", row)
       par[pid] = ppid; age[pid] = radar_elapsed(et); cmd[pid] = row
     }
-    END { print radar_firing(me, kind, want) }' || true)"
+    END {
+      out = radar_firing(me, kind, want)
+      if (out != "") { split(out, o, "\t"); out = out "\t" radar_teammate(cmd[o[1]]) }
+      print out
+    }' || true)"
   [ -n "$out" ] || return 0
-  IFS=$'\t' read -r AGENT_PID AGENT_PROC AGENT_NESTED AGENT_KIND <<< "$out"
+  IFS=$'\t' read -r AGENT_PID AGENT_PROC AGENT_NESTED AGENT_KIND AGENT_TEAM <<< "$out"
   case "$AGENT_NESTED" in 1) ;; *) AGENT_NESTED=0 ;; esac
+  case "$AGENT_TEAM" in 1) ;; *) AGENT_TEAM=0 ;; esac
 }
 
 # An event that claims a pane must come from the agent sitting in it. A run
@@ -645,14 +652,38 @@ _refresh_status() {  # redraw every attached client's status line right now
   done
 }
 
+# The shortest chip lifetime @radar-bar-ttl gives any level, in seconds; 0
+# when every chip stays until handled. Same reading as the chip renderer: one
+# number for every level, or level=seconds words over the defaults.
+_bar_ttl_min() {
+  local v w a=0 d=600 n=600 min=0 t
+  v="$(opt @radar-bar-ttl 'action=0 done=600 notice=600')"
+  case "$v" in
+    ''|*[!0-9]*)
+      for w in $(printf '%s' "$v" | tr ',' ' '); do
+        case "$w" in
+          action=[0-9]*) a="${w#action=}" ;;
+          done=[0-9]*)   d="${w#done=}" ;;
+          notice=[0-9]*) n="${w#notice=}" ;;
+        esac
+      done ;;
+    *) a="$v"; d="$v"; n="$v" ;;
+  esac
+  for t in "$a" "$d" "$n"; do
+    case "$t" in ''|*[!0-9]*) continue ;; esac
+    [ "$t" -gt 0 ] || continue
+    { [ "$min" -eq 0 ] || [ "$t" -lt "$min" ]; } && min="$t"
+  done
+  printf '%s' "$min"
+}
+
 # While chips are visible, guarantee a future resync so TTL fade and the
 # agent-liveness GC keep running without any event: one tmux-owned sleeper at a
 # time (stamp-guarded), never a resident poller. The chip strip itself is pure
 # option content, so nothing redraws or forks between resyncs.
 _schedule_resync() {
   local barttl delay
-  barttl="$(opt @radar-bar-ttl 60)"
-  case "$barttl" in ''|*[!0-9]*) barttl=60 ;; esac
+  barttl="$(_bar_ttl_min)"
   delay=$((barttl + 2))
   { [ "$barttl" -gt 0 ] && [ "$delay" -lt 30 ]; } || delay=30
   _schedule_tick "$delay" "$STATE_DIR/.resync-at"
@@ -765,7 +796,7 @@ cmd_announce() {  # announce: run by the tmux server after a write
       if [ "$cpos" = top ]; then top=$((nstatus + 1)); bottom=$crows
       else top=1; bottom=$((crows - nstatus)); fi
       "$SCRIPT_DIR/radar-float.sh" "$cname" "$ctty" "$cpid" "$ccols" "$top" "$bottom" "$cutf8" \
-        "$level" "$where" "$label" "$dur" "$key" "$STATE_FILE" "$STATE_DIR/.toast-slots" &
+        "$level" "$where" "$label" "$dur" "$key" "$STATE_FILE" "$STATE_DIR/.toast-slots" "$pane" &
     done <<< "$clients"
     [ -n "$cmd" ] || continue
     session=""
@@ -781,6 +812,65 @@ cmd_announce() {  # announce: run by the tmux server after a write
   find "$ANNOUNCED_DIR" -mindepth 1 -maxdepth 1 -type d -mmin +10 -exec rmdir {} + 2>/dev/null || true
   wait
   return 0
+}
+
+# --- click: a chip or a toast leads to its pane ---------------------------------
+# The plugin wraps the first mouse button's root bindings (tmux-radar.tmux):
+# a click on a chip, a status range named radar<pane number> (see
+# needinput-toast.sh), or on a floating toast jumps to the pane of its mark on
+# the client that was clicked. radar- (a paneless chip, "+N") opens the
+# picker, where background sessions are. Every other click keeps the binding
+# it had.
+cmd_click() {  # click <client> <range>
+  local client="${1:-}" range="${2:-}" pane cmd
+  have_tmux || return 0
+  [ -n "$client" ] || return 0
+  case "$range" in
+    radar-)
+      _sh_quote_to cmd "$SCRIPT_DIR/switcher.sh"
+      tmux display-popup -c "$client" -E -w "$(opt @radar-popup-width 100%)" \
+        -h "$(opt @radar-popup-height 100%)" "$(_fmt_literal "$cmd menu inbox")" 2>/dev/null || true
+      return 0 ;;
+    radar[0-9]*) pane="%${range#radar}" ;;
+    *) return 0 ;;
+  esac
+  case "${pane#%}" in *[!0-9]*) return 0 ;; esac
+  if [ "$(tmux display-message -p -t "$pane" '#{pane_id}' 2>/dev/null || true)" != "$pane" ]; then
+    tmux display-message -c "$client" 'tmux-radar: that pane has closed' 2>/dev/null || true
+    return 0
+  fi
+  tmux switch-client -c "$client" -t "$pane" 2>/dev/null || return 0
+  [ -x "$SCRIPT_DIR/mru-record.sh" ] && "$SCRIPT_DIR/mru-record.sh" "$pane" >/dev/null 2>&1 || true
+}
+
+# Run inside the wrapped MouseDown1Pane binding while a toast is up, so it
+# decides whether the click is the binding's own: exit 0 when the click landed
+# on a toast (the jump is handed to the server, the binding stops there),
+# 1 when it did not (the binding runs as before, mouse event and all). Each
+# toast leaves its box in .toast-slots/<client>/<slot>/hit as
+# "<column> <row> <width> <pane> <pid>", 1-based terminal cells, three rows
+# high; one whose process is gone is no toast.
+cmd_toast_click() {  # toast-click <client> <pane_left> <pane_top> <mouse_x> <mouse_y> <status> <status-position> <offset_x> <offset_y>
+  local client="${1:-}" pl="${2:-}" pt="${3:-}" mx="${4:-}" my="${5:-}" st="${6:-}" pos="${7:-}" ox="${8:-0}" oy="${9:-0}"
+  local col row nstatus f x y w target tpid range notify qc qr
+  case "$pl$pt$mx$my$ox$oy" in ''|*[!0-9]*) return 1 ;; esac
+  case "$st" in on) nstatus=1 ;; off|'') nstatus=0 ;; *[!0-9]*) nstatus=1 ;; *) nstatus=$st ;; esac
+  col=$((pl + mx + 1 - ox)); row=$((pt + my + 1 - oy))
+  [ "$pos" != top ] || row=$((row + nstatus))
+  for f in "$STATE_DIR/.toast-slots/${client//[^A-Za-z0-9._-]/_}"/*/hit; do
+    [ -r "$f" ] || continue
+    read -r x y w target tpid < "$f" || continue
+    case "$x$y$w$tpid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$tpid" 2>/dev/null || continue        # a toast killed before it could tidy up
+    { [ "$col" -ge "$x" ] && [ "$col" -lt $((x + w)) ] && [ "$row" -ge "$y" ] && [ "$row" -le $((y + 2)) ]; } || continue
+    case "$target" in %[0-9]*) range="radar${target#%}" ;; *) range="radar-" ;; esac
+    _sh_quote_to notify "$SCRIPT_DIR/needinput-notify.sh"
+    _sh_quote_to qc "$client"
+    _sh_quote_to qr "$range"
+    tmux run-shell -b "$(_fmt_literal "$notify click $qc $qr")" 2>/dev/null || true
+    return 0
+  done
+  return 1
 }
 
 # Publish the chips, then hand what the write before this sync added to the
@@ -799,8 +889,9 @@ _sync_bar() {
 # is never changed at runtime: toggling `status` resizes every pane and
 # SIGWINCHes every full-screen app, which is exactly the flicker the old
 # raise/lower design caused. A chip is visible while its mark is off-screen
-# AND younger than @radar-bar-ttl seconds (0 = until handled); the mark itself
-# persists in the AI status view / pane title until cleared.
+# AND younger than its level's lifetime in @radar-bar-ttl (by default an
+# approval stays until handled, a finished turn for ten minutes); the mark
+# itself persists in the AI status view / pane title until cleared.
 _publish_chips() {
   local mode chips
   mode="$(opt @radar-bar auto)"
@@ -810,7 +901,7 @@ _publish_chips() {
     tmux set -g @radar-chips "" >/dev/null 2>&1 || true
     return 0
   fi
-  chips="$("$SCRIPT_DIR/needinput-toast.sh" render 2>/dev/null || true)"
+  chips="$("$SCRIPT_DIR/needinput-toast.sh" render "$mode" 2>/dev/null || true)"
   [ -z "$chips" ] || chips="$chips "
   tmux set -g @radar-chips "$chips" >/dev/null 2>&1 || true
   [ -z "$chips" ] || _schedule_resync
@@ -863,7 +954,8 @@ cmd_clear_pane() {
   [ -n "$target" ] || exit 0
   # ':' is tmux's "current session". An empty #{hook_session_name} produces it
   # and would clear whatever pane is focused now, not the session that changed.
-  case "$target" in :) return 0 ;; esac
+  # '-' is the focus hooks' "no client shows this pane".
+  case "$target" in :|-) return 0 ;; esac
   # Restore creates and selects windows; that is topology, not "the user read this".
   _restoring && return 0
   # Hooks may provide a pane, window, or session target. Resolve it once to the
@@ -1138,12 +1230,14 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       if (k != "") {
         akind[pid] = k; atty[pid] = cleantty(tty)
         aproc[pid] = radar_proc(rest, k)
+        ateam[pid] = (k == "claude") ? radar_teammate(rest) : 0
       }
       next
     }
     mode == 3 && NF >= 4 {
       pth[$1] = $2; psh[$1] = $3; pstreak[$1] = $4 + 0
       phstreak[$1] = (NF >= 5 ? $5 + 0 : 0); phepoch[$1] = (NF >= 6 ? $6 + 0 : 0)
+      phkey[$1] = (NF >= 7 ? $7 : "-")
       next
     }
     mode == 6 && NF >= 3 { oldstate[$1] = $3; next }
@@ -1216,12 +1310,12 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
               (pane in pth ? pth[pane] : "-") "\t" (pane in psh ? psh[pane] : "-") "\t" (pane in pstreak ? pstreak[pane] : 0) "\t" \
               (pane in phstreak ? phstreak[pane] : 0) "\t" (pane in phepoch ? phepoch[pane] : 0) "\t" \
               claimed "\t" prev "\t" ponscreen[pane] "\t" ((pane in markseen) ? 1 : 0) "\t" mk "\t" me "\t" \
-              ((pane in ownkey) ? ownkey[pane] : "-") "\t" ((pane in ownkind) ? ownkind[pane] : "-")
+              ((pane in ownkey) ? ownkey[pane] : "-") "\t" ((pane in ownkind) ? ownkind[pane] : "-") "\t" (ateam[pid] + 0) "\t" (pane in phkey ? phkey[pane] : "-")
       }
       for (p in waitkey)   print "DOWN\t" p "\t" waitkey[p]
     }')"
 
-  local pane kind apid aproc path title pth psh pstreak phstreak phepoch claimed prev onscreen hasmark mkey mepoch okey okind
+  local pane kind apid aproc path title pth psh pstreak phstreak phepoch claimed prev onscreen hasmark mkey mepoch okey okind team phkey
   local live_rows="" sample_rows="" adopt_rows="" heal_keys="" down_keys="" rehome_spec="" rehome_drop="" working2="" synth_rows=""
   local th sh state streak hstreak tag key kn skey synth s_pane s_kind s_label s_key
   while IFS=$'\t' read -r tag pane rest; do
@@ -1231,7 +1325,7 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       A) ;;
       *) continue ;;                                                    # DOWN resolved below
     esac
-    IFS=$'\t' read -r kind apid aproc path title pth psh pstreak phstreak phepoch claimed prev onscreen hasmark mkey mepoch okey okind <<< "$rest"
+    IFS=$'\t' read -r kind apid aproc path title pth psh pstreak phstreak phepoch claimed prev onscreen hasmark mkey mepoch okey okind team phkey <<< "$rest"
     [ "$title" = "-" ] && title=""
     [ "$pth" = "-" ] && pth=""
     [ "$psh" = "-" ] && psh=""
@@ -1260,10 +1354,12 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
     # Post-mark healing: an agent mark is dropped once the pane has been seen
     # working in two scans SINCE the mark was written. A freshly rendered
     # permission prompt explains one screen change, never two in a row, so a
-    # genuine "needs you" never heals under the user.
+    # genuine "needs you" never heals under the user. The count belongs to one
+    # mark, its key and its second: a new mark written in the same second as
+    # the one it replaces starts again from zero.
     hstreak=0
     if [ "$mkey" != "-" ]; then
-      [ "$mepoch" = "$phepoch" ] && hstreak="$phstreak"
+      [ "$mepoch" = "$phepoch" ] && [ "$mkey" = "$phkey" ] && hstreak="$phstreak"
       [ "$state" = working ] && hstreak=$((hstreak + 1))
       if [ "$hstreak" -ge 2 ]; then
         heal_keys="${heal_keys}${mkey}"$'\001'
@@ -1271,7 +1367,7 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       fi
     fi
     live_rows="${live_rows}${pane}"$'\t'"${kind}"$'\t'"${state}"$'\t'"$(_san "$title")"$'\t'"${now}"$'\n'
-    sample_rows="${sample_rows}${pane}"$'\t'"${th}"$'\t'"${sh}"$'\t'"${streak}"$'\t'"${hstreak}"$'\t'"${mepoch}"$'\n'
+    sample_rows="${sample_rows}${pane}"$'\t'"${th}"$'\t'"${sh}"$'\t'"${streak}"$'\t'"${hstreak}"$'\t'"${mepoch}"$'\t'"${mkey}"$'\n'
     if [ "$claimed" = 0 ]; then
       adopt_rows="${adopt_rows}${kind}"$'\t'"p:${apid}"$'\t'"${apid}"$'\t'"${pane}"$'\t'"${now}"$'\t'"${now}"$'\t'"${state}"$'\t'"$(_san "$path")"$'\t'"$(_san "$aproc")"$'\n'
       claimed=1   # adopted now: event synthesis below applies from this scan on
@@ -1292,7 +1388,7 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       kn="$(_agent_display_name "$kind")"
       if [ "$state" = blocked ] && [ "$prev" != blocked ]; then
         synth_rows="${synth_rows}${pane}"$'\t'"${kind}"$'\t'"${kn} needs approval (scan)"$'\t'"${skey}"$'\n'
-      elif [ "$state" = stalled ] && [ "$prev" = working ]; then
+      elif [ "$state" = stalled ] && [ "$prev" = working ] && [ "$team" != 1 ]; then
         synth_rows="${synth_rows}${pane}"$'\t'"${kind}"$'\t'"${kn} finished — your turn (scan)"$'\t'"${skey}"$'\n'
       fi
     fi
@@ -1669,6 +1765,12 @@ _hook_stop() {  # the turn ended; how decides what it means
     error|failed) _hook_fail "$outcome"; return 0 ;;
   esac
   _hook_target
+  # A team member's finished turn goes to its lead, whose own turn reports to
+  # you; marking every member that idles fills the bar with done chips.
+  if [ "$AGENT_TEAM" = 1 ]; then
+    _hook_resume "done"
+    return 0
+  fi
   if _hook_paused "$(_reg_state "$KEY")"; then
     # not the user's turn, and no longer waiting on the user either
     _hook_resume
@@ -2293,7 +2395,7 @@ cmd_doctor() {  # one-stop "why is this row (not) showing?"
   echo "-- options in effect --"
   for o in @radar-needinput @radar-needinput-commands @radar-bar @radar-bar-ttl \
            @radar-retitle @radar-claude-bg @radar-claude-bg-ignore \
-           @radar-toast @radar-toast-levels @radar-toast-duration @radar-notify-command; do
+           @radar-toast @radar-toast-levels @radar-toast-duration @radar-notify-command @radar-click; do
     v="$(opt "$o" '(default)')"
     printf '  %-26s %s\n' "$o" "$v"
   done
@@ -2365,6 +2467,8 @@ case "${1:-}" in
   hook)            shift; cmd_hook "${1:-}" ;;
   hook-resolved)   shift; _hook_open "${1:-}"; _hook_dispatch resolved ;;
   announce)        cmd_announce ;;
+  click)           shift; cmd_click "${1:-}" "${2:-}" ;;
+  toast-click)     shift; cmd_toast_click "$@" ;;
   codex-hook)      cmd_codex_hook ;;
   codex)           shift; cmd_codex "${1:-}" ;;
   opencode-hook)   cmd_opencode_hook ;;
@@ -2378,5 +2482,5 @@ case "${1:-}" in
   agent-panes)     _agent_panes | tr '\001' '\n' ;;  # debug: which panes host an agent
   resolve-pane)    _resolve_pane_by_proc ;;          # debug: pane of this process tree
   resolve-cwd)     shift; _resolve_pane_by_cwd "${1:-$PWD}" ;;  # debug: pane owning a cwd
-  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|hook-tick|restore-begin|restore-end|claude-mark|claude-stop|claude-clear|claude-register|claude-end|codex-hook|codex <json>|opencode-hook|opencode-stream|kimi-hook|agent-event <kind> <event>|agent-register <kind> <key> <pid> <pane> [cwd]|agent-end <kind> <key>|registry|doctor|agent-panes|resolve-pane|resolve-cwd [cwd]}" >&2; exit 2 ;;
+  *) echo "usage: needinput-notify.sh {mark|clear|clear-key <k>|clear-window <t>|clear-all|tick|hook-tick|restore-begin|restore-end|click <client> <range>|toast-click <client> <pane geometry...>|claude-mark|claude-stop|claude-clear|claude-register|claude-end|codex-hook|codex <json>|opencode-hook|opencode-stream|kimi-hook|agent-event <kind> <event>|agent-register <kind> <key> <pid> <pane> [cwd]|agent-end <kind> <key>|registry|doctor|agent-panes|resolve-pane|resolve-cwd [cwd]}" >&2; exit 2 ;;
 esac

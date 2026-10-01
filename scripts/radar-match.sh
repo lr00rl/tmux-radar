@@ -32,6 +32,11 @@
 #                                (parent, command line, elapsed seconds):
 #                                "<pid> <proc> <nested> <kind>", tab-separated,
 #                                or "". kind == "": the nearest watched agent.
+#   radar_teammate(cmd)          1 when `cmd` is a Claude Code teammate: the
+#                                lead of an agent team starts each member as
+#                                `claude --agent-id <id> --agent-name <name>
+#                                --team-name <team>` (all three or none), and
+#                                a member reports to that lead, not to you.
 #
 # radar_firing answers two questions with one walk up from the hook process
 # `me`. The agent that fired the event is the nearest ancestor of `kind`. It is
@@ -88,6 +93,9 @@ function radar_kind(cmd, name, want,    a0, k) {
 function radar_proc(cmd, kind,    b) {
   b = radar_base(radar_argv0(cmd))
   return radar_wrapper(b) ? kind : b
+}
+function radar_teammate(cmd) {
+  return (index(cmd " ", " --agent-id ") > 0 || index(cmd, " --agent-id=") > 0) ? 1 : 0
 }
 function radar_elapsed(etime,    n, f, days) {
   days = 0

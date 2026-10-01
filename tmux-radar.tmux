@@ -69,16 +69,25 @@ fi
 
 # `|| true` is load-bearing: tmux prints `'cmd' returned 1` for a background
 # run-shell whose command exits non-zero, even when stdout/stderr are redirected.
-tmux set-hook -g 'session-window-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_window}' || true\""
-tmux set-hook -g 'client-session-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_session_name}:' || true\""
+# Every focus hook names its pane as #{pane_id}: run in the hook's own target,
+# that is the pane that just came into view (the new window's active pane, the
+# window's new active pane, the client's new current pane). The hook_* formats
+# are no use here: tmux 3.6 leaves #{hook_window} empty in
+# session-window-changed, #{hook_pane} in window-pane-changed, and
+# #{hook_session_name} in client-session-changed.
+tmux set-hook -g 'session-window-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{pane_id}' || true\""
+tmux set-hook -g 'client-session-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{pane_id}' || true\""
 # pane-level MRU: fires when the active pane changes inside a window
-tmux set-hook -g 'window-pane-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{hook_pane}' || true\""
+tmux set-hook -g 'window-pane-changed[9000]' "run-shell -b \"$SCRIPTS/mru-record.sh '#{pane_id}' || true\""
 if [ "$NEEDINPUT" = "on" ]; then
-  # Read handling is pane-specific. Resolve session/window targets once to
-  # their newly active pane; never consume unread sibling panes.
-  tmux set-hook -g 'session-window-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{hook_window}' || true\""
-  tmux set-hook -g 'window-pane-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{hook_pane}' || true\""
-  tmux set-hook -g 'client-session-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{hook_session_name}:' || true\""
+  # Read handling is pane-specific: clear the one pane that came into view,
+  # never its unread siblings, and only while some client shows its window
+  # (a script that switches windows in a detached session has read nothing;
+  # a window linked into several sessions counts every client showing it).
+  # `-` says "nobody": an empty argument would fall back to $TMUX_PANE.
+  tmux set-hook -g 'session-window-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{?window_active_clients,#{pane_id},-}' || true\""
+  tmux set-hook -g 'window-pane-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{?window_active_clients,#{pane_id},-}' || true\""
+  tmux set-hook -g 'client-session-changed[9001]' "run-shell -b \"$SCRIPTS/needinput-notify.sh clear '#{?window_active_clients,#{pane_id},-}' || true\""
   # Session switches change which panes are on screen -> resync the bar.
   tmux set-hook -g 'client-session-changed[9002]' "run-shell -b \"$SCRIPTS/needinput-notify.sh hook-tick || true\""
 else
@@ -138,4 +147,56 @@ if [ "$NEEDINPUT" = "on" ]; then
   # prune marks left over from a previous server / restore on every (re)load;
   # hook-tick also republishes @radar-chips and heals a pre-inline raised bar
   tmux run-shell -b "$SCRIPTS/needinput-notify.sh hook-tick || true" 2>/dev/null || true
+fi
+
+# Clicks: a chip or a floating toast jumps to its pane (needinput-notify.sh
+# click / toast-click). The first mouse button's root bindings are wrapped,
+# and what was bound there still runs for every other click: the original is
+# kept in @radar-click-orig-<key> when first wrapped, so a reload wraps it
+# again, never the wrapper. A pane click forks nothing unless a toast is up
+# (@radar-toast-live). `@radar-click off` puts the originals back.
+_radar_click_bound() {  # the command bound to <key> in the root table, as list-keys prints it
+  tmux list-keys -T root "$1" 2>/dev/null | head -1 |
+    sed -E 's/^bind-key +(-[rn] +)*-T +root +[^ ]+ +//'
+}
+_radar_click() {  # _radar_click on|off
+  local want="$1" key cur orig conf notify else_part inner
+  notify="$SCRIPTS/needinput-notify.sh"
+  case "$notify" in *[\'\"\$\`\\]*) return 0 ;; esac   # cannot be quoted in a binding
+  notify="${notify//\#/##}"                            # run-shell and if-shell expand formats
+  conf="$(mktemp "${TMPDIR:-/tmp}/radar-click.XXXXXX")" || return 0
+  for key in MouseDown1Status MouseDown1Pane; do
+    cur="$(_radar_click_bound "$key")"
+    case "$cur" in
+      *needinput-notify.sh*) orig="$(tmux show-option -gqv "@radar-click-orig-$key" 2>/dev/null || true)" ;;
+      *)
+        [ "$want" = on ] || continue                   # not wrapped: nothing to undo
+        orig="$cur"
+        tmux set-option -g "@radar-click-orig-$key" "$orig"
+        ;;
+    esac
+    if [ "$want" != on ]; then
+      if [ -n "$orig" ]; then printf 'bind-key -T root %s %s\n' "$key" "$orig" >> "$conf"
+      else printf 'unbind-key -T root %s\n' "$key" >> "$conf"; fi
+      tmux set-option -gu "@radar-click-orig-$key" 2>/dev/null || true
+      continue
+    fi
+    # list-keys separates commands with "\;"; inside braces that is a literal
+    # semicolon, so the original goes in with plain separators
+    inner="${orig// \\; / ; }"
+    else_part=""
+    [ -z "$orig" ] || else_part=" { $inner }"
+    if [ "$key" = MouseDown1Status ]; then
+      printf '%s\n' "bind-key -T root $key if-shell -F '#{m/r:^radar(-|[0-9]+)\$,#{mouse_status_range}}' { run-shell -b '\"$notify\" click #{q:client_name} #{q:mouse_status_range}' }$else_part" >> "$conf"
+    else
+      printf '%s\n' "bind-key -T root $key if-shell -F '#{@radar-toast-live}' { if-shell '\"$notify\" toast-click #{q:client_name} #{pane_left} #{pane_top} #{mouse_x} #{mouse_y} \"#{status}\" \"#{status-position}\" #{?window_bigger,#{window_offset_x},0} #{?window_bigger,#{window_offset_y},0}' {}$else_part }$else_part" >> "$conf"
+    fi
+  done
+  [ ! -s "$conf" ] || tmux source-file "$conf" 2>/dev/null || true
+  rm -f "$conf"
+}
+if [ "$NEEDINPUT" = "on" ] && [ "$(opt @radar-click on)" != off ]; then
+  _radar_click on
+else
+  _radar_click off
 fi

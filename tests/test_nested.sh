@@ -8,6 +8,7 @@ set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 N="$WT/scripts/needinput-notify.sh"
 T="$(mktemp -d /tmp/radar-nested.XXXXXX)"
+export TMUX_TMPDIR="$T"   # the test servers' sockets go with $T at cleanup
 export TMUX_RADAR_STATE_DIR="$T/state" TMUX_RADAR_NO_SCHEDULE=1
 MARKS="$TMUX_RADAR_STATE_DIR/need-input"
 REG="$TMUX_RADAR_STATE_DIR/agent-registry"
@@ -127,6 +128,25 @@ chk "a nested claude run writes no mark" "[ \"\$(rows_for s:inner)\" = 0 ]"
 chk "a nested claude run registers nothing" "[ \"\$(reg_for s:inner)\" = 0 ]"
 chk "the host's unread mark survives the nested run" "[ \"\$(rows_for s:host)\" = 1 ]"
 chk "the host pane keeps its action title" "[ \"\$(title)\" = '⚠ Claude needs approval' ]"
+
+# --- a member of a Claude agent team reports to its lead, not to you ------------
+TEAMMATE='ME 500 00:01 bash needinput-notify.sh
+500 400 05:00 /Users/u/.local/share/claude/versions/2.1.286 --agent-id reviewer@audit --agent-name reviewer --team-name audit --agent-color blue --parent-session-id lead --permission-mode default
+400 300 03:00:00 -zsh
+300 1 1-00:00:00 tmux'
+reset_all
+printf '{"session_id":"tm","cwd":"/tmp/p","last_assistant_message":"Review done."}' | hook "$TEAMMATE" claude-stop
+chk "a teammate's finished turn writes no mark" "[ \"\$(rows_for s:tm)\" = 0 ]"
+chk "the teammate is still on record, as done" \
+  "awk -F'\t' '\$2==\"s:tm\" && \$7==\"done\"' '$REG' | grep -q ."
+chk "the teammate's pane keeps its own title" "[ \"\$(title)\" = 'host-title' ]"
+printf '{"session_id":"tm","cwd":"/tmp/p","notification_type":"permission_prompt","message":"Claude needs your permission to use Bash"}' |
+  hook "$TEAMMATE" claude-mark
+chk "a teammate that waits for approval is still marked" "[ \"\$(rows_for s:tm)\" = 1 ]"
+printf '{"session_id":"tm","cwd":"/tmp/p"}' | hook "$TEAMMATE" claude-stop
+chk "the teammate's stop clears its approval mark" "[ \"\$(rows_for s:tm)\" = 0 ]"
+printf '{"session_id":"solo","cwd":"/tmp/p"}' | hook "$ALONE_CLAUDE" claude-stop
+chk "a session that is not in a team still marks its finished turn" "[ \"\$(rows_for s:solo)\" = 1 ]"
 
 # --- Codex: native hooks and the legacy notify program ------------------------
 reset_all

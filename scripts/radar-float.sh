@@ -22,14 +22,23 @@
 # person went to the pane), or the moment its client leaves: the client
 # process exits on detach, and from then on the terminal is the shell's.
 #
+# A click on the box goes to the mark's pane. tmux never sees the box, so the
+# plugin's MouseDown1Pane binding asks needinput-notify.sh toast-click whether
+# a click landed on one, but only while @radar-toast-live is set: no fork per
+# click otherwise. While a toast is up its slot holds `hit`:
+#   <column> <row> <width> <pane> <pid of this script>
+# and the flag stays set while any slot does.
+#
 # usage: radar-float.sh <client> <tty> <client-pid> <cols> <top> <bottom>
 #                       <utf8> <level> <where> <label> <ms> <key> <marks> <slots>
+#                       [pane]
 #   top, bottom  first and last screen rows free of status lines (1-based)
 #   utf8         1 when the client's terminal speaks UTF-8
+#   pane         where a click goes; `-` (a paneless mark) opens the picker
 set -u
 
 client="$1" tty="$2" cpid="$3" cols="$4" top="$5" bottom="$6" utf8="$7" level="$8"
-where="$9" label="${10}" ms="${11}" key="${12}" marks="${13}" slots="${14}"
+where="$9" label="${10}" ms="${11}" key="${12}" marks="${13}" slots="${14}" pane="${15:--}"
 
 case "$cpid$cols$top$bottom$ms" in *[!0-9]*) exit 0 ;; esac
 [ -n "$tty" ] && [ -w "$tty" ] || exit 0
@@ -128,7 +137,7 @@ x=$(( cols - width - 1 ))
 # minutes was left by a toast that was killed.
 sdir="$slots/${client//[^A-Za-z0-9._-]/_}"
 mkdir -p "$sdir" 2>/dev/null || exit 0
-find "$sdir" -mindepth 1 -maxdepth 1 -type d -mmin +2 -exec rmdir {} + 2>/dev/null
+find "$sdir" -mindepth 1 -maxdepth 1 -type d -mmin +2 -exec rm -rf {} + 2>/dev/null
 slot=""
 for s in 0 1 2 3 4 5; do
   if mkdir "$sdir/$s" 2>/dev/null; then slot=$s; break; fi
@@ -163,12 +172,24 @@ marked() {
 # However the toast ends (its time, its mark, its client, a signal), the slot
 # is freed and tmux repaints the screen over the box, if the client is there.
 cleanup() {
+  rm -f "$sdir/$slot/hit"
   rmdir "$sdir/$slot" 2>/dev/null
+  # the last toast anywhere lowers the click flag; one that started meanwhile
+  # raises it again
+  set -- "$slots"/*/*/hit
+  if [ ! -e "$1" ]; then
+    tmux set -gu @radar-toast-live 2>/dev/null
+    set -- "$slots"/*/*/hit
+    [ ! -e "$1" ] || tmux set -g @radar-toast-live 1 2>/dev/null
+  fi
   exec 3>&- 2>/dev/null
   attached && tmux refresh-client -t "$client" 2>/dev/null
 }
 trap cleanup EXIT
 trap 'exit 0' HUP INT TERM PIPE
+
+printf '%s %s %s %s %s\n' "$x" "$y" "$width" "$pane" "$$" > "$sdir/$slot/hit" 2>/dev/null
+tmux set -g @radar-toast-live 1 2>/dev/null
 
 { exec 3>"$tty"; } 2>/dev/null || exit 0
 n=$(( ms / 20 )); [ "$n" -ge 1 ] || n=1

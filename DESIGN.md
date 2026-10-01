@@ -417,6 +417,88 @@ up. The plugin wraps the root `MouseDown1Status` and `MouseDown1Pane`
 bindings, keeps the original under `@radar-click-orig-<key>`, and runs it for
 every click that is not radar's; `@radar-click off` restores it.
 
+### Window names fitted to the width
+
+A theme cuts nothing: with ten windows on a laptop the list ran past the
+right edge and tmux hid the last windows behind `>`. The first fix (a
+format in the user's config, 2026-10-01) gave every window an equal share
+and cut names to a ladder of lengths, which left 27 of 175 columns empty
+while four names were cut: a short name could not hand its unused share to a
+long one. `radar-winfit.sh` replaces it with the rule a person would apply by
+hand: equal shares of the room left after status-left, status-right, every
+window's number and padding, and the separators; what a short name does not
+use goes back to the cut ones; repeat. The fixed point has a closed form:
+the cut names share one length c, and the first r of them by window order
+get c+1, so the list fills the line to the column.
+
+The room depends on each client's width, and clients of one session differ
+(a laptop and a phone over SSH), so radar cannot publish a length. It
+publishes, per window, the cut points: `@radar-wname` is a format that
+compares the room (`@radar-win-avail`, which tmux measures at draw time) with
+the thresholds where this window gains a character, by binary search, whole
+name first. Window i gets c cells when `sum over the set of min(len, c-1)`
+plus the windows up to i that are long enough for c fits; that total grows
+with c, so the search is sound.
+
+The room is one `#{W:...}` loop: every other window contributes its format
+without its name (`@radar-win-shell`), the current window contributes its own
+plus `#{T:status-left}#{T:status-right}`. The first version expanded the two
+sides inside each window's format, and the review caught two faults in that.
+A side that depends on the window (tmux's default status-right shows the
+pane title) was measured with each drawn window instead of the current one,
+so the windows disagreed on the room and the bar overflowed. And a
+`#(command)` job expanded in each window's format started a copy of its own
+per window: a counting job ran 44 times in four seconds instead of 3. The
+sides are now expanded in the loop's current-window branch, so they resolve
+as the status line draws them (the current pane, the session's own values).
+A second review argued that a job expanded there is the status line's own
+and could stay; measured, it is not: tmux keys a job by the format tree it
+runs in, and the counting job ran 8 times in four seconds against 3. That
+second run starts in the same instant as the status line's, and
+tmux-continuum's auto-save, a common companion of tmux-resurrect, would then
+race itself into two resurrect saves of the same second. So the sides are
+measured from copies without their jobs (`@radar-win-left`,
+`@radar-win-right`, set per session where a session has its own sides and
+refreshed by every publish), a job's output counts as zero width,
+`@radar-win-reserve` keeps columns for jobs that print, and `doctor` says
+when a side runs one. Drawing ten windows costs about 0.5 ms more than
+the theme alone, thirty about 3 ms; each window's search measures every
+window, so the cost grows with the square of the count, and a session with
+more than 30 windows keeps its names whole.
+
+Below `@radar-win-min` cells per window (4) the fill stops: a two-letter stub
+says less than the coloured number. Then only marked windows keep names,
+the most urgent first and at most four, and what they leave goes to the
+current window, which is picked by `window_active` at draw time so a window
+switch needs no republish. Radar republishes on `window-linked`,
+`window-unlinked` and `window-renamed` (automatic renames fire it), and when
+the set of coloured windows changes; a restore publishes once at its end.
+Publishes run one at a time behind the notifier's kind of lock (flock, else
+shlock, both of which free a dead holder's lock), because two that read the
+window list at different moments could leave the later write's stale
+thresholds; one that finds the lock taken asks the holder to run once more.
+A window linked into several sessions takes the cut points of the session
+with the most windows, so in the others it can only under-use.
+A stale publish can only waste room: every leaf is `#{=c:window_name}`, never
+longer than planned.
+
+At load, after the theme, `patch` swaps the single stand-alone `#W` or
+`#{window_name}` in both window formats for `#{E:@radar-wname}` and records
+the rest as the window's cost (`@radar-win-shell`). Anything else (no name,
+two, a name inside a conditional, a customised `status-format[0]`, a status
+side that lists windows itself and would recurse) leaves the theme's own
+formats in place, undoing an earlier patch, and says why in
+`@radar-win-fit-state`. catppuccin copies its number colour
+into the format at load (`set -gF`), so `patch` rewrites that one `bg=` to
+follow `@radar-color`.
+
+tmux sends a command line to its server as one message of at most 16 KB.
+The first version batched every window's cut points into one `set-option`
+chain; with marks the chain passed 16 KB, tmux refused it, and the error was
+silenced, so the narrow names never appeared. Updates now go in pieces of 12
+KB, a name is fitted over its first 32 cells, and the narrow set stops at
+four windows, which keeps one window's value near 10 KB at worst.
+
 ### Severity
 
 A label reads `<head>[: <detail>]`. Adapters write the head from a fixed

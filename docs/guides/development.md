@@ -79,6 +79,7 @@ bash tests/test_claude_adapter.sh  # Claude payload and environment handling, se
 bash tests/test_dialects.sh      # Grok, Cursor, Droid, Gemini, Auggie payloads through one adapter
 bash tests/test_nested.sh        # process-tree matcher: who fired an event, nested runs
 bash tests/test_announce.sh      # floating and status toasts on a real attached client, the notify command
+bash tests/test_winfit.sh        # window names fitted to a real client's width, narrow rules, format patching
 bash tests/test_safety.sh        # fail-closed notifier and adapter behavior
 bash tests/test_install.sh       # installer ownership/idempotency/rollback
 bash tests/test_opencode_plugin.sh

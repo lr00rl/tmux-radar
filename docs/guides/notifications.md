@@ -95,7 +95,7 @@ other click; while no toast is up, a click in a pane costs nothing extra.
 `@radar-click off` puts your original bindings back. A status-line toast
 (`@radar-toast status`) cannot be clicked: tmux owns that line.
 
-## Narrow screens and the window list
+## Narrow screens and window colours
 
 On a client under 120 columns the chips give way to one count per level,
 most urgent first, in the level's colour:
@@ -111,25 +111,95 @@ monitor attached to the same session each get what fits.
 radar also writes the level of every window that holds an unread mark into
 the window option `@radar-color` (`colour208` for an approval, `colour35` for
 a finished turn, `colour220` for a notice; unset otherwise), under the same
-rules as the chips. A window-status format can use it to light the window's
-number, so the window list itself shows what needs you. With catppuccin:
-
-```tmux
-set -g @catppuccin_window_number_color '#{?#{@radar-color},#{@radar-color},#{@thm_overlay_2}}'
-```
-
-and with a plain format:
+rules as the chips. With catppuccin, radar points the window number's colour
+at it when the plugin loads, so the window list itself shows what needs you.
+With another format, use it yourself:
 
 ```tmux
 set -g window-status-format '#[bg=#{?#{@radar-color},#{@radar-color},colour238}] #I #[default] #W '
 ```
 
-To keep every window visible on a small screen, a window-status format can
-also cut names to a share of the width. One recipe gives each
-window `(client_width - status-left - chips - clock - 20) / (windows - 1)`
-columns and cuts the name to the largest of 16, 12, 10, 8, 6 or 4
-characters that fits, or shows the number alone; `#{w:#{E:@radar-chips}}`
-and `#{w:#{E:@radar-chips-short}}` give the width the chips take.
+## The window list fits your width
+
+radar shares the status line's width out among the window names, per client
+(`@radar-win-fit`, on by default):
+
+1. Take the client's width, less status-left, status-right (chips and clock
+   included), every window's number and padding (one or two digits), and the
+   separators. What is left is the room for names.
+2. Give every window an equal share. A name shorter than its share keeps its
+   whole length and hands the rest back.
+3. Share what was handed back among the names that were cut, and repeat until
+   nothing changes. Spare columns go one each to the first cut windows.
+
+The list then fills the line exactly: no window hides behind `<` or `>`, and
+no column is left empty while a name is cut. At 175 columns with ten windows:
+
+```
+[work]  0  tmux-radar  1  editor_theme  2  editor-plugin-lite  3  feedsync  4  infra  5  shared_working_place  …
+```
+
+and at 150 columns the long names give way first:
+
+```
+[work]  0  tmux-radar  1  editor_them  2  editor-plug  3  feedsync  4  infra  5  shared_wor  6  billing-cl  …
+```
+
+A name shows at least `@radar-win-min` characters (default 4) or none. When
+the room cannot give every window that much, only windows with an unread mark
+keep their names, the most urgent first (approvals, then notices, then
+finished turns, at most four), and the room they leave goes to the current
+window's name:
+
+```
+[work]  0    1    2  editor-p  3    4    5  shared_  6    7    8    9   ⚠1 ✓1 10-01 06:27
+```
+
+tmux does the measuring when it draws the bar, so a laptop and a phone over
+SSH attached to the same session each get the list that fits them. radar
+republishes the cut points when windows come, go or are renamed, and when the
+set of marked windows changes.
+
+status-left and status-right are measured as tmux draws them: your
+session's own values, with the current window, so a pane title or a
+directory on the right counts at its real width. A `#(command)` in them is
+left out of the measurement: measuring it would run the command a second
+time at every redraw, at the same instant as the status line's own run, and
+a command like tmux-continuum's auto-save would race itself. Its output
+therefore counts as zero width. If a command on your bar prints text, keep
+columns back for it (`doctor` reminds you when a side runs a command):
+
+```tmux
+set -g @radar-win-reserve 6   # columns that #(...) output on the bar needs
+```
+
+A status-left or status-right changed while tmux runs is measured from the
+next window change, session switch or mark; a config reload applies it at
+once.
+
+How it attaches: when the plugin loads (after your theme), radar replaces the
+one stand-alone `#W` or `#{window_name}` in `window-status-format` and
+`window-status-current-format` with its fitted name. That works with tmux's
+own formats and with most themes. catppuccin shows the pane title by
+default, so set its window text to the name:
+
+```tmux
+set -g @catppuccin_window_text ' #W'
+set -g @catppuccin_window_current_text ' #W'
+```
+
+If a format has no such name, or more than one, or your status line lists
+the windows some other way, radar leaves the bar alone and
+`needinput-notify.sh doctor` says why (`window names fitted`).
+`set -g @radar-win-fit off` puts `#W` back.
+
+Limits: a name is fitted over its first 32 cells; a session with more than
+30 windows keeps its names whole, as your theme draws them (the numbers alone
+fill a wide screen there, and fitting would cost each redraw several
+milliseconds); a window linked into several sessions is fitted for the one
+with the most windows, so in the others it may leave room unused;
+`swap-window` fires no hook, so after a swap the spare columns may go
+to the wrong window until the next change (the total still fits).
 
 ## Your own notification: `@radar-notify-command`
 

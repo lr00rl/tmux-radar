@@ -29,7 +29,10 @@ set -g @radar-preview-follow 'on'
 | `@radar-retitle` | `on` | Prefix marked pane titles with a textual status label and restore the mark-owned saved title when cleared. A matching glyph prefix alone is never treated as ownership. |
 | `@radar-claude-bg` | `on` | Track paneless Claude sessions on notification surfaces; they never become selectable picker rows. |
 | `@radar-bar` | `auto` | `auto` adds chips to `status-right`, `pinned` reserves a stable second line, and `off` hides chips while retaining marks. |
-| `@radar-bar-ttl` | `60` | Seconds before a chip fades (`0` keeps it until handled); the underlying mark remains. |
+| `@radar-bar-ttl` | `action=0 done=600 notice=600` | Seconds a chip stays on the bar, per level (`0` keeps it until handled; one number sets every level); the underlying mark remains. |
+| `@radar-win-fit` | `on` | Fit window names to each client's width; on a narrow client only marked windows, then the current one, keep names ([the window list](notifications.md#the-window-list-fits-your-width)). |
+| `@radar-win-min` | `4` | The fewest characters a fitted name shows; below that it shows none. |
+| `@radar-win-reserve` | `0` | Columns kept back for text printed by `#(command)` jobs on the status sides, which the fitting counts as zero width. |
 | `@radar-done-ttl` | `0` | Seconds a finished-turn (DONE) mark is kept for review (`0` keeps it until focused or cleared). |
 | `@radar-toast` | `float` | Show a new mark once on clients that are not on its pane: `float` (a box in the top-right corner), `status` (the status line), or `off`. |
 | `@radar-toast-levels` | `action done notice` | Levels that toast. |

@@ -206,3 +206,22 @@ if [ "$NEEDINPUT" = "on" ] && [ "$(opt @radar-click on)" != off ]; then
 else
   _radar_click off
 fi
+
+# Window names fitted to each client's width (radar-winfit.sh). Loaded after
+# the theme, so the patch sees the window formats the theme built. tmux
+# redraws from per-window cut points that radar republishes whenever windows
+# come, go or are renamed (move-window links and unlinks), and on a session
+# switch, which refreshes the measured copies of status-left and status-right;
+# a client's width needs no republish. tmux has no hook for swap-window: a swap only changes
+# which cut windows get the spare characters, never the total, and the next
+# republish puts them back in order.
+WINFIT_EVENTS="window-linked window-unlinked window-renamed client-session-changed"
+if [ "$(opt @radar-win-fit on)" != off ]; then
+  "$SCRIPTS/radar-winfit.sh" patch || true
+  for ev in $WINFIT_EVENTS; do
+    tmux set-hook -g "$ev[9003]" "run-shell -b \"$SCRIPTS/radar-winfit.sh publish || true\"" 2>/dev/null || true
+  done
+else
+  "$SCRIPTS/radar-winfit.sh" off || true
+  for ev in $WINFIT_EVENTS; do tmux set-hook -gu "$ev[9003]" 2>/dev/null || true; done
+fi

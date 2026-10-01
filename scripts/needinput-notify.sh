@@ -941,6 +941,19 @@ _publish_window_colours() {  # _publish_window_colours <"@id<TAB>colour" lines>
     else args+=(set-option -wqu -t "$id" @radar-color); fi
   done <<< "$plan"
   [ "${#args[@]}" -eq 0 ] || tmux "${args[@]}" >/dev/null 2>&1 || true
+  # names on a narrow client are kept for marked windows only
+  _winfit_later
+}
+
+# Window names are refitted by the tmux server (run-shell -b), like the
+# announce job: the hook returns at once, and its end cannot cut the publish
+# short. radar-winfit.sh runs one publish at a time.
+_winfit_later() {
+  local dir fit h='#' hh='##' cmd
+  _sh_quote_to dir "$STATE_DIR"
+  _sh_quote_to fit "$SCRIPT_DIR/radar-winfit.sh"
+  cmd="TMUX_RADAR_STATE_DIR=$dir $fit publish >/dev/null 2>&1 || true"
+  tmux run-shell -b "${cmd//"$h"/$hh}" 2>/dev/null || true
 }
 
 cmd_mark() {  # cmd_mark <pane|-> <source> <label> [key]
@@ -1164,6 +1177,7 @@ cmd_restore_begin() {
 cmd_restore_end() {
   have_tmux && tmux set-option -gu @radar-restoring >/dev/null 2>&1 || true
   _schedule_tick 1 "$STATE_DIR/.restore-at"
+  _winfit_later                                   # skipped while restoring
   return 0
 }
 # --- live agent scanner (see file header) ------------------------------------
@@ -2430,10 +2444,16 @@ cmd_doctor() {  # one-stop "why is this row (not) showing?"
   echo "-- options in effect --"
   for o in @radar-needinput @radar-needinput-commands @radar-bar @radar-bar-ttl \
            @radar-retitle @radar-claude-bg @radar-claude-bg-ignore \
-           @radar-toast @radar-toast-levels @radar-toast-duration @radar-notify-command @radar-click; do
+           @radar-toast @radar-toast-levels @radar-toast-duration @radar-notify-command @radar-click \
+           @radar-win-fit @radar-win-min @radar-win-reserve; do
     v="$(opt "$o" '(default)')"
     printf '  %-26s %s\n' "$o" "$v"
   done
+  printf '  %-26s %s\n' 'window names fitted' "$(opt @radar-win-fit-state 'not set up (plugin not loaded?)')"
+  case "$(opt status-left '')$(opt status-right '')" in *'#('*)
+    printf '  %-26s %s\n' '' 'status-left/right run #(commands): their output counts as zero width;'
+    printf '  %-26s %s\n' '' 'if one prints text, set @radar-win-reserve to its width' ;;
+  esac
   echo
   echo "-- agent registry --"
   cmd_registry | sed 's/^/  /'

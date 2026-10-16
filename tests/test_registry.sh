@@ -264,6 +264,15 @@ chk "codex mark key matches its registry key" \
   "[ '$CODEX_REG_KEY' = 's:codex-key' ] && [ '$CODEX_MARK_KEY' = '$CODEX_REG_KEY' ]"
 "$N" clear-all
 
+# Codex shows a Stop hook's systemMessage too: the prompt files the start,
+# the stop prints the stamp, keyed by the same session as the registry.
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"codex-ts"}' | TMUX_PANE="$PANE" "$N" codex-hook >/dev/null
+chk "codex prompt files the turn start" "[ -s '$TMUX_RADAR_STATE_DIR/turn-start/codex_codex-ts' ]"
+CODEX_OUT="$(printf '{"hook_event_name":"Stop","session_id":"codex-ts","last_assistant_message":"ok"}' | TMUX_PANE="$PANE" "$N" codex-hook)"
+chk "codex stop prints the stamp as its only output" \
+  "printf '%s' \"\$CODEX_OUT\" | jq -r .systemMessage | grep -Eq '^UTC [0-9-]{10}T[0-9:]{8}Z → ([0-9-]{10}T)?[0-9:]{8}Z  turn took [0-9]+s\$'"
+"$N" clear-all
+
 # Kimi's documented hook payload always carries hook_event_name, session_id,
 # and cwd. pid/process are optional normalized-adapter fields; the fixture
 # supplies this shell's identity so registry liveness remains deterministic.

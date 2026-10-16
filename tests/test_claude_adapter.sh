@@ -288,6 +288,34 @@ claude_hook claude-resolved '{"session_id":"r3","cwd":"/tmp/proj","tool_name":"B
   CLAUDE_CODE_SESSION_ID=r3
 chk "a tool call in the marked session resolves it" "[ -z \"\$(mark_of s:r3)\" ]"
 
+# --- turn stamps: the stop hook prints one systemMessage line ----------------
+# Claude Code hides a UserPromptSubmit systemMessage, so the prompt files the
+# start and the stop prints both times and the length of the turn. The line
+# must be the stop hook's only stdout, or Claude reads it as plain text.
+claude_hook claude-clear '{"session_id":"ts1","cwd":"/tmp/proj"}' CLAUDE_CODE_SESSION_ATTENDED=1 >/dev/null
+chk "the prompt files the turn's start" "[ -s '$TMUX_RADAR_STATE_DIR/turn-start/ts1' ]"
+printf '%s' "$(( $(date +%s) - 75 ))" > "$TMUX_RADAR_STATE_DIR/turn-start/ts1"  # began 75s ago
+OUT="$(claude_hook claude-stop '{"session_id":"ts1","cwd":"/tmp/proj","last_assistant_message":"Done."}' CLAUDE_CODE_SESSION_ATTENDED=1)"
+chk "stop prints a single JSON line" "[ \"\$(printf '%s\n' \"\$OUT\" | wc -l | tr -d ' ')\" = 1 ] && printf '%s' \"\$OUT\" | jq -e 'keys == [\"systemMessage\"]' >/dev/null"
+chk "stamp has the start, the end and the length" \
+  "printf '%s' \"\$OUT\" | jq -r .systemMessage | grep -Eq '^UTC [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z → ([0-9]{4}-[0-9]{2}-[0-9]{2}T)?[0-9:]{8}Z  turn took 1m 1[5-7]s\$'"
+chk "the turn's start is used once" "[ ! -e '$TMUX_RADAR_STATE_DIR/turn-start/ts1' ]"
+OUT="$(claude_hook claude-stop '{"session_id":"ts1","cwd":"/tmp/proj"}' CLAUDE_CODE_SESSION_ATTENDED=1)"
+chk "a stop with no start on file says only when the turn ended" \
+  "printf '%s' \"\$OUT\" | jq -r .systemMessage | grep -Eq '^UTC [0-9-]{10}T[0-9:]{8}Z  turn end\$'"
+OUT="$(claude_hook claude-stop '{"session_id":"ts2","cwd":"/tmp/proj"}' CLAUDE_CODE_SESSION_ATTENDED=0)"
+chk "an unattended run prints nothing" "[ -z \"\$OUT\" ]"
+tmux set -g @radar-turn-stamp off
+claude_hook claude-clear '{"session_id":"ts3","cwd":"/tmp/proj"}' CLAUDE_CODE_SESSION_ATTENDED=1 >/dev/null
+OUT="$(claude_hook claude-stop '{"session_id":"ts3","cwd":"/tmp/proj"}' CLAUDE_CODE_SESSION_ATTENDED=1)"
+chk "@radar-turn-stamp off: nothing printed, the start still cleared" \
+  "[ -z \"\$OUT\" ] && [ ! -e '$TMUX_RADAR_STATE_DIR/turn-start/ts3' ]"
+tmux set -gu @radar-turn-stamp
+claude_hook claude-clear '{"session_id":"ts4","cwd":"/tmp/proj"}' CLAUDE_CODE_SESSION_ATTENDED=1 >/dev/null
+claude_hook claude-end '{"session_id":"ts4","cwd":"/tmp/proj"}' CLAUDE_CODE_SESSION_ATTENDED=1 >/dev/null
+chk "a session's end drops its turn start" "[ ! -e '$TMUX_RADAR_STATE_DIR/turn-start/ts4' ]"
+chk "prompt and other events print nothing" \
+  "[ -z \"\$(claude_hook claude-clear '{\"session_id\":\"ts5\",\"cwd\":\"/tmp/proj\"}' CLAUDE_CODE_SESSION_ATTENDED=1)\" ]"
 echo
 echo "=============================="
 echo "PASS=$PASS FAIL=$FAIL"

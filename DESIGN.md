@@ -375,6 +375,19 @@ decides; this is how a turn-end notification leaves tmux (desktop, sound,
 chat). A claim `mkdir` per mark makes "once" hold across concurrent hooks, and
 only marks from the last 30 seconds qualify, so a restart announces nothing.
 
+Turn stamps go through the agent instead of tmux. Claude Code and Codex
+show the user a hook's `systemMessage`, so the stop hook prints one line,
+`UTC <start> → <end>  turn took <length>`, as its only stdout. Claude Code
+drops a `UserPromptSubmit` hook's `systemMessage` before display (it filters
+every attachment from that event out of the visible list), so the prompt
+hook prints nothing and only files the turn's start under
+`$STATE_DIR/turn-start/<session>`. The stop reads and removes it, and a stop
+with no start on file says only when the turn ended. The stamp is written
+before the event is dispatched, because marking leaves early for team
+members and paused turns, whose turns still ended on someone's screen.
+An unattended run (`claude -p`, the SDK) or a headless Codex run gets none.
+`@radar-turn-stamp off` turns it off.
+
 ### Chips, focus and clicks
 
 On a narrow client (under 120 columns) the strip is `@radar-chips-short`: one

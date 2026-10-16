@@ -279,15 +279,21 @@ merge_codex_hooks_json() {
   _replace_file "$tmp" "$CODEX_HOOKS_JSON"
 }
 
+# Whether a notify setting already runs radar, at any depth. A tool that wraps
+# the chain after radar did (Codex Computer Use passes the old chain on in
+# --previous-notify) keeps radar's wrapper inside a JSON string, where its path
+# is escaped (\/), so only the file names, which have no slash, are matched.
+notify_runs_radar() {  # notify_runs_radar <config file>
+  grep -E '^[[:space:]]*notify[[:space:]]*=' "$1" 2>/dev/null |
+    grep -qE "$(basename "$CODEX_WRAP" | sed 's/\./\\./g')|$(basename "$NOTIFY" | sed 's/\./\\./g')"
+}
+
 install_notify_fallback() {
   local base tmp escaped_wrap
   tmp="$(mktemp "$(dirname "$CODEX_CONFIG")/.config.XXXXXX")" || die "mktemp failed for $CODEX_CONFIG"
   base="$(mktemp "$(dirname "$CODEX_CONFIG")/.config-base.XXXXXX")" || die "mktemp failed for $CODEX_CONFIG"
   strip_marker_block "$CODEX_CONFIG" > "$base"
-  if grep -qF "$CODEX_WRAP" "$base"; then
-    cp "$base" "$tmp"
-    info "Codex notify already integrated (legacy fallback)" >&2
-  elif grep -qF "$NOTIFY" "$base"; then
+  if notify_runs_radar "$base"; then
     cp "$base" "$tmp"
     info "Codex notify already integrated (legacy fallback)" >&2
   elif grep -qE '^[[:space:]]*notify[[:space:]]*=[[:space:]]*\[' "$base"; then

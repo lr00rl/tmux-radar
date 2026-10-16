@@ -335,6 +335,23 @@ OUT_KIMI_ABSENT="$(bash "$IH" status 2>&1)"
 chk "kimi absent: reported as skipped" "printf '%s' \"\$OUT_KIMI_ABSENT\" | grep -qi 'Kimi: not installed'"
 chk "kimi absent: no directory created" "[ ! -d '$T/home2/.kimi-code' ]"
 
+echo
+echo "### codex: a chain another tool wrapped after radar is not wrapped again"
+# Codex Computer Use wraps the chain it finds and passes it on as a JSON
+# string, where radar's wrapper path is escaped (\/). A reinstall must still
+# see radar in it, or every turn end runs radar's mark twice.
+export CODEX_CONFIG="$T/home3/.codex/config.toml" CODEX_HOOKS_JSON="$T/home3/.codex/hooks.json"
+mkdir -p "$T/home3/.codex"
+cat > "$CODEX_CONFIG" <<'TOML'
+model = "gpt-5.5"
+notify = ["/Apps/Sky.app/SkyClient", "turn-ended", "--previous-notify", "[\"\\/opt\\/radar\\/codex-notify-wrap.sh\",\"node\",\"\\/opt\\/omx\\/notify-hook.js\"]"]
+TOML
+cp "$CODEX_CONFIG" "$T/codex-nested.before"
+OUT_NESTED="$(bash "$IH" install 2>&1)"
+chk "codex nested: reported as already integrated" "printf '%s' \"\$OUT_NESTED\" | grep -q 'Codex notify already integrated'"
+chk "codex nested: notify line left as it was" \
+  "[ \"\$(grep '^notify' '$CODEX_CONFIG')\" = \"\$(grep '^notify' '$T/codex-nested.before')\" ]"
+
 rm -rf "$T"
 echo
 echo "=============================="

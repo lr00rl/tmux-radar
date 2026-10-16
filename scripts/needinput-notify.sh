@@ -1869,6 +1869,56 @@ _hook_end() {  # the session is gone: its row and its marks go with it
   _sync_bar
 }
 
+# --- turn stamps --------------------------------------------------------------
+# Claude Code and Codex show the user a hook's systemMessage, but Claude Code
+# drops one from UserPromptSubmit before display. So the prompt event only
+# files when the turn began, and the stop event prints one line with both
+# times and how long the turn took:
+#   UTC 2026-10-16T11:39:03Z → 11:39:50Z  turn took 47s
+# Off with `set -g @radar-turn-stamp off`. Nothing else in a stop hook may
+# write to stdout, or the agent reads the line as plain text.
+TURN_DIR="$STATE_DIR/turn-start"
+
+_turn_file() { printf '%s/%s' "$TURN_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"; }
+
+# _utc <epoch> <format>: BSD date takes -r, GNU date -d @.
+_utc() { date -u -r "$1" +"$2" 2>/dev/null || date -u -d "@$1" +"$2" 2>/dev/null; }
+
+_turn_begin() {  # _turn_begin <session key>
+  [ -n "${1:-}" ] || return 0
+  mkdir -p "$TURN_DIR" 2>/dev/null || return 0
+  date +%s > "$(_turn_file "$1")" 2>/dev/null || true
+  # starts of sessions that died mid-turn
+  find "$TURN_DIR" -type f -mtime +2 -delete 2>/dev/null || true
+}
+
+# _turn_text <start epoch, or empty when unknown> <end epoch>
+_turn_text() {
+  local start="$1" end="$2" from to d took
+  to="$(_utc "$end" '%Y-%m-%dT%H:%M:%SZ')"
+  case "$start" in ''|*[!0-9]*) printf 'UTC %s  turn end' "$to"; return 0 ;; esac
+  [ "$start" -le "$end" ] || { printf 'UTC %s  turn end' "$to"; return 0; }
+  from="$(_utc "$start" '%Y-%m-%dT%H:%M:%SZ')"
+  [ "$(_utc "$start" %F)" != "$(_utc "$end" %F)" ] || to="$(_utc "$end" '%H:%M:%SZ')"
+  d=$((end - start))
+  if [ "$d" -lt 60 ]; then took="${d}s"
+  elif [ "$d" -lt 3600 ]; then took="$(printf '%dm %02ds' $((d / 60)) $((d % 60)))"
+  else took="$(printf '%dh %02dm' $((d / 3600)) $((d % 3600 / 60)))"
+  fi
+  printf 'UTC %s → %s  turn took %s' "$from" "$to" "$took"
+}
+
+_turn_end() {  # _turn_end <session key>: print the stamp for the agent to show
+  local file start=""
+  if [ -n "${1:-}" ]; then
+    file="$(_turn_file "$1")"
+    start="$(cat "$file" 2>/dev/null || true)"
+    rm -f "$file" 2>/dev/null || true
+  fi
+  [ "$(opt @radar-turn-stamp on)" = on ] || return 0
+  printf '{"systemMessage":"%s"}\n' "$(_turn_text "$start" "$(date +%s)")"
+}
+
 _hook_dispatch() {  # _hook_dispatch <event>
   case "$1" in
     start)    _hook_start ;;
@@ -1907,7 +1957,15 @@ cmd_hook() {  # hook [kind]: a hook installed in an agent's own config; the payl
 }
 
 cmd_hook_as() {  # the claude-* subcommands: the event is the subcommand
+  local sid
   _hook_open ""
+  # Stamped before dispatch: marking leaves early for a team member or a
+  # paused turn, whose turn still ended on someone's screen.
+  case "$1" in
+    prompt) _turn_begin "$(_hook_field session_id)" ;;
+    stop)   _turn_end "$(_hook_field session_id)" ;;
+    end)    sid="$(_hook_field session_id)"; [ -z "$sid" ] || rm -f "$(_turn_file "$sid")" 2>/dev/null || true ;;
+  esac
   _hook_dispatch "$1"
 }
 
@@ -1940,16 +1998,24 @@ _codex_headless() {  # _codex_headless <json>
 }
 
 CODEX_KEY=""
+# The session a Codex payload belongs to: notify payloads carry thread-id or
+# thread_id, hook payloads session_id.
+_codex_sid() {  # _codex_sid <json>
+  local sid
+  sid="$(_json_field thread-id "$1")"
+  [ -n "$sid" ] || sid="$(_json_field thread_id "$1")"
+  [ -n "$sid" ] || sid="$(_json_field session_id "$1")"
+  printf '%s' "$sid"
+}
+
 _codex_adopt() {  # _codex_adopt <state> <json> <pane> — sets CODEX_KEY
   local state="$1" json="$2" pane="${3:--}" sid key pid proc
   CODEX_KEY=""
   _agent_identify codex
   pid="$AGENT_PID"; proc="$AGENT_PROC"
-  # notify payloads carry thread-id / thread_id; hook payloads may not — fall
-  # back to a pid key so liveness GC still applies
-  sid="$(_json_field thread-id "$json")"
-  [ -n "$sid" ] || sid="$(_json_field thread_id "$json")"
-  [ -n "$sid" ] || sid="$(_json_field session_id "$json")"
+  # hook payloads may carry no id: fall back to a pid key so liveness GC
+  # still applies
+  sid="$(_codex_sid "$json")"
   if [ -n "$sid" ]; then key="s:${sid}"
   elif [ -n "$pid" ]; then key="p:${pid}"
   else return 0; fi
@@ -1997,13 +2063,17 @@ _codex_label() {  # _codex_label <event-or-type> <json>
 }
 
 cmd_codex_hook() {  # Codex native hooks pass JSON on stdin
-  local json event pane kind label
+  local json event pane kind label sid
   json="$(cat 2>/dev/null || true)"
   event="$(_json_field hook_event_name "$json")"
   [ -n "$event" ] || exit 0
   if _codex_headless "$json"; then exit 0; fi
   pane="$(_codex_pane)"
   if [ -n "$pane" ] && _nested_run codex; then exit 0; fi
+  case "$event" in
+    UserPromptSubmit) sid="$(_codex_sid "$json")"; _turn_begin "${sid:+codex:$sid}" ;;
+    Stop)             sid="$(_codex_sid "$json")"; _turn_end "${sid:+codex:$sid}" ;;
+  esac
   case "$event" in
     UserPromptSubmit)
       _codex_adopt working "$json" "$pane"

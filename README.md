@@ -80,6 +80,9 @@ long-running agents.
   **toast** floats in the top-right corner to say what just happened, over
   SSH too. `@radar-notify-command` turns the same event into a desktop, sound
   or chat notification.
+  At the end of every Claude Code and Codex turn the agent itself shows one
+  line with when the turn began and ended and how long it took:
+  `UTC 2026-10-16T11:39:03Z → 11:39:50Z  turn took 47s`.
   Only the pane you focus is marked read; sibling agent panes remain unread.
   Marks also clear when you reply — and
   **stale marks self-heal**: a mark whose agent TUI has exited is dropped
@@ -201,6 +204,7 @@ Set these **before** the plugin loads:
 | `@radar-toast-levels` | `action done notice` | Levels that toast. |
 | `@radar-toast-duration` | `5000` | Milliseconds a toast stays up. |
 | `@radar-notify-command` | (none) | Shell command run once per new mark with `RADAR_LEVEL`, `RADAR_AGENT`, `RADAR_LABEL`, `RADAR_WHERE`, `RADAR_PANE`, `RADAR_SESSION`, `RADAR_KEY`, `RADAR_WATCHED` and `RADAR_TEXT` set. See [notifications](docs/guides/notifications.md). |
+| `@radar-turn-stamp` | `on` | At each turn's end, Claude Code and Codex show `UTC <start> → <end>  turn took <length>`. `off` prints nothing. |
 | `@radar-claude-bg-ignore` | `~/.claude:~/.claude-mem` | Colon-separated path prefixes; background sessions whose cwd starts with one (plugin observers, SDK helpers) are not tracked. |
 
 Example:

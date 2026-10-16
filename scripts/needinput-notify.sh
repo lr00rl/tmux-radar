@@ -1869,15 +1869,48 @@ _hook_end() {  # the session is gone: its row and its marks go with it
   _sync_bar
 }
 
-# --- turn stamps --------------------------------------------------------------
+# --- turn stamps and session lines --------------------------------------------
 # Claude Code and Codex show the user a hook's systemMessage, but Claude Code
 # drops one from UserPromptSubmit before display. So the prompt event only
-# files when the turn began, and the stop event prints one line with both
-# times and how long the turn took:
+# files when the turn began, and the stop event prints both times and how
+# long the turn took, then the session's id and transcript file:
 #   UTC 2026-10-16T11:39:03Z → 11:39:50Z  turn took 47s
-# Off with `set -g @radar-turn-stamp off`. Nothing else in a stop hook may
-# write to stdout, or the agent reads the line as plain text.
+#   session 2942498d-2c31-4d90-9a2c-ad76dd751434
+#   ~/.claude/projects/-Users-me-code-app/2942498d-2c31-4d90-9a2c-ad76dd751434.jsonl
+# A Claude session start shows the two session lines on their own. The path
+# has a line to itself so it copies in one piece on a narrow screen.
+# `set -g @radar-turn-stamp off` drops the time, `@radar-session-info off`
+# the session lines. Nothing else in these hooks may write to stdout, or the
+# agent reads the output as plain text.
 TURN_DIR="$STATE_DIR/turn-start"
+
+# _sys_msg <text>: the JSON a hook prints for the agent to show; text may
+# hold newlines.
+_sys_msg() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/ }"
+  s="${s//$'\n'/\\n}"
+  printf '{"systemMessage":"%s"}\n' "$s"
+}
+
+# _session_text <session id> <transcript path>: the id, then the file with
+# the home dir as ~. Nothing without an id; the id alone without a path.
+_session_text() {
+  local id="${1:-}" path="${2:-}"
+  [ -n "$id" ] || return 0
+  case "$path" in "$HOME"/*) path="~${path#"$HOME"}" ;; esac
+  printf 'session %s' "$id"
+  [ -z "$path" ] || printf '\n%s' "$path"
+}
+
+_session_start() {  # _session_start <session id> <transcript path>
+  local text
+  [ "$(opt @radar-session-info on)" = on ] || return 0
+  text="$(_session_text "${1:-}" "${2:-}")"
+  [ -z "$text" ] || _sys_msg "$text"
+}
 
 _turn_file() { printf '%s/%s' "$TURN_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"; }
 
@@ -1908,15 +1941,20 @@ _turn_text() {
   printf 'UTC %s → %s  turn took %s' "$from" "$to" "$took"
 }
 
-_turn_end() {  # _turn_end <session key>: print the stamp for the agent to show
-  local file start=""
+# _turn_end <state key> <session id> <transcript path>: print the turn's end
+# for the agent to show
+_turn_end() {
+  local file start="" stamp="" session=""
   if [ -n "${1:-}" ]; then
     file="$(_turn_file "$1")"
     start="$(cat "$file" 2>/dev/null || true)"
     rm -f "$file" 2>/dev/null || true
   fi
-  [ "$(opt @radar-turn-stamp on)" = on ] || return 0
-  printf '{"systemMessage":"%s"}\n' "$(_turn_text "$start" "$(date +%s)")"
+  [ "$(opt @radar-turn-stamp on)" != on ] || stamp="$(_turn_text "$start" "$(date +%s)")"
+  [ "$(opt @radar-session-info on)" != on ] || session="$(_session_text "${2:-}" "${3:-}")"
+  if [ -n "$stamp" ] && [ -n "$session" ]; then _sys_msg "$stamp"$'\n'"$session"
+  elif [ -n "$stamp$session" ]; then _sys_msg "$stamp$session"
+  fi
 }
 
 _hook_dispatch() {  # _hook_dispatch <event>
@@ -1961,10 +1999,12 @@ cmd_hook_as() {  # the claude-* subcommands: the event is the subcommand
   _hook_open ""
   # Stamped before dispatch: marking leaves early for a team member or a
   # paused turn, whose turn still ended on someone's screen.
+  sid="$(_hook_field session_id)"
   case "$1" in
-    prompt) _turn_begin "$(_hook_field session_id)" ;;
-    stop)   _turn_end "$(_hook_field session_id)" ;;
-    end)    sid="$(_hook_field session_id)"; [ -z "$sid" ] || rm -f "$(_turn_file "$sid")" 2>/dev/null || true ;;
+    start)  _session_start "$sid" "$(_hook_field transcript_path)" ;;
+    prompt) _turn_begin "$sid" ;;
+    stop)   _turn_end "$sid" "$sid" "$(_hook_field transcript_path)" ;;
+    end)    [ -z "$sid" ] || rm -f "$(_turn_file "$sid")" 2>/dev/null || true ;;
   esac
   _hook_dispatch "$1"
 }
@@ -2072,7 +2112,7 @@ cmd_codex_hook() {  # Codex native hooks pass JSON on stdin
   if [ -n "$pane" ] && _nested_run codex; then exit 0; fi
   case "$event" in
     UserPromptSubmit) sid="$(_codex_sid "$json")"; _turn_begin "${sid:+codex:$sid}" ;;
-    Stop)             sid="$(_codex_sid "$json")"; _turn_end "${sid:+codex:$sid}" ;;
+    Stop)             sid="$(_codex_sid "$json")"; _turn_end "${sid:+codex:$sid}" "$sid" "$(_json_field transcript_path "$json")" ;;
   esac
   case "$event" in
     UserPromptSubmit)

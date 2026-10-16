@@ -308,14 +308,40 @@ chk "an unattended run prints nothing" "[ -z \"\$OUT\" ]"
 tmux set -g @radar-turn-stamp off
 claude_hook claude-clear '{"session_id":"ts3","cwd":"/tmp/proj"}' CLAUDE_CODE_SESSION_ATTENDED=1 >/dev/null
 OUT="$(claude_hook claude-stop '{"session_id":"ts3","cwd":"/tmp/proj"}' CLAUDE_CODE_SESSION_ATTENDED=1)"
-chk "@radar-turn-stamp off: nothing printed, the start still cleared" \
-  "[ -z \"\$OUT\" ] && [ ! -e '$TMUX_RADAR_STATE_DIR/turn-start/ts3' ]"
+chk "@radar-turn-stamp off: only the session line, the start still cleared" \
+  "[ \"\$(printf '%s' \"\$OUT\" | jq -r .systemMessage)\" = 'session ts3' ] && [ ! -e '$TMUX_RADAR_STATE_DIR/turn-start/ts3' ]"
 tmux set -gu @radar-turn-stamp
 claude_hook claude-clear '{"session_id":"ts4","cwd":"/tmp/proj"}' CLAUDE_CODE_SESSION_ATTENDED=1 >/dev/null
 claude_hook claude-end '{"session_id":"ts4","cwd":"/tmp/proj"}' CLAUDE_CODE_SESSION_ATTENDED=1 >/dev/null
 chk "a session's end drops its turn start" "[ ! -e '$TMUX_RADAR_STATE_DIR/turn-start/ts4' ]"
 chk "prompt and other events print nothing" \
   "[ -z \"\$(claude_hook claude-clear '{\"session_id\":\"ts5\",\"cwd\":\"/tmp/proj\"}' CLAUDE_CODE_SESSION_ATTENDED=1)\" ]"
+
+# --- session lines: the id and the transcript file, at start and turn end ----
+TP="$HOME/.claude/projects/-tmp-proj/ss1.jsonl"
+OUT="$(claude_hook claude-register "{\"session_id\":\"ss1\",\"cwd\":\"/tmp/proj\",\"transcript_path\":\"$TP\",\"source\":\"startup\"}" CLAUDE_CODE_SESSION_ATTENDED=1)"
+chk "session start shows the id, then the transcript file under ~" \
+  "[ \"\$(printf '%s' \"\$OUT\" | jq -r .systemMessage)\" = \"\$(printf 'session ss1\n~/.claude/projects/-tmp-proj/ss1.jsonl')\" ]"
+claude_hook claude-clear "{\"session_id\":\"ss1\",\"cwd\":\"/tmp/proj\",\"transcript_path\":\"$TP\"}" CLAUDE_CODE_SESSION_ATTENDED=1 >/dev/null
+OUT="$(claude_hook claude-stop "{\"session_id\":\"ss1\",\"cwd\":\"/tmp/proj\",\"transcript_path\":\"$TP\"}" CLAUDE_CODE_SESSION_ATTENDED=1)"
+chk "turn end shows the stamp, then the id, then the file" \
+  "printf '%s' \"\$OUT\" | jq -r .systemMessage | awk 'NR==1 && /^UTC .* turn took [0-9]+s\$/ {a=1} NR==2 && \$0==\"session ss1\" {b=1} NR==3 && \$0==\"~/.claude/projects/-tmp-proj/ss1.jsonl\" {c=1} END {exit !(a && b && c && NR==3)}'"
+OUT="$(claude_hook claude-stop '{"session_id":"ss4","cwd":"/tmp/proj"}' CLAUDE_CODE_SESSION_ATTENDED=1)"
+chk "a payload without a transcript path shows the id alone" \
+  "[ \"\$(printf '%s' \"\$OUT\" | jq -r .systemMessage | sed -n 2p)\" = 'session ss4' ] && [ \"\$(printf '%s' \"\$OUT\" | jq -r .systemMessage | wc -l | tr -d ' ')\" = 2 ]"
+OUT="$(claude_hook claude-register '{"session_id":"ss2","cwd":"/tmp/proj"}' CLAUDE_CODE_SESSION_ATTENDED=0)"
+chk "an unattended session start shows nothing" "[ -z \"\$OUT\" ]"
+tmux set -g @radar-session-info off
+OUT="$(claude_hook claude-register "{\"session_id\":\"ss3\",\"cwd\":\"/tmp/proj\",\"transcript_path\":\"$TP\"}" CLAUDE_CODE_SESSION_ATTENDED=1)"
+chk "@radar-session-info off: session start shows nothing" "[ -z \"\$OUT\" ]"
+OUT="$(claude_hook claude-stop "{\"session_id\":\"ss3\",\"cwd\":\"/tmp/proj\",\"transcript_path\":\"$TP\"}" CLAUDE_CODE_SESSION_ATTENDED=1)"
+chk "@radar-session-info off: turn end shows only the stamp" \
+  "[ \"\$(printf '%s' \"\$OUT\" | jq -r .systemMessage | wc -l | tr -d ' ')\" = 1 ] && printf '%s' \"\$OUT\" | jq -r .systemMessage | grep -q '^UTC '"
+tmux set -g @radar-turn-stamp off
+OUT="$(claude_hook claude-stop "{\"session_id\":\"ss3\",\"cwd\":\"/tmp/proj\",\"transcript_path\":\"$TP\"}" CLAUDE_CODE_SESSION_ATTENDED=1)"
+chk "both off: turn end prints nothing" "[ -z \"\$OUT\" ]"
+tmux set -gu @radar-turn-stamp
+tmux set -gu @radar-session-info
 echo
 echo "=============================="
 echo "PASS=$PASS FAIL=$FAIL"

@@ -376,17 +376,26 @@ chat). A claim `mkdir` per mark makes "once" hold across concurrent hooks, and
 only marks from the last 30 seconds qualify, so a restart announces nothing.
 
 Turn stamps go through the agent instead of tmux. Claude Code and Codex
-show the user a hook's `systemMessage`, so the stop hook prints one line,
-`UTC <start> → <end>  turn took <length>`, as its only stdout. Claude Code
-drops a `UserPromptSubmit` hook's `systemMessage` before display (it filters
-every attachment from that event out of the visible list), so the prompt
-hook prints nothing and only files the turn's start under
+show the user a hook's `systemMessage`, so the stop hook prints one
+message, `UTC <start> → <end>  turn took <length>`, as its only stdout.
+Claude Code drops a `UserPromptSubmit` hook's `systemMessage` before display
+(it filters every attachment from that event out of the visible list), so
+the prompt hook prints nothing and only files the turn's start under
 `$STATE_DIR/turn-start/<session>`. The stop reads and removes it, and a stop
 with no start on file says only when the turn ended. The stamp is written
 before the event is dispatched, because marking leaves early for team
 members and paused turns, whose turns still ended on someone's screen.
 An unattended run (`claude -p`, the SDK) or a headless Codex run gets none.
-`@radar-turn-stamp off` turns it off.
+
+Under the stamp come two session lines from the hook payload: `session
+<id>`, then `transcript_path` with the home dir shown as `~`, on a line of
+its own so it copies in one piece. Claude Code's `SessionStart` hook prints
+the same two lines (Claude Code shows that event's `systemMessage`, and
+multi-line messages render indented under the first line), so a session
+names itself on startup, resume, `/clear` and compaction. Codex gets them at
+turn end only, since radar does not hook Codex's `SessionStart`.
+`@radar-turn-stamp off` drops the stamp and `@radar-session-info off` the
+session lines.
 
 ### Chips, focus and clicks
 

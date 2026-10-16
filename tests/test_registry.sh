@@ -268,7 +268,9 @@ chk "codex mark key matches its registry key" \
 # the stop prints the stamp, keyed by the same session as the registry.
 printf '{"hook_event_name":"UserPromptSubmit","session_id":"codex-ts"}' | TMUX_PANE="$PANE" "$N" codex-hook >/dev/null
 chk "codex prompt files the turn start" "[ -s '$TMUX_RADAR_STATE_DIR/turn-start/codex_codex-ts' ]"
-CODEX_OUT="$(printf '{"hook_event_name":"Stop","session_id":"codex-ts","last_assistant_message":"ok"}' | TMUX_PANE="$PANE" "$N" codex-hook)"
+CODEX_OUT="$(printf '{"hook_event_name":"Stop","session_id":"codex-ts","transcript_path":"%s/.codex/sessions/2026/10/16/rollout-2026-10-16T12-00-00-codex-ts.jsonl","last_assistant_message":"ok"}' "$HOME" | TMUX_PANE="$PANE" "$N" codex-hook)"
+chk "codex stop shows the session id, then its rollout file under ~" \
+  "[ \"\$(printf '%s' \"\$CODEX_OUT\" | jq -r .systemMessage | sed -n '2,3p')\" = \"\$(printf 'session codex-ts\n~/.codex/sessions/2026/10/16/rollout-2026-10-16T12-00-00-codex-ts.jsonl')\" ]"
 chk "codex stop prints the stamp as its only output" \
   "printf '%s' \"\$CODEX_OUT\" | jq -r .systemMessage | grep -Eq '^UTC [0-9-]{10}T[0-9:]{8}Z → ([0-9-]{10}T)?[0-9:]{8}Z  turn took [0-9]+s\$'"
 "$N" clear-all

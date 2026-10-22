@@ -182,6 +182,14 @@ chk "status reports all 3 Codex hooks" \
 chk "status reports all 7 Kimi hooks" "printf '%s' \"\$STATUS\" | grep -q 'Kimi hooks installed: 7/7'"
 chk "status reports the opencode plugin" "printf '%s' \"\$STATUS\" | grep -qi 'opencode plugin: installed'"
 chk "status reports the pi extension" "printf '%s' \"\$STATUS\" | grep -qi 'pi extension: installed'"
+# a copy older than the checkout misses what the bridge learned since
+PI_EXT="$PI_AGENT_DIR/extensions/tmux-radar.ts"
+cp "$PI_EXT" "$T/pi-ext.keep"
+printf '// an older bridge\n' >> "$PI_EXT"
+PI_RC=0; PI_STATUS="$(bash "$IH" status 2>&1)" || PI_RC=$?
+chk "status reports an outdated pi extension and fails" \
+  "[ '$PI_RC' -ne 0 ] && printf '%s' \"\$PI_STATUS\" | grep -q 'pi extension: outdated'"
+cp "$T/pi-ext.keep" "$PI_EXT"
 chk "status reports Cursor, Droid, Gemini and Auggie in full" \
   "printf '%s' \"\$STATUS\" | grep -q 'Cursor hooks installed: 5/5' && printf '%s' \"\$STATUS\" | grep -q 'Droid hooks installed: 6/6' && printf '%s' \"\$STATUS\" | grep -q 'Gemini hooks installed: 6/6' && printf '%s' \"\$STATUS\" | grep -q 'Auggie hooks installed: 4/4'"
 

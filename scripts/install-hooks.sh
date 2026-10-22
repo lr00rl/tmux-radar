@@ -748,20 +748,26 @@ pi_present() {
   [ -d "$(dirname "$PI_EXT_DIR")" ] || command -v pi >/dev/null 2>&1
 }
 
+# _pi_render <out>: the extension as install writes it, notifier path filled in
+_pi_render() {
+  local src="$SCRIPT_DIR/pi-tmux-notify.ts" esc
+  [ -f "$src" ] || die "$src not found"
+  case "$NOTIFY" in
+    *'"'*|*\\*|*$'\n'*) die "notify path cannot be represented safely in TypeScript: $NOTIFY" ;;
+  esac
+  esc="$(_esc_rhs "$NOTIFY")"
+  sed "s#__TMUX_RADAR_NOTIFY__#$esc#g" "$src" > "$1"
+}
+
 pi_install() {
   if ! pi_present; then
     info "pi not found (no ~/.pi/agent, no 'pi' on PATH) - skipped"
     return 0
   fi
-  local src="$SCRIPT_DIR/pi-tmux-notify.ts" tmp esc
-  [ -f "$src" ] || die "$src not found"
+  local tmp
   mkdir -p "$PI_EXT_DIR"
   tmp="$(mktemp "${TMPDIR:-/tmp}/radar-pi.XXXXXX")"
-  case "$NOTIFY" in
-    *'"'*|*\\*|*$'\n'*) die "notify path cannot be represented safely in TypeScript: $NOTIFY" ;;
-  esac
-  esc="$(_esc_rhs "$NOTIFY")"
-  sed "s#__TMUX_RADAR_NOTIFY__#$esc#g" "$src" > "$tmp"
+  _pi_render "$tmp"
   if [ -f "$PI_EXTENSION" ] && ! cmp -s "$tmp" "$PI_EXTENSION"; then
     backup_file "$PI_EXTENSION"
   fi
@@ -778,10 +784,23 @@ pi_uninstall() {
   fi
 }
 
+# A copy older than this checkout misses what the bridge learned since, so it
+# is reported, like a drifted Kimi block. Running pi sessions keep the copy
+# they loaded until /reload.
 pi_status() {
-  if ! pi_present; then echo "pi: not installed (skipped)"
-  elif [ -f "$PI_EXTENSION" ]; then echo "pi extension: installed"
-  else echo "pi extension: absent"; fi
+  local tmp rc=0
+  if ! pi_present; then echo "pi: not installed (skipped)"; return 0; fi
+  if [ ! -f "$PI_EXTENSION" ]; then echo "pi extension: absent"; return 0; fi
+  tmp="$(mktemp "${TMPDIR:-/tmp}/radar-pi.XXXXXX")"
+  _pi_render "$tmp"
+  if cmp -s "$tmp" "$PI_EXTENSION"; then
+    echo "pi extension: installed"
+  else
+    echo "pi extension: outdated ($PI_EXTENSION); rerun install, then /reload in live pi sessions"
+    rc=1
+  fi
+  rm -f "$tmp"
+  return "$rc"
 }
 
 # Droid, Gemini and Auggie read Claude's hook layout from their own settings

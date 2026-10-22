@@ -328,6 +328,15 @@ GENERIC_MARK_KEY="$(awk -F '\t' '$3=="demo" { print $4; exit }' "$MARKS")"
 chk "generic agent-event uses one session key for registry and mark" \
   "[ '$GENERIC_REG_KEY' = 's:generic-1' ] && [ '$GENERIC_MARK_KEY' = '$GENERIC_REG_KEY' ]"
 jq -cn --arg sid generic-1 --arg pane "$PANE" --argjson pid "$$" \
+  '{session_id:$sid,pane:$pane,pid:$pid,process:"bash",label:"429 rate limited"}' |
+  "$N" agent-event demo turn_failed
+chk "generic turn_failed replaces the session's mark with a failed turn" \
+  "[ \"\$(awk -F'\t' '\$4==\"s:generic-1\" { print \$5 }' '$MARKS')\" = 'demo turn failed: 429 rate limited' ]"
+chk "a failed turn leaves the session done" \
+  "awk -F'\t' '\$2==\"s:generic-1\" && \$7==\"done\"' '$REG' | grep -q ."
+chk "a failed turn is a notice, not a finished turn" \
+  "[ \"\$(. '$WT/scripts/radar-level.sh'; radar_level demo 'demo turn failed: 429 rate limited')\" = notice ]"
+jq -cn --arg sid generic-1 --arg pane "$PANE" --argjson pid "$$" \
   '{session_id:$sid,pane:$pane,pid:$pid,process:"bash"}' |
   "$N" agent-event demo session_end
 chk "generic session_end removes action and registry state" \

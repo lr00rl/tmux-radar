@@ -336,7 +336,7 @@ by a different one changes nothing, since that agent reports through hooks of
 its own. Only Claude's paneless hooks are placed by working directory: any
 other agent's event without a pane comes from a desktop app (the Cursor
 editor runs the same hook file) and is dropped. Agents with no approval event
-(pi, Cursor, Auggie) and agents with no hooks (Amp) rely on the scanner for
+(Cursor, Auggie) and agents with no hooks (Amp) rely on the scanner for
 waits; Cursor's status title makes its approvals visible when the user turns
 it on.
 
@@ -396,6 +396,14 @@ names itself on startup, resume, `/clear` and compaction. Codex gets them at
 turn end only, since radar does not hook Codex's `SessionStart`.
 `@radar-turn-stamp off` drops the stamp and `@radar-session-info off` the
 session lines.
+
+pi has no hook output to show, so its bridge writes the same lines itself
+with `ctx.ui.notify`, a status line under the transcript that is neither sent
+to the model nor saved in the session file. The bridge times the run in
+process, from `agent_start` to `agent_settled`, formats it exactly as
+`_turn_text` does, and reads the two options with `tmux show-options` at
+each settle. A session start, a resume, `/new` and `/fork` show the session
+lines; `/reload` does not.
 
 ### Chips, focus and clicks
 
@@ -565,12 +573,17 @@ aimed at a foreign tmux server (Claude teammate swarms run under
    adopted `p:<pid>` row. That is how sessions started before hook install,
    and agents without an adapter, still reach the board. A pane owned by a
    hook-claimed session of an agent that reports approvals and finished turns
-   natively (Claude, Codex, Kimi, OpenCode) gets no synthesized mark at all:
-   every real transition there arrives as an event, and the screen adds only
-   redraw (a resize, a banner) read as work. pi has no approval event, so its
-   panes keep the floor, and the mark carries the owning session key so pi's
-   own events clear it. A synthesized mark never replaces an existing unread
-   one.
+   natively (Claude, Codex, Kimi, OpenCode, pi) gets no synthesized mark at
+   all: every real transition there arrives as an event, and the screen adds
+   only redraw (a resize, a banner) read as work. pi joined that list once
+   its bridge reported dialogs (`ui_prompt_start`): before, a pi blocked on
+   pi-permission-system's approval, or running a tool that prints nothing,
+   showed a static screen and was flagged as finished. A pi session still
+   running the older bridge, which keyed sessions by pid and reported no
+   dialogs, keeps the floor until `/reload`. Where a hook-owned
+   pane still gets a synthesized mark, the mark carries the owning session
+   key so that session's own events clear it. A synthesized mark never
+   replaces an existing unread one.
 6. Recent and Tree rows aggregate per-pane states into window badges, and
    `Ctrl-a` shows the live fleet. Both surfaces are deliberately lossy in the
    same direction: a finished turn stays in the Inbox review queue, and an
@@ -698,9 +711,9 @@ Required end-to-end checks:
 19. A Stop with agent work in flight, or with a wakeup pending in a turn the
     schedule started, writes no mark; a background shell does not suppress
     one; a turn the user started is finished while a loop is armed.
-20. A hook-owned pane of a natively reporting agent gets no synthesized mark
-    on a working to stalled transition; a hook-owned pi pane gets one keyed by
-    its session.
+20. A hook-owned pane of a natively reporting agent, pi included, gets no
+    synthesized mark on a working to stalled transition; a hook-owned pane of
+    an agent with no approval event gets one keyed by its session.
 21. Every removal of a mark restores the pane title, done-ttl expiry included,
     and a focus-clear that lands during a tick strands no status title.
 22. Chip text is literal: a `#` in a window or directory name is doubled

@@ -232,8 +232,9 @@ chk "a hook-owned Claude pane gets no synthesized mark" \
   "! awk -F'\t' -v p='$OPANE' '\$1==p' '$MARKS' | grep -q ."
 tmux kill-window -t "$OPANE" 2>/dev/null || true
 
-# pi reports finished turns but has no approval event, so its panes keep the
-# scanner floor; the mark carries the session key so pi's own events clear it
+# pi's bridge reports the dialogs it blocks on and the run's final settle, so
+# a still pi screen (an approval dialog, a tool that prints nothing) is not
+# a finished turn
 tmux new-window -n piowned "$T/lib/pi-coding-agent/cli.js"
 PO_PANE="$(tmux display-message -p '#{pane_id}')"
 tmux select-window -t 0
@@ -242,11 +243,47 @@ force_scan
 PO_PID="$(awk -F'\t' -v p="$PO_PANE" '$4==p && $2 ~ /^p:/ { print $3; exit }' "$REG")"
 printf 'pi\ts:pi-owned\t%s\t%s\t100\t100\tworking\t/tmp\tpi\n' "$PO_PID" "$PO_PANE" >> "$REG"
 force_scan
-chk "a hook-owned pi pane still gets the synthesized mark" \
-  "[ -n '$PO_PID' ] && awk -F'\t' -v p='$PO_PANE' '\$1==p && \$5 ~ /finished.*scan/' '$MARKS' | grep -q ."
-chk "that mark is keyed by the owning session, not the pid" \
-  "awk -F'\t' -v p='$PO_PANE' '\$1==p && \$4==\"s:pi-owned\"' '$MARKS' | grep -q ."
+chk "the hook-owned pi pane made the working to stalled transition" \
+  "[ -n '$PO_PID' ] && awk -F'\t' -v p='$PO_PANE' '\$1==p && \$3==\"stalled\"' '$LIVE' | grep -q ."
+chk "a hook-owned pi pane gets no synthesized mark" \
+  "! awk -F'\t' -v p='$PO_PANE' '\$1==p' '$MARKS' | grep -q ."
 tmux kill-window -t "$PO_PANE" 2>/dev/null || true
+
+# a pi still running the older bridge (sessions keyed by pid, no dialogs) keeps
+# the floor until it reloads
+tmux new-window -n piold "$T/lib/pi-coding-agent/cli.js"
+PL_PANE="$(tmux display-message -p '#{pane_id}')"
+tmux select-window -t 0
+sleep 1
+force_scan
+PL_PID="$(awk -F'\t' -v p="$PL_PANE" '$4==p && $2 ~ /^p:/ { print $3; exit }' "$REG")"
+printf 'pi\ts:%s\t%s\t%s\t100\t100\tworking\t/tmp\tpi\n' "$PL_PID" "$PL_PID" "$PL_PANE" >> "$REG"
+force_scan
+chk "an old-bridge pi pane still gets the synthesized mark" \
+  "[ -n '$PL_PID' ] && awk -F'\t' -v p='$PL_PANE' '\$1==p && \$5 ~ /finished.*scan/' '$MARKS' | grep -q ."
+tmux kill-window -t "$PL_PANE" 2>/dev/null || true
+
+# Auggie reports finished turns but has no approval event, so its panes keep
+# the scanner floor; the mark carries the session key so its own events
+# clear it
+cat > "$T/start-auggie.sh" <<EOF
+#!/usr/bin/env bash
+printf 'waiting at a prompt\n'
+exec -a "$T/bin2/auggie" sleep 600
+EOF
+tmux new-window -n auowned "bash $T/start-auggie.sh"
+AU_PANE="$(tmux display-message -p '#{pane_id}')"
+tmux select-window -t 0
+sleep 1
+force_scan
+AU_PID="$(awk -F'\t' -v p="$AU_PANE" '$4==p && $2 ~ /^p:/ { print $3; exit }' "$REG")"
+printf 'auggie\ts:au-owned\t%s\t%s\t100\t100\tworking\t/tmp\tauggie\n' "$AU_PID" "$AU_PANE" >> "$REG"
+force_scan
+chk "a hook-owned Auggie pane still gets the synthesized mark" \
+  "[ -n '$AU_PID' ] && awk -F'\t' -v p='$AU_PANE' '\$1==p && \$5 ~ /finished.*scan/' '$MARKS' | grep -q ."
+chk "that mark is keyed by the owning session, not the pid" \
+  "awk -F'\t' -v p='$AU_PANE' '\$1==p && \$4==\"s:au-owned\"' '$MARKS' | grep -q ."
+tmux kill-window -t "$AU_PANE" 2>/dev/null || true
 
 # a member of a Claude agent team going quiet is its lead's news, not yours
 cat > "$T/start-teammate.sh" <<EOF

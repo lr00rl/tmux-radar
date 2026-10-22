@@ -147,7 +147,7 @@ printf '%s\n' "$hook_json" |
 
 Allowed normalized events are `session_start`, `approval`,
 `approval_resolved`, `input_required`, `user_resumed`, `turn_complete`,
-`interrupt`, and `session_end`. The payload must be valid JSON and identify a
+`turn_failed`, `interrupt`, and `session_end`. The payload must be valid JSON and identify a
 session; pane, PID/process, cwd, and label are accepted as resolution evidence.
 The notifier validates agent/event names, resolves the owning pane, updates the
 same registry/mark key, and emits a sanitized supervisor event. Agent-specific

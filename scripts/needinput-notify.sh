@@ -329,13 +329,18 @@ _agent_sources() {
 }
 
 # Agents whose adapter reports both approval waits and finished turns as native
-# events. The scanner synthesizes nothing on a pane such a session owns. pi,
-# Cursor and Auggie are absent on purpose (no approval event), and so is any
-# agent wired through the generic agent-event adapter, whose coverage radar
-# cannot know.
-_native_events() {  # _native_events <kind>
+# events. The scanner synthesizes nothing on a pane such a session owns. pi
+# reports a dialog an extension opens mid-run (pi-permission-system's
+# approvals) and the run's final settle; the screen alone reads a pi blocked
+# on a dialog as finished. The older pi bridge reported no dialogs and keyed
+# its session by pid, so a pi still running that copy (until /reload) keeps
+# the scanner floor. Cursor and Auggie are absent on purpose (no approval
+# event), and so is any agent wired through the generic agent-event adapter,
+# whose coverage radar cannot know.
+_native_events() {  # _native_events <kind> [session key]
   case "${1:-}" in
     claude|codex|kimi|opencode|grok|droid|gemini) return 0 ;;
+    pi) case "${2:-}" in s:*[!0-9]*) return 0 ;; esac ;;
   esac
   return 1
 }
@@ -1431,7 +1436,7 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
     skey="p:${apid}"; synth=1
     if [ "$claimed" = 2 ] && [ "$okind" = "$kind" ] && [ "$okey" != "-" ]; then
       skey="$okey"
-      _native_events "$kind" && synth=0
+      _native_events "$kind" "$okey" && synth=0
     fi
     if [ "$synth" = 1 ] && [ "$claimed" -ge 1 ] && [ "$onscreen" = 0 ] && [ "$hasmark" = 0 ]; then
       kn="$(_agent_display_name "$kind")"
@@ -2345,7 +2350,7 @@ _agent_kind_valid() {
 
 _agent_event_valid() {
   case "${1:-}" in
-    session_start|approval|approval_resolved|input_required|user_resumed|turn_complete|interrupt|session_end) return 0 ;;
+    session_start|approval|approval_resolved|input_required|user_resumed|turn_complete|turn_failed|interrupt|session_end) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -2457,6 +2462,12 @@ _agent_event_apply() {  # <agent-kind> <normalized-event> <one JSON object>
     turn_complete)
       _reg_upsert_locked "$kind" "$key" "$pid" "$pane" "done" "$cwd" "$proc"
       label="$display finished - your turn${detail:+: $detail}"
+      [ "$(opt @radar-needinput on)" = "on" ] &&
+        _session_mark_locked "$pane" "$kind" "$label" "$key"
+      ;;
+    turn_failed)
+      _reg_upsert_locked "$kind" "$key" "$pid" "$pane" "done" "$cwd" "$proc"
+      label="$display turn failed${detail:+: $detail}"
       [ "$(opt @radar-needinput on)" = "on" ] &&
         _session_mark_locked "$pane" "$kind" "$label" "$key"
       ;;

@@ -207,8 +207,8 @@ Set these **before** the plugin loads:
 | `@radar-toast-levels` | `action done notice` | Levels that toast. |
 | `@radar-toast-duration` | `5000` | Milliseconds a toast stays up. |
 | `@radar-notify-command` | (none) | Shell command run once per new mark with `RADAR_LEVEL`, `RADAR_AGENT`, `RADAR_LABEL`, `RADAR_WHERE`, `RADAR_PANE`, `RADAR_SESSION`, `RADAR_KEY`, `RADAR_WATCHED` and `RADAR_TEXT` set. See [notifications](docs/guides/notifications.md). |
-| `@radar-turn-stamp` | `on` | At each turn's end, Claude Code and Codex show `UTC <start> → <end>  turn took <length>`. `off` leaves it out. |
-| `@radar-session-info` | `on` | At each turn's end, and when a Claude Code session starts, show `session <id>` and the transcript file. `off` leaves them out. |
+| `@radar-turn-stamp` | `on` | At each turn's end, Claude Code, Codex and pi show `UTC <start> → <end>  turn took <length>`. `off` leaves it out. |
+| `@radar-session-info` | `on` | At each turn's end, and when a Claude Code or pi session starts, show `session <id>` and the transcript file. `off` leaves them out. |
 | `@radar-claude-bg-ignore` | `~/.claude:~/.claude-mem` | Colon-separated path prefixes; background sessions whose cwd starts with one (plugin observers, SDK helpers) are not tracked. |
 
 Example:
@@ -252,7 +252,7 @@ once. The installer wires every agent it finds and skips the rest:
 | Codex | `~/.codex/hooks.json` + `notify` | `PermissionRequest` | `Stop` |
 | Kimi Code | marker block in its `config.toml` | `PermissionRequest` | `Stop` |
 | OpenCode | `~/.config/opencode/plugins/` | permission and question events | idle |
-| pi | `~/.pi/agent/extensions/` | none: a wait reads as a stalled pane | `agent_end` |
+| pi | `~/.pi/agent/extensions/` | `ui_prompt_start`, a dialog an extension opens mid-run | `agent_settled` |
 | Grok Build | runs Claude's hooks as they are | `Notification` | `Stop`, with the answer's first line |
 | Cursor CLI | `~/.cursor/hooks.json` | its pane title, with `display.showStatusIndicators` on | `stop` |
 | Factory Droid | `~/.factory/settings.json` | `Notification` | `Stop` |
@@ -296,9 +296,12 @@ Permission requests, structured questions, replies, idle completion, errors,
 and deletion are ordered by session/generation before changing marks. When pi
 is installed, the installer drops a small in-process extension at
 `~/.pi/agent/extensions/tmux-radar.ts` (auto-discovered; `/reload` picks it up
-in live sessions) bridging `session_start` / interactive `input` / `agent_end`
-/ `session_shutdown`. pi exposes no approval-request event, so its permission
-waits are covered by the live scanner instead. For Cursor, Droid, Gemini and
+in live sessions). It reports a run's start, a dialog an extension opens
+during a run (pi asks for nothing itself; pi-permission-system's approvals
+arrive this way), and the run's final settle as finished, failed or
+interrupted, after any automatic retry, compaction or queued message. At
+each settle it shows the turn stamp and session lines that Claude Code and
+Codex get. For Cursor, Droid, Gemini and
 Auggie the installer merges hook entries into the files in the table and
 writes a backup only when a file changes. Existing
 user hooks, trust entries, notify chains, and symlinked config paths are
@@ -346,7 +349,7 @@ only hooks provide is the *unread event* itself (board rows, chips, retitles)
 An observed transition on an off-screen pane (into blocked, or from
 working into stalled) also synthesizes exactly one board event, so hookless
 sessions still reach the Inbox-equivalent surface once per real change. This
-is all radar knows of Amp. pi, Cursor and Auggie report finished turns but
+is all radar knows of Amp. Cursor and Auggie report finished turns but
 have no approval event, so a pane waiting on approval reads as stalled and
 is flagged as a finished turn, unless the title says otherwise. Cursor does,
 when `display.showStatusIndicators` is `true` in `~/.cursor/cli-config.json`:

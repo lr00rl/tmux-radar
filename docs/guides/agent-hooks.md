@@ -205,9 +205,15 @@ approval_resolved
 input_required
 user_resumed
 turn_complete
+turn_failed
 interrupt
 session_end
 ```
+
+`turn_failed` is a turn that ended on an error, such as an API failure after
+the agent's own retries. It marks the session done with the label
+`<Agent> turn failed[: <label>]`, a notice rather than a finished turn, the
+same as Claude Code's `StopFailure`.
 
 The notifier owns locking, identity, registry rows, marks, watcher inbox
 events, notification labels, and cleanup. An adapter must never write the

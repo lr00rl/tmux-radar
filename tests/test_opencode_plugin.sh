@@ -215,31 +215,143 @@ chk "a flag ahead of the subcommand does not hide it" \
 chk "the word run inside a path is no subcommand" \
   "[ \"\$(node '$T/headless.mjs' '$T/plugin.mjs' /work/run/project)\" -gt 0 ]"
 
-# pi loads its extensions in print, json and rpc mode as well; only the TUI
-# has a person in front of it.
-sed "s#__TMUX_RADAR_NOTIFY__#$escaped#g" "$WT/scripts/pi-tmux-notify.ts" > "$T/pi-bridge.mjs"
+# pi: the bridge runs in-process, so drive its handlers the way pi fires them.
+# The fake notifier, called as `agent-event pi <event>`, logs
+# "<event>\t<payload>"; it can stall one event to show
+# that the next one still lands after it. The fake tmux answers the two
+# display options from the environment.
+cat > "$T/pi-notify" <<'SH'
+#!/usr/bin/env bash
+payload="$(cat)"
+# a notifier that ignores TERM and never returns
+if [ "${3:-}" = "${PI_HANG_EVENT:-}" ]; then trap '' TERM; exec sleep 30; fi
+[ "${3:-}" != "${PI_SLOW_EVENT:-}" ] || sleep 0.4
+printf '%s\t%s\n' "${3:-}" "$payload" >> "$PI_EVENT_LOG"
+SH
+mkdir -p "$T/fakebin"
+cat > "$T/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${3:-}" in
+  @radar-turn-stamp) printf '%s\n' "${FAKE_TURN_STAMP:-}" ;;
+  @radar-session-info) printf '%s\n' "${FAKE_SESSION_INFO:-}" ;;
+esac
+SH
+chmod +x "$T/pi-notify" "$T/fakebin/tmux"
+pi_escaped="$(printf '%s' "$T/pi-notify" | sed 's/[&#\]/\\&/g')"
+sed "s#__TMUX_RADAR_NOTIFY__#$pi_escaped#g" "$WT/scripts/pi-tmux-notify.ts" > "$T/pi-bridge.mjs"
+chk "pi bridge parses as plain JS" "node --check '$T/pi-bridge.mjs'"
 cat > "$T/pi-run.mjs" <<'JS'
-const { default: bridge } = await import(process.argv[2]);
+const [bridgePath, scenario, mode] = process.argv.slice(2);
+const { default: bridge } = await import(bridgePath);
 const handlers = {};
 bridge({ on: (name, fn) => { handlers[name] = fn; } });
-const ctx = { cwd: "/tmp/pi-project" };
-if (process.argv[3] !== "none") ctx.mode = process.argv[3];
-handlers.session_start({}, ctx);
-handlers.input({ source: "interactive" }, ctx);
-handlers.agent_end({}, ctx);
-await new Promise((resolve) => setTimeout(resolve, 400));
-JS
-pi_events() {  # pi_events <ctx.mode|none>: how many events reached the notifier
-  export OPENCODE_EVENT_LOG="$T/pi-$1.jsonl" OPENCODE_PID_LOG="$T/pi-$1.pids"
-  : > "$OPENCODE_EVENT_LOG"
-  node "$T/pi-run.mjs" "$T/pi-bridge.mjs" "$1"
-  grep -c . "$OPENCODE_EVENT_LOG" || true
+const notes = [];
+const ctx = { cwd: process.env.PI_CWD || "/tmp/pi-project", hasUI: true, ui: { notify: (text) => notes.push(text) } };
+if (mode !== "none") ctx.mode = mode;
+if (!process.env.PI_NO_SESSION) {
+  ctx.sessionManager = {
+    getSessionId: () => "sess-1",
+    getSessionFile: () => `${process.env.HOME}/.pi/agent/sessions/--tmp-pi-project--/s1.jsonl`,
+  };
 }
-chk "pi in its TUI reports every turn boundary" "[ \"\$(pi_events tui)\" = 3 ]"
-chk "pi in print mode reports nothing" "[ \"\$(pi_events print)\" = 0 ]"
-chk "pi in json mode reports nothing" "[ \"\$(pi_events json)\" = 0 ]"
-chk "pi in rpc mode reports nothing" "[ \"\$(pi_events rpc)\" = 0 ]"
-chk "a pi that does not say its mode is served as before" "[ \"\$(pi_events none)\" = 3 ]"
+const said = (stopReason, errorMessage) => ({ messages: [{ role: "assistant", stopReason, errorMessage }] });
+const start = ["session_start", { reason: "startup" }];
+const settle = (outcome, aborted = false) => [["agent_before_settle", { outcome }], ["agent_settled", { aborted }]];
+const steps = {
+  run: [start, ["agent_start"], ["agent_end", said("stop")], ...settle("completed")],
+  approval: [start, ["agent_start"],
+    ["ui_prompt_start", { kind: "select", title: "Permission Required\nCurrent agent requested bash command 'rm -rf x'" }],
+    ["ui_prompt_end", { kind: "select" }],
+    ["agent_end", said("stop")], ...settle("completed")],
+  question: [start, ["agent_start"], ["ui_prompt_start", { kind: "input", title: "Which target?" }],
+    ["ui_prompt_end", { kind: "input" }], ["agent_end", said("stop")], ...settle("completed")],
+  idle_dialog: [start, ["ui_prompt_start", { kind: "select", title: "Pick a model" }], ["ui_prompt_end", { kind: "select" }]],
+  retry: [start, ["agent_start"], ["agent_end", said("error", "overloaded")],
+    ["agent_start"], ["agent_end", said("stop")], ...settle("completed")],
+  failed: [start, ["agent_start"], ["agent_end", said("error", "429 Too Many Requests\nretry later")], ...settle("error")],
+  aborted: [start, ["agent_start"], ["agent_end", said("aborted")], ...settle("aborted", true)],
+  settle_only: [start, ...settle("completed")],
+  reload: [["session_start", { reason: "reload" }]],
+  shutdown: [start, ["session_shutdown", { reason: "quit" }]],
+};
+for (const [name, event = {}] of steps[scenario]) await handlers[name]?.(event, ctx);
+await new Promise((resolve) => setTimeout(resolve, Number(process.env.PI_WAIT || 700)));
+process.stdout.write(JSON.stringify(notes));
+JS
+pi_run() {  # pi_run <scenario> <ctx.mode|none>: events to $PI_EVENT_LOG, notes on stdout
+  export PI_EVENT_LOG="$T/pi-$1-$2.log"
+  : > "$PI_EVENT_LOG"
+  PATH="$T/fakebin:$PATH" TMUX_PANE="${PI_PANE-%9}" node "$T/pi-run.mjs" "$T/pi-bridge.mjs" "$1" "$2"
+}
+pi_events() { pi_run "$1" "$2" >/dev/null; cut -f1 "$PI_EVENT_LOG" | paste -sd' ' -; }
+pi_field() {  # pi_field <scenario> <event> <field>: from that scenario's last TUI run
+  awk -F'\t' -v e="$2" '$1 == e { print $2; exit }' "$T/pi-$1-tui.log" | jq -r ".$3"
+}
+
+# only the TUI has a person in front of it
+chk "pi in its TUI reports a run's start and end" \
+  "[ \"\$(pi_events run tui)\" = 'session_start user_resumed turn_complete' ]"
+chk "pi in print mode reports nothing" "[ -z \"\$(pi_events run print)\" ]"
+chk "pi in json mode reports nothing" "[ -z \"\$(pi_events run json)\" ]"
+chk "pi in rpc mode reports nothing" "[ -z \"\$(pi_events run rpc)\" ]"
+chk "a pi that does not say its mode is served as before" \
+  "[ \"\$(pi_events run none)\" = 'session_start user_resumed turn_complete' ]"
+pi_run run tui >/dev/null
+chk "pi events carry pi's own session id" "[ \"\$(pi_field run turn_complete session_id)\" = sess-1 ]"
+PI_NO_SESSION=1 pi_run run tui >/dev/null
+chk "a pi with no session manager is keyed by its pid" \
+  "[ \"\$(pi_field run turn_complete session_id)\" -gt 0 ] 2>/dev/null"
+
+# dialogs: an approval mid-run is one, a dialog between runs is not
+chk "an approval dialog mid-run marks the session and its answer clears it" \
+  "[ \"\$(pi_events approval tui)\" = 'session_start user_resumed approval approval_resolved turn_complete' ]"
+chk "the dialog's title becomes one line of label" \
+  "[ \"\$(pi_field approval approval label)\" = \"Permission Required Current agent requested bash command 'rm -rf x'\" ]"
+chk "a question mid-run asks for input" \
+  "[ \"\$(pi_events question tui)\" = 'session_start user_resumed input_required approval_resolved turn_complete' ]"
+chk "a dialog between runs is the person's own and reports nothing" \
+  "[ \"\$(pi_events idle_dialog tui)\" = 'session_start' ]"
+PI_SLOW_EVENT=approval_resolved PI_WAIT=2000 pi_run approval tui >/dev/null
+chk "a slow event still reaches radar before the one fired after it" \
+  "[ \"\$(cut -f1 '$PI_EVENT_LOG' | paste -sd' ' -)\" = 'session_start user_resumed approval approval_resolved turn_complete' ]"
+
+# agent_end is not the end of a run; agent_settled is, and says how it ended
+chk "an automatic retry after agent_end is the same run" \
+  "[ \"\$(pi_events retry tui)\" = 'session_start user_resumed turn_complete' ]"
+chk "a run that settles on an error is a failed turn" \
+  "[ \"\$(pi_events failed tui)\" = 'session_start user_resumed turn_failed' ]"
+chk "the failed turn carries the error as one line" \
+  "[ \"\$(pi_field failed turn_failed label)\" = '429 Too Many Requests retry later' ]"
+chk "a run stopped with Escape is an interrupt, not a finished turn" \
+  "[ \"\$(pi_events aborted tui)\" = 'session_start user_resumed interrupt' ]"
+chk "quitting ends the session" "[ \"\$(pi_events shutdown tui)\" = 'session_start session_end' ]"
+chk "a settle with no run behind it reports nothing" \
+  "[ \"\$(pi_events settle_only tui)\" = 'session_start' ]"
+chk "and shows no stamp" "[ \"\$(pi_run settle_only tui | jq length)\" = 1 ]"
+PI_HANG_EVENT=approval_resolved PI_WAIT=11500 pi_run approval tui >/dev/null
+chk "a notifier that hangs is killed and the next event still goes out" \
+  "[ \"\$(cut -f1 '$T/pi-approval-tui.log' | paste -sd' ' -)\" = 'session_start user_resumed approval turn_complete' ]"
+PI_CWD="$(printf '/tmp/pi\tproject')" pi_run run tui >/dev/null
+chk "a working directory radar would reject is left out" \
+  "[ \"\$(grep -c . '$T/pi-run-tui.log')\" = 3 ] && [ \"\$(pi_field run turn_complete cwd)\" = '' ]"
+
+# the turn stamp and session lines Claude Code and Codex get
+PI_NOTES="$(pi_run run tui)"
+chk "a session start shows the session id and file" \
+  "[ \"\$(printf '%s' '$PI_NOTES' | jq -r '.[0]')\" = \"\$(printf 'session sess-1\n~/.pi/agent/sessions/--tmp-pi-project--/s1.jsonl')\" ]"
+chk "a run's end shows its start, end and length, then the session" \
+  "printf '%s' '$PI_NOTES' | jq -e '.[1] | test(\"^UTC [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z → ([0-9]{4}-[0-9]{2}-[0-9]{2}T)?[0-9:]{8}Z  turn took [0-9]+s\\nsession sess-1\\n~/.pi/agent/sessions/--tmp-pi-project--/s1.jsonl$\")' >/dev/null"
+PI_NOTES="$(FAKE_TURN_STAMP=off pi_run run tui)"
+chk "@radar-turn-stamp off leaves only the session lines" \
+  "printf '%s' '$PI_NOTES' | jq -e '.[1] | startswith(\"session sess-1\")' >/dev/null"
+PI_NOTES="$(FAKE_SESSION_INFO=off pi_run run tui)"
+chk "@radar-session-info off leaves only the stamp" \
+  "printf '%s' '$PI_NOTES' | jq -e 'length == 1 and (.[0] | test(\"turn took [0-9]+s$\"))' >/dev/null"
+chk "a reload shows nothing" "[ \"\$(pi_run reload tui)\" = '[]' ]"
+PI_NOTES="$(PI_PANE='' pi_run run tui)"
+chk "pi outside tmux reports nothing to radar" "! [ -s '$T/pi-run-tui.log' ]"
+chk "but still shows the stamp and session lines" \
+  "printf '%s' '$PI_NOTES' | jq -e 'length == 2' >/dev/null"
 
 echo
 echo "=============================="

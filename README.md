@@ -166,10 +166,10 @@ existing scripts but is no longer a documented product view.
 Tree deliberately scans as a compact hierarchy rather than a prose report:
 
 ```text
-▾ Openjobs-data                         8w
-  ├─  0 openjobs-data-spark          zsh · ~/project
-  ├─  7 tidb_123                  3p · ssh · ~
-  └─  8 scripts                      ssh · ~/Falcon
+▾ dev                                   8w
+  ├─  0 api                          zsh · ~/src/api
+  ├─  7 web                       3p · ssh · ~
+  └─  8 scripts                      ssh · ~/src/notes
 ```
 
 Single-pane windows omit the meaningless `1p`; only multi-pane windows show a

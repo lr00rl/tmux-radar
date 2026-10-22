@@ -14,7 +14,7 @@
   - live tmux state on 2026-08-20: a Codex session started before hook install was invisible to every surface; a Claude pane held an ACTION mark while observably working (approved in place); teammate-swarm registry rows pointed at panes of a foreign tmux server;
   - live tmux state on 2026-09-28: one pane held five registry rows because headless runs started from its agent's tool calls inherited `TMUX_PANE`; two hook-owned sessions idle for days carried scanner-synthesized DONE marks; one pane kept a `✓` title with no mark under it;
   - a probe on Claude Code 2.1.283: the hooks of a nested `claude -p` run see `CLAUDE_CODE_SESSION_ATTENDED=0` and `CLAUDE_CODE_ENTRYPOINT=sdk-cli`, and a Stop payload carries `background_tasks` and `session_crons`;
-  - the Claude Code 2.1.274 hook type reference vendored in `fast-jev-compaction` (`types/claude-code.d.ts`), read for the payload fields the adapter did not use;
+  - the Claude Code 2.1.274 hook type reference vendored in a compaction plugin (`types/claude-code.d.ts`), read for the payload fields the adapter did not use;
   - probes on 2026-09-28 in isolated tmux servers: Grok Build 1.0.41 ran the hooks in `~/.claude/settings.json` with a camelCase payload and did not load `~/.cursor/hooks.json`; Cursor CLI 2026.09.28 ran `~/.cursor/hooks.json` but not Claude's hooks, fired `stop` only in its TUI, and titled a pane `… - 🔐 Waiting for confirmation` during an approval with status indicators on; Droid 0.82.0 ran project hooks with snake_case fields and camelCase twins; Gemini, Auggie and Amp could not run a turn (not logged in, out of credits);
   - the local `cd-design-skill` Product/Deep design gates;
   - upstream fzf, tmux tree-mode, GitHub Notifications, Raycast, Warp, and Zellij documentation.
@@ -33,7 +33,7 @@ the Agents board, one key to get there).
 
 What happens inside a single session belongs to the agent and its plugins:
 context, compaction, approvals, the toast a plugin shows in its own
-transcript. An agent plugin such as `fast-jev-compaction` is that layer. It
+transcript. An agent plugin, such as one that manages compaction, is that layer. It
 speaks to the person already looking at the session. tmux-radar speaks to the
 person looking somewhere else.
 

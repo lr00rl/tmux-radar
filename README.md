@@ -384,6 +384,13 @@ normalized event contract and a copyable adapter.
   `CLAUDE_CODE_SESSION_ATTENDED=0` (or an `sdk-*` `CLAUDE_CODE_ENTRYPOINT`),
   the originator in a `codex exec` rollout, pi's `ctx.mode`, and OpenCode's
   `run` subcommand. The pane keeps reporting the agent that owns it.
+- **Codex's shared background server.** When Codex runs every TUI's turns in
+  one `codex app-server`, the hooks come from that server with the pane of
+  whichever TUI started it. radar places each session from the payload
+  instead: the Codex TUI in the session's folder whose pane you are looking
+  at, or the one whose screen shows the prompt you just sent. A prompt sent
+  from outside tmux places nothing, and a subagent's approval goes to the pane
+  of the session that started it. The turn stamp prints either way.
 - **Members of a Claude agent team.** The lead starts each member as
   `claude --agent-id … --agent-name … --team-name …`, often in a pane of its
   own. A member reports to its lead, and the lead's turn reports to you, so a

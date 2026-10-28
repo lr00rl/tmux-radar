@@ -47,6 +47,13 @@
 # a direct parent of the same kind that started within three seconds of its
 # child is skipped. A host that ran the same CLI through an exec-ing shell is
 # a direct parent of the same kind too, but it started long before.
+#
+# Codex can run every TUI's turns in one shared background server (`codex
+# app-server`, started by the first TUI and kept by `app-server daemon`). Its
+# hooks then descend from that server, whatever pane the session is in. Such
+# an agent is reported as a server (fifth field 1) and never as nested: the
+# Codex processes above it are the server's own launcher and the TUI that
+# happened to start it, not a host that ran it from a tool call.
 # shellcheck disable=SC2034  # consumed by the scripts that source this file
 RADAR_MATCH_AWK='
 function radar_norm(c) {
@@ -105,13 +112,18 @@ function radar_elapsed(etime,    n, f, days) {
   if (n == 2) return days * 86400 + f[1] * 60 + f[2]
   return days * 86400 + f[1]
 }
-function radar_firing(me, kind, want,    cur, hops, agent, is, top, up, gap, nested) {
+function radar_server(cmd) {
+  return (index(cmd " ", " app-server ") > 0) ? 1 : 0
+}
+function radar_firing(me, kind, want,    cur, hops, agent, is, top, up, gap, nested, server) {
   agent = ""; is = ""; cur = me
   for (hops = 0; hops < 60 && cur != "" && cur != "0" && cur != "1"; hops++) {
     if (cur in cmd) { is = radar_kind(cmd[cur], kind, want); if (is != "") { agent = cur; break } }
     cur = par[cur]
   }
   if (agent == "") return ""
+  server = (is == "codex") ? radar_server(cmd[agent]) : 0
+  if (server) return agent "\t" radar_proc(cmd[agent], is) "\t0\t" is "\t1"
   top = agent
   for (hops = 0; hops < 8; hops++) {
     up = par[top]
@@ -125,6 +137,6 @@ function radar_firing(me, kind, want,    cur, hops, agent, is, top, up, gap, nes
     if ((cur in cmd) && radar_kind(cmd[cur], "", want) != "") { nested = 1; break }
     cur = par[cur]
   }
-  return agent "\t" radar_proc(cmd[agent], is) "\t" nested "\t" is
+  return agent "\t" radar_proc(cmd[agent], is) "\t" nested "\t" is "\t0"
 }
 '

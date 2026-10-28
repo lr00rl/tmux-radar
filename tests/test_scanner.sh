@@ -106,20 +106,30 @@ chk "an agent started from a pane shell fired for itself" \
   "[ \"\$(firing claude '900 500 00:01 bash needinput-notify.sh claude-stop
 500 400 02:10:00 claude --permission-mode default
 400 300 03:00:00 -zsh
-300 1 1-00:00:00 tmux')\" = '500 claude 0 claude' ]"
+300 1 1-00:00:00 tmux')\" = '500 claude 0 claude 0' ]"
 chk "a claude -p run inside another agent's tool call is nested" \
   "[ \"\$(firing claude '900 800 00:01 bash needinput-notify.sh claude-stop
 800 700 00:09 claude -p say-ok
 700 500 00:10 /bin/zsh -c source snapshot.sh && claude -p say-ok
 500 400 02:10:00 claude --permission-mode default
 400 300 03:00:00 -zsh
-300 1 1-00:00:00 tmux')\" = '800 claude 1 claude' ]"
+300 1 1-00:00:00 tmux')\" = '800 claude 1 claude 0' ]"
 chk "a codex launcher and the binary it spawned are one agent" \
   "[ \"\$(firing codex '900 600 00:01 bash needinput-notify.sh codex-hook
 600 500 10:00 /x/node_modules/@openai/codex/vendor/aarch64/codex/codex
 500 400 10:01 node /x/lib/node_modules/@openai/codex/bin/codex.js
 400 300 03:00:00 -zsh
-300 1 1-00:00:00 tmux')\" = '600 codex 0 codex' ]"
+300 1 1-00:00:00 tmux')\" = '600 codex 0 codex 0' ]"
+# The shape seen on a real machine: the first Codex TUI (pane %18) started the
+# shared server and its daemon three days ago; a TUI in another pane attached
+# later, and its session's hook runs under the server.
+chk "a hook run by the shared codex app-server is a server event, never nested" \
+  "[ \"\$(firing codex '900 810 00:01 bash needinput-notify.sh codex-hook
+810 360 20:00:00 /h/.codex/packages/standalone/releases/0.165.0/bin/codex app-server --remote-control --listen unix://
+360 350 3-18:00:00 /h/.codex/packages/standalone/releases/0.165.0/bin/codex app-server daemon pid-update-loop
+350 340 3-18:00:01 codex
+340 300 3-18:00:05 -zsh
+300 1 4-00:00:00 tmux')\" = '810 codex 0 codex 1' ]"
 chk "codex exec run by a claude session is nested" \
   "[ \"\$(firing codex '900 800 00:01 bash needinput-notify.sh codex-hook
 800 750 00:20 /x/node_modules/@openai/codex/vendor/aarch64/codex/codex exec fix-it
@@ -127,7 +137,7 @@ chk "codex exec run by a claude session is nested" \
 700 500 00:21 /bin/zsh -c codex exec fix-it; echo done
 500 400 02:10:00 claude
 400 300 03:00:00 -zsh
-300 1 1-00:00:00 tmux')\" = '800 codex 1 codex' ]"
+300 1 1-00:00:00 tmux')\" = '800 codex 1 codex 0' ]"
 chk "the same CLI run through an exec-ing shell is nested, not a launcher" \
   "[ \"\$(firing codex '900 800 00:01 bash needinput-notify.sh codex-hook
 800 750 00:20 /x/node_modules/@openai/codex/vendor/aarch64/codex/codex exec fix-it
@@ -135,14 +145,14 @@ chk "the same CLI run through an exec-ing shell is nested, not a launcher" \
 600 500 45:00 /x/node_modules/@openai/codex/vendor/aarch64/codex/codex
 500 400 45:01 node /x/lib/node_modules/@openai/codex/bin/codex.js
 400 300 03:00:00 -zsh
-300 1 1-00:00:00 tmux')\" = '800 codex 1 codex' ]"
+300 1 1-00:00:00 tmux')\" = '800 codex 1 codex 0' ]"
 chk "an SDK-run claude session under a claude host is nested" \
   "[ \"\$(firing claude '900 800 00:01 bash needinput-notify.sh claude-stop
 800 700 00:30 node /x/node_modules/@anthropic-ai/claude-code/cli.js --output-format stream-json
 700 650 00:31 python run_people.py
 650 500 00:31 /bin/zsh -c python run_people.py
 500 400 02:10:00 claude --permission-mode bypassPermissions
-400 300 03:00:00 -zsh')\" = '800 claude 1 claude' ]"
+400 300 03:00:00 -zsh')\" = '800 claude 1 claude 0' ]"
 # asked for nobody in particular: a hook radar installed for Claude may be
 # fired by another agent that runs Claude's hooks
 chk "Grok running Claude's hooks inside a Claude session is Grok, nested" \
@@ -151,18 +161,18 @@ chk "Grok running Claude's hooks inside a Claude session is Grok, nested" \
 700 500 00:07 /bin/zsh -c source snapshot.sh && grok -p say-ok
 500 400 02:10:00 claude --permission-mode bypassPermissions
 400 300 03:00:00 -zsh
-300 1 1-00:00:00 tmux')\" = '800 grok 1 grok' ]"
+300 1 1-00:00:00 tmux')\" = '800 grok 1 grok 0' ]"
 chk "Cursor's TUI launched as agent is Cursor, on its own" \
   "[ \"\$(firing '' '900 850 00:01 bash tap.sh
 850 800 00:01 /bin/zsh -c builtin export PATH=/usr/bin; snap=1
 800 400 00:29 /Users/u/.local/bin/agent --use-system-ca /Users/u/.local/share/cursor-agent/versions/2026.09.26/index.js
 400 300 03:00:00 -zsh
-300 1 1-00:00:00 tmux')\" = '800 cursor-agent 0 cursor-agent' ]"
+300 1 1-00:00:00 tmux')\" = '800 cursor-agent 0 cursor-agent 0' ]"
 chk "a launcher of another kind right above is no launcher of this one" \
   "[ \"\$(firing '' '900 800 00:01 bash needinput-notify.sh claude-stop
 800 500 00:02 grok -p say-ok
 500 400 00:03 claude -p wrap
-400 300 03:00:00 -zsh')\" = '800 grok 1 grok' ]"
+400 300 03:00:00 -zsh')\" = '800 grok 1 grok 0' ]"
 chk "a hook with no agent above it names nobody" \
   "[ \"\$(firing claude '900 400 00:01 bash needinput-notify.sh claude-stop
 400 300 03:00:00 -zsh

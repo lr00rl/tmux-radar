@@ -20,6 +20,7 @@ bad()  { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 chk()  { if eval "$2"; then ok "$1"; else bad "$1 -- [$2]"; fi; }
 
 cleanup() {
+  tmux -L "${SOCKET}v" kill-server 2>/dev/null || true
   tmux -L "$SOCKET" kill-server 2>/dev/null || true
   rm -rf "$T" 2>/dev/null || true
 }
@@ -221,6 +222,108 @@ printf '{"event":"idle","session_id":"oc-inner","pane":"%s","pid":800,"cwd":"/tm
   hook "$OPENCODE_IN_PI" opencode-hook
 chk "opencode run inside a pi session writes nothing" \
   "[ \"\$(rows_for oc:s:oc-inner)\" = 0 ] && [ \"\$(reg_for oc:s:oc-inner)\" = 0 ]"
+
+# --- Codex's shared background server --------------------------------------------
+# Every TUI's turns can run in one `codex app-server`, which the first TUI
+# started and which kept that TUI's environment: its hooks all arrive with
+# the first pane's $TMUX_PANE. Each session's own pane comes from the payload:
+# the folder of the one TUI there, or the screen showing the prompt.
+SERVER_CODEX='ME 810 00:01 bash needinput-notify.sh
+810 360 20:00:00 /h/.codex/packages/standalone/releases/0.165.0/bin/codex app-server --remote-control --listen unix://
+360 350 3-18:00:00 /h/.codex/packages/standalone/releases/0.165.0/bin/codex app-server daemon pid-update-loop
+350 340 3-18:00:01 codex
+340 300 3-18:00:05 -zsh
+300 1 4-00:00:00 tmux'
+mkdir -p "$T/projA" "$T/projB"
+PA="$(cd "$T/projA" && pwd -P)"; PB="$(cd "$T/projB" && pwd -P)"
+# stand-in TUIs: a process named codex in its pane's folder, after printing
+# what its screen would show
+tmux new-window -d -c "$PB" "bash -c 'echo \"› first task in B\"; exec -a $T/bin/codex sleep 600'"
+tmux new-window -d -c "$PB" "bash -c 'echo \"› refactor the parser please\"; exec -a $T/bin/codex sleep 600'"
+sleep 1
+PANE_B1="$(tmux list-panes -a -F '#{pane_id} #{pane_start_command}' | awk '/first task/ { print $1; exit }')"
+PANE_B2="$(tmux list-panes -a -F '#{pane_id} #{pane_start_command}' | awk '/refactor the parser/ { print $1; exit }')"
+reset_all
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"sx-b2","turn_id":"t1","cwd":"%s","prompt":"refactor the parser please"}' "$PB" |
+  hook "$SERVER_CODEX" codex-hook >/dev/null
+chk "a server prompt places its session in the pane whose screen shows it" \
+  "awk -F'\t' -v p='$PANE_B2' '\$2==\"s:sx-b2\" && \$4==p' '$REG' | grep -q ."
+chk "the placed session records its own TUI, not the server" \
+  "awk -F'\t' '\$2==\"s:sx-b2\" && \$3!=810 && \$3!=0' '$REG' | grep -q ."
+OUT="$(printf '{"hook_event_name":"Stop","session_id":"sx-b2","turn_id":"t1","cwd":"%s","last_assistant_message":"done"}' "$PB" |
+  hook "$SERVER_CODEX" codex-hook)"
+chk "its stop marks that pane, not the pane the server inherited" \
+  "awk -F'\t' -v p='$PANE_B2' '\$1==p && \$4==\"s:sx-b2\"' '$MARKS' | grep -q . && ! awk -F'\t' -v p='$PANE' '\$1==p' '$MARKS' | grep -q ."
+chk "a server stop still prints the turn stamp" "printf '%s' \"\$OUT\" | grep -q 'turn took'"
+printf '{"hook_event_name":"Stop","session_id":"sx-bg","turn_id":"t9","cwd":"%s","last_assistant_message":"hi"}' "$PB" |
+  hook "$SERVER_CODEX" codex-hook >/dev/null
+chk "a server stop of a session no prompt placed marks nothing" \
+  "[ \"\$(rows_for s:sx-bg)\" = 0 ] && [ \"\$(reg_for s:sx-bg)\" = 0 ]"
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"sx-amb","turn_id":"t2","cwd":"%s","prompt":"a prompt no screen shows"}' "$PB" |
+  hook "$SERVER_CODEX" codex-hook >/dev/null
+chk "a server prompt two panes could own and neither shows places nothing" \
+  "! awk -F'\t' '\$2==\"s:sx-amb\" && \$4!=\"-\"' '$REG' | grep -q ."
+tmux kill-pane -t "$PANE_B1"
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"sx-b1","turn_id":"t3","cwd":"%s","prompt":"anything"}' "$PB" |
+  hook "$SERVER_CODEX" codex-hook >/dev/null
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"sx-a","turn_id":"t4","cwd":"%s","prompt":"anything"}' "$PA" |
+  hook "$SERVER_CODEX" codex-hook >/dev/null
+# The server also runs prompts sent from outside tmux, so a folder alone
+# places nothing.
+chk "one TUI in the folder is not enough when no client shows it and its screen lacks the prompt" \
+  "! awk -F'\t' '\$2==\"s:sx-b1\" && \$4!=\"-\"' '$REG' | grep -q ."
+chk "a folder no TUI works in places nothing" \
+  "! awk -F'\t' '\$2==\"s:sx-a\" && \$4!=\"-\"' '$REG' | grep -q ."
+# A viewer: a client attached from inside a pane of a second server.
+tmux -L "${SOCKET}v" -f /dev/null new-session -d -s view -x 160 -y 40 "env -u TMUX tmux -L $SOCKET attach -t nested; exec bash --norc"
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -n "$(tmux list-clients -F '#{client_name}' 2>/dev/null)" ] && break; sleep 0.3; done
+tmux select-window -t "$PANE_B2"; tmux select-pane -t "$PANE_B2"
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"sx-b1","turn_id":"t3","cwd":"%s","prompt":"anything"}' "$PB" |
+  hook "$SERVER_CODEX" codex-hook >/dev/null
+chk "the TUI in the folder whose pane a client shows takes the prompt" \
+  "awk -F'\t' -v p='$PANE_B2' '\$2==\"s:sx-b1\" && \$4==p' '$REG' | grep -q ."
+"$N" mark "$PANE_B2" codex "keep me" s:sx-b2 >/dev/null 2>&1 || true
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"sx-sub","turn_id":"t5","cwd":"%s","prompt":"refactor the parser please","agent_id":"a1","agent_type":"researcher"}' "$PB" |
+  hook "$SERVER_CODEX" codex-hook >/dev/null
+chk "a subagent thread's prompt is not yours: it registers and clears nothing" \
+  "[ \"\$(reg_for s:sx-sub)\" = 0 ] && [ \"\$(rows_for s:sx-b2)\" = 1 ]"
+# A subagent's rollout names the session that spawned it: its approval waits
+# on you in that session's pane, while its end is part of the parent's turn.
+printf '{"type":"session_meta","payload":{"id":"sx-sub2","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"sx-b1","depth":1}}}}}\n' > "$T/sub-rollout.jsonl"
+"$N" clear-all
+printf '{"hook_event_name":"PermissionRequest","session_id":"sx-sub2","turn_id":"t6","cwd":"%s","transcript_path":"%s","tool_name":"Bash"}' "$PB" "$T/sub-rollout.jsonl" |
+  hook "$SERVER_CODEX" codex-hook >/dev/null
+chk "a subagent's approval marks the pane of the session that spawned it" \
+  "awk -F'\t' -v p='$PANE_B2' '\$1==p && \$4==\"s:sx-b1\" && \$5 ~ /approval/' '$MARKS' | grep -q . && [ \"\$(reg_for s:sx-sub2)\" = 0 ]"
+printf '{"hook_event_name":"Stop","session_id":"sx-sub2","turn_id":"t6","cwd":"%s","transcript_path":"%s","last_assistant_message":"found it"}' "$PB" "$T/sub-rollout.jsonl" |
+  hook "$SERVER_CODEX" codex-hook >/dev/null
+chk "a subagent's end marks nothing finished" "! awk -F'\t' '\$5 ~ /finished/' '$MARKS' | grep -q ."
+# A session lives as long as its own TUI: a new TUI in the same pane is not it.
+tmux respawn-pane -k -t "$PANE_B2" "bash -c 'echo \"› a new session\"; exec -a $T/bin/codex sleep 600'"
+sleep 0.5
+"$N" clear-all
+printf '{"hook_event_name":"Stop","session_id":"sx-b2","turn_id":"t7","cwd":"%s","last_assistant_message":"late"}' "$PB" |
+  hook "$SERVER_CODEX" codex-hook >/dev/null
+chk "a session whose TUI was replaced in its pane marks nothing there" "[ \"\$(rows_for s:sx-b2)\" = 0 ]"
+# `codex exec` is nobody's prompt, and a TUI behind a launcher counts as the
+# launcher.
+mkdir -p "$T/projC"; PC="$(cd "$T/projC" && pwd -P)"
+printf 'exec -a %s/bin/codex bash -c "sleep 600; :" exec fix-it\n' "$T" > "$T/exec-standin.sh"
+printf '( exec -a %s/bin/codex sleep 600 ) & wait\n' "$T" > "$T/wrap.sh"
+printf 'exec -a %s/bin/codex bash %s/wrap.sh\n' "$T" "$T" > "$T/wrap-start.sh"
+tmux new-window -c "$PA" "bash $T/exec-standin.sh"
+sleep 0.5
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"sx-exec","turn_id":"t8","cwd":"%s","prompt":"fix it"}' "$PA" |
+  hook "$SERVER_CODEX" codex-hook >/dev/null
+chk "a codex exec in the shown pane is not a TUI to place a prompt in" \
+  "! awk -F'\t' '\$2==\"s:sx-exec\" && \$4!=\"-\"' '$REG' | grep -q ."
+tmux new-window -c "$PC" "bash $T/wrap-start.sh"
+sleep 0.5
+PANE_C="$(tmux display-message -p '#{pane_id}')"; PID_C="$(pgrep -f "bin/codex $T/wrap.sh" | head -1)"
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"sx-wrap","turn_id":"t9","cwd":"%s","prompt":"anything"}' "$PC" |
+  hook "$SERVER_CODEX" codex-hook >/dev/null
+chk "a TUI behind a launcher is recorded as the launcher" \
+  "awk -F'\t' -v p='$PANE_C' -v pid='$PID_C' '\$2==\"s:sx-wrap\" && \$4==p && \$3==pid' '$REG' | grep -q ."
 
 # --- a paneless event is none of this rule's business ---------------------------
 reset_all

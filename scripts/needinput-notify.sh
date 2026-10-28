@@ -411,13 +411,15 @@ _agent_panes() {
 #   AGENT_NESTED  1 when another watched agent stands above it
 #   AGENT_KIND    what it is; `*` for <kind> asks for the nearest watched
 #                 agent whatever it is
+#   AGENT_SERVER  1 when it is Codex's shared background server, which runs the
+#                 hooks of every TUI attached to it (see _codex_locate)
 #   AGENT_TEAM    1 when it is a member of a Claude agent team (radar_teammate)
-AGENT_FOR=""; AGENT_PID=""; AGENT_PROC=""; AGENT_NESTED=0; AGENT_KIND=""; AGENT_TEAM=0
+AGENT_FOR=""; AGENT_PID=""; AGENT_PROC=""; AGENT_NESTED=0; AGENT_KIND=""; AGENT_SERVER=0; AGENT_TEAM=0
 _agent_identify() {  # _agent_identify <kind|*>
   local kind out
   kind="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
   [ "$AGENT_FOR" = "$kind" ] && return 0
-  AGENT_FOR="$kind"; AGENT_PID=""; AGENT_PROC=""; AGENT_NESTED=0; AGENT_KIND=""; AGENT_TEAM=0
+  AGENT_FOR="$kind"; AGENT_PID=""; AGENT_PROC=""; AGENT_NESTED=0; AGENT_KIND=""; AGENT_SERVER=0; AGENT_TEAM=0
   [ -n "$kind" ] || return 0
   [ "$kind" != '*' ] || kind=""
   out="$("$PS_BIN" -axo pid=,ppid=,etime=,command= 2>/dev/null |
@@ -440,8 +442,9 @@ _agent_identify() {  # _agent_identify <kind|*>
       print out
     }' || true)"
   [ -n "$out" ] || return 0
-  IFS=$'\t' read -r AGENT_PID AGENT_PROC AGENT_NESTED AGENT_KIND AGENT_TEAM <<< "$out"
+  IFS=$'\t' read -r AGENT_PID AGENT_PROC AGENT_NESTED AGENT_KIND AGENT_SERVER AGENT_TEAM <<< "$out"
   case "$AGENT_NESTED" in 1) ;; *) AGENT_NESTED=0 ;; esac
+  case "$AGENT_SERVER" in 1) ;; *) AGENT_SERVER=0 ;; esac
   case "$AGENT_TEAM" in 1) ;; *) AGENT_TEAM=0 ;; esac
 }
 
@@ -2043,27 +2046,172 @@ _codex_pane() {
   printf '%s' "$pane"
 }
 
-# `codex exec` and `codex review` run the same hooks with nobody at the
-# prompt. Codex says which it is in two places: the legacy notify payload
-# names the client, and the first line of the session's rollout file names
-# who originated it.
-_codex_headless() {  # _codex_headless <json>
-  local path
-  [ "$(_json_field client "$1")" = codex_exec ] && return 0
+# Where a Codex event goes: CODEX_PANE, and under the shared server also
+# CODEX_TUI_PID. Returns 1 for a nested run (codex started from another
+# agent's tool call), which reports nothing. A TUI normally runs its own
+# turns and fires its hooks itself, so $TMUX_PANE names its pane. Codex can
+# instead run every TUI's turns in one shared background server, which keeps
+# the environment of whichever TUI started it: there $TMUX_PANE names that
+# first pane for every session, and the pane is found from the payload.
+CODEX_PANE=""; CODEX_TUI_PID=""
+_codex_locate() {  # _codex_locate <json> <event>
+  CODEX_PANE=""; CODEX_TUI_PID=""
+  _agent_identify codex
+  if [ "$AGENT_SERVER" = 1 ]; then
+    _codex_client_pane "$1" "${2:-}"
+    return 0
+  fi
+  CODEX_PANE="$(_codex_pane)"
+  [ -n "$CODEX_PANE" ] && [ "$AGENT_NESTED" = 1 ] && return 1
+  return 0
+}
+
+# The Codex TUIs in tmux panes: "<pane>\t<pid>\t<cwd>\t<shown>\t<command>"
+# per TUI, where <shown> is 1 while an attached client shows that pane. Never
+# the shared server itself (it runs in the tree of the TUI that started it),
+# nor `codex exec` or `codex review`, which nobody types into. A TUI started
+# through a wrapper counts once, as its outermost process. The cwd comes from
+# the process, since tmux reports the pane's shell for some foreground
+# programs.
+_codex_tuis() {
+  have_tmux || return 0
+  local rows pids cwds
+  rows="$({ printf '__PANES__\n'; tmux list-panes -a -F '#{pane_id} #{pane_pid} #{pane_tty}' 2>/dev/null
+    printf '__CLIENTS__\n'; tmux list-clients -F '#{pane_id}' 2>/dev/null
+    printf '__PS__\n'; "$PS_BIN" -axo pid=,ppid=,tty=,command= 2>/dev/null; } |
+    LC_ALL=C awk "$RADAR_MATCH_AWK"'
+    function cleantty(t) { sub(/^\/dev\//, "", t); return t }
+    function command_of(row) {
+      sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", row)
+      return row
+    }
+    BEGIN { want["codex"] = 1 }
+    $0 == "__PANES__"   { mode = 1; next }
+    $0 == "__CLIENTS__" { mode = 3; next }
+    $0 == "__PS__"      { mode = 2; next }
+    mode == 1 && $1 != "" { bypid[$2] = $1; bytty[cleantty($3)] = $1; next }
+    mode == 3 && $1 != "" { shown[$1] = 1; next }
+    mode == 2 && $1 != "" {
+      par[$1] = $2; c = command_of($0)
+      if (radar_kind(c, "codex", want) != "" && !radar_server(c) && c !~ /[[:space:]](exec|review)([[:space:]]|$)/) {
+        tui[$1] = c; atty[$1] = cleantty($3)
+      }
+      next
+    }
+    END {
+      for (pid in tui) {
+        if (par[pid] in tui) continue
+        pane = ""
+        if (atty[pid] != "" && atty[pid] != "??" && (atty[pid] in bytty)) pane = bytty[atty[pid]]
+        for (cur = par[pid]; pane == "" && cur != "" && cur != "0" && cur != "1"; cur = par[cur])
+          if (cur in bypid) pane = bypid[cur]
+        if (pane == "" || (pane in seen)) continue
+        seen[pane] = 1
+        print pane "\t" pid "\t" ((pane in shown) ? 1 : 0) "\t" tui[pid]
+      }
+    }' || true)"
+  [ -n "$rows" ] || return 0
+  pids="$(printf '%s\n' "$rows" | cut -f2 | paste -sd, -)"
+  if [ -d /proc/self ]; then
+    cwds="$(printf '%s\n' "$rows" | cut -f2 | while read -r p; do printf '%s\t%s\n' "$p" "$(readlink "/proc/$p/cwd" 2>/dev/null)"; done)"
+  else
+    cwds="$(lsof -a -d cwd -p "$pids" -Fpn 2>/dev/null | awk '/^p/ { p = substr($0, 2) } /^n/ { print p "\t" substr($0, 2) }')"
+  fi
+  # Both lists on stdin: awk -v rejects a value with a newline in it.
+  printf '%s\n__ROWS__\n%s\n' "$cwds" "$rows" | awk -F '\t' '
+    $0 == "__ROWS__" { rows = 1; next }
+    !rows { if ($1 != "") cwd[$1] = $2; next }
+    $1 != "" { print $1 "\t" $2 "\t" cwd[$2] "\t" $3 "\t" $4 }'
+}
+
+# The pane of the TUI a shared-server event belongs to (CODEX_PANE,
+# CODEX_TUI_PID), or neither when no pane can be told apart. A session keeps
+# the pane it was placed in while the same TUI still runs there, and a TUI
+# resumed with the session's id on its command line is its pane. Otherwise
+# only a prompt places a session, since you typed it into one pane: among the
+# TUIs working in the session's folder, the one pane a client is showing, or
+# else the one whose screen shows the prompt. The folder alone is not
+# enough, since the server also runs prompts sent from outside tmux. Every
+# other event of an unplaced session names no pane.
+_codex_client_pane() {  # _codex_client_pane <json> <event>
+  local json="$1" event="${2:-}" sid cwd tuis row hit needle pane pid path shown cmd matches
+  sid="$(_codex_sid "$json")"
+  cwd="$(_json_field cwd "$json")"
+  # The TUIs' folders are real paths (/private/tmp, never /tmp).
+  if [ -n "$cwd" ] && [ -d "$cwd" ]; then cwd="$(cd "$cwd" 2>/dev/null && pwd -P || printf '%s' "$cwd")"; fi
+  tuis="$(_codex_tuis)"
+  [ -n "$tuis" ] || return 0
+  if [ -n "$sid" ]; then
+    row="$(awk -F '\t' -v k="s:$sid" 'NF >= 9 && $1 == "codex" && $2 == k { print $4 "\t" $3; exit }' "$REG_FILE" 2>/dev/null || true)"
+    hit=""
+    [ -z "$row" ] || hit="$(printf '%s\n' "$tuis" | awk -F '\t' -v r="$row" '($1 "\t" $2) == r { print; exit }')"
+    [ -n "$hit" ] || hit="$(printf '%s\n' "$tuis" | awk -F '\t' -v s="$sid" 'index($5, s) { print; exit }')"
+    if [ -n "$hit" ]; then
+      IFS=$'\t' read -r CODEX_PANE CODEX_TUI_PID path shown cmd <<< "$hit"
+      return 0
+    fi
+  fi
+  [ "$event" = UserPromptSubmit ] || return 0
+  matches="$(printf '%s\n' "$tuis" | awk -F '\t' -v c="$cwd" 'c != "" && $3 == c')"
+  [ -n "$matches" ] || return 0
+  hit="$(printf '%s\n' "$matches" | awk -F '\t' '$4 == 1 { n++; h = $1 "\t" $2 } END { if (n == 1) print h }')"
+  if [ -z "$hit" ]; then
+    # The TUI echoes the prompt: a stretch of its first line picks the pane.
+    needle="$(_json_field prompt "$json" | sed -n '/[^[:space:]]/{p;q;}' | sed 's/^[[:space:]]*//' | cut -c1-32)"
+    if [ "${#needle}" -ge 6 ]; then
+      while IFS=$'\t' read -r pane pid path shown cmd; do
+        if tmux capture-pane -p -J -S -300 -t "$pane" 2>/dev/null | grep -qF -- "$needle"; then
+          [ -n "$hit" ] && { hit=""; break; }
+          hit="$pane"$'\t'"$pid"
+        fi
+      done <<< "$matches"
+    fi
+  fi
+  [ -n "$hit" ] || return 0
+  IFS=$'\t' read -r CODEX_PANE CODEX_TUI_PID <<< "$hit"
+}
+
+# Who a Codex session belongs to, from the first line of its rollout file.
+# CODEX_HEADLESS=1 for `codex exec` and `codex review`, which run the same
+# hooks with nobody at the prompt (the legacy notify payload names that
+# client too). CODEX_SUB=1 for a subagent thread, and CODEX_PARENT is the
+# session that spawned it when the rollout says.
+CODEX_HEADLESS=0; CODEX_SUB=0; CODEX_PARENT=""
+_codex_origin() {  # _codex_origin <json>
+  local path line
+  CODEX_HEADLESS=0; CODEX_SUB=0; CODEX_PARENT=""
+  if [ "$(_json_field client "$1")" = codex_exec ]; then CODEX_HEADLESS=1; return 0; fi
   path="$(_json_field transcript_path "$1")"
   # The payload names the file: only a regular one is read, since a FIFO would
   # block the hook, and only its first MiB (real first lines run 14 to 46 KB).
-  [ -n "$path" ] && [ -f "$path" ] && [ -r "$path" ] || return 1
-  command -v jq >/dev/null 2>&1 || return 1
-  head -c 1048576 "$path" 2>/dev/null | head -n 1 |
-    jq -e '(.payload.originator // "") == "codex_exec" or (.payload.source // "") == "exec"' >/dev/null 2>&1
+  [ -n "$path" ] && [ -f "$path" ] && [ -r "$path" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  line="$(head -c 1048576 "$path" 2>/dev/null | head -n 1 | jq -r '.payload as $p
+    | (($p.source | objects | .subagent) // null) as $sub
+    | [ (if ($p.originator // "") == "codex_exec" or ($p.source // "") == "exec" then 1 else 0 end),
+        (if $sub == null then 0 else 1 end),
+        (($sub | objects | .thread_spawn.parent_thread_id) // "") ] | @tsv' 2>/dev/null || true)"
+  [ -n "$line" ] || return 0
+  IFS=$'\t' read -r CODEX_HEADLESS CODEX_SUB CODEX_PARENT <<< "$line"
+}
+
+# A subagent thread works inside its parent's turn: its prompt and its end
+# are not yours, while an approval it waits on is.
+_codex_subagent_skip() {  # _codex_subagent_skip <event-or-type> <json>
+  { [ "$CODEX_SUB" = 1 ] || [ -n "$(_json_field agent_id "$2")" ]; } || return 1
+  case "$(_codex_event_kind "$1" || true)" in
+    turn_complete|user_resumed) return 0 ;;
+  esac
+  return 1
 }
 
 CODEX_KEY=""
-# The session a Codex payload belongs to: notify payloads carry thread-id or
-# thread_id, hook payloads session_id.
+# The session a Codex payload reports to: notify payloads carry thread-id or
+# thread_id, hook payloads session_id. A subagent thread reports to the
+# session that spawned it (CODEX_PARENT, from _codex_origin).
 _codex_sid() {  # _codex_sid <json>
   local sid
+  if [ -n "$CODEX_PARENT" ]; then printf '%s' "$CODEX_PARENT"; return 0; fi
   sid="$(_json_field thread-id "$1")"
   [ -n "$sid" ] || sid="$(_json_field thread_id "$1")"
   [ -n "$sid" ] || sid="$(_json_field session_id "$1")"
@@ -2075,6 +2223,9 @@ _codex_adopt() {  # _codex_adopt <state> <json> <pane> — sets CODEX_KEY
   CODEX_KEY=""
   _agent_identify codex
   pid="$AGENT_PID"; proc="$AGENT_PROC"
+  # Under the shared server the firing process serves every session; the
+  # session lives as long as its own TUI.
+  [ "$AGENT_SERVER" = 1 ] && { pid="$CODEX_TUI_PID"; proc=codex; }
   # hook payloads may carry no id: fall back to a pid key so liveness GC
   # still applies
   sid="$(_codex_sid "$json")"
@@ -2129,9 +2280,11 @@ cmd_codex_hook() {  # Codex native hooks pass JSON on stdin
   json="$(cat 2>/dev/null || true)"
   event="$(_json_field hook_event_name "$json")"
   [ -n "$event" ] || exit 0
-  if _codex_headless "$json"; then exit 0; fi
-  pane="$(_codex_pane)"
-  if [ -n "$pane" ] && _nested_run codex; then exit 0; fi
+  _codex_origin "$json"
+  [ "$CODEX_HEADLESS" = 1 ] && exit 0
+  _codex_subagent_skip "$event" "$json" && exit 0
+  _codex_locate "$json" "$event" || exit 0
+  pane="$CODEX_PANE"
   case "$event" in
     UserPromptSubmit) sid="$(_codex_sid "$json")"; _turn_begin "${sid:+codex:$sid}" ;;
     Stop)             sid="$(_codex_sid "$json")"; _turn_end "${sid:+codex:$sid}" "$sid" "$(_json_field transcript_path "$json")" ;;
@@ -2160,9 +2313,11 @@ cmd_codex() {  # Codex notify passes its event JSON as the last argv argument
   local json="${1:-}" type pane kind label
   type="$(_json_field type "$json")"
   [ -n "$type" ] || exit 0
-  if _codex_headless "$json"; then exit 0; fi
-  pane="$(_codex_pane)"
-  if [ -n "$pane" ] && _nested_run codex; then exit 0; fi
+  _codex_origin "$json"
+  [ "$CODEX_HEADLESS" = 1 ] && exit 0
+  _codex_subagent_skip "$type" "$json" && exit 0
+  _codex_locate "$json" "$type" || exit 0
+  pane="$CODEX_PANE"
   case "$type" in
     UserPromptSubmit)
       _codex_adopt working "$json" "$pane"

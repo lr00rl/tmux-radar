@@ -394,6 +394,31 @@ the same two lines (Claude Code shows that event's `systemMessage`, and
 multi-line messages render indented under the first line), so a session
 names itself on startup, resume, `/clear` and compaction. Codex gets them at
 turn end only, since radar does not hook Codex's `SessionStart`.
+
+Codex can run every TUI's turns in one shared background server: the first
+TUI starts `codex app-server` (kept alive by `codex app-server daemon`), and
+later TUIs attach to it. The server runs the hooks, so they descend from it
+and carry the environment of the TUI that started it, `$TMUX_PANE` included,
+whichever pane the session is in. `radar_firing` reports such an agent as a
+server and never as nested (the Codex processes above it are its launcher
+and that first TUI), and the notifier finds the session's pane from the
+payload instead. A session placed in a pane keeps it while the same TUI
+process still runs there, and a TUI resumed with the session's id on its
+command line is its pane. Otherwise only a prompt places a session, since you
+typed it into one pane: among the Codex TUIs whose working directory is the
+session's `cwd`, the one pane an attached client is showing, or else the one
+whose screen shows the prompt. The folder alone places nothing, because the
+server also runs prompts sent from outside tmux and no rollout field names
+the client (every session it runs records `source: vscode`). Any other event
+of a session no prompt placed names no pane. `codex exec` and `codex review`
+are never candidates; they run their own turns (their rollouts record
+`source: exec`), so the nested check covers them. The turn stamp needs no
+pane and always prints. A subagent thread (its rollout's `source.subagent`,
+or `agent_id` in the payload) works inside its parent's turn: its prompt and
+its end report nothing, while its approval marks the pane of the session
+named by `parent_thread_id`. Before this, every hook under the server looked nested and
+was dropped, so Codex printed no stamp and reached radar only through the
+scanner.
 `@radar-turn-stamp off` drops the stamp and `@radar-session-info off` the
 session lines.
 

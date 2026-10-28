@@ -552,7 +552,13 @@ aimed at a foreign tmux server (Claude teammate swarms run under
    as the mark GC — as `working` (pane title or screen changed since the last
    sample), `stalled` (no visible change while the process lives), or
    `blocked` (the agent's own title asks for action, e.g. Codex's animated
-   `Action Required` marker). Results publish to `ai-live` (pane, kind, state,
+   `Action Required` marker). A Codex pane is `working` exactly while its
+   busy line (`• Working (12s • esc to interrupt)`, where a reasoning header
+   can replace "Working") is in the last 15 lines of its screen: an idle
+   Codex screen changes too, since quota warnings arrive in every open
+   session as the account's shared 5-hour window fills and the usage footer
+   ticks, and change detection read each of those as a turn that then
+   "finished". Results publish to `ai-live` (pane, kind, state,
    title, epoch), atomically, under a claim-stamp that caps scan frequency.
 2. A pane with no hook-claimed registry row is adopted as a `p:<pid>` row with
    the scanned state, so every surface reads one model. A later native event

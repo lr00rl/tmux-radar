@@ -307,6 +307,58 @@ chk "the teammate is still listed as an agent" \
 tmux kill-window -t "$TM_PANE" 2>/dev/null || true
 "$N" tick   # the fixtures are gone: GC their rows before the next section
 
+# --- 2.8 Codex: only its busy line is work ---------------------------------------
+# An idle Codex screen still changes: quota warnings arrive in every open
+# session as the account's shared 5-hour window fills, and the usage footer
+# ticks. Codex says it is busy in one line, and only that line counts.
+cat > "$T/start-codex-idle.sh" <<EOF
+exec -a "$T/bin3/codex" bash -c 'printf "⚠ Heads up, you have less than 50%% of your 5h limit left\\n"; sleep 1.5; printf "⚠ Heads up, you have less than 25%% of your 5h limit left\\n"; sleep 600'
+EOF
+cat > "$T/start-codex-busy.sh" <<EOF
+exec -a "$T/bin3/codex" bash -c 'for i in 1 2 3 4 5 6 7 8; do printf "• Working (%ss • esc to interrupt)\\n" "\$i"; sleep 0.25; done; clear; echo pong; sleep 600'
+EOF
+tmux new-window -n cxidle "bash $T/start-codex-idle.sh"
+CX_IDLE="$(tmux display-message -p '#{pane_id}')"
+tmux new-window -n cxbusy "bash $T/start-codex-busy.sh"
+CX_BUSY="$(tmux display-message -p '#{pane_id}')"
+tmux select-window -t 0
+sleep 0.7
+force_scan   # busy line on screen in one, a quota warning in the other
+chk "a Codex showing its busy line is working" \
+  "awk -F'\t' -v p='$CX_BUSY' '\$1==p && \$2==\"codex\" && \$3==\"working\"' '$LIVE' | grep -q ."
+chk "an idle Codex whose screen changed is stalled" \
+  "awk -F'\t' -v p='$CX_IDLE' '\$1==p && \$3==\"stalled\"' '$LIVE' | grep -q ."
+sleep 2.5
+force_scan   # the busy line is gone; a second quota warning arrived meanwhile
+force_scan   # both screens are still now
+chk "a Codex whose busy line went away gets one finished mark" \
+  "[ \"\$(awk -F'\t' -v p='$CX_BUSY' '\$1==p && \$5 ~ /finished.*scan/' '$MARKS' | wc -l | tr -d ' ')\" = 1 ]"
+chk "an idle Codex that got a quota warning and went still gets no mark" \
+  "! awk -F'\t' -v p='$CX_IDLE' '\$1==p' '$MARKS' | grep -q ."
+tmux kill-window -t "$CX_IDLE" 2>/dev/null || true
+tmux kill-window -t "$CX_BUSY" 2>/dev/null || true
+# The busy line sits just above the prompt, where a reasoning header can take
+# the place of "Working". A conversation that quotes it further up is not it.
+cat > "$T/start-codex-quote.sh" <<EOF
+exec -a "$T/bin3/codex" bash -c 'printf "• Working (3s • esc to interrupt)\\n"; for i in \$(seq 1 20); do echo "reply line \$i"; done; sleep 600'
+EOF
+cat > "$T/start-codex-header.sh" <<EOF
+exec -a "$T/bin3/codex" bash -c 'printf "• Planning the fix (1m 05s •\\n"; sleep 600'
+EOF
+tmux new-window -n cxquote "bash $T/start-codex-quote.sh"
+CX_QUOTE="$(tmux display-message -p '#{pane_id}')"
+tmux new-window -n cxhead "bash $T/start-codex-header.sh"
+CX_HEAD="$(tmux display-message -p '#{pane_id}')"
+tmux select-window -t 0
+sleep 0.7
+force_scan
+chk "a busy line under a reasoning header, cut short, is working" \
+  "awk -F'\t' -v p='$CX_HEAD' '\$1==p && \$3==\"working\"' '$LIVE' | grep -q ."
+chk "a busy line quoted far above the prompt is not" \
+  "awk -F'\t' -v p='$CX_QUOTE' '\$1==p && \$3==\"stalled\"' '$LIVE' | grep -q ."
+tmux kill-window -t "$CX_QUOTE" 2>/dev/null || true
+tmux kill-window -t "$CX_HEAD" 2>/dev/null || true
+
 # --- 3. blocked title beats change detection ---------------------------------
 tmux select-pane -t "$SPANE" -T '[ . ] Action Required | proj'
 force_scan

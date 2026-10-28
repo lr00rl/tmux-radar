@@ -43,9 +43,10 @@
 # fires, so the ACTION mark outlives the wait). Every @radar-scan-interval
 # seconds the scanner classifies each pane hosting a watched agent process
 # (same ps argv0 rules as _agent_panes) as `working` (pane title or screen
-# changed since the previous sample), `stalled` (no visible change while the
-# process stays alive), or `blocked` (the agent's own title says action is
-# required, e.g. Codex's animated "Action Required" marker). Output:
+# changed since the previous sample; for Codex, its busy line on screen),
+# `stalled` (no visible change while the process stays alive), or `blocked`
+# (the agent's own title says action is required, e.g. Codex's animated
+# "Action Required" marker). Output:
 #   "<pane>\t<kind>\t<state>\t<title>\t<epoch>"
 # Untracked agent panes are adopted into the registry as "p:<pid>" rows so
 # every surface reads one model; an agent-sourced mark heals once its pane has
@@ -1371,7 +1372,7 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
 
   local pane kind apid aproc path title pth psh pstreak phstreak phepoch claimed prev onscreen hasmark mkey mepoch okey okind team phkey
   local live_rows="" sample_rows="" adopt_rows="" heal_keys="" down_keys="" rehome_spec="" rehome_drop="" working2="" synth_rows=""
-  local th sh state streak hstreak tag key kn skey synth s_pane s_kind s_label s_key
+  local th sh screen state streak hstreak tag key kn skey synth s_pane s_kind s_label s_key
   while IFS=$'\t' read -r tag pane rest; do
     case "$tag" in
       REHOME) rehome_spec="${rehome_spec}${pane}=${rest:-}"$'\001'; continue ;;  # pane=key, rest=new pane
@@ -1386,7 +1387,8 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
     th="$(printf '%s' "$title" | cksum)"; th="${th%% *}"
     # One capture per agent pane per scan: cheap at scan cadence, and the
     # working/stalled verdict stays exact even across title-only changes.
-    sh="$(tmux capture-pane -p -t "$pane" 2>/dev/null | cksum || true)"; sh="${sh%% *}"
+    screen="$(tmux capture-pane -p -t "$pane" 2>/dev/null || true)"
+    sh="$(printf '%s' "$screen" | cksum)"; sh="${sh%% *}"
     case "$title" in
       # Codex animates an attention marker into its native title while blocked
       # on approval; change detection alone would read it as working. Cursor
@@ -1395,7 +1397,22 @@ _scan_live() {  # _scan_live [ps-snapshot] — TTL-guarded; called from cmd_tick
       *"Action Required"*|*"action required"*|*"Needs Approval"*|*"needs approval"*|*"Waiting for confirmation"*)
         state=blocked ;;
       *)
-        if { [ -n "$pth" ] && [ "$th" != "$pth" ]; } || { [ -n "$psh" ] && [ "$sh" != "$psh" ]; } || [ -z "$psh" ]; then
+        if [ "$kind" = codex ]; then
+          # Codex says it is busy in one line above its prompt, "• Working
+          # (12s • esc to interrupt)", where a reasoning header can stand in
+          # for "Working" and a narrow pane cuts the hint short. The rest of
+          # an idle Codex screen changes too: quota warnings arrive in every
+          # open session as the account's shared 5-hour window fills, the
+          # usage footer ticks, a draft gets typed, and radar's own
+          # retitling moves the title. Only that line counts, looked for at
+          # the bottom of the screen so a conversation quoting it does not.
+          if printf '%s\n' "$screen" | awk 'NF { l[++n] = $0 } END { for (i = (n > 15 ? n - 14 : 1); i <= n; i++) print l[i] }' |
+            grep -Eq 'esc to interrupt|(^|[[:space:]])Working \([0-9]+[smh]|\(([0-9]+h )?([0-9]+m )?[0-9]+s •'; then
+            state=working
+          else
+            state=stalled
+          fi
+        elif { [ -n "$pth" ] && [ "$th" != "$pth" ]; } || { [ -n "$psh" ] && [ "$sh" != "$psh" ]; } || [ -z "$psh" ]; then
           state=working
         else
           state=stalled

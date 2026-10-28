@@ -46,7 +46,10 @@ long-running agents.
   `@radar-scan-interval` seconds the scanner classifies each pane hosting a
   watched agent process (ps argv0/argv1 match — node/bun-wrapped CLIs like pi
   included) as `working`, `stalled`, or `blocked` (Codex's own
-  `Action Required` title is honored) from visible title/screen change.
+  `Action Required` title is honored) from visible title/screen change. A
+  Codex pane counts as working only while its busy line is on screen, so a
+  quota warning or a usage footer tick in an idle Codex is not a finished
+  turn.
   Untracked agent panes are adopted into the registry, stale ACTION marks
   heal after two consecutive working scans, registry rows whose pane lives on
   a foreign tmux server (Claude teammate swarms) are re-homed to paneless,

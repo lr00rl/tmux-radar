@@ -14,6 +14,8 @@ cleanup() {
   [ -z "${ATT_REG_PID:-}" ] || kill "$ATT_REG_PID" >/dev/null 2>&1 || true
   [ -z "${TICK_HOLDER_PID:-}" ] || kill "$TICK_HOLDER_PID" >/dev/null 2>&1 || true
   tmux -L "$SOCKET" kill-server >/dev/null 2>&1 || true
+  # The real picker outlives its pane and ignores SIGTERM.
+  pkill -KILL -f "$TMP/real-fzf-bin/" >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
